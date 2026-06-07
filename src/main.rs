@@ -37,8 +37,10 @@ enum Commands {
         type_cache_ttl: u64,
         #[arg(long, default_value = "1")]
         stat_cache_ttl: u64,
-        /// Allow other users to access the mount
-        #[arg(long)]
+        /// Allow other users to access the mount. 
+        /// ⚠️  Security: enables access for ALL local users.
+        ///     Use with --uid/--gid to control file ownership.
+        #[arg(long, verbatim_doc_comment)]
         allow_other: bool,
         /// Volume name (shown in mount table)
         #[arg(long, default_value = "mntrs")]
