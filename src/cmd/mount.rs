@@ -133,10 +133,10 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
     };
     let fs = MntrsFs {
         op: Arc::new(op),
-        inodes: std::sync::Mutex::new(std::collections::HashMap::new()),
-        dir_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        inodes: dashmap::DashMap::new(),
+        dir_cache: dashmap::DashMap::new(),
         cache_dir: cache_dir_path,
-        handles: std::sync::Mutex::new(std::collections::HashMap::new()),
+        handles: dashmap::DashMap::new(),
         dir_cache_ttl: std::time::Duration::from_secs(dir_cache_time),
         attr_ttl: std::time::Duration::from_secs(attr_timeout),
         volname: volname.to_string(),

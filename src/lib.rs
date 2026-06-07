@@ -1,6 +1,6 @@
 pub mod cmd;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{Write, Seek, SeekFrom};
@@ -29,12 +29,10 @@ const FUSE_ROOT_INO: u64 = 1;
 
 pub struct MntrsFs {
     pub op: Arc<Operator>,
-    inodes: Mutex<HashMap<u64, (String, FileType, u64)>>,
-    #[allow(clippy::type_complexity)]
-    dir_cache: Mutex<HashMap<String, (std::time::Instant, Vec<(String, EntryMode)>)>>,
+    inodes: dashmap::DashMap<u64, (String, FileType, u64)>,
+    dir_cache: dashmap::DashMap<String, (std::time::Instant, Vec<(String, EntryMode)>)>,
     cache_dir: PathBuf,
-    #[allow(clippy::type_complexity)]
-    handles: Mutex<HashMap<u64, (String, bool, Option<std::time::Instant>)>>, // +dirty_since
+    handles: dashmap::DashMap<u64, (String, bool, Option<std::time::Instant>)>, // +dirty_since
     pub dir_cache_ttl: Duration,
     pub attr_ttl: Duration,
     pub volname: String,
@@ -130,13 +128,12 @@ pub fn cache_path(cache_dir: &Path, path: &str) -> PathBuf {
 
 impl MntrsFs {
     fn resolve(&self, ino: u64) -> Option<(String, FileType, u64)> {
-        self.inodes.lock().unwrap().get(&ino).cloned()
+        self.inodes.get(&ino).map(|r| r.clone())
     }
 
     fn alloc_ino(&self, path: &str, kind: FileType, size: u64) -> u64 {
         let ino = path_hash(path);
-        let mut map = self.inodes.lock().unwrap();
-        map.entry(ino).or_insert((path.to_string(), kind, size));
+        self.inodes.entry(ino).or_insert((path.to_string(), kind, size));
         ino
     }
 
@@ -162,9 +159,10 @@ impl MntrsFs {
 
     fn list_op(&self, path: &str) -> Vec<(String, EntryMode)> {
         {
-            let cache = self.dir_cache.lock().unwrap();
-            if let Some((t, entries)) = cache.get(path)
-                && t.elapsed() < self.dir_cache_ttl { return entries.clone(); }
+            if let Some(entry) = self.dir_cache.get(path) {
+                let (t, entries) = entry.value();
+                if t.elapsed() < self.dir_cache_ttl { return entries.clone(); }
+            }
         }
         let depth = path.matches('/').count();
         let result = rt().block_on(async {
@@ -194,7 +192,7 @@ impl MntrsFs {
             }
             Some(out)
         }).unwrap_or_default();
-        self.dir_cache.lock().unwrap().insert(path.to_string(), (std::time::Instant::now(), result.clone()));
+        self.dir_cache.insert(path.to_string(), (std::time::Instant::now(), result.clone()));
         result
     }
 
@@ -393,14 +391,14 @@ impl Filesystem for MntrsFs {
         let parent_path = self.resolve(parent.into()).map(|(p, _, _)| p).unwrap_or_default();
         let full_path = if parent_path.is_empty() { name.to_string() } else { format!("{}/{}", parent_path, name) };
         let ino = self.alloc_ino(&full_path, FileType::RegularFile, 0);
-        self.handles.lock().unwrap().insert(ino, (full_path.clone(), false, None));
+        self.handles.insert(ino, (full_path.clone(), false, None));
         reply.created(&self.attr_ttl, &self.make_attr(ino, 0, FileType::RegularFile), Generation(0), FileHandle(ino), FopenFlags::empty());
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         let ino: u64 = ino.into();
         if let Some((path, FileType::RegularFile, _)) = self.resolve(ino) {
-            self.handles.lock().unwrap().insert(ino, (path, false, None));
+            self.handles.insert(ino, (path, false, None));
         }
         reply.opened(FileHandle(ino), FopenFlags::empty());
     }
@@ -455,7 +453,7 @@ impl Filesystem for MntrsFs {
 
     fn write(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64, data: &[u8], _write_flags: WriteFlags, _flags: OpenFlags, _lock_owner: Option<LockOwner>, reply: ReplyWrite) {
         let fh_val: u64 = fh.into();
-        let path = match self.handles.lock().unwrap().get(&fh_val).map(|(p, d, _)| (p.clone(), *d)) {
+        let path = match self.handles.get(&fh_val).map(|r| { let (p, d, _) = r.clone(); (p, d) }) {
             Some((p, _)) => p,
             None => { reply.error(Errno::ENOENT); return; }
         };
@@ -478,7 +476,7 @@ impl Filesystem for MntrsFs {
         })();
         self.evict_lru();
         match result {
-            Ok(()) => { self.handles.lock().unwrap().insert(fh_val, (path, true, Some(std::time::Instant::now()))); reply.written(data.len() as u32); }
+            Ok(()) => { self.handles.insert(fh_val, (path, true, Some(std::time::Instant::now()))); reply.written(data.len() as u32); }
             Err(_) => reply.error(Errno::EIO),
         }
     }
@@ -610,10 +608,9 @@ impl Filesystem for MntrsFs {
     fn flush(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
         let fh_val: u64 = fh.into();
         let (path, dirty) = {
-            let mut h = self.handles.lock().unwrap();
-            let entry = h.get(&fh_val).cloned();
+            let entry = self.handles.get(&fh_val).map(|r| r.clone());
             if let Some((p, d, _)) = entry {
-                if d { h.insert(fh_val, (p.clone(), false, None)); }
+                if d { self.handles.insert(fh_val, (p.clone(), false, None)); }
                 (p, d)
             } else { return reply.ok(); }
         };
@@ -627,7 +624,7 @@ impl Filesystem for MntrsFs {
     }
 
     fn release(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _flags: OpenFlags, _lock_owner: Option<LockOwner>, _flush: bool, reply: ReplyEmpty) {
-        self.handles.lock().unwrap().remove(&fh.into());
+        self.handles.remove(&fh.into());
         reply.ok();
     }
 }
