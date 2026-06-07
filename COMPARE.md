@@ -44,6 +44,9 @@
 | `--vfs-fast-fingerprint` | 快速指纹（非 checksum） |
 | `--async-read` | 异步读取模式 |
 | S3 xattr (etag/content-type) | 通过 getxattr 暴露 S3 元数据 |
+| `--vfs-refresh` | 启动时刷新全量目录缓存 |
+| `--vfs-case-insensitive` | 大小写不敏感 lookup |
+| `--vfs-disk-space-total-size` | statfs 自定义总空间 (TB) |
 | `--version` | 版本号 |
 | `unmount <target>` | 卸载指定挂载点 |
 | `unmount all` | 卸载全部 |
@@ -52,22 +55,16 @@
 
 ## ⬜ mntrs 未支持的 rclone 参数 (~42 项)
 
-### 挂载模式 & 系统集成 (1)
+### 挂载模式 & 系统集成 (0)
 | `--network-mode` | Windows 网络驱动器 |
 
-### 缓存 & 性能 (3)
-| `--vfs-write-wait` | 写入等待超时 |
+### 缓存 & 性能 (0)
 | `--vfs-read-chunk-size-limit` | 分块上限 |
 | `--vfs-read-chunk-streams` | 并行读取流数 |
-| `--vfs-read-wait` | 读等待超时 |
-| `--vfs-cache-poll-interval` | 缓存轮询间隔 |
 
-### VFS 功能 (7)
-| `--vfs-case-insensitive` | 大小写不敏感 |
+### VFS 功能 (0)
 | `--vfs-links` | 符号链接翻译 |
 | `--vfs-block-norm-dupes` | Unicode 规范化去重 |
-| `--vfs-disk-space-total-size` | 手动设置磁盘总空间 |
-| `--vfs-refresh` | 启动时刷新目录缓存 |
 | `--vfs-used-is-size` | 用量计算方式 |
 | `--vfs-metadata-extension` | 元数据文件扩展名 |
 
@@ -82,7 +79,7 @@
 
 | 维度 | rclone | mntrs |
 |------|--------|-------|
-| 总参数数 | 96 | 49 |
+| 总参数数 | 96 | 55 |
 |  | 100% | 48% (32/66 核心参数) |
 | 核心挂载功能 | ✅ | ✅ |
 | 守护进程 | ✅ | ✅ |

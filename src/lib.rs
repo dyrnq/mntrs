@@ -60,6 +60,12 @@ pub struct MntrsFs {
     pub ignore_case: bool,
     pub fast_fingerprint: bool,
     pub async_read: bool,
+    pub vfs_refresh: bool,
+    pub case_insensitive: bool,
+    pub write_wait: Duration,
+    pub read_wait: Duration,
+    pub cache_poll_interval: Duration,
+    pub disk_total_size: u64,
     writeback_queue: Arc<Mutex<VecDeque<(String, PathBuf)>>>,
     
 }
@@ -300,6 +306,10 @@ impl Filesystem for MntrsFs {
         let delay = self.write_back_delay;
         let max_age = self.cache_max_age;
         thread::spawn(move || writeback_worker(op, queue, delay, max_age));
+        // Pre-populate root directory cache on mount if --vfs-refresh
+        if self.vfs_refresh {
+            let _ = self.list_op("");
+        }
         Ok(())
     }
 
@@ -318,6 +328,18 @@ impl Filesystem for MntrsFs {
         let full_path = if parent_path.is_empty() { name2 } else { format!("{}/{}", parent_path, name2) };
         if let Some((kind, size)) = self.stat_op(&full_path) {
             reply.entry(&self.attr_ttl, &self.make_attr(self.alloc_ino(&full_path, kind, size), size, kind), Generation(0));
+        } else if self.case_insensitive {
+            // Fallback: search directory listing for case-insensitive match
+            let entries = self.list_op(&parent_path);
+            let lower = name.to_lowercase();
+            if let Some((matched_name, mode)) = entries.iter().find(|(n, _)| n.to_lowercase() == lower) {
+                let mp = if parent_path.is_empty() { matched_name.clone() } else { format!("{}/{}", parent_path, matched_name) };
+                let kind = match mode { EntryMode::DIR => FileType::Directory, _ => FileType::RegularFile };
+                let size = self.stat_op(&mp).map(|(_, s)| s).unwrap_or(0);
+                reply.entry(&self.attr_ttl, &self.make_attr(self.alloc_ino(&mp, kind, size), size, kind), Generation(0));
+            } else {
+                reply.error(Errno::ENOENT);
+            }
         } else { reply.error(Errno::ENOENT); }
     }
 
@@ -336,9 +358,13 @@ impl Filesystem for MntrsFs {
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
         // Report virtual unlimited space (S3 is effectively infinite)
         const BLOCK_SIZE: u32 = 4096;
-        const TOTAL_BLOCKS: u64 = 256 * 1024 * 1024; // 1TB worth of 4K blocks = ~1PB
-        const TOTAL_INODES: u64 = 1_000_000_000;
-        reply.statfs(TOTAL_BLOCKS, TOTAL_BLOCKS, TOTAL_BLOCKS, TOTAL_INODES, TOTAL_INODES, BLOCK_SIZE, 255, 0);
+        let total_blocks = if self.disk_total_size > 0 {
+            self.disk_total_size / BLOCK_SIZE as u64
+        } else {
+            256 * 1024 * 1024 // default ~1PB
+        };
+        let total_inodes = 1_000_000_000u64;
+        reply.statfs(total_blocks, total_blocks, total_blocks, total_inodes, total_inodes, BLOCK_SIZE, 255, 0);
     }
 
     fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
