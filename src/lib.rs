@@ -65,6 +65,7 @@ pub struct MntrsFs {
     pub cache_poll_interval: Duration,
     pub disk_total_size: u64,
     writeback_queue: Arc<Mutex<VecDeque<(String, PathBuf)>>>,
+    mem_cache: dashmap::DashMap<u64, bytes::Bytes>,
     
 }
 
@@ -406,20 +407,38 @@ impl Filesystem for MntrsFs {
     fn read(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, size: u32, _flags: OpenFlags, _lock_owner: Option<LockOwner>, reply: ReplyData) {
         let ino: u64 = ino.into();
         let path = match self.resolve(ino) { Some((p, _, _)) => p, None => { reply.error(Errno::ENOENT); return; } };
+        // 1. Check memory cache first (fast path)
+        if let Some(entry) = self.mem_cache.get(&ino) {
+            let data = entry.value().clone();
+            let start = offset as usize;
+            let end = (start + size as usize).min(data.len());
+            if start < data.len() { reply.data(&data[start..end]); } else { reply.data(&[]); }
+            return;
+        }
+        // 2. Check disk cache
         if !self.direct_io {
             let cpath = cache_path(&self.cache_dir, &path);
             if cpath.exists()
                 && let Ok(data) = fs::read(&cpath) {
+                    // Populate memory cache
+                    let b = bytes::Bytes::from(data);
                     let start = offset as usize;
-                    let end = (start + size as usize).min(data.len());
-                    if start < data.len() { reply.data(&data[start..end]); } else { reply.data(&[]); }
+                    let end = (start + size as usize).min(b.len());
+                    if start < b.len() { reply.data(&b[start..end]); } else { reply.data(&[]); }
+                    self.mem_cache.insert(ino, b);
                     return;
                 }
         }
+        // 3. Fetch from remote
         let op = self.op.clone(); let p = path.clone();
         let fetch_size = if self.read_chunk_size > 0 { self.read_chunk_size.max(size as u64) } else { u64::MAX };
         match rt().block_on(async move { op.read_with(&p).range(offset..offset+fetch_size).await }) {
-            Ok(buf) => { let b = buf.to_vec(); reply.data(&b[..(b.len() as u32).min(size) as usize]); }
+            Ok(buf) => {
+                let b: bytes::Bytes = buf.to_vec().into();
+                let slice = &b[..(b.len() as u32).min(size) as usize];
+                reply.data(slice);
+                self.mem_cache.insert(ino, b);
+            }
             Err(_) => reply.error(Errno::EIO),
         }
         // Read-ahead: pre-fetch next block in background

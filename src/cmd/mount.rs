@@ -169,6 +169,7 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
         cache_poll_interval: std::time::Duration::from_secs(vfs_cache_poll_interval),
         disk_total_size: vfs_disk_space_total_size * 1024 * 1024 * 1024 * 1024, // TB to bytes
         writeback_queue: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+        mem_cache: dashmap::DashMap::new(),
     };
 
     // Create pipe for daemon_wait parent-child synchronization
