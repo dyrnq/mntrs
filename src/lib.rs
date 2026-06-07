@@ -60,6 +60,7 @@ pub struct MntrsFs {
     pub async_read: bool,
     pub vfs_refresh: bool,
     pub case_insensitive: bool,
+    pub block_norm_dupes: bool,
     pub write_wait: Duration,
     pub read_wait: Duration,
     pub cache_poll_interval: Duration,
@@ -67,6 +68,7 @@ pub struct MntrsFs {
     writeback_queue: Arc<Mutex<VecDeque<(String, PathBuf)>>>,
     mem_cache: dashmap::DashMap<u64, bytes::Bytes>,
     attr_cache: dashmap::DashMap<String, (FileType, u64, std::time::Instant)>,
+    out_of_space: std::sync::atomic::AtomicBool,
     
 }
 
@@ -174,11 +176,14 @@ impl MntrsFs {
         {
             if let Some(entry) = self.dir_cache.get(path) {
                 let (t, entries) = entry.value();
-                if t.elapsed() < self.dir_cache_ttl { return entries.clone(); }
+                let age = t.elapsed();
+                if age < self.dir_cache_ttl { return entries.clone(); }
+                // Cache expired — re-read from remote
+                tracing::debug!(path, age_ms = age.as_millis(), "Re-reading directory ({}ms old)", age.as_millis());
             }
         }
         let depth = path.matches('/').count();
-        let result = rt().block_on(async {
+        let mut result = rt().block_on(async {
             let op = self.op.clone();
             let p = path.to_string();
             let mut lister = op.lister(&p).await.ok()?;
@@ -205,6 +210,15 @@ impl MntrsFs {
             }
             Some(out)
         }).unwrap_or_default();
+        // Deduplicate by Unicode-normalized name if enabled
+        if self.block_norm_dupes && !result.is_empty() {
+            let mut seen = std::collections::HashSet::new();
+            result.retain(|(name, _)| {
+                use unicode_normalization::UnicodeNormalization;
+                let norm: String = name.nfc().collect::<String>();
+                seen.insert(norm)
+            });
+        }
         self.dir_cache.insert(path.to_string(), (std::time::Instant::now(), result.clone()));
         result
     }
@@ -245,14 +259,24 @@ impl MntrsFs {
             0
         };
         let to_free = size_limit.max(need_free.unwrap_or(0));
-        if to_free == 0 { return; }
+        if to_free == 0 {
+            self.out_of_space.store(false, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        self.out_of_space.store(true, std::sync::atomic::Ordering::Relaxed);
         // LRU: sort by access time ascending, remove oldest until under limit
         files.sort_by_key(|(_, _, atime)| *atime);
         let mut remaining = to_free;
+        let mut freed: u64 = 0;
         for (path, size, _) in files {
             if remaining == 0 { break; }
             let _ = fs::remove_file(&path);
+            freed += size;
             remaining = remaining.saturating_sub(size);
+        }
+        // If we freed enough, clear out_of_space
+        if freed >= to_free {
+            self.out_of_space.store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -516,6 +540,14 @@ impl Filesystem for MntrsFs {
                 Err(_) => reply.error(Errno::EIO),
             }
             return;
+        }
+        // Check out_of_space backpressure
+        if self.out_of_space.load(std::sync::atomic::Ordering::Relaxed) {
+            self.evict_lru();
+            if self.out_of_space.load(std::sync::atomic::Ordering::Relaxed) {
+                reply.error(Errno::ENOSPC);
+                return;
+            }
         }
         let cpath = cache_path(&self.cache_dir, &path);
         if let Some(parent) = cpath.parent() { let _ = fs::create_dir_all(parent); }
