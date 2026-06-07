@@ -117,7 +117,7 @@ extern "C" fn cleanup() {
 }
 
 pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>, read_only: bool,
-                dir_cache_time: u64, attr_timeout: u64, allow_other: bool, volname: &str, write_back_cache: bool) -> Result<()> {
+                dir_cache_time: u64, attr_timeout: u64, allow_other: bool, volname: &str, write_back_cache: bool, fuse_options: &[String]) -> Result<()> {
     let op = rt_block_on(build_operator(storage_url, opts))?;
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let cache_dir = std::path::PathBuf::from(format!("{}/.cache/mntrs", home));

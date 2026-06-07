@@ -41,6 +41,9 @@ enum Commands {
         /// Enable write-back caching (kernel buffers writes before sending to mntrs)
         #[arg(long)]
         write_back_cache: bool,
+        /// Raw FUSE option (repeatable), e.g. -o allow_other
+        #[arg(short = 'o', long = "option", value_name = "OPT", num_args = 0..)]
+        option: Vec<String>,
     },
     /// Unmount a mounted directory (use "all" to unmount all)
     Unmount {
@@ -54,14 +57,14 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
     match cli.command {
-        Commands::Mount { storage, mountpoint, opt, read_only, dir_cache_time, attr_timeout, allow_other, volname, write_back_cache } => {
+        Commands::Mount { storage, mountpoint, opt, read_only, dir_cache_time, attr_timeout, allow_other, volname, write_back_cache, option } => {
             let opts: HashMap<String, String> = opt.iter()
                 .filter_map(|kv| kv.split_once('='))
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
             mntrs::cmd::mount::mount(
                 &storage, &mountpoint, &opts, read_only,
-                dir_cache_time, attr_timeout, allow_other, &volname, write_back_cache,
+                dir_cache_time, attr_timeout, allow_other, &volname, write_back_cache, &option,
             )?;
         }
         Commands::Unmount { target } => {
