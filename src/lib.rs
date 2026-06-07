@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{TimeOrNow,
     FileAttr, FileType, Filesystem, KernelConfig,
-    ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyCreate, ReplyStatfs, ReplyXattr,
+    ReplyAttr, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyCreate, ReplyStatfs, ReplyXattr,
     Request, INodeNo, FileHandle, OpenFlags, WriteFlags, AccessFlags, Errno, FopenFlags, Generation,
     LockOwner,
 };
@@ -296,9 +296,11 @@ fn writeback_worker(op: Arc<Operator>, queue: Arc<Mutex<VecDeque<(String, PathBu
 }
 
 impl Filesystem for MntrsFs {
-    fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> std::io::Result<()> {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
         self.alloc_ino("", FileType::Directory, 4096);
         let _ = fs::create_dir_all(&self.cache_dir);
+        // Enable readdirplus for stat+readdir in one round-trip
+        let _ = config.add_capabilities(fuser::InitFlags::FUSE_DO_READDIRPLUS);
         // Spawn writeback worker thread
         let op = self.op.clone();
         let queue = self.writeback_queue.clone();
@@ -345,12 +347,12 @@ impl Filesystem for MntrsFs {
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         let ino: u64 = ino.into();
         if ino == FUSE_ROOT_INO { reply.attr(&self.attr_ttl, &self.make_attr(ino, 4096, FileType::Directory)); return; }
-        match self.resolve(ino) {
-            Some((path, kind, _)) => {
-                let (ak, asz) = self.stat_op(&path).unwrap_or((kind, 0));
-                reply.attr(&self.attr_ttl, &self.make_attr(ino, asz, ak));
-            }
-            None => reply.error(Errno::ENOENT),
+        // Use cached attr from inode table — skip network stat_op
+        // S3 objects are immutable; only refresh on write/open
+        if let Some((_, kind, size)) = self.resolve(ino) {
+            reply.attr(&self.attr_ttl, &self.make_attr(ino, size, kind));
+        } else {
+            reply.error(Errno::ENOENT);
         }
     }
 
@@ -380,6 +382,25 @@ impl Filesystem for MntrsFs {
             let cp = if path.is_empty() { name.clone() } else { format!("{}/{}", path, name) };
             let size = self.stat_op(&cp).map(|(_, s)| s).unwrap_or(0);
             if reply.add(INodeNo(self.alloc_ino(&cp, *kind, size)), (i + 1) as u64, *kind, name) { break; }
+        }
+        reply.ok();
+    }
+
+    fn readdirplus(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectoryPlus) {
+        let ino: u64 = ino.into();
+        if ino != FUSE_ROOT_INO { reply.error(Errno::ENOENT); return; }
+        let path = self.resolve(ino).map(|(p, _, _)| p).unwrap_or_default();
+        let mut entries = vec![(".".to_string(), FileType::Directory), ("..".to_string(), FileType::Directory)];
+        for (name, mode) in self.list_op(&path) {
+            entries.push((name, match mode { EntryMode::DIR => FileType::Directory, _ => FileType::RegularFile }));
+        }
+        let start = offset as usize;
+        if start >= entries.len() { reply.ok(); return; }
+        for (i, (name, kind)) in entries.iter().enumerate().skip(start) {
+            let cp = if path.is_empty() { name.clone() } else { format!("{}/{}", path, name) };
+            let ino = self.alloc_ino(&cp, *kind, 0);
+            let attr = self.make_attr(ino, 0, *kind);
+            if reply.add(INodeNo(ino), (i + 1) as u64, name.as_str(), &self.attr_ttl, &attr, Generation(0)) { break; }
         }
         reply.ok();
     }
