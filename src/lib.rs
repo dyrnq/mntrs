@@ -20,7 +20,11 @@ use opendal::{EntryMode, Operator};
 
 fn rt() -> &'static tokio::runtime::Runtime {
     static RT: once_cell::sync::OnceCell<tokio::runtime::Runtime> = once_cell::sync::OnceCell::new();
-    RT.get_or_init(|| tokio::runtime::Runtime::new().expect("tokio rt"))
+    RT.get_or_init(|| tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("tokio rt"))
 }
 
 // TTL now comes from MntrsFs.attr_ttl field
@@ -56,7 +60,7 @@ impl FileHandleState {
 pub struct MntrsFs {
     pub op: Arc<Operator>,
     inodes: dashmap::DashMap<u64, (String, FileType, u64)>,
-    dir_cache: dashmap::DashMap<String, (std::time::Instant, Vec<(String, EntryMode)>)>,
+    dir_cache: dashmap::DashMap<String, (std::time::Instant, std::sync::Arc<Vec<(String, EntryMode)>>)>,
     cache_dir: PathBuf,
     handles: dashmap::DashMap<u64, FileHandleState>,
     pub dir_cache_ttl: Duration,
@@ -211,9 +215,9 @@ impl MntrsFs {
     fn list_op(&self, path: &str) -> Vec<(String, EntryMode)> {
         {
             if let Some(entry) = self.dir_cache.get(path) {
-                let (t, entries) = entry.value();
+                let (t, entries) = entry.value(); let entries = entries.clone();
                 let age = t.elapsed();
-                if age < self.dir_cache_ttl { return entries.clone(); }
+                if age < self.dir_cache_ttl { return entries.as_ref().clone(); }
                 // Cache expired — re-read from remote
                 tracing::debug!(path, age_ms = age.as_millis(), "Re-reading directory ({}ms old)", age.as_millis());
             }
@@ -255,7 +259,7 @@ impl MntrsFs {
                 seen.insert(norm)
             });
         }
-        self.dir_cache.insert(path.to_string(), (std::time::Instant::now(), result.clone()));
+        self.dir_cache.insert(path.to_string(), (std::time::Instant::now(), std::sync::Arc::new(result.clone())));
         result
     }
 
