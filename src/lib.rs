@@ -27,12 +27,35 @@ fn rt() -> &'static tokio::runtime::Runtime {
 const FUSE_ROOT_INO: u64 = 1;
 // DIR_CACHE_TTL now comes from MntrsFs.dir_cache_ttl field
 
+
+/// Per-open-file-handle state
+#[derive(Debug, Clone)]
+enum FileHandleState {
+    Read {
+        path: String,
+    },
+    Write {
+        path: String,
+        dirty: bool,
+        dirty_since: Option<std::time::Instant>,
+    },
+}
+
+impl FileHandleState {
+    fn path(&self) -> &str {
+        match self {
+            FileHandleState::Read { path } => path,
+            FileHandleState::Write { path, .. } => path,
+        }
+    }
+}
+
 pub struct MntrsFs {
     pub op: Arc<Operator>,
     inodes: dashmap::DashMap<u64, (String, FileType, u64)>,
     dir_cache: dashmap::DashMap<String, (std::time::Instant, Vec<(String, EntryMode)>)>,
     cache_dir: PathBuf,
-    handles: dashmap::DashMap<u64, (String, bool, Option<std::time::Instant>)>, // +dirty_since
+    handles: dashmap::DashMap<u64, FileHandleState>,
     pub dir_cache_ttl: Duration,
     pub attr_ttl: Duration,
     pub volname: String,
@@ -452,14 +475,14 @@ impl Filesystem for MntrsFs {
         let parent_path = self.resolve(parent.into()).map(|(p, _, _)| p).unwrap_or_default();
         let full_path = if parent_path.is_empty() { name.to_string() } else { format!("{}/{}", parent_path, name) };
         let ino = self.alloc_ino(&full_path, FileType::RegularFile, 0);
-        self.handles.insert(ino, (full_path.clone(), false, None));
+        self.handles.insert(ino, FileHandleState::Write { path: full_path.clone(), dirty: false, dirty_since: None });
         reply.created(&self.attr_ttl, &self.make_attr(ino, 0, FileType::RegularFile), Generation(0), FileHandle(ino), FopenFlags::empty());
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         let ino: u64 = ino.into();
         if let Some((path, FileType::RegularFile, _)) = self.resolve(ino) {
-            self.handles.insert(ino, (path, false, None));
+            self.handles.insert(ino, FileHandleState::Read { path });
         }
         reply.opened(FileHandle(ino), FopenFlags::empty());
     }
@@ -532,8 +555,8 @@ impl Filesystem for MntrsFs {
 
     fn write(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64, data: &[u8], _write_flags: WriteFlags, _flags: OpenFlags, _lock_owner: Option<LockOwner>, reply: ReplyWrite) {
         let fh_val: u64 = fh.into();
-        let path = match self.handles.get(&fh_val).map(|r| { let (p, d, _) = r.clone(); (p, d) }) {
-            Some((p, _)) => p,
+        let path = match self.handles.get(&fh_val).map(|r| r.value().path().to_string()) {
+            Some(p) => p,
             None => { reply.error(Errno::ENOENT); return; }
         };
         if self.direct_io {
@@ -563,7 +586,7 @@ impl Filesystem for MntrsFs {
         })();
         self.evict_lru();
         match result {
-            Ok(()) => { self.handles.insert(fh_val, (path, true, Some(std::time::Instant::now()))); reply.written(data.len() as u32); }
+            Ok(()) => { self.handles.insert(fh_val, FileHandleState::Write { path: path.clone(), dirty: true, dirty_since: Some(std::time::Instant::now()) }); reply.written(data.len() as u32); }
             Err(_) => reply.error(Errno::EIO),
         }
     }
@@ -696,8 +719,8 @@ impl Filesystem for MntrsFs {
         let fh_val: u64 = fh.into();
         let (path, dirty) = {
             let entry = self.handles.get(&fh_val).map(|r| r.clone());
-            if let Some((p, d, _)) = entry {
-                if d { self.handles.insert(fh_val, (p.clone(), false, None)); }
+            if let Some(FileHandleState::Write { path: p, dirty: d, .. }) = entry {
+                if d { self.handles.insert(fh_val, FileHandleState::Write { path: p.clone(), dirty: false, dirty_since: None }); }
                 (p, d)
             } else { return reply.ok(); }
         };
