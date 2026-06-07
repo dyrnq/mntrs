@@ -39,6 +39,11 @@
 | `--max-depth` | 递归深度限制 |
 | `--links` | 符号链接翻译 |
 | `--max-read-ahead` | 最大预读大小 |
+| `--devname` | 设备名（mount 表中显示） |
+| `--vfs-cache-min-free-space` | 最小剩余磁盘空间触发缓存清理 |
+| `--vfs-fast-fingerprint` | 快速指纹（非 checksum） |
+| `--async-read` | 异步读取模式 |
+| S3 xattr (etag/content-type) | 通过 getxattr 暴露 S3 元数据 |
 | `--version` | 版本号 |
 | `unmount <target>` | 卸载指定挂载点 |
 | `unmount all` | 卸载全部 |
@@ -47,20 +52,15 @@
 
 ## ⬜ mntrs 未支持的 rclone 参数 (~42 项)
 
-### 挂载模式 & 系统集成 (2)
-| `--devname` | 设备名 |
+### 挂载模式 & 系统集成 (1)
 | `--network-mode` | Windows 网络驱动器 |
-| `--fuse-flag` | (mntrs 用 `-o` 等价) |
 
-### 缓存 & 性能 (6)
-| `--vfs-cache-min-free-space` | 最小剩余磁盘空间 |
+### 缓存 & 性能 (3)
 | `--vfs-write-wait` | 写入等待超时 |
 | `--vfs-read-chunk-size-limit` | 分块上限 |
 | `--vfs-read-chunk-streams` | 并行读取流数 |
 | `--vfs-read-wait` | 读等待超时 |
 | `--vfs-cache-poll-interval` | 缓存轮询间隔 |
-| `--vfs-fast-fingerprint` | 快速指纹 |
-| `--async-read` | 异步读 |
 
 ### VFS 功能 (7)
 | `--vfs-case-insensitive` | 大小写不敏感 |
@@ -82,7 +82,7 @@
 
 | 维度 | rclone | mntrs |
 |------|--------|-------|
-| 总参数数 | 96 | 44 |
+| 总参数数 | 96 | 49 |
 |  | 100% | 48% (32/66 核心参数) |
 | 核心挂载功能 | ✅ | ✅ |
 | 守护进程 | ✅ | ✅ |

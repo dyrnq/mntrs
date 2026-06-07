@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{TimeOrNow,
     FileAttr, FileType, Filesystem, KernelConfig,
-    ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyCreate, ReplyXattr,
+    ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyCreate, ReplyStatfs, ReplyXattr,
     Request, INodeNo, FileHandle, OpenFlags, WriteFlags, AccessFlags, Errno, FopenFlags, Generation,
     LockOwner,
 };
@@ -51,12 +51,15 @@ pub struct MntrsFs {
     pub direct_io: bool,
     pub poll_interval: Duration,
     pub cache_max_age: Duration,
+    pub cache_min_free_space: u64,
     pub exclude_patterns: Vec<String>,
     pub include_patterns: Vec<String>,
     pub max_size: Option<u64>,
     pub min_size: Option<u64>,
     pub max_depth: Option<usize>,
     pub ignore_case: bool,
+    pub fast_fingerprint: bool,
+    pub async_read: bool,
     writeback_queue: Arc<Mutex<VecDeque<(String, PathBuf)>>>,
     
 }
@@ -190,7 +193,7 @@ impl MntrsFs {
     }
 
     fn evict_lru(&self) {
-        if self.cache_max_size == 0 { return; }
+        if self.cache_max_size == 0 && self.cache_min_free_space == 0 { return; }
         // Collect all cached files with their sizes and access times
         let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
         let mut total: u64 = 0;
@@ -204,14 +207,35 @@ impl MntrsFs {
                 }
             }
         }
-        if total <= self.cache_max_size { return; }
+        // Check free disk space if configured
+        let need_free = if self.cache_min_free_space > 0 {
+            if let Ok(fs_stat) = rustix::fs::statvfs(&self.cache_dir) {
+                let free = fs_stat.f_bavail.saturating_mul(fs_stat.f_frsize);
+                if free < self.cache_min_free_space {
+                    Some(self.cache_min_free_space - free)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let size_limit = if self.cache_max_size > 0 {
+            total.saturating_sub(self.cache_max_size)
+        } else {
+            0
+        };
+        let to_free = size_limit.max(need_free.unwrap_or(0));
+        if to_free == 0 { return; }
         // LRU: sort by access time ascending, remove oldest until under limit
         files.sort_by_key(|(_, _, atime)| *atime);
-        let mut to_free = total.saturating_sub(self.cache_max_size);
+        let mut remaining = to_free;
         for (path, size, _) in files {
-            if to_free == 0 { break; }
+            if remaining == 0 { break; }
             let _ = fs::remove_file(&path);
-            to_free = to_free.saturating_sub(size);
+            remaining = remaining.saturating_sub(size);
         }
     }
 }
@@ -307,6 +331,14 @@ impl Filesystem for MntrsFs {
             }
             None => reply.error(Errno::ENOENT),
         }
+    }
+
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        // Report virtual unlimited space (S3 is effectively infinite)
+        const BLOCK_SIZE: u32 = 4096;
+        const TOTAL_BLOCKS: u64 = 256 * 1024 * 1024; // 1TB worth of 4K blocks = ~1PB
+        const TOTAL_INODES: u64 = 1_000_000_000;
+        reply.statfs(TOTAL_BLOCKS, TOTAL_BLOCKS, TOTAL_BLOCKS, TOTAL_INODES, TOTAL_INODES, BLOCK_SIZE, 255, 0);
     }
 
     fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
@@ -460,11 +492,62 @@ impl Filesystem for MntrsFs {
         reply.ok();
     }
 
-    fn getxattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, _size: u32, reply: ReplyXattr) {
-        reply.error(Errno::ENODATA);
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, _size: u32, reply: ReplyXattr) {
+        let ino: u64 = ino.into();
+        let name = name.to_string_lossy();
+        if let Some((path, kind, _)) = self.resolve(ino) {
+            if kind == FileType::Directory {
+                reply.error(Errno::ENODATA);
+                return;
+            }
+            // Fetch object metadata for ETag / storage-class
+            let op = self.op.clone();
+            let p = path.clone();
+            match rt().block_on(async move { op.stat(&p).await }) {
+                Ok(meta) => {
+                    match name.as_ref() {
+                        "user.etag" | "s3.etag" => {
+                            if let Some(etag) = meta.etag() {
+                                reply.data(etag.as_bytes());
+                                return;
+                            }
+                            reply.error(Errno::ENODATA);
+                        }
+                        "user.content-type" | "s3.content-type" => {
+                            if let Some(ct) = meta.content_type() {
+                                reply.data(ct.as_bytes());
+                                return;
+                            }
+                            reply.error(Errno::ENODATA);
+                        }
+                        _ => reply.error(Errno::ENODATA),
+                    }
+                }
+                Err(_) => reply.error(Errno::EIO),
+            }
+        } else {
+            reply.error(Errno::ENOENT);
+        }
     }
-    fn listxattr(&self, _req: &Request, _ino: INodeNo, _size: u32, reply: ReplyXattr) {
-        reply.error(Errno::ENODATA);
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let ino: u64 = ino.into();
+        if let Some((_, kind, _)) = self.resolve(ino) {
+            if kind == FileType::Directory {
+                reply.error(Errno::ENODATA);
+                return;
+            }
+            // Return known xattr names
+            let attrs = b"user.etag user.content-type ";
+            if size == 0 {
+                reply.size(attrs.len() as u32);
+            } else if size < attrs.len() as u32 {
+                reply.error(Errno::ERANGE);
+            } else {
+                reply.data(attrs);
+            }
+        } else {
+            reply.error(Errno::ENOENT);
+        }
     }
 
     fn setattr(&self, _req: &Request, ino: INodeNo, mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, size: Option<u64>, _atime: Option<TimeOrNow>, _mtime: Option<TimeOrNow>, _ctime: Option<SystemTime>, _fh: Option<FileHandle>, _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>, _bkuptime: Option<SystemTime>, _flags: Option<fuser::BsdFileFlags>, reply: ReplyAttr) {

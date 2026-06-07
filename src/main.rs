@@ -39,6 +39,9 @@ enum Commands {
         /// Volume name (shown in mount table)
         #[arg(long, default_value = "mntrs")]
         volname: String,
+        /// Device name shown in mount table
+        #[arg(long)]
+        devname: Option<String>,
         /// Enable write-back caching (kernel buffers writes before sending to mntrs)
         #[arg(long)]
         write_back_cache: bool,
@@ -105,6 +108,9 @@ enum Commands {
         /// Max age of cached files in seconds (default: 3600, 0 to disable)
         #[arg(long, default_value = "3600")]
         vfs_cache_max_age: u64,
+        /// Minimum free disk space before triggering cache eviction (MB, default: 100)
+        #[arg(long, default_value = "100")]
+        vfs_cache_min_free_space: u64,
         /// Glob pattern to exclude (repeatable)
         #[arg(long = "exclude", value_name = "PATTERN", num_args = 0..)]
         exclude: Vec<String>,
@@ -138,6 +144,12 @@ enum Commands {
         /// Max read-ahead in bytes (default: 131072)
         #[arg(long, default_value = "131072")]
         max_read_ahead: u64,
+        /// Use fast fingerprint (size+mtime) instead of checksums
+        #[arg(long)]
+        vfs_fast_fingerprint: bool,
+        /// Use async reads (don't wait for full read before replying to kernel)
+        #[arg(long)]
+        async_read: bool,
     },
     /// Unmount a mounted directory (use "all" to unmount all)
     Unmount {
@@ -162,15 +174,15 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
     match cli.command {
-        Commands::Mount { storage, mountpoint, opt, read_only, dir_cache_time, attr_timeout, allow_other, volname, write_back_cache, option, daemon, daemon_wait, daemon_timeout, allow_root, vfs_cache_max_size, vfs_write_back, vfs_cache_mode, vfs_read_ahead, vfs_read_chunk_size, default_permissions, uid, gid, umask, dir_perms, file_perms, allow_non_empty, cache_dir, direct_io, poll_interval, vfs_cache_max_age, exclude, include, max_size, min_size, max_depth, ignore_case, no_modtime, no_checksum, no_seek, links, max_read_ahead } => {
+        Commands::Mount { storage, mountpoint, opt, read_only, dir_cache_time, attr_timeout, allow_other, volname, devname, write_back_cache, option, daemon, daemon_wait, daemon_timeout, allow_root, vfs_cache_max_size, vfs_write_back, vfs_cache_mode, vfs_read_ahead, vfs_read_chunk_size, default_permissions, uid, gid, umask, dir_perms, file_perms, allow_non_empty, cache_dir, direct_io, poll_interval, vfs_cache_max_age, vfs_cache_min_free_space, exclude, include, max_size, min_size, max_depth, ignore_case, no_modtime, no_checksum, no_seek, links, max_read_ahead, vfs_fast_fingerprint, async_read } => {
             let opts: HashMap<String, String> = opt.iter()
                 .filter_map(|kv| kv.split_once('='))
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
             mntrs::cmd::mount::mount(
                 &storage, &mountpoint, &opts, read_only,
-                dir_cache_time, attr_timeout, allow_other, &volname, write_back_cache, &option,
-                daemon, daemon_wait, daemon_timeout, allow_root, vfs_cache_max_size, vfs_write_back, &vfs_cache_mode, vfs_read_ahead, vfs_read_chunk_size, default_permissions, uid, gid, umask, dir_perms, file_perms, allow_non_empty, cache_dir.as_deref(), direct_io, poll_interval, vfs_cache_max_age, exclude, include, max_size, min_size, max_depth, ignore_case, no_modtime, no_checksum, no_seek, links, max_read_ahead,
+                dir_cache_time, attr_timeout, allow_other, &volname, devname.as_deref(), write_back_cache, &option,
+                daemon, daemon_wait, daemon_timeout, allow_root, vfs_cache_max_size, vfs_write_back, &vfs_cache_mode, vfs_read_ahead, vfs_read_chunk_size, default_permissions, uid, gid, umask, dir_perms, file_perms, allow_non_empty, cache_dir.as_deref(), direct_io, poll_interval, vfs_cache_max_age, vfs_cache_min_free_space, exclude, include, max_size, min_size, max_depth, ignore_case, no_modtime, no_checksum, no_seek, links, max_read_ahead, vfs_fast_fingerprint, async_read,
             )?;
         }
         Commands::Unmount { target } => {

@@ -8,7 +8,7 @@ use std::io::{Write, BufRead, BufReader};
 use std::process::Command;
 use opendal::Operator;
 use opendal::layers::TimeoutLayer;
-use opendal::services::{S3, Gcs, Azblob, HdfsNative};
+use opendal::services::{S3, Gcs, Azblob, HdfsNative, Oss, Cos, Obs, B2};
 use fuser::MountOption;
 use once_cell::sync::OnceCell;
 use std::sync::OnceLock;
@@ -120,10 +120,10 @@ extern "C" fn cleanup() {
 
 #[allow(clippy::too_many_arguments)]
 pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>, read_only: bool,
-                dir_cache_time: u64, attr_timeout: u64, allow_other: bool, volname: &str, write_back_cache: bool, fuse_options: &[String],
+                dir_cache_time: u64, attr_timeout: u64, allow_other: bool, volname: &str, devname: Option<&str>, write_back_cache: bool, fuse_options: &[String],
                 daemon: bool, daemon_wait: bool, _daemon_timeout: u64, allow_root: bool, vfs_cache_max_size: u64, vfs_write_back: u64, vfs_cache_mode: &str, vfs_read_ahead: u64, vfs_read_chunk_size: u64, default_permissions: bool,
                 uid: Option<u32>, gid: Option<u32>, umask: Option<u32>, dir_perms: Option<u32>, file_perms: Option<u32>,
-                allow_non_empty: bool, cache_dir: Option<&str>, direct_io: bool, poll_interval: u64, vfs_cache_max_age: u64, exclude: Vec<String>, include: Vec<String>, max_size: Option<u64>, min_size: Option<u64>, max_depth: Option<usize>, ignore_case: bool, _no_modtime: bool, _no_checksum: bool, _no_seek: bool, _links: bool, _max_read_ahead: u64) -> Result<()> {
+                allow_non_empty: bool, cache_dir: Option<&str>, direct_io: bool, poll_interval: u64, vfs_cache_max_age: u64, vfs_cache_min_free_space: u64, exclude: Vec<String>, include: Vec<String>, max_size: Option<u64>, min_size: Option<u64>, max_depth: Option<usize>, ignore_case: bool, _no_modtime: bool, _no_checksum: bool, _no_seek: bool, _links: bool, _max_read_ahead: u64, vfs_fast_fingerprint: bool, async_read: bool) -> Result<()> {
     let op = rt_block_on(build_operator(storage_url, opts))?;
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let cache_dir_path = if let Some(cd) = cache_dir {
@@ -153,12 +153,15 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
         direct_io,
         poll_interval: std::time::Duration::from_secs(poll_interval.max(1)),
         cache_max_age: std::time::Duration::from_secs(vfs_cache_max_age),
+        cache_min_free_space: vfs_cache_min_free_space * 1024 * 1024,
         exclude_patterns: exclude,
         include_patterns: include,
         max_size,
         min_size,
         max_depth,
         ignore_case,
+        fast_fingerprint: vfs_fast_fingerprint,
+        async_read,
         writeback_queue: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
     };
 
@@ -196,7 +199,7 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
     cfg.mount_options = vec![
         if read_only { MountOption::RO } else { MountOption::RW },
         MountOption::Exec,
-        MountOption::FSName(volname.to_string()),
+        MountOption::FSName(devname.unwrap_or(volname).to_string()),
     ];
     if write_back_cache {
         cfg.mount_options.push(MountOption::CUSTOM("writeback_cache".to_string()));
@@ -268,7 +271,11 @@ async fn build_operator(storage_url: &str, opts: &HashMap<String, String>) -> Re
         "gs" | "gcs" => build_gcs(&url, opts).await,
         "azblob" => build_azblob(&url, opts).await,
         "hdfs" | "hdfs-native" => build_hdfs_native(&url, opts).await,
-        s => Err(anyhow!("unsupported scheme '{s}'; try s3://, gs://, azblob://, hdfs://")),
+        "oss" => build_oss(&url, opts).await,
+        "cos" => build_cos(&url, opts).await,
+        "obs" => build_obs(&url, opts).await,
+        "b2" => build_b2(&url, opts).await,
+        s => Err(anyhow!("unsupported scheme '{s}'; try s3://, gs://, azblob://, hdfs://, oss://, cos://, obs://, b2://")),
     }
 }
 
@@ -358,6 +365,49 @@ fn unblock_parent() {
         // Safety: fd was created by pipe() and is valid
         unsafe { rustix::io::close(fd); }
     }
+}
+
+async fn build_oss(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+    let bucket = url.host_str().ok_or_else(|| anyhow!("missing bucket"))?;
+    let mut builder = Oss::default().bucket(bucket);
+    let p = url.path().trim_start_matches('/');
+    if !p.is_empty() { builder = builder.root(p); }
+    if let Some(v) = opts.get("endpoint") { builder = builder.endpoint(v); }
+    if let Some(v) = opts.get("access-key") { builder = builder.access_key_id(v); }
+    if let Some(v) = opts.get("secret-key") { builder = builder.access_key_secret(v); }
+    apply_operator(builder)
+}
+
+async fn build_cos(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+    let bucket = url.host_str().ok_or_else(|| anyhow!("missing bucket"))?;
+    let mut builder = Cos::default().bucket(bucket);
+    let p = url.path().trim_start_matches('/');
+    if !p.is_empty() { builder = builder.root(p); }
+    if let Some(v) = opts.get("endpoint") { builder = builder.endpoint(v); }
+    if let Some(v) = opts.get("secret-id") { builder = builder.secret_id(v); }
+    if let Some(v) = opts.get("secret-key") { builder = builder.secret_key(v); }
+    apply_operator(builder)
+}
+
+async fn build_obs(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+    let bucket = url.host_str().ok_or_else(|| anyhow!("missing bucket"))?;
+    let mut builder = Obs::default().bucket(bucket);
+    let p = url.path().trim_start_matches('/');
+    if !p.is_empty() { builder = builder.root(p); }
+    if let Some(v) = opts.get("endpoint") { builder = builder.endpoint(v); }
+    if let Some(v) = opts.get("access-key") { builder = builder.access_key_id(v); }
+    if let Some(v) = opts.get("secret-key") { builder = builder.secret_access_key(v); }
+    apply_operator(builder)
+}
+
+async fn build_b2(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+    let bucket = url.host_str().ok_or_else(|| anyhow!("missing bucket"))?;
+    let mut builder = B2::default().bucket(bucket);
+    let p = url.path().trim_start_matches('/');
+    if !p.is_empty() { builder = builder.root(p); }
+    if let Some(v) = opts.get("application-key-id") { builder = builder.application_key_id(v); }
+    if let Some(v) = opts.get("application-key") { builder = builder.application_key(v); }
+    apply_operator(builder)
 }
 
 extern "C" fn handler(_: i32) {
