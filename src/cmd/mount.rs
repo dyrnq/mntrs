@@ -34,18 +34,6 @@ pub struct MountInfo {
     pub backend: String,
 }
 
-#[allow(dead_code)]
-fn mount_alive(mp: &str) -> bool {
-    if !std::path::Path::new(mp).exists() { return false; }
-    // Check /proc/mounts — dead FUSE mount may still have a directory but no entry
-    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts")
-        && !mounts.lines().any(|l| l.contains(mp)) {
-            return false;
-        }
-    // read_dir returns Transport endpoint not connected on dead FUSE mounts
-    std::path::Path::new(mp).read_dir().is_ok()
-}
-
 pub fn read_mounts() -> Vec<MountInfo> {
     let path = mounts_db();
     let file = match File::open(&path) {
