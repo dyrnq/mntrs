@@ -16,7 +16,7 @@ fn rt_block_on<F, T>(f: F) -> T where F: std::future::Future<Output = T> {
 
 pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>) -> Result<()> {
     let op = rt_block_on(build_operator(storage_url, opts))?;
-    let fs = MntrsFs { op: Arc::new(op) };
+    let fs = MntrsFs { op: Arc::new(op), inodes: std::sync::Mutex::new(std::collections::HashMap::new()) };
 
     let mount_path = Path::new(mountpoint);
     let session = fuser::spawn_mount2(fs, mount_path, &[MountOption::RW, MountOption::Exec])?;
