@@ -612,12 +612,12 @@ impl Filesystem for MntrsFs {
                 let p = p.clone();
                 tasks.push(rt().spawn(async move {
                     let _permit = permit.acquire().await;
-                    op.read_with(&p).range(off..e).await.map(|b| b.to_vec())
+                    op.read_with(&p).range(off..e).await.map(|b| bytes::Bytes::from(b.to_vec()))
                 }));
                 off = e;
             }
             let results: Vec<_> = rt().block_on(futures::future::join_all(tasks));
-            let mut all_data = Vec::with_capacity(fetch_size as usize);
+            let mut all_data = bytes::BytesMut::with_capacity(fetch_size as usize);
             let mut ok = true;
             for r in &results {
                 match r {
@@ -626,7 +626,7 @@ impl Filesystem for MntrsFs {
                 }
             }
             if ok {
-                let b: bytes::Bytes = all_data.into();
+                let b: bytes::Bytes = all_data.freeze();
                 let slice = &b[..(b.len() as u32).min(size) as usize];
                 reply.data(slice);
                 self.mem_cache_insert(ino, b);
