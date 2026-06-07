@@ -5,21 +5,27 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use opendal::Operator;
 use opendal::services::S3;
+use fuser::MountOption;
+use once_cell::sync::OnceCell;
+
+fn rt_block_on<F, T>(f: F) -> T where F: std::future::Future<Output = T> {
+    static RT: OnceCell<tokio::runtime::Runtime> = OnceCell::new();
+    let rt = RT.get_or_init(|| tokio::runtime::Runtime::new().expect("tokio rt"));
+    rt.block_on(f)
+}
 
 pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>) -> Result<()> {
     let op = rt_block_on(build_operator(storage_url, opts))?;
     let fs = MntrsFs { op: Arc::new(op) };
 
     let mount_path = Path::new(mountpoint);
-    let session = fuser::spawn_mount2(fs, mount_path, &[])?;
-    session.join();
-    Ok(())
-}
+    let session = fuser::spawn_mount2(fs, mount_path, &[MountOption::RW, MountOption::Exec])?;
 
-fn rt_block_on<F, T>(f: F) -> T where F: std::future::Future<Output = T> {
-    static RT: once_cell::sync::OnceCell<tokio::runtime::Runtime> = once_cell::sync::OnceCell::new();
-    let rt = RT.get_or_init(|| tokio::runtime::Runtime::new().expect("tokio rt"));
-    rt.block_on(f)
+    // Prevent drop-unmount, block forever
+    std::mem::forget(session);
+    let (_tx, rx) = std::sync::mpsc::channel::<()>();
+    let _ = rx.recv();
+    Ok(())
 }
 
 async fn build_operator(storage_url: &str, opts: &HashMap<String, String>) -> Result<Operator> {

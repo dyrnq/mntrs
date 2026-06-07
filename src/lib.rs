@@ -10,16 +10,13 @@ use fuser::{
     Request,
 };
 use futures::StreamExt;
-use libc::{ENOENT, EIO};
+use libc::{ENOENT, EIO, ENOSYS};
 use opendal::{EntryMode, Metadata, Operator};
-use tokio::runtime::Runtime;
+use once_cell::sync::OnceCell;
 
-// 全局多线程 Tokio Runtime，不依赖 FUSE 工作线程
-fn rt() -> &'static Runtime {
-    static RT: once_cell::sync::OnceCell<Runtime> = once_cell::sync::OnceCell::new();
-    RT.get_or_init(|| {
-        Runtime::new().expect("failed to create tokio runtime")
-    })
+fn rt() -> &'static tokio::runtime::Runtime {
+    static RT: OnceCell<tokio::runtime::Runtime> = OnceCell::new();
+    RT.get_or_init(|| tokio::runtime::Runtime::new().expect("tokio rt"))
 }
 
 const TTL: Duration = Duration::from_secs(1);
@@ -47,10 +44,6 @@ impl MntrsFs {
         for b in name.bytes() { h = h.wrapping_mul(0x01000193) ^ b as u64; }
         (h & 0x7FFFFFFFFFFFFFFF).max(2)
     }
-
-    fn root_attr(&self) -> FileAttr {
-        make_attr(FUSE_ROOT_INO, 4096, FileType::Directory)
-    }
 }
 
 impl Filesystem for MntrsFs {
@@ -58,57 +51,46 @@ impl Filesystem for MntrsFs {
     fn access(&mut self, _req: &Request<'_>, _ino: u64, _mask: i32, reply: ReplyEmpty) { reply.ok(); }
 
     fn lookup(&mut self, _req: &Request<'_>, _parent: u64, name: &OsStr, reply: ReplyEntry) {
-        std::fs::write("/tmp/mntrs-lookup.log", format!("lookup called parent={} name={:?}\n", _parent, name)).ok();
         let name = name.to_string_lossy().to_string();
-        let name_owned = name.clone();
+        let name2 = name.clone();
         if name == "." || name == ".." {
-            reply.entry(&TTL, &self.root_attr(), 0);
-        } else {
-            let op = self.op.clone();
-            let result = rt().block_on(async move { op.stat(&name_owned).await });
-            match result {
-                Ok(meta) => {
-                    let ino = self.inode_for(&name);
-                    let kind = match meta.mode() {
-                        EntryMode::DIR => FileType::Directory,
-                        _ => FileType::RegularFile,
-                    };
-                    reply.entry(&TTL, &make_attr(ino, meta.content_length(), kind), 0);
-                }
-                Err(_) => reply.error(ENOENT),
+            reply.entry(&TTL, &make_attr(FUSE_ROOT_INO, 4096, FileType::Directory), 0);
+            return;
+        }
+        let op = self.op.clone();
+        let result = rt().block_on(async move { op.stat(&name2).await });
+        match result {
+            Ok(meta) => {
+                let ino = self.inode_for(&name);
+                let kind = match meta.mode() {
+                    EntryMode::DIR => FileType::Directory,
+                    _ => FileType::RegularFile,
+                };
+                reply.entry(&TTL, &make_attr(ino, meta.content_length(), kind), 0);
             }
+            Err(_) => reply.error(ENOENT),
         }
     }
 
     fn getattr(&mut self, _req: &Request<'_>, _ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        reply.attr(&TTL, &self.root_attr());
+        reply.attr(&TTL, &make_attr(FUSE_ROOT_INO, 4096, FileType::Directory));
     }
 
-    fn readdir(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, _offset: i64, mut reply: ReplyDirectory) {
-        std::fs::write("/tmp/mntrs-readdir.log", format!("readdir called ino={} offset={} NO ASYNC\n", ino, _offset)).ok();
+    fn opendir(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
+        reply.opened(1, 0);
+    }
+
+    fn readdir(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
         if ino != FUSE_ROOT_INO { reply.error(ENOENT); return; }
 
-        reply.add(FUSE_ROOT_INO, 1, FileType::Directory, ".");
-        reply.add(FUSE_ROOT_INO, 2, FileType::Directory, "..");
-        reply.add(3, 3, FileType::RegularFile, "hello.txt");
-        reply.add(4, 4, FileType::Directory, "testdir");
+        let entries: &[(&str, FileType)] = &[
+            (".", FileType::Directory),
+            ("..", FileType::Directory),
+        ];
 
-        reply.ok();
-    }
-
-    fn readdirplus(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
-        mut reply: fuser::ReplyDirectoryPlus,
-    ) {
-        std::fs::write("/tmp/mntrs-readdirplus.log", format!("readdirplus called ino={} offset={}\n", ino, offset)).ok();
-        if ino != FUSE_ROOT_INO { reply.error(libc::ENOSYS); return; }
-
+        // Fetch from S3
         let op = self.op.clone();
-        let entries: Vec<(String, EntryMode)> = rt().block_on(async move {
+        let remote: Vec<(String, EntryMode)> = rt().block_on(async move {
             let mut lister = op.lister("").await.ok()?;
             let mut out = vec![];
             while let Some(Ok(entry)) = lister.next().await {
@@ -119,31 +101,40 @@ impl Filesystem for MntrsFs {
             Some(out)
         }).unwrap_or_default();
 
-        reply.add(FUSE_ROOT_INO, 1, ".", &TTL, &make_attr(FUSE_ROOT_INO, 4096, FileType::Directory), 0);
-        reply.add(FUSE_ROOT_INO, 2, "..", &TTL, &make_attr(FUSE_ROOT_INO, 4096, FileType::Directory), 0);
+        let mut all: Vec<(&str, FileType)> = entries.to_vec();
+        let (static_names, static_types): (Vec<_>, Vec<_>) = all.iter().map(|(n, k)| (*n, *k)).unzip();
+        drop(all);
 
-        for (i, (name, mode)) in entries.iter().enumerate() {
-            let ino_child = self.inode_for(name);
+        // 把 entries 改为包含远程条目
+        let start = if offset <= 0 { 0 } else { offset as usize };
+        let total_entries = 2 + remote.len();
+        if start >= total_entries { reply.ok(); return; }
+
+        let mut idx = 0;
+        if start <= idx && idx < total_entries {
+            let ino = FUSE_ROOT_INO;
+            if reply.add(ino, (idx + 1) as i64, FileType::Directory, ".") { reply.ok(); return; }
+        }
+        idx = 1;
+        if start <= idx && idx < total_entries {
+            if reply.add(FUSE_ROOT_INO, (idx + 1) as i64, FileType::Directory, "..") { reply.ok(); return; }
+        }
+        idx = 2;
+        for (name, mode) in &remote {
+            if start > idx { idx += 1; continue; }
+            let ino = self.inode_for(name);
             let kind = match mode { EntryMode::DIR => FileType::Directory, _ => FileType::RegularFile };
-            let size = if kind == FileType::Directory { 4096 } else { 0 };
-            if reply.add(ino_child, (i + 3) as i64, name, &TTL, &make_attr(ino_child, size, kind), 0) {
-                break;
-            }
+            if reply.add(ino, (idx + 1) as i64, kind, name) { break; }
+            idx += 1;
         }
 
         reply.ok();
     }
 
+    fn releasedir(&mut self, _req: &Request<'_>, _ino: u64, _fh: u64, _flags: i32, reply: ReplyEmpty) { reply.ok(); }
     fn open(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) { reply.opened(0, 0); }
-
-    fn read(&mut self, _req: &Request<'_>, _ino: u64, _fh: u64, _offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
-        reply.error(EIO);
-    }
-
-    fn write(&mut self, _req: &Request<'_>, _ino: u64, _fh: u64, _offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyWrite) {
-        reply.error(EIO);
-    }
-
+    fn read(&mut self, _req: &Request<'_>, _ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) { reply.error(EIO); }
+    fn write(&mut self, _req: &Request<'_>, _ino: u64, _fh: u64, offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyWrite) { reply.error(EIO); }
     fn flush(&mut self, _req: &Request<'_>, _ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) { reply.ok(); }
     fn release(&mut self, _req: &Request<'_>, _ino: u64, _fh: u64, _flags: i32, _lock_owner: Option<u64>, _flush: bool, reply: ReplyEmpty) { reply.ok(); }
 }
