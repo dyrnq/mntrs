@@ -77,7 +77,7 @@ extern "C" fn cleanup() {
     }
 }
 
-pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>) -> Result<()> {
+pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>, read_only: bool) -> Result<()> {
     let op = rt_block_on(build_operator(storage_url, opts))?;
     let fs = MntrsFs {
         op: Arc::new(op),
@@ -86,7 +86,7 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
 
     let mount_path = Path::new(mountpoint);
     let session = fuser::spawn_mount2(fs, mount_path, &[
-        MountOption::RW,
+        if read_only { MountOption::RO } else { MountOption::RW },
         MountOption::Exec,
     ])?;
 
