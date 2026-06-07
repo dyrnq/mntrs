@@ -58,16 +58,12 @@
 ## ⬜ mntrs 未支持的 rclone 参数 (~42 项)
 
 ### 挂载模式 & 系统集成 (0)
-| `--network-mode` | Windows 网络驱动器 |
 
 ### 缓存 & 性能 (0)
 
 ### VFS 功能 (0)
 
 ### macOS / Windows 专用 (3)
-| `--noappledouble` | 忽略 Apple Double 文件 |
-| `--noapplexattr` | 忽略 Apple 扩展属性 |
-| `--mount-case-insensitive` | 大小写敏感 |
 
 ### 文件过滤 (1)
 
@@ -75,7 +71,7 @@
 
 | 维度 | rclone | mntrs |
 |------|--------|-------|
-| 总参数数 | 96 | 61 |
+| 总参数数 | 96 | 64 |
 |  | 100% | 48% (32/66 核心参数) |
 | 核心挂载功能 | ✅ | ✅ |
 | 守护进程 | ✅ | ✅ |

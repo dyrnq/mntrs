@@ -104,7 +104,7 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
                 dir_cache_time: u64, attr_timeout: u64, _type_cache_ttl: u64, stat_cache_ttl: u64, allow_other: bool, volname: &str, devname: Option<&str>, write_back_cache: bool, fuse_options: &[String],
                 daemon: bool, daemon_wait: bool, _daemon_timeout: u64, allow_root: bool, vfs_cache_max_size: u64, mem_limit: u64, vfs_write_back: u64, vfs_cache_mode: &str, vfs_read_ahead: u64, vfs_read_chunk_size: u64, default_permissions: bool,
                 uid: Option<u32>, gid: Option<u32>, umask: Option<u32>, dir_perms: Option<u32>, file_perms: Option<u32>,
-                allow_non_empty: bool, cache_dir: Option<&str>, direct_io: bool, poll_interval: u64, vfs_cache_max_age: u64, vfs_cache_min_free_space: u64, exclude: Vec<String>, include: Vec<String>, max_size: Option<u64>, min_size: Option<u64>, max_depth: Option<usize>, ignore_case: bool, _no_modtime: bool, _no_checksum: bool, _no_seek: bool, _links: bool, _max_read_ahead: u64, vfs_read_chunk_size_limit: u64, vfs_read_chunk_streams: u32, vfs_fast_fingerprint: bool, async_read: bool, vfs_refresh: bool, vfs_case_insensitive: bool, no_implicit_dir: bool, vfs_block_norm_dupes: bool, _vfs_links: bool, _vfs_used_is_size: bool, _vfs_metadata_extension: Option<String>, storage_class: Option<&str>, vfs_write_wait: u64, vfs_read_wait: u64, vfs_cache_poll_interval: u64, vfs_disk_space_total_size: u64) -> Result<()> {
+                allow_non_empty: bool, cache_dir: Option<&str>, direct_io: bool, poll_interval: u64, vfs_cache_max_age: u64, vfs_cache_min_free_space: u64, exclude: Vec<String>, include: Vec<String>, max_size: Option<u64>, min_size: Option<u64>, max_depth: Option<usize>, ignore_case: bool, _no_modtime: bool, _no_checksum: bool, _no_seek: bool, _links: bool, _noapple_double: bool, _noapple_xattr: bool, _mount_case_insensitive: bool, _max_read_ahead: u64, vfs_read_chunk_size_limit: u64, vfs_read_chunk_streams: u32, vfs_fast_fingerprint: bool, async_read: bool, vfs_refresh: bool, vfs_case_insensitive: bool, no_implicit_dir: bool, vfs_block_norm_dupes: bool, _vfs_links: bool, _vfs_used_is_size: bool, _vfs_metadata_extension: Option<String>, storage_class: Option<&str>, vfs_write_wait: u64, vfs_read_wait: u64, vfs_cache_poll_interval: u64, vfs_disk_space_total_size: u64) -> Result<()> {
     let op = rt_block_on(build_operator(storage_url, opts))?;
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let cache_dir_path = if let Some(cd) = cache_dir {
@@ -205,6 +205,18 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
     }
     if allow_root {
         cfg.mount_options.push(MountOption::CUSTOM("allow_root".to_string()));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if _noapple_double {
+            cfg.mount_options.push(MountOption::CUSTOM("noappledouble".to_string()));
+        }
+        if _noapple_xattr {
+            cfg.mount_options.push(MountOption::CUSTOM("noapplexattr".to_string()));
+        }
+        if _mount_case_insensitive {
+            cfg.mount_options.push(MountOption::CUSTOM("mount_case_insensitive".to_string()));
+        }
     }
     if default_permissions {
         cfg.mount_options.push(MountOption::CUSTOM("default_permissions".to_string()));
