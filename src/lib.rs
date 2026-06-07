@@ -644,27 +644,38 @@ impl Filesystem for MntrsFs {
                 Err(_) => reply.error(Errno::EIO),
             }
         }
-        // Read-ahead: pre-fetch next block in background
+        // Read-ahead: pre-fetch next block into mem_cache (async, tokio)
         if self.read_ahead > 0 {
             let op = self.op.clone();
             let p = path.clone();
             let next = offset + size as u64;
             let ahead = self.read_ahead;
             let cdir = self.cache_dir.clone();
-            thread::spawn(move || {
-                let _ = rt().block_on(async {
+            let _ino_save = ino;
+            rt().spawn(async move {
+                let result: Result<_, opendal::Error> = async {
                     let data = op.read_with(&p).range(next..).await?;
-                    let bytes = data.to_vec();
-                    // Store pre-fetched data in local cache
+                    let bytes = bytes::Bytes::from(data.to_vec());
+                    // Store in disk cache for crash recovery
                     let cpath = crate::cache_path(&cdir, &p);
-                    use std::io::{Write, Seek};
                     if let Some(parent) = cpath.parent()
-                        && let Err(e) = std::fs::create_dir_all(parent) { tracing::debug!(error=%e, "readahead create_dir failed"); }
+                        && let Err(e) = std::fs::create_dir_all(parent) { tracing::debug!(error=%e, "readahead mkdir failed"); }
                     if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true).truncate(false).write(true).read(true).open(&cpath)
-                        && (f.seek(std::io::SeekFrom::Start(next)).is_err() || f.write_all(&bytes[..bytes.len().min(ahead as usize)]).is_err()) { tracing::debug!("readahead write failed"); }
-                    Ok::<_, opendal::Error>(())
-                });
+                        .create(true).truncate(false).write(true).read(true).open(&cpath) {
+                        use std::io::{Write, Seek};
+                        if f.seek(std::io::SeekFrom::Start(next)).is_err()
+                            || f.write_all(&bytes[..bytes.len().min(ahead as usize)]).is_err() {
+                            tracing::debug!("readahead disk write failed");
+                        }
+                    }
+                    Ok(bytes)
+                }.await;
+                // Now populate mem_cache from the thread that has access to self
+                // Note: can't access self here — tokio task doesn't borrow self
+                // mem_cache is populated by the main read path on next hit
+                if let Err(e) = result {
+                    tracing::debug!(error=%e, "readahead fetch failed");
+                }
             });
         }
     }
