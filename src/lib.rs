@@ -22,9 +22,9 @@ fn rt() -> &'static tokio::runtime::Runtime {
     RT.get_or_init(|| tokio::runtime::Runtime::new().expect("tokio rt"))
 }
 
-const TTL: Duration = Duration::from_secs(1);
+// TTL now comes from MntrsFs.attr_ttl field
 const FUSE_ROOT_INO: u64 = 1;
-const DIR_CACHE_TTL: Duration = Duration::from_secs(10);
+// DIR_CACHE_TTL now comes from MntrsFs.dir_cache_ttl field
 
 pub struct MntrsFs {
     pub op: Arc<Operator>,
@@ -32,6 +32,9 @@ pub struct MntrsFs {
     dir_cache: Mutex<HashMap<String, (std::time::Instant, Vec<(String, EntryMode)>)>>,
     cache_dir: PathBuf,
     handles: Mutex<HashMap<u64, (String, bool)>>,
+    pub dir_cache_ttl: Duration,
+    pub attr_ttl: Duration,
+    pub volname: String,
 }
 
 fn make_attr(ino: u64, size: u64, kind: FileType) -> FileAttr {
@@ -93,7 +96,7 @@ impl MntrsFs {
         {
             let cache = self.dir_cache.lock().unwrap();
             if let Some((t, entries)) = cache.get(path) {
-                if t.elapsed() < DIR_CACHE_TTL { return entries.clone(); }
+                if t.elapsed() < self.dir_cache_ttl { return entries.clone(); }
             }
         }
         let result = rt().block_on(async {
@@ -129,22 +132,22 @@ impl Filesystem for MntrsFs {
         if name == "." || name == ".." {
             let p = if name == "." { parent } else { FUSE_ROOT_INO };
             let attr = self.resolve(p).map(|(_, k, s)| make_attr(p, s, k)).unwrap_or_else(|| make_attr(FUSE_ROOT_INO, 4096, FileType::Directory));
-            reply.entry(&TTL, &attr, Generation(0)); return;
+            reply.entry(&self.attr_ttl, &attr, Generation(0)); return;
         }
         let parent_path = self.resolve(parent).map(|(p, _, _)| p).unwrap_or_default();
         let full_path = if parent_path.is_empty() { name2 } else { format!("{}/{}", parent_path, name2) };
         if let Some((kind, size)) = self.stat_op(&full_path) {
-            reply.entry(&TTL, &make_attr(self.alloc_ino(&full_path, kind, size), size, kind), Generation(0));
+            reply.entry(&self.attr_ttl, &make_attr(self.alloc_ino(&full_path, kind, size), size, kind), Generation(0));
         } else { reply.error(Errno::ENOENT); }
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         let ino: u64 = ino.into();
-        if ino == FUSE_ROOT_INO { reply.attr(&TTL, &make_attr(ino, 4096, FileType::Directory)); return; }
+        if ino == FUSE_ROOT_INO { reply.attr(&self.attr_ttl, &make_attr(ino, 4096, FileType::Directory)); return; }
         match self.resolve(ino) {
             Some((path, kind, _)) => {
                 let (ak, asz) = self.stat_op(&path).unwrap_or((kind, 0));
-                reply.attr(&TTL, &make_attr(ino, asz, ak));
+                reply.attr(&self.attr_ttl, &make_attr(ino, asz, ak));
             }
             None => reply.error(Errno::ENOENT),
         }
@@ -178,7 +181,7 @@ impl Filesystem for MntrsFs {
         let full_path = if parent_path.is_empty() { name.to_string() } else { format!("{}/{}", parent_path, name) };
         let ino = self.alloc_ino(&full_path, FileType::RegularFile, 0);
         self.handles.lock().unwrap().insert(ino, (full_path.clone(), false));
-        reply.created(&TTL, &make_attr(ino, 0, FileType::RegularFile), Generation(0), FileHandle(ino), FopenFlags::empty());
+        reply.created(&self.attr_ttl, &make_attr(ino, 0, FileType::RegularFile), Generation(0), FileHandle(ino), FopenFlags::empty());
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
@@ -244,7 +247,7 @@ impl Filesystem for MntrsFs {
                 if cpath.exists() { let _ = fs::write(&cpath, &[] as &[u8]); }
                 self.alloc_ino(&p, kind, s);
             }
-            reply.attr(&TTL, &make_attr(ino, size.unwrap_or(0), kind));
+            reply.attr(&self.attr_ttl, &make_attr(ino, size.unwrap_or(0), kind));
         } else {
             reply.error(Errno::ENOENT);
         }

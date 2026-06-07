@@ -116,7 +116,8 @@ extern "C" fn cleanup() {
     }
 }
 
-pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>, read_only: bool) -> Result<()> {
+pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>, read_only: bool,
+                dir_cache_time: u64, attr_timeout: u64, allow_other: bool, volname: &str, write_back_cache: bool) -> Result<()> {
     let op = rt_block_on(build_operator(storage_url, opts))?;
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let cache_dir = std::path::PathBuf::from(format!("{}/.cache/mntrs", home));
@@ -126,14 +127,24 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
         dir_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         cache_dir,
         handles: std::sync::Mutex::new(std::collections::HashMap::new()),
+        dir_cache_ttl: std::time::Duration::from_secs(dir_cache_time),
+        attr_ttl: std::time::Duration::from_secs(attr_timeout),
+        volname: volname.to_string(),
     };
 
     let mount_path = Path::new(mountpoint);
     let mut cfg: fuser::Config = Default::default();
+    if allow_other {
+        cfg.acl = fuser::SessionACL::All;
+    }
     cfg.mount_options = vec![
         if read_only { MountOption::RO } else { MountOption::RW },
         MountOption::Exec,
+        MountOption::FSName(volname.to_string()),
     ];
+    if write_back_cache {
+        cfg.mount_options.push(MountOption::CUSTOM("writeback_cache".to_string()));
+    }
     let session = fuser::spawn_mount2(fs, mount_path, &cfg)?;
 
     record_mount(storage_url, mountpoint, read_only);
