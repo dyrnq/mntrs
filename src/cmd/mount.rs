@@ -8,7 +8,7 @@ use std::io::{Write, BufRead, BufReader};
 use std::process::Command;
 use opendal::Operator;
 use opendal::layers::TimeoutLayer;
-use opendal::services::{S3, Gcs, Azblob, HdfsNative, Oss, Cos, Obs, B2};
+use opendal::services::{S3, Gcs, Azblob, HdfsNative, Oss, Cos, Obs, B2, VercelBlob};
 use fuser::MountOption;
 use once_cell::sync::OnceCell;
 use std::sync::OnceLock;
@@ -281,6 +281,7 @@ async fn build_operator(storage_url: &str, opts: &HashMap<String, String>) -> Re
         "cos" => build_cos(&url, opts).await,
         "obs" => build_obs(&url, opts).await,
         "b2" => build_b2(&url, opts).await,
+        "vercel" | "vercel-blob" => build_vercel_blob(&url, opts).await,
         s => Err(anyhow!("unsupported scheme '{s}'; try s3://, gs://, azblob://, hdfs://, oss://, cos://, obs://, b2://")),
     }
 }
@@ -413,6 +414,14 @@ async fn build_b2(url: &url::Url, opts: &HashMap<String, String>) -> Result<Oper
     if !p.is_empty() { builder = builder.root(p); }
     if let Some(v) = opts.get("application-key-id") { builder = builder.application_key_id(v); }
     if let Some(v) = opts.get("application-key") { builder = builder.application_key(v); }
+    apply_operator(builder)
+}
+
+async fn build_vercel_blob(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+    let mut builder = VercelBlob::default();
+    let p = url.path().trim_start_matches('/');
+    if !p.is_empty() { builder = builder.root(p); }
+    if let Some(v) = opts.get("token") { builder = builder.token(v); }
     apply_operator(builder)
 }
 

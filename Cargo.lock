@@ -1588,6 +1588,7 @@ dependencies = [
  "opendal-service-obs",
  "opendal-service-oss",
  "opendal-service-s3",
+ "opendal-service-vercel-blob",
 ]
 
 [[package]]
@@ -1812,6 +1813,21 @@ dependencies = [
  "reqsign-file-read-tokio",
  "serde",
  "url",
+]
+
+[[package]]
+name = "opendal-service-vercel-blob"
+version = "0.57.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c03e4830a86ad143a810306185b4cf680bd007ce9dd03dc0116e1edd62be8eb"
+dependencies = [
+ "bytes",
+ "http",
+ "log",
+ "opendal-core",
+ "quick-xml 0.39.4",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
