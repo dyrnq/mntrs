@@ -3,8 +3,8 @@ use anyhow::{Result, anyhow};
 use std::path::Path;
 use std::sync::Arc;
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, OpenOptions, File};
+use std::io::{Write, BufRead, BufReader};
 use opendal::Operator;
 use opendal::services::S3;
 use fuser::MountOption;
@@ -16,12 +16,33 @@ fn rt_block_on<F, T>(f: F) -> T where F: std::future::Future<Output = T> {
     rt.block_on(f)
 }
 
-const MOUNTS_DB: &str = "/tmp/mntrs-mounts.txt";
+fn mounts_db() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    format!("{}/.local/share/mntrs/mounts.txt", home)
+}
+
+pub fn read_mounts() -> Vec<(String, String)> {
+    let path = mounts_db();
+    let file = match File::open(&path) {
+        Ok(f) => f,
+        Err(_) => return vec![],
+    };
+    let reader = BufReader::new(file);
+    reader.lines()
+        .filter_map(|l| l.ok())
+        .filter_map(|l| {
+            let idx = l.find(' ')?;
+            Some((l[..idx].to_string(), l[idx+1..].to_string()))
+        })
+        .collect()
+}
 
 fn record_mount(storage: &str, mountpoint: &str) {
-    let _ = fs::create_dir_all("/tmp");
+    let path = mounts_db();
+    let dir = Path::new(&path).parent().unwrap();
+    let _ = fs::create_dir_all(dir);
     let line = format!("{} {}\n", storage, mountpoint);
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(MOUNTS_DB) {
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = f.write_all(line.as_bytes());
     }
 }

@@ -4,34 +4,42 @@ use std::process::Command;
 use std::fs;
 
 pub fn unmount(target: &str) -> Result<()> {
+    let mounts = crate::cmd::mount::read_mounts();
+
     if target == "all" || target == "-a" {
-        let content = fs::read_to_string("/tmp/mntrs-mounts.txt").unwrap_or_default();
-        if content.trim().is_empty() {
+        if mounts.is_empty() {
             return Err(anyhow!("no mntrs mounts found"));
         }
-        for line in content.lines() {
-            if let Some(idx) = line.find(' ') {
-                let mountpoint = &line[idx+1..];
-                eprintln!("unmounting {mountpoint}");
-                let _ = fuse_unmount(mountpoint);
-            }
+        for (_, mountpoint) in &mounts {
+            eprintln!("unmounting {mountpoint}");
+            let _ = fuse_unmount(mountpoint);
         }
-        let _ = fs::remove_file("/tmp/mntrs-mounts.txt");
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let _ = fs::remove_file(format!("{}/.local/share/mntrs/mounts.txt", home));
         return Ok(());
     }
 
-    let path = Path::new(target);
-    if !path.exists() {
-        return Err(anyhow!("mount point '{}' does not exist", target));
-    }
-    fuse_unmount(target)?;
+    let mountpoint = if Path::new(target).exists() {
+        target.to_string()
+    } else {
+        // try to match by storage URL
+        if let Some(m) = mounts.iter().find(|(s, _)| s == target) {
+            m.1.clone()
+        } else {
+            return Err(anyhow!("mount point '{}' does not exist", target));
+        }
+    };
 
-    // remove from mounts db
-    if let Ok(content) = fs::read_to_string("/tmp/mntrs-mounts.txt") {
+    fuse_unmount(&mountpoint)?;
+
+    // remove from db
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let db = format!("{}/.local/share/mntrs/mounts.txt", home);
+    if let Ok(content) = fs::read_to_string(&db) {
         let filtered: Vec<&str> = content.lines()
-            .filter(|l| !l.ends_with(target))
+            .filter(|l| !l.contains(&mountpoint))
             .collect();
-        let _ = fs::write("/tmp/mntrs-mounts.txt", filtered.join("\n"));
+        let _ = fs::write(&db, filtered.join("\n"));
     }
     Ok(())
 }
