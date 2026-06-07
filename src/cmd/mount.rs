@@ -7,7 +7,7 @@ use std::fs::{self, OpenOptions, File};
 use std::io::{Write, BufRead, BufReader};
 use std::process::Command;
 use opendal::Operator;
-use opendal::layers::TimeoutLayer;
+use opendal::layers::{TimeoutLayer, RetryLayer, ConcurrentLimitLayer};
 use opendal::services::{S3, Gcs, Azblob, HdfsNative, Oss, Cos, Obs, B2, VercelBlob, AliyunDrive};
 use fuser::MountOption;
 use once_cell::sync::OnceCell;
@@ -276,7 +276,9 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
 
 fn apply_operator(builder: impl opendal::Builder) -> Result<Operator> {
     let op: Operator = Operator::new(builder)?
-        .layer(TimeoutLayer::new().with_io_timeout(std::time::Duration::from_secs(5)))
+        .layer(TimeoutLayer::new().with_io_timeout(std::time::Duration::from_secs(30)))
+        .layer(RetryLayer::new().with_max_times(3).with_factor(2.0))
+        .layer(ConcurrentLimitLayer::new(16))
         .finish();
     Ok(op)
 }
