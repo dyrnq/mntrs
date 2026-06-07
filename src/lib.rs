@@ -232,6 +232,41 @@ impl Filesystem for MntrsFs {
         }
     }
 
+    fn mkdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
+        let name = name.to_string_lossy();
+        let parent_path = self.resolve(parent.into()).map(|(p, _, _)| p).unwrap_or_default();
+        let full_path = if parent_path.is_empty() { name.to_string() } else { format!("{}/{}", parent_path, name) };
+        let dir_path = format!("{}/", full_path.trim_end_matches('/'));
+        let op = self.op.clone(); let p = dir_path.clone();
+        match rt().block_on(async move { op.create_dir(&p).await }) {
+            Ok(_) => {
+                let ino = self.alloc_ino(&full_path, FileType::Directory, 4096);
+                reply.entry(&self.attr_ttl, &make_attr(ino, 4096, FileType::Directory), Generation(0));
+            }
+            Err(_) => reply.error(Errno::EIO),
+        }
+    }
+
+    fn rmdir(&self, _req: &Request, _parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let name = name.to_string_lossy();
+        let dir_path = format!("{}/", name.trim_end_matches('/'));
+        let op = self.op.clone(); let p = dir_path.clone();
+        let _ = rt().block_on(async move { op.delete(&p).await });
+        reply.ok();
+    }
+
+    fn rename(&self, _req: &Request, _parent: INodeNo, name: &OsStr, _newparent: INodeNo, newname: &OsStr, _flags: fuser::RenameFlags, reply: ReplyEmpty) {
+        let src = name.to_string_lossy().to_string();
+        let dst = newname.to_string_lossy().to_string();
+        let op = self.op.clone();
+        let _ = rt().block_on(async move {
+            if op.copy(&src, &dst).await.is_ok() {
+                let _ = op.delete(&src).await;
+            }
+        });
+        reply.ok();
+    }
+
     fn getxattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, _size: u32, reply: ReplyXattr) {
         reply.error(Errno::ENODATA);
     }
