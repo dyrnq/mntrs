@@ -15,22 +15,36 @@
 | `--type-cache-ttl` | 分离目录类型缓存 TTL 和属性缓存 TTL | goofys |
 | 八进制权限输入 | `--dir-perms`/`--file-perms` 支持八进制（如 0777）而非仅十进制 | goofys/geesefs |
 
-## 🟡 中优先级
+
+## 🟡 中优先级 (1项)
 
 | 功能 | 说明 | 来源 |
 |------|------|------|
-| `MemoryLimiter` | 全局内存预算管理，prefetch + upload 共享配额，超限拒绝扩容防止 OOM | mountpoint-s3 |
-| Prefetcher 自适应窗口 | 逐步扩大 read window（1MB→128MB），随机读时自动 reset + backpressure 流控 | mountpoint-s3 |
-| `--no-implicit-dir` | 关闭隐式目录检测（S3 中 key 前缀 `a/b/` 暗示目录存在） | goofys |
-| `--stat-cache-ttl` | 分离 StatObject 结果缓存 TTL 和目录列表缓存 TTL | goofys |
+| Prefetcher backpressure | 下载流控 + part queue 防止内存溢出 | mountpoint-s3 |
 
-## 🟢 低优先级
+## ✅ 已借鉴完成 (9项)
 
-| 功能 | 说明 | 来源 |
-|------|------|------|
-| Multipart upload 流式上传 | 大文件用 multipart 分片上传（增量 append + 原子 finalize），小文件用 PutObject | mountpoint-s3 |
-| 块级 DataCache | 固定块大小（如 1MB）+ checksum 校验 + 按 ObjectId+BlockIndex 索引，替代当前文件级缓存 | mountpoint-s3 |
-| 多级缓存 | disk + in-memory + S3 Express 三级缓存层 | mountpoint-s3 |
-| Metablock 结构化 inode | 树状 inode 管理 + pending upload 状态跟踪 + 目录原子操作 | mountpoint-s3 |
-| cgroup 内存检测 | 运行时检测 cgroup 内存限制（容器环境），自动调整缓存策略 | geesefs |
-| CRC32C 上传校验 | 上传时自动计算 CRC32C 校验和，S3 服务端验证完整性 | mountpoint-s3 |
+| 功能 | 来源 |
+|------|------|
+| statfs / df -h 输出 | mountpoint-s3, goofys |
+| S3 xattr (etag/content-type) | goofys, mountpoint-s3 |
+| --storage-class | goofys |
+| --type-cache-ttl / --stat-cache-ttl | goofys |
+| --no-implicit-dir | goofys |
+| Handle 状态机 Read/Write | rclone, mountpoint-s3 |
+| ChunkedReader 自适应翻倍 | rclone |
+| MemoryLimiter (mem_limit) | mountpoint-s3 |
+| io_uring 评估 (不可行) | fuser-iouring |
+
+## 🟢 低优先级 (8项)
+
+| 功能 | 来源 |
+|------|------|
+| Multipart upload 流式上传 | mountpoint-s3 |
+| 块级 DataCache | mountpoint-s3 |
+| 多级缓存 | mountpoint-s3 |
+| Metablock 结构化 inode | mountpoint-s3 |
+| cgroup 内存检测 | geesefs |
+| CRC32C 上传校验 | mountpoint-s3 |
+| Windows 支持 (WinFsp) | - |
+| CSI plugin | - |
