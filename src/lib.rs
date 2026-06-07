@@ -1,7 +1,6 @@
 pub mod cmd;
 
 use std::collections::HashMap;
-use std::time::Instant;
 use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -9,10 +8,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig,
     ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite,
-    Request,
+    Request, INodeNo, FileHandle, OpenFlags, WriteFlags, AccessFlags, Errno, LockOwner,
 };
 use futures::StreamExt;
-use libc::{ENOENT, EIO};
 use opendal::{EntryMode, Operator};
 
 fn rt() -> &'static tokio::runtime::Runtime {
@@ -26,16 +24,14 @@ const FUSE_ROOT_INO: u64 = 1;
 pub struct MntrsFs {
     pub op: Arc<Operator>,
     inodes: Mutex<HashMap<u64, (String, FileType, u64)>>,
-    dir_cache: Mutex<HashMap<String, (Instant, Vec<(String, EntryMode)>)>>,
+    dir_cache: Mutex<HashMap<String, (std::time::Instant, Vec<(String, EntryMode)>)>>,
 }
-
-const DIR_CACHE_TTL: Duration = Duration::from_secs(10);
 
 fn make_attr(ino: u64, size: u64, kind: FileType) -> FileAttr {
     let now = UNIX_EPOCH;
     let perm = if kind == FileType::Directory { 0o755u16 } else { 0o644u16 };
     FileAttr {
-        ino, size, blocks: (size + 4095) / 4096,
+        ino: INodeNo(ino), size, blocks: (size + 4095) / 4096,
         atime: now, mtime: now, ctime: now, crtime: now,
         kind, perm,
         nlink: if kind == FileType::Directory { 2 } else { 1 },
@@ -74,7 +70,6 @@ impl MntrsFs {
                     Some((kind, meta.content_length()))
                 }
                 Err(_) => {
-                    // S3 directories are prefix-based; check if path/ has children
                     let op2 = self.op.clone();
                     let p2 = format!("{}/", path.trim_end_matches('/'));
                     if let Ok(mut l) = op2.lister(&p2).await {
@@ -92,12 +87,11 @@ impl MntrsFs {
         {
             let cache = self.dir_cache.lock().unwrap();
             if let Some((t, entries)) = cache.get(path) {
-                if t.elapsed() < DIR_CACHE_TTL {
+                if t.elapsed() < Duration::from_secs(10) {
                     return entries.clone();
                 }
             }
         }
-
         let result = rt().block_on(async {
             let op = self.op.clone();
             let p = path.to_string();
@@ -110,44 +104,46 @@ impl MntrsFs {
             }
             Some(out)
         }).unwrap_or_default();
-
         let mut cache = self.dir_cache.lock().unwrap();
-        cache.insert(path.to_string(), (Instant::now(), result.clone()));
+        cache.insert(path.to_string(), (std::time::Instant::now(), result.clone()));
         result
     }
 }
 
 impl Filesystem for MntrsFs {
-    fn init(&mut self, _req: &Request<'_>, _config: &mut KernelConfig) -> Result<(), i32> {
+    fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> std::io::Result<()> {
         self.alloc_ino("", FileType::Directory, 4096);
         Ok(())
     }
 
-    fn access(&mut self, _req: &Request<'_>, _ino: u64, _mask: i32, reply: ReplyEmpty) { reply.ok(); }
+    fn access(&self, _req: &Request, _ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
+        reply.ok();
+    }
 
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name = name.to_string_lossy().to_string();
+        let name2 = name.clone();
+        let parent: u64 = parent.into();
         if name == "." || name == ".." {
             let p = if name == "." { parent } else { FUSE_ROOT_INO };
             let attr = self.resolve(p)
                 .map(|(_, k, s)| make_attr(p, s, k))
                 .unwrap_or_else(|| make_attr(FUSE_ROOT_INO, 4096, FileType::Directory));
-            reply.entry(&TTL, &attr, 0);
+            reply.entry(&TTL, &attr, fuser::Generation(0));
             return;
         }
-
         let parent_path = self.resolve(parent).map(|(p, _, _)| p).unwrap_or_default();
-        let full_path = if parent_path.is_empty() { name.clone() } else { format!("{}/{}", parent_path, name) };
-
+        let full_path = if parent_path.is_empty() { name2.clone() } else { format!("{}/{}", parent_path, name2) };
         if let Some((kind, size)) = self.stat_op(&full_path) {
             let ino = self.alloc_ino(&full_path, kind, size);
-            reply.entry(&TTL, &make_attr(ino, size, kind), 0);
+            reply.entry(&TTL, &make_attr(ino, size, kind), fuser::Generation(0));
         } else {
-            reply.error(ENOENT);
+            reply.error(Errno::ENOENT);
         }
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        let ino: u64 = ino.into();
         if ino == FUSE_ROOT_INO {
             reply.attr(&TTL, &make_attr(ino, 4096, FileType::Directory));
             return;
@@ -157,18 +153,19 @@ impl Filesystem for MntrsFs {
                 let (actual_kind, actual_size) = self.stat_op(&path).unwrap_or((kind, 0));
                 reply.attr(&TTL, &make_attr(ino, actual_size, actual_kind));
             }
-            None => reply.error(ENOENT),
+            None => reply.error(Errno::ENOENT),
         }
     }
 
-    fn readdir(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
+    fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
+        let ino: u64 = ino.into();
+        if ino != FUSE_ROOT_INO { reply.error(Errno::ENOENT); return; }
         let path = self.resolve(ino).map(|(p, _, _)| p).unwrap_or_default();
 
         let mut entries: Vec<(String, FileType)> = vec![
             (".".to_string(), FileType::Directory),
             ("..".to_string(), FileType::Directory),
         ];
-
         let list_path = path.clone();
         for (name, mode) in self.list_op(&list_path) {
             let kind = match mode { EntryMode::DIR => FileType::Directory, _ => FileType::RegularFile };
@@ -177,42 +174,43 @@ impl Filesystem for MntrsFs {
 
         let start = if offset <= 0 { 0 } else { offset as usize };
         if start >= entries.len() { reply.ok(); return; }
-
         for i in start..entries.len() {
             let (ref name, kind) = entries[i];
             let child_path = if path.is_empty() { name.clone() } else { format!("{}/{}", path, name) };
-            let size = 0u64; // size from stat_op would add HEAD overhead
+            let size = self.stat_op(&child_path).map(|(_, s)| s).unwrap_or(0);
             let ino = self.alloc_ino(&child_path, kind, size);
-            if reply.add(ino, (i + 1) as i64, kind, name) { break; }
+            if reply.add(INodeNo(ino), (i + 1) as u64, kind, name) { break; }
         }
         reply.ok();
     }
 
-    fn opendir(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) { reply.opened(1, 0); }
-    fn releasedir(&mut self, _req: &Request<'_>, _ino: u64, _fh: u64, _flags: i32, reply: ReplyEmpty) { reply.ok(); }
-    fn open(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) { reply.opened(0, 0); }
+    fn opendir(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) { reply.opened(FileHandle(1), fuser::FopenFlags::empty()); }
+    fn releasedir(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) { reply.ok(); }
+    fn open(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) { reply.opened(FileHandle(0), fuser::FopenFlags::empty()); }
 
-    fn read(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
+    fn read(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, size: u32, _flags: OpenFlags, _lock_owner: Option<LockOwner>, reply: ReplyData) {
+        let ino: u64 = ino.into();
         let path = match self.resolve(ino) {
             Some((p, _, _)) => p,
-            None => { reply.error(ENOENT); return; }
+            None => { reply.error(Errno::ENOENT); return; }
         };
         let op = self.op.clone();
         let p = path.clone();
-        let result = rt().block_on(async move {
-            op.read_with(&p).range(offset as u64..).await
-        });
+        let result = rt().block_on(async move { op.read_with(&p).range(offset..).await });
         match result {
             Ok(buf) => {
                 let bytes = buf.to_vec();
-                let len = bytes.len().min(size as usize);
+                let len = (bytes.len() as u32).min(size) as usize;
                 reply.data(&bytes[..len]);
             }
-            Err(_) => reply.error(EIO),
+            Err(_) => reply.error(Errno::EIO),
         }
     }
 
-    fn write(&mut self, _req: &Request<'_>, _ino: u64, _fh: u64, _offset: i64, _data: &[u8], _write_flags: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyWrite) { reply.error(EIO); }
-    fn flush(&mut self, _req: &Request<'_>, _ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) { reply.ok(); }
-    fn release(&mut self, _req: &Request<'_>, _ino: u64, _fh: u64, _flags: i32, _lock_owner: Option<u64>, _flush: bool, reply: ReplyEmpty) { reply.ok(); }
+    fn write(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _offset: u64, _data: &[u8], _write_flags: WriteFlags, _flags: OpenFlags, _lock_owner: Option<LockOwner>, reply: ReplyWrite) {
+        reply.error(Errno::EIO);
+    }
+
+    fn flush(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) { reply.ok(); }
+    fn release(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _flags: OpenFlags, _lock_owner: Option<LockOwner>, _flush: bool, reply: ReplyEmpty) { reply.ok(); }
 }

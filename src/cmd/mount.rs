@@ -113,10 +113,12 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
     };
 
     let mount_path = Path::new(mountpoint);
-    let session = fuser::spawn_mount2(fs, mount_path, &[
+    let mut cfg: fuser::Config = Default::default();
+    cfg.mount_options = vec![
         if read_only { MountOption::RO } else { MountOption::RW },
         MountOption::Exec,
-    ])?;
+    ];
+    let session = fuser::spawn_mount2(fs, mount_path, &cfg)?;
 
     record_mount(storage_url, mountpoint, read_only);
 
