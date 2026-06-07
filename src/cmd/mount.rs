@@ -134,8 +134,7 @@ async fn build_s3(url: &url::Url, opts: &HashMap<String, String>) -> Result<Oper
 
     let op: Operator = Operator::new(builder)?
         .layer(TimeoutLayer::new()
-            .with_io_timeout(std::time::Duration::from_secs(5))
-            .with_timeout(std::time::Duration::from_secs(10)))
+            .with_io_timeout(std::time::Duration::from_secs(5)))
         .finish();
     Ok(op)
 }
