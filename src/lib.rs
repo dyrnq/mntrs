@@ -33,6 +33,8 @@ const FUSE_ROOT_INO: u64 = 1;
 enum FileHandleState {
     Read {
         path: String,
+        last_offset: u64,
+        chunk_size: u64,
     },
     Write {
         path: String,
@@ -44,7 +46,7 @@ enum FileHandleState {
 impl FileHandleState {
     fn path(&self) -> &str {
         match self {
-            FileHandleState::Read { path } => path,
+            FileHandleState::Read { path, .. } => path,
             FileHandleState::Write { path, .. } => path,
         }
     }
@@ -482,7 +484,7 @@ impl Filesystem for MntrsFs {
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         let ino: u64 = ino.into();
         if let Some((path, FileType::RegularFile, _)) = self.resolve(ino) {
-            self.handles.insert(ino, FileHandleState::Read { path });
+            self.handles.insert(ino, FileHandleState::Read { path, last_offset: 0, chunk_size: 131072 });
         }
         reply.opened(FileHandle(ino), FopenFlags::empty());
     }
@@ -513,8 +515,35 @@ impl Filesystem for MntrsFs {
                 }
         }
         // 3. Fetch from remote
+        // Adaptive chunking: grow on sequential read, reset on seek
+        let fh_val = u64::from(_fh);
+        let chunk_size = if let Some(entry) = self.handles.get(&fh_val) {
+            if let FileHandleState::Read { ref last_offset, chunk_size: cs, .. } = *entry.value() {
+                if offset == *last_offset {
+                    // Sequential read: double chunk size, up to max
+                    (cs * 2).min(8 * 1024 * 1024)
+                } else {
+                    // Random seek: reset to initial
+                    131072
+                }
+            } else {
+                self.read_chunk_size.max(size as u64)
+            }
+        } else {
+            self.read_chunk_size.max(size as u64)
+        };
+        // Update handle chunk tracking
+        if let Some(mut entry) = self.handles.get_mut(&fh_val)
+            && let FileHandleState::Read { ref mut last_offset, chunk_size: ref mut cs, .. } = *entry.value_mut() {
+                *last_offset = offset + size as u64;
+                *cs = chunk_size;
+            }
+        let fetch_size = if self.read_chunk_size > 0 {
+            self.read_chunk_size.max(size as u64)
+        } else {
+            chunk_size.max(size as u64)
+        };
         let op = self.op.clone(); let p = path.clone();
-        let fetch_size = if self.read_chunk_size > 0 { self.read_chunk_size.max(size as u64) } else { u64::MAX };
         match rt().block_on(async move { op.read_with(&p).range(offset..offset+fetch_size).await }) {
             Ok(buf) => {
                 let b: bytes::Bytes = buf.to_vec().into();
