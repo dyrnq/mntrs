@@ -66,6 +66,7 @@ pub struct MntrsFs {
     pub disk_total_size: u64,
     writeback_queue: Arc<Mutex<VecDeque<(String, PathBuf)>>>,
     mem_cache: dashmap::DashMap<u64, bytes::Bytes>,
+    attr_cache: dashmap::DashMap<String, (FileType, u64, std::time::Instant)>,
     
 }
 
@@ -139,7 +140,14 @@ impl MntrsFs {
     }
 
     fn stat_op(&self, path: &str) -> Option<(FileType, u64)> {
-        rt().block_on(async {
+        // Check attr cache first
+        if let Some(entry) = self.attr_cache.get(path) {
+            let (kind, size, ts) = entry.value();
+            if ts.elapsed() < self.attr_ttl {
+                return Some((*kind, *size));
+            }
+        }
+        let result = rt().block_on(async {
             let op = self.op.clone();
             let p = path.to_string();
             match op.stat(&p).await {
@@ -155,7 +163,11 @@ impl MntrsFs {
                     None
                 }
             }
-        })
+        });
+        if let Some((kind, size)) = result {
+            self.attr_cache.insert(path.to_string(), (kind, size, std::time::Instant::now()));
+        }
+        result
     }
 
     fn list_op(&self, path: &str) -> Vec<(String, EntryMode)> {

@@ -170,6 +170,7 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
         disk_total_size: vfs_disk_space_total_size * 1024 * 1024 * 1024 * 1024, // TB to bytes
         writeback_queue: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         mem_cache: dashmap::DashMap::new(),
+        attr_cache: dashmap::DashMap::new(),
     };
 
     // Create pipe for daemon_wait parent-child synchronization
