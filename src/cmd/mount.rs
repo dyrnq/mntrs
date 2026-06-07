@@ -120,10 +120,10 @@ extern "C" fn cleanup() {
 
 #[allow(clippy::too_many_arguments)]
 pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>, read_only: bool,
-                dir_cache_time: u64, attr_timeout: u64, allow_other: bool, volname: &str, devname: Option<&str>, write_back_cache: bool, fuse_options: &[String],
+                dir_cache_time: u64, attr_timeout: u64, _type_cache_ttl: u64, stat_cache_ttl: u64, allow_other: bool, volname: &str, devname: Option<&str>, write_back_cache: bool, fuse_options: &[String],
                 daemon: bool, daemon_wait: bool, _daemon_timeout: u64, allow_root: bool, vfs_cache_max_size: u64, vfs_write_back: u64, vfs_cache_mode: &str, vfs_read_ahead: u64, vfs_read_chunk_size: u64, default_permissions: bool,
                 uid: Option<u32>, gid: Option<u32>, umask: Option<u32>, dir_perms: Option<u32>, file_perms: Option<u32>,
-                allow_non_empty: bool, cache_dir: Option<&str>, direct_io: bool, poll_interval: u64, vfs_cache_max_age: u64, vfs_cache_min_free_space: u64, exclude: Vec<String>, include: Vec<String>, max_size: Option<u64>, min_size: Option<u64>, max_depth: Option<usize>, ignore_case: bool, _no_modtime: bool, _no_checksum: bool, _no_seek: bool, _links: bool, _max_read_ahead: u64, vfs_read_chunk_size_limit: u64, vfs_read_chunk_streams: u32, vfs_fast_fingerprint: bool, async_read: bool, vfs_refresh: bool, vfs_case_insensitive: bool, vfs_block_norm_dupes: bool, _vfs_links: bool, _vfs_used_is_size: bool, _vfs_metadata_extension: Option<String>, storage_class: Option<&str>, vfs_write_wait: u64, vfs_read_wait: u64, vfs_cache_poll_interval: u64, vfs_disk_space_total_size: u64) -> Result<()> {
+                allow_non_empty: bool, cache_dir: Option<&str>, direct_io: bool, poll_interval: u64, vfs_cache_max_age: u64, vfs_cache_min_free_space: u64, exclude: Vec<String>, include: Vec<String>, max_size: Option<u64>, min_size: Option<u64>, max_depth: Option<usize>, ignore_case: bool, _no_modtime: bool, _no_checksum: bool, _no_seek: bool, _links: bool, _max_read_ahead: u64, vfs_read_chunk_size_limit: u64, vfs_read_chunk_streams: u32, vfs_fast_fingerprint: bool, async_read: bool, vfs_refresh: bool, vfs_case_insensitive: bool, no_implicit_dir: bool, vfs_block_norm_dupes: bool, _vfs_links: bool, _vfs_used_is_size: bool, _vfs_metadata_extension: Option<String>, storage_class: Option<&str>, vfs_write_wait: u64, vfs_read_wait: u64, vfs_cache_poll_interval: u64, vfs_disk_space_total_size: u64) -> Result<()> {
     let op = rt_block_on(build_operator(storage_url, opts))?;
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let cache_dir_path = if let Some(cd) = cache_dir {
@@ -139,6 +139,7 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
         handles: dashmap::DashMap::new(),
         dir_cache_ttl: std::time::Duration::from_secs(dir_cache_time),
         attr_ttl: std::time::Duration::from_secs(attr_timeout),
+        stat_cache_ttl: std::time::Duration::from_secs(stat_cache_ttl),
         volname: volname.to_string(),
         cache_max_size: vfs_cache_max_size * 1024 * 1024,
         write_back_delay: std::time::Duration::from_secs(vfs_write_back),
@@ -166,6 +167,7 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
         async_read,
         vfs_refresh,
         case_insensitive: vfs_case_insensitive,
+        no_implicit_dir,
         block_norm_dupes: vfs_block_norm_dupes,
         write_wait: std::time::Duration::from_secs(vfs_write_wait),
         read_wait: std::time::Duration::from_secs(vfs_read_wait),

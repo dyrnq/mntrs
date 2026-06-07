@@ -39,6 +39,7 @@ enum FileHandleState {
     Write {
         path: String,
         dirty: bool,
+        #[allow(dead_code)]
         dirty_since: Option<std::time::Instant>,
     },
 }
@@ -60,6 +61,7 @@ pub struct MntrsFs {
     handles: dashmap::DashMap<u64, FileHandleState>,
     pub dir_cache_ttl: Duration,
     pub attr_ttl: Duration,
+    pub stat_cache_ttl: Duration,
     pub volname: String,
     pub cache_max_size: u64,
     pub write_back_delay: Duration,
@@ -87,6 +89,7 @@ pub struct MntrsFs {
     pub async_read: bool,
     pub vfs_refresh: bool,
     pub case_insensitive: bool,
+    pub no_implicit_dir: bool,
     pub block_norm_dupes: bool,
     pub write_wait: Duration,
     pub read_wait: Duration,
@@ -173,7 +176,7 @@ impl MntrsFs {
         // Check attr cache first
         if let Some(entry) = self.attr_cache.get(path) {
             let (kind, size, ts) = entry.value();
-            if ts.elapsed() < self.attr_ttl {
+            if ts.elapsed() < self.stat_cache_ttl {
                 return Some((*kind, *size));
             }
         }
@@ -186,6 +189,9 @@ impl MntrsFs {
                     Some((kind, meta.content_length()))
                 }
                 Err(_) => {
+                    if self.no_implicit_dir {
+                        return None;
+                    }
                     let op2 = self.op.clone();
                     let p2 = format!("{}/", path.trim_end_matches('/'));
                     if let Ok(mut l) = op2.lister(&p2).await
