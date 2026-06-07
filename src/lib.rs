@@ -100,6 +100,8 @@ pub struct MntrsFs {
     attr_cache: dashmap::DashMap<String, (FileType, u64, std::time::Instant)>,
     out_of_space: std::sync::atomic::AtomicBool,
     pub storage_class: Option<String>,
+    pub mem_limit: u64,
+    mem_used: std::sync::atomic::AtomicU64,
     
 }
 
@@ -255,6 +257,27 @@ impl MntrsFs {
         }
         self.dir_cache.insert(path.to_string(), (std::time::Instant::now(), result.clone()));
         result
+    }
+
+    fn mem_cache_insert(&self, ino: u64, data: bytes::Bytes) {
+        let size = data.len() as u64;
+        let new_total = self.mem_used.fetch_add(size, std::sync::atomic::Ordering::Relaxed) + size;
+        if new_total > self.mem_limit {
+            // Evict oldest entries from mem_cache until under limit
+            let mut to_free = new_total.saturating_sub(self.mem_limit);
+            let mut victims: Vec<u64> = Vec::new();
+            for entry in self.mem_cache.iter() {
+                if to_free == 0 { break; }
+                victims.push(*entry.key());
+                to_free = to_free.saturating_sub(entry.value().len() as u64);
+            }
+            for v in &victims {
+                if let Some((_, removed)) = self.mem_cache.remove(v) {
+                    self.mem_used.fetch_sub(removed.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        self.mem_cache.insert(ino, data);
     }
 
     fn evict_lru(&self) {
@@ -516,7 +539,7 @@ impl Filesystem for MntrsFs {
                     let start = offset as usize;
                     let end = (start + size as usize).min(b.len());
                     if start < b.len() { reply.data(&b[start..end]); } else { reply.data(&[]); }
-                    self.mem_cache.insert(ino, b);
+                    self.mem_cache_insert(ino, b);
                     return;
                 }
         }
@@ -555,7 +578,7 @@ impl Filesystem for MntrsFs {
                 let b: bytes::Bytes = buf.to_vec().into();
                 let slice = &b[..(b.len() as u32).min(size) as usize];
                 reply.data(slice);
-                self.mem_cache.insert(ino, b);
+                self.mem_cache_insert(ino, b);
             }
             Err(_) => reply.error(Errno::EIO),
         }
