@@ -306,7 +306,31 @@ impl Filesystem for MntrsFs {
         reply.ok();
     }
 
-    fn flush(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
+    fn flush(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
+        let fh_val: u64 = fh.into();
+        let (path, dirty) = {
+            let mut h = self.handles.lock().unwrap();
+            let entry = h.get(&fh_val).cloned();
+            if let Some((p, d, _)) = entry {
+                if d { h.insert(fh_val, (p.clone(), false, None)); }
+                (p, d)
+            } else { return reply.ok(); }
+        };
+        if dirty {
+            let cpath = cache_path(&self.cache_dir, &path);
+            if cpath.exists() {
+                if let Ok(data) = fs::read(&cpath) {
+                    let op = self.op.clone();
+                    let p2 = path.clone();
+                    std::thread::spawn(move || {
+                        let r = rt().block_on(async move { op.write(&p2, data).await });
+                        if let Err(e) = r {
+                            eprintln!("[mntrs] writeback failed for {:?}", e);
+                        }
+                    });
+                }
+            }
+        }
         reply.ok();
     }
 
