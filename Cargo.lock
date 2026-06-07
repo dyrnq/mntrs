@@ -1603,6 +1603,7 @@ dependencies = [
  "opendal-layer-logging",
  "opendal-layer-retry",
  "opendal-layer-timeout",
+ "opendal-service-aliyun-drive",
  "opendal-service-azblob",
  "opendal-service-b2",
  "opendal-service-cos",
@@ -1683,6 +1684,21 @@ checksum = "1e91f731724c213af81e9d03517859c8fc47b4578e64ad61ae4f099f10fe36e3"
 dependencies = [
  "opendal-core",
  "tokio",
+]
+
+[[package]]
+name = "opendal-service-aliyun-drive"
+version = "0.57.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d24985a08900516491180eb374eacb811baf64c80755bb4751852d6b35344804"
+dependencies = [
+ "bytes",
+ "http",
+ "log",
+ "mea",
+ "opendal-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

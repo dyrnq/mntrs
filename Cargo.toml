@@ -6,7 +6,7 @@ description = "Mount remote storage (S3, HDFS, GCS, etc.) to local directory via
 
 [dependencies]
 fuser = "0.17"
-opendal = { version = "0.57", features = ["services-s3", "services-gcs", "services-azblob", "services-hdfs-native", "services-oss", "services-cos", "services-obs", "services-b2", "services-vercel-blob"] }
+opendal = { version = "0.57", features = ["services-s3", "services-gcs", "services-azblob", "services-hdfs-native", "services-oss", "services-cos", "services-obs", "services-b2", "services-vercel-blob", "services-aliyun-drive"] }
 clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1", features = ["full", "rt-multi-thread"] }
 anyhow = "1"
