@@ -3,6 +3,8 @@ use anyhow::{Result, anyhow};
 use std::path::Path;
 use std::sync::Arc;
 use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use opendal::Operator;
 use opendal::services::S3;
 use fuser::MountOption;
@@ -12,6 +14,16 @@ fn rt_block_on<F, T>(f: F) -> T where F: std::future::Future<Output = T> {
     static RT: OnceCell<tokio::runtime::Runtime> = OnceCell::new();
     let rt = RT.get_or_init(|| tokio::runtime::Runtime::new().expect("tokio rt"));
     rt.block_on(f)
+}
+
+const MOUNTS_DB: &str = "/tmp/mntrs-mounts.txt";
+
+fn record_mount(storage: &str, mountpoint: &str) {
+    let _ = fs::create_dir_all("/tmp");
+    let line = format!("{} {}\n", storage, mountpoint);
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(MOUNTS_DB) {
+        let _ = f.write_all(line.as_bytes());
+    }
 }
 
 pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>) -> Result<()> {
@@ -27,7 +39,8 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
         MountOption::Exec,
     ])?;
 
-    // Prevent drop-unmount, block forever
+    record_mount(storage_url, mountpoint);
+
     std::mem::forget(session);
     let (_tx, rx) = std::sync::mpsc::channel::<()>();
     let _ = rx.recv();

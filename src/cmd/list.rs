@@ -1,30 +1,18 @@
 use anyhow::{Result, anyhow};
-use std::process::Command;
+use std::fs;
 
 pub fn list() -> Result<()> {
-    let output = Command::new("mount")
-        .output()
-        .map_err(|e| anyhow!("failed to list mounts: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut found = false;
-
-    for line in stdout.lines() {
-        // match our mntrs processes: look for our binary name in mount source
-        if !line.contains(" type fuse") { continue; }
-        found = true;
-        if let Some(idx) = line.find(" on ") {
-            let rest = &line[idx + 4..];
-            if let Some(idx2) = rest.find(" type ") {
-                let mp = rest[..idx2].to_string();
-                let storage = line.split(' ').next().unwrap_or("?");
-                println!("{:40} {}", storage, mp);
-            }
-        }
+    let content = fs::read_to_string("/tmp/mntrs-mounts.txt").unwrap_or_default();
+    if content.trim().is_empty() {
+        println!("no active mntrs mounts");
+        return Ok(());
     }
-
-    if !found {
-        println!("no active fuse mounts");
+    for line in content.lines() {
+        if let Some(idx) = line.find(' ') {
+            let storage = &line[..idx];
+            let mountpoint = &line[idx+1..];
+            println!("{:40} {}", storage, mountpoint);
+        }
     }
     Ok(())
 }
