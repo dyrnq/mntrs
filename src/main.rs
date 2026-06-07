@@ -1,8 +1,14 @@
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Parser)]
-#[command(name = "mntrs", about = "Mount remote storage to local directory via FUSE")]
+#[command(
+    name = "mntrs",
+    about = "Mount remote storage to local directory via FUSE",
+    version = VERSION,
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -10,13 +16,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Mount storage to a local directory
     Mount {
         storage: String,
         mountpoint: String,
         #[arg(long = "opt", value_name = "KEY=VAL", num_args = 0..)]
         opt: Vec<String>,
     },
-    Unmount { target: String },
+    /// Unmount a mounted directory (use "all" to unmount all)
+    Unmount {
+        target: String,
+    },
+    /// List active mounts
     List,
 }
 
