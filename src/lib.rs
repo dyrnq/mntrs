@@ -129,13 +129,13 @@ impl MntrsFs {
     }
 }
 
-fn path_hash(path: &str) -> u64 {
+pub fn path_hash(path: &str) -> u64 {
     let mut h: u64 = 0x811c9dc5;
     for b in path.bytes() { h = h.wrapping_mul(0x01000193) ^ b as u64; }
     (h & 0x7FFFFFFFFFFFFFFF).max(2)
 }
 
-fn fnmatch(pattern: &str, name: &str, ignore_case: bool) -> bool {
+pub fn fnmatch(pattern: &str, name: &str, ignore_case: bool) -> bool {
     let (p, n): (Vec<char>, Vec<char>) = if ignore_case {
         (pattern.to_lowercase().chars().collect(), name.to_lowercase().chars().collect())
     } else {
@@ -381,6 +381,7 @@ fn writeback_worker(op: Arc<Operator>, queue: Arc<Mutex<VecDeque<(String, PathBu
             match r {
                 Ok(_) => {
                     let _ = fs::remove_file(&cache_path);
+                    let _ = fs::remove_file(cache_path.with_extension("dirty"));
                     break;
                 }
                 Err(e) if attempt < 2 => {
@@ -401,6 +402,22 @@ impl Filesystem for MntrsFs {
         let _ = fs::create_dir_all(&self.cache_dir);
         // Enable readdirplus for stat+readdir in one round-trip
         let _ = config.add_capabilities(fuser::InitFlags::FUSE_DO_READDIRPLUS);
+        // Recover writeback queue from dirty sidecars
+        if let Ok(entries) = fs::read_dir(&self.cache_dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().is_some_and(|ext| ext == "dirty") {
+                    let cache_path = p.with_extension("");
+                    if let Ok(remote) = fs::read_to_string(&p) {
+                        let remote = remote.trim().to_string();
+                        if !remote.is_empty() && cache_path.exists() {
+                            self.writeback_queue.lock().unwrap().push_back((remote, cache_path));
+                        }
+                    }
+                    let _ = fs::remove_file(&p);
+                }
+            }
+        }
         // Spawn writeback worker thread
         let op = self.op.clone();
         let queue = self.writeback_queue.clone();
@@ -794,6 +811,9 @@ impl Filesystem for MntrsFs {
         if dirty {
             let cpath = cache_path(&self.cache_dir, &path);
             if cpath.exists() {
+                // Write sidecar for crash recovery
+                let sidecar = cpath.with_extension("dirty");
+                let _ = fs::write(&sidecar, path.as_bytes());
                 self.writeback_queue.lock().unwrap().push_back((path, cpath));
             }
         }

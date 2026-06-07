@@ -1,0 +1,56 @@
+use mntrs::{path_hash, fnmatch};
+
+#[test]
+fn path_hash_is_stable() {
+    assert_eq!(path_hash("/foo/bar"), path_hash("/foo/bar"));
+    assert_eq!(path_hash(""), path_hash(""));
+    // Different paths should produce different hashes (practically)
+    assert_ne!(path_hash("a"), path_hash("b"));
+}
+
+#[test]
+fn path_hash_always_positive() {
+    for p in &["/", "/a", "/very/long/path/here", "x", ""] {
+        let h = path_hash(p);
+        assert!(h >= 2, "hash for '{p}' should be >= 2, got {h}");
+    }
+}
+
+#[test]
+fn fnmatch_exact() {
+    assert!(fnmatch("hello", "hello", false));
+    assert!(!fnmatch("hello", "world", false));
+}
+
+#[test]
+fn fnmatch_star() {
+    assert!(fnmatch("*.txt", "foo.txt", false));
+    assert!(fnmatch("*.txt", "bar.txt", false));
+    assert!(!fnmatch("*.txt", "foo.rs", false));
+    assert!(fnmatch("a*c", "abc", false));
+    assert!(fnmatch("a*c", "ac", false));
+    assert!(fnmatch("a*c", "axyzc", false));
+}
+
+#[test]
+fn fnmatch_question() {
+    assert!(fnmatch("a?c", "abc", false));
+    assert!(fnmatch("a?c", "axc", false));
+    assert!(!fnmatch("a?c", "ac", false));
+    assert!(!fnmatch("a?c", "abbc", false));
+}
+
+#[test]
+fn fnmatch_case_insensitive() {
+    assert!(fnmatch("Hello", "hello", true));
+    assert!(fnmatch("*.TXT", "foo.txt", true));
+    assert!(!fnmatch("Hello", "hello", false));
+}
+
+#[test]
+fn fnmatch_edge_cases() {
+    assert!(fnmatch("*", "anything", false));
+    assert!(fnmatch("?", "x", false));
+    assert!(!fnmatch("?", "xx", false));
+    assert!(fnmatch("file.*", "file.", false));
+}
