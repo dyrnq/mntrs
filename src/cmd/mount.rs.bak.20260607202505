@@ -122,7 +122,7 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
                 dir_cache_time: u64, attr_timeout: u64, allow_other: bool, volname: &str, write_back_cache: bool, fuse_options: &[String],
                 daemon: bool, daemon_wait: bool, _daemon_timeout: u64, allow_root: bool, vfs_cache_max_size: u64, vfs_write_back: u64, vfs_cache_mode: &str, vfs_read_ahead: u64, vfs_read_chunk_size: u64, default_permissions: bool,
                 uid: Option<u32>, gid: Option<u32>, umask: Option<u32>, dir_perms: Option<u32>, file_perms: Option<u32>,
-                allow_non_empty: bool, cache_dir: Option<&str>, direct_io: bool, poll_interval: u64, vfs_cache_max_age: u64, exclude: Vec<String>, include: Vec<String>, max_size: Option<u64>, min_size: Option<u64>, max_depth: Option<usize>, ignore_case: bool, _no_modtime: bool, _no_checksum: bool, _no_seek: bool, _links: bool, _max_read_ahead: u64) -> Result<()> {
+                allow_non_empty: bool, cache_dir: Option<&str>, direct_io: bool) -> Result<()> {
     let op = rt_block_on(build_operator(storage_url, opts))?;
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let cache_dir_path = if let Some(cd) = cache_dir {
@@ -149,15 +149,6 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
         umask,
         dir_perms: dir_perms.unwrap_or(0o755) as u16,
         file_perms: file_perms.unwrap_or(0o644) as u16,
-        direct_io,
-        poll_interval: std::time::Duration::from_secs(poll_interval.max(1)),
-        cache_max_age: std::time::Duration::from_secs(vfs_cache_max_age),
-        exclude_patterns: exclude,
-        include_patterns: include,
-        max_size,
-        min_size,
-        max_depth,
-        ignore_case,
         writeback_queue: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
     };
 

@@ -170,7 +170,7 @@ fn main() -> anyhow::Result<()> {
             mntrs::cmd::mount::mount(
                 &storage, &mountpoint, &opts, read_only,
                 dir_cache_time, attr_timeout, allow_other, &volname, write_back_cache, &option,
-                daemon, daemon_wait, daemon_timeout, allow_root, vfs_cache_max_size, vfs_write_back, &vfs_cache_mode, vfs_read_ahead, vfs_read_chunk_size, default_permissions, uid, gid, umask, dir_perms, file_perms, allow_non_empty, cache_dir.as_deref(), direct_io, poll_interval, vfs_cache_max_age, exclude, include, max_size, min_size, max_depth, ignore_case, no_modtime, no_checksum, no_seek, links, max_read_ahead,
+                daemon, daemon_wait, daemon_timeout, allow_root, vfs_cache_max_size, vfs_write_back, &vfs_cache_mode, vfs_read_ahead, vfs_read_chunk_size, default_permissions, uid, gid, umask, dir_perms, file_perms, allow_non_empty, cache_dir.as_deref(), direct_io, poll_interval, vfs_cache_max_age, exclude, include, max_size, min_size, max_depth, ignore_case,
             )?;
         }
         Commands::Unmount { target } => {

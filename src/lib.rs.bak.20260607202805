@@ -157,7 +157,6 @@ impl MntrsFs {
             if let Some((t, entries)) = cache.get(path)
                 && t.elapsed() < self.dir_cache_ttl { return entries.clone(); }
         }
-        let depth = path.matches('/').count();
         let result = rt().block_on(async {
             let op = self.op.clone();
             let p = path.to_string();
@@ -166,21 +165,6 @@ impl MntrsFs {
             while let Some(Ok(entry)) = lister.next().await {
                 let name = entry.name().trim_end_matches('/').to_string();
                 let mode = entry.metadata().mode();
-                let content_length = entry.metadata().content_length();
-                // Apply filters
-                if let Some(max_depth) = self.max_depth
-                    && depth >= max_depth && mode == EntryMode::DIR { continue; }
-                if let Some(ms) = self.max_size && content_length > ms { continue; }
-                if let Some(ms) = self.min_size && content_length < ms { continue; }
-                // exclude/include glob patterns
-                if !self.exclude_patterns.is_empty() {
-                    let matched = self.exclude_patterns.iter().any(|pat| fnmatch(pat, &name, self.ignore_case));
-                    if matched { continue; }
-                }
-                if !self.include_patterns.is_empty() {
-                    let matched = self.include_patterns.iter().any(|pat| fnmatch(pat, &name, self.ignore_case));
-                    if !matched { continue; }
-                }
                 out.push((name, mode));
             }
             Some(out)

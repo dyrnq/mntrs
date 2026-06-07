@@ -1,0 +1,58 @@
+# mntrs TODO
+
+## ✅ 已实现
+
+| 功能                                          | 说明                           |
+| --------------------------------------------- | ------------------------------ |
+| `mntrs mount <storage> <mountpoint>`          | 基本挂载                       |
+| `--read-only`                                 | 只读模式                       |
+| `--opt endpoint/access-key/secret-key/region` | 存储参数                       |
+| `unmount <target>` / `unmount all`            | 卸载                           |
+| `list`                                        | 列出挂载（用户/PID/模式/后端） |
+| 信号处理 + atexit 清理                        | Ctrl-C/SIGTERM 正常退出        |
+| `--dir-cache-time` / `--attr-timeout`         | 缓存 TTL 可配置                |
+| `--allow-other`                               | 允许其他用户                   |
+| `--volname`                                   | 卷名                           |
+| `--write-back-cache`                          | 内核写缓存                     |
+| `--version`                                   | 版本号                         |
+| S3 / GCS / AzBlob / HDFS-native               | 多后端支持                     |
+| 写入支持（本地缓存）                          | `~/.cache/mntrs/`              |
+| `mkdir` / `rmdir`                             | 目录创建和删除                 |
+| `rename`                                      | 文件/目录重命名                |
+| `unlink`                                      | 文件删除                       |
+| `getxattr` / `listxattr`                      | xattr 支持（返回 ENODATA）     |
+
+## 🟡 中优先级
+
+| 功能                            | 说明                                     |
+| ------------------------------- | ---------------------------------------- |
+| 写后自动异步回传到 S3           | 后台线程队列 + 重试                      |
+| 缓存文件自动清理                | LRU、磁盘上限                            |
+| `--vfs-cache-mode writes/full`  | 完整 VFS 缓存（range 追踪、元数据）      |
+| `--vfs-cache-max-size`          | 缓存空间上限                             |
+| `--vfs-write-back 5s`           | 写回延迟                                 |
+| `--daemon-wait` | ✅ | pipe + poll 父进程等待挂载就绪     |
+
+## 🟢 低优先级
+
+| 功能                        | 说明                      |
+| --------------------------- | ------------------------- |
+| `--vfs-read-ahead`          | 预读                      |
+| `--vfs-read-chunk-size`     | 分块读取                  |
+| `--default-permissions`     | 内核权限检查              |
+| `--option` / `-o`           | 原始 FUSE 选项            |
+| `--network-mode` (Windows)  | Windows 网络驱动器        |
+| Windows 支持 (WinFsp)       | 跨平台                    |
+| CSI plugin (`dalmount-csi`) | Kubernetes CSI driver     |
+| systemd service 生成        | `mntrs install --systemd` |
+
+## 🟡 中优先级（已完成）
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| `chmod` / `chown` | ✅ | setattr 支持 mode/uid/gid |
+| `mkdir` / `rmdir` | ✅ | 目录创建和删除 |
+| `rename` | ✅ | 文件/目录重命名 |
+| `--daemon` | ✅ | fork+setsid 后台守护进程、PID 文件 |
+| `--daemon-timeout` | ✅ | daemon_wait 超时参数 |
+| `--allow-root` | ✅ | FUSE allow_root mount option |
