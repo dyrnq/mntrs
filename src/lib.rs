@@ -597,14 +597,52 @@ impl Filesystem for MntrsFs {
             chunk_size.max(size as u64)
         };
         let op = self.op.clone(); let p = path.clone();
-        match rt().block_on(async move { op.read_with(&p).range(offset..offset+fetch_size).await }) {
-            Ok(buf) => {
-                let b: bytes::Bytes = buf.to_vec().into();
+        let streams = self.read_chunk_streams.max(1);
+        if streams > 1 && fetch_size > 128 * 1024 {
+            // Multi-chunk concurrent fetch
+            let chunk_size = (fetch_size / streams as u64).max(64 * 1024);
+            let end = offset + fetch_size;
+            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(streams as usize));
+            let mut tasks = Vec::new();
+            let mut off = offset;
+            while off < end {
+                let e = (off + chunk_size).min(end);
+                let permit = sem.clone();
+                let op = op.clone();
+                let p = p.clone();
+                tasks.push(rt().spawn(async move {
+                    let _permit = permit.acquire().await;
+                    op.read_with(&p).range(off..e).await.map(|b| b.to_vec())
+                }));
+                off = e;
+            }
+            let mut all_data = Vec::new();
+            let mut ok = true;
+            for t in tasks {
+                match rt().block_on(t) {
+                    Ok(Ok(data)) => all_data.extend_from_slice(&data),
+                    _ => { ok = false; break; }
+                }
+            }
+            if ok {
+                let b: bytes::Bytes = all_data.into();
                 let slice = &b[..(b.len() as u32).min(size) as usize];
                 reply.data(slice);
                 self.mem_cache_insert(ino, b);
+            } else {
+                reply.error(Errno::EIO);
             }
-            Err(_) => reply.error(Errno::EIO),
+        } else {
+            // Single-chunk fetch (original path)
+            match rt().block_on(async move { op.read_with(&p).range(offset..offset+fetch_size).await }) {
+                Ok(buf) => {
+                    let b: bytes::Bytes = buf.to_vec().into();
+                    let slice = &b[..(b.len() as u32).min(size) as usize];
+                    reply.data(slice);
+                    self.mem_cache_insert(ino, b);
+                }
+                Err(_) => reply.error(Errno::EIO),
+            }
         }
         // Read-ahead: pre-fetch next block in background
         if self.read_ahead > 0 {
