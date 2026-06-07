@@ -95,13 +95,7 @@ extern "C" fn cleanup() {
     if let Some(mp) = CLEANUP_MP.get() {
         let _ = Command::new("fusermount3").arg("-u").arg(mp).status()
             .or_else(|_| Command::new("fusermount").arg("-u").arg(mp).status());
-        let path = mounts_db();
-        if let Ok(content) = fs::read_to_string(&path) {
-            let filtered: Vec<&str> = content.lines()
-                .filter(|l| !l.contains(mp.as_str()))
-                .collect();
-            if let Err(e) = fs::write(&path, filtered.join("\n")) { tracing::debug!(error=%e, "mounts db cleanup failed"); }
-        }
+        remove_mount(mp);
     }
 }
 
