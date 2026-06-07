@@ -118,10 +118,14 @@ extern "C" fn cleanup() {
 
 pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>, read_only: bool) -> Result<()> {
     let op = rt_block_on(build_operator(storage_url, opts))?;
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let cache_dir = std::path::PathBuf::from(format!("{}/.cache/mntrs", home));
     let fs = MntrsFs {
         op: Arc::new(op),
         inodes: std::sync::Mutex::new(std::collections::HashMap::new()),
         dir_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        cache_dir,
+        handles: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let mount_path = Path::new(mountpoint);
