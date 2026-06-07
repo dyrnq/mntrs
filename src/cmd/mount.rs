@@ -12,6 +12,7 @@ use opendal::services::{S3, Gcs, Azblob, HdfsNative};
 use fuser::MountOption;
 use once_cell::sync::OnceCell;
 use std::sync::OnceLock;
+use std::os::fd::{AsRawFd, FromRawFd};
 
 fn rt_block_on<F, T>(f: F) -> T where F: std::future::Future<Output = T> {
     static RT: OnceCell<tokio::runtime::Runtime> = OnceCell::new();
@@ -163,11 +164,18 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
 
     // Create pipe for daemon_wait parent-child synchronization
     let wait_pipe = if daemon_wait {
-        let mut fds = [-1i32; 2];
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(anyhow!("pipe failed"));
+        match rustix::pipe::pipe() {
+            Ok((r, w)) => {
+                // Take ownership of raw fds so they aren't closed on drop until we're done
+                let r_fd = r.as_raw_fd();
+                let w_fd = w.as_raw_fd();
+                // Prevent OwnedFd from closing on drop — we manage lifetime manually
+                std::mem::forget(r);
+                std::mem::forget(w);
+                Some((r_fd, w_fd))
+            }
+            Err(_) => return Err(anyhow!("pipe failed")),
         }
-        Some((fds[0], fds[1]))
     } else {
         None
     };
@@ -176,7 +184,7 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
         daemonize(mountpoint, wait_pipe.map(|(_, w)| w))?;
         // After daemonize returns (in grandchild), close read end if we inherited it
         if let Some((r, _)) = wait_pipe {
-            unsafe { libc::close(r); }
+            unsafe { rustix::io::close(r); }
         }
     }
 
@@ -216,9 +224,10 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
     // Foreground mode with --daemon-wait: parent waits for pipe close
     if !daemon
         && let Some((r, w)) = wait_pipe {
-            unsafe { libc::close(w); }
+            unsafe { rustix::io::close(w); }
             let deadline = std::time::Instant::now()
                 + std::time::Duration::from_secs(_daemon_timeout);
+            // Use libc::poll for timeout-based polling
             while std::time::Instant::now() < deadline {
                 let mut pfd = libc::pollfd { fd: r, events: libc::POLLIN, revents: 0 };
                 let ms = (deadline - std::time::Instant::now()).as_millis().min(100) as i32;
@@ -228,7 +237,7 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
                     break;
                 }
             }
-            unsafe { libc::close(r); }
+            unsafe { rustix::io::close(r); }
             std::process::exit(0);
     }
 
@@ -306,6 +315,7 @@ async fn build_hdfs_native(url: &url::Url, _opts: &HashMap<String, String>) -> R
 static DAEMON_PIPE_WR: OnceLock<i32> = OnceLock::new();
 
 fn daemonize(mountpoint: &str, wait_pipe: Option<i32>) -> Result<()> {
+    // fork/setsid require unsafe — rustix intentionally doesn't wrap them
     match unsafe { libc::fork() } {
         -1 => return Err(anyhow!("fork failed")),
         0 => {}
@@ -319,19 +329,19 @@ fn daemonize(mountpoint: &str, wait_pipe: Option<i32>) -> Result<()> {
         0 => {}
         _ => std::process::exit(0),
     }
-    // Store write end of pipe so unblock_parent can signal parent
     if let Some(fd) = wait_pipe {
         DAEMON_PIPE_WR.set(fd).ok();
     }
     let _ = std::env::set_current_dir("/");
-    unsafe {
-        libc::close(0);
-        libc::close(1);
-        libc::close(2);
-        libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
-        libc::dup2(0, 1);
-        libc::dup2(0, 2);
-    }
+    // Use rustix for safe fd operations
+    let devnull = rustix::fs::open("/dev/null", rustix::fs::OFlags::RDWR, rustix::fs::Mode::empty())
+        .unwrap_or_else(|_| {
+            // Safety: fd 0 is always valid (stdin)
+            unsafe { rustix::fd::OwnedFd::from_raw_fd(std::os::fd::RawFd::from(0)) }
+        });
+    let _ = rustix::stdio::dup2_stdin(&devnull);
+    let _ = rustix::stdio::dup2_stdout(&devnull);
+    let _ = rustix::stdio::dup2_stderr(&devnull);
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let pid_dir = format!("{}/.local/share/mntrs", home);
     let _ = fs::create_dir_all(&pid_dir);
@@ -345,8 +355,8 @@ fn daemonize(mountpoint: &str, wait_pipe: Option<i32>) -> Result<()> {
 
 fn unblock_parent() {
     if let Some(&fd) = DAEMON_PIPE_WR.get() {
-        // Close write end to signal parent that mount is ready
-        unsafe { libc::close(fd); }
+        // Safety: fd was created by pipe() and is valid
+        unsafe { rustix::io::close(fd); }
     }
 }
 
