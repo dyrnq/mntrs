@@ -10,25 +10,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Mount storage to a local directory
     Mount {
         storage: String,
         mountpoint: String,
         #[arg(long = "opt", value_name = "KEY=VAL", num_args = 0..)]
         opt: Vec<String>,
     },
-    /// Unmount a mounted directory (use "all" or "-a" to unmount all)
-    Unmount {
-        target: String,
-    },
-    /// List active mounts
+    Unmount { target: String },
     List,
 }
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
-
     match cli.command {
         Commands::Mount { storage, mountpoint, opt } => {
             let opts: HashMap<String, String> = opt.iter()

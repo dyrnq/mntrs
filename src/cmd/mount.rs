@@ -5,10 +5,12 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions, File};
 use std::io::{Write, BufRead, BufReader};
+use std::process::Command;
 use opendal::Operator;
 use opendal::services::S3;
 use fuser::MountOption;
 use once_cell::sync::OnceCell;
+use std::sync::OnceLock;
 
 fn rt_block_on<F, T>(f: F) -> T where F: std::future::Future<Output = T> {
     static RT: OnceCell<tokio::runtime::Runtime> = OnceCell::new();
@@ -47,6 +49,34 @@ fn record_mount(storage: &str, mountpoint: &str) {
     }
 }
 
+fn remove_mount(mountpoint: &str) {
+    let path = mounts_db();
+    if let Ok(content) = fs::read_to_string(&path) {
+        let filtered: Vec<&str> = content.lines()
+            .filter(|l| !l.contains(mountpoint))
+            .collect();
+        let _ = fs::write(&path, filtered.join("\n"));
+    }
+}
+
+static CLEANUP_MP: OnceLock<String> = OnceLock::new();
+
+extern "C" fn cleanup() {
+    if let Some(mp) = CLEANUP_MP.get() {
+        // Unmount
+        let _ = Command::new("fusermount3").arg("-u").arg(mp).status()
+            .or_else(|_| Command::new("fusermount").arg("-u").arg(mp).status());
+        // Remove registry entry
+        let path = mounts_db();
+        if let Ok(content) = fs::read_to_string(&path) {
+            let filtered: Vec<&str> = content.lines()
+                .filter(|l| !l.contains(mp.as_str()))
+                .collect();
+            let _ = fs::write(&path, filtered.join("\n"));
+        }
+    }
+}
+
 pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>) -> Result<()> {
     let op = rt_block_on(build_operator(storage_url, opts))?;
     let fs = MntrsFs {
@@ -62,10 +92,24 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
 
     record_mount(storage_url, mountpoint);
 
+    // Register atexit + signal handlers for clean exit
+    CLEANUP_MP.set(mountpoint.to_string()).ok();
+    unsafe { libc::atexit(cleanup); }
+
+    // Register signal handlers too (for SIGTERM/SIGINT — atexit also runs)
+    unsafe {
+        libc::signal(libc::SIGINT, handler as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
+    }
+
     std::mem::forget(session);
-    let (_tx, rx) = std::sync::mpsc::channel::<()>();
-    let _ = rx.recv();
-    Ok(())
+
+    loop { std::thread::sleep(std::time::Duration::from_secs(3600)); }
+}
+
+extern "C" fn handler(_: i32) {
+    // Just exit — atexit cleanup will run
+    std::process::exit(0);
 }
 
 async fn build_operator(storage_url: &str, opts: &HashMap<String, String>) -> Result<Operator> {
