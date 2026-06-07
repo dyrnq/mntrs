@@ -176,6 +176,7 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
         writeback_queue: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         mem_cache: dashmap::DashMap::new(),
         attr_cache: dashmap::DashMap::new(),
+        disk_cache_index: dashmap::DashMap::new(),
         out_of_space: std::sync::atomic::AtomicBool::new(false),
         storage_class: storage_class.map(|s| s.to_string()),
         mem_limit: if mem_limit > 0 { mem_limit * 1024 * 1024 } else { u64::MAX },

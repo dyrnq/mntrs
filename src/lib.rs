@@ -57,6 +57,7 @@ impl FileHandleState {
     }
 }
 
+#[allow(clippy::type_complexity)]
 pub struct MntrsFs {
     pub op: Arc<Operator>,
     inodes: dashmap::DashMap<u64, (String, FileType, u64)>,
@@ -102,6 +103,8 @@ pub struct MntrsFs {
     writeback_queue: Arc<Mutex<VecDeque<(String, PathBuf)>>>,
     mem_cache: dashmap::DashMap<u64, bytes::Bytes>,
     attr_cache: dashmap::DashMap<String, (FileType, u64, std::time::Instant)>,
+    #[allow(clippy::type_complexity)]
+    disk_cache_index: dashmap::DashMap<String, (u64, std::time::SystemTime)>,
     out_of_space: std::sync::atomic::AtomicBool,
     pub storage_class: Option<String>,
     pub mem_limit: u64,
@@ -286,18 +289,14 @@ impl MntrsFs {
 
     fn evict_lru(&self) {
         if self.cache_max_size == 0 && self.cache_min_free_space == 0 { return; }
-        // Collect all cached files with their sizes and access times
-        let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
+        // Collect from in-memory index instead of fs::read_dir
+        let mut files: Vec<(String, u64, std::time::SystemTime)> = Vec::new();
         let mut total: u64 = 0;
-        if let Ok(entries) = fs::read_dir(&self.cache_dir) {
-            for e in entries.flatten() {
-                if let Ok(meta) = e.metadata()
-                    && meta.is_file() {
-                        let size = meta.len();
-                        total += size;
-                        files.push((e.path(), size, meta.accessed().unwrap_or(std::time::UNIX_EPOCH)));
-                }
-            }
+        for entry in self.disk_cache_index.iter() {
+            let path: String = entry.key().clone();
+            let (size, atime) = *entry.value();
+            total += size;
+            files.push((path, size, atime));
         }
         // Check free disk space if configured
         let need_free = if self.cache_min_free_space > 0 {
@@ -331,7 +330,9 @@ impl MntrsFs {
         let mut freed: u64 = 0;
         for (path, size, _) in files {
             if remaining == 0 { break; }
-            let _ = fs::remove_file(&path);
+            let cpath = cache_path(&self.cache_dir, &path);
+            let _ = fs::remove_file(&cpath);
+            self.disk_cache_index.remove(&path as &str);
             freed += size;
             remaining = remaining.saturating_sub(size);
         }
@@ -368,7 +369,9 @@ fn writeback_worker(op: Arc<Operator>, queue: Arc<Mutex<VecDeque<(String, PathBu
                     }
         let data = match fs::read(&cache_path) {
             Ok(d) if !d.is_empty() => d,
-            _ => { let _ = fs::remove_file(&cache_path); continue; }
+            _ => { let _ = fs::remove_file(&cache_path);
+            // Note: disk_cache_index cleanup happens via the path in evict_lru
+            continue; }
         };
         let op = op.clone();
         let p = remote_path.clone();
@@ -641,6 +644,7 @@ impl Filesystem for MntrsFs {
         if let Some(parent) = cpath.parent() { let _ = fs::create_dir_all(parent); }
         let result = (|| -> std::io::Result<()> {
             let file = fs::OpenOptions::new().create(true).truncate(true).write(true).read(true).open(&cpath)?;
+            self.disk_cache_index.insert(path.clone(), (data.len() as u64, std::time::SystemTime::now()));
             let end = offset + data.len() as u64;
             let current_len = file.metadata()?.len();
             if end > current_len { file.set_len(end)?; }
@@ -774,6 +778,7 @@ impl Filesystem for MntrsFs {
         // Also remove from local cache
         let cpath = cache_path(&self.cache_dir, &name);
         let _ = fs::remove_file(&cpath);
+        self.disk_cache_index.remove(&name as &str);
         reply.ok();
     }
 
