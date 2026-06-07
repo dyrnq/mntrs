@@ -47,6 +47,8 @@
 | `--vfs-refresh` | 启动时刷新全量目录缓存 |
 | `--vfs-case-insensitive` | 大小写不敏感 lookup |
 | `--vfs-disk-space-total-size` | statfs 自定义总空间 (TB) |
+| `--vfs-read-chunk-size-limit` | 分块读取上限 |
+| `--vfs-used-is-size` | statfs used 用实际大小 |
 | `--version` | 版本号 |
 | `unmount <target>` | 卸载指定挂载点 |
 | `unmount all` | 卸载全部 |
@@ -59,14 +61,8 @@
 | `--network-mode` | Windows 网络驱动器 |
 
 ### 缓存 & 性能 (0)
-| `--vfs-read-chunk-size-limit` | 分块上限 |
-| `--vfs-read-chunk-streams` | 并行读取流数 |
 
 ### VFS 功能 (0)
-| `--vfs-links` | 符号链接翻译 |
-| `--vfs-block-norm-dupes` | Unicode 规范化去重 |
-| `--vfs-used-is-size` | 用量计算方式 |
-| `--vfs-metadata-extension` | 元数据文件扩展名 |
 
 ### macOS / Windows 专用 (3)
 | `--noappledouble` | 忽略 Apple Double 文件 |
@@ -79,7 +75,7 @@
 
 | 维度 | rclone | mntrs |
 |------|--------|-------|
-| 总参数数 | 96 | 55 |
+| 总参数数 | 96 | 61 |
 |  | 100% | 48% (32/66 核心参数) |
 | 核心挂载功能 | ✅ | ✅ |
 | 守护进程 | ✅ | ✅ |

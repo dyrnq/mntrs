@@ -41,6 +41,8 @@ pub struct MntrsFs {
     pub cache_mode: String,
     pub read_ahead: u64,
     pub read_chunk_size: u64,
+    pub read_chunk_size_limit: u64,
+    pub read_chunk_streams: u32,
     pub uid: Option<u32>,
     pub gid: Option<u32>,
     pub umask: Option<u32>,

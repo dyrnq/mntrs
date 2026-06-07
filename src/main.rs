@@ -144,6 +144,12 @@ enum Commands {
         /// Max read-ahead in bytes (default: 131072)
         #[arg(long, default_value = "131072")]
         max_read_ahead: u64,
+        /// Read chunk size limit in bytes (default: 0 = unlimited)
+        #[arg(long, default_value = "0")]
+        vfs_read_chunk_size_limit: u64,
+        /// Number of parallel read streams (default: 1)
+        #[arg(long, default_value = "1")]
+        vfs_read_chunk_streams: u32,
         /// Use fast fingerprint (size+mtime) instead of checksums
         #[arg(long)]
         vfs_fast_fingerprint: bool,
@@ -159,6 +165,15 @@ enum Commands {
         /// Block Unicode normalization duplicates (NFC/NFD)
         #[arg(long)]
         vfs_block_norm_dupes: bool,
+        /// Translate symlinks
+        #[arg(long)]
+        vfs_links: bool,
+        /// Use file size for used space in statfs
+        #[arg(long)]
+        vfs_used_is_size: bool,
+        /// Metadata file extension
+        #[arg(long)]
+        vfs_metadata_extension: Option<String>,
         /// Write wait timeout in seconds (default: 5)
         #[arg(long, default_value = "5")]
         vfs_write_wait: u64,
@@ -195,7 +210,7 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
     match cli.command {
-        Commands::Mount { storage, mountpoint, opt, read_only, dir_cache_time, attr_timeout, allow_other, volname, devname, write_back_cache, option, daemon, daemon_wait, daemon_timeout, allow_root, vfs_cache_max_size, vfs_write_back, vfs_cache_mode, vfs_read_ahead, vfs_read_chunk_size, default_permissions, uid, gid, umask, dir_perms, file_perms, allow_non_empty, cache_dir, direct_io, poll_interval, vfs_cache_max_age, vfs_cache_min_free_space, exclude, include, max_size, min_size, max_depth, ignore_case, no_modtime, no_checksum, no_seek, links, max_read_ahead, vfs_fast_fingerprint, async_read, vfs_refresh, vfs_case_insensitive, vfs_block_norm_dupes, vfs_write_wait, vfs_read_wait, vfs_cache_poll_interval, vfs_disk_space_total_size } => {
+        Commands::Mount { storage, mountpoint, opt, read_only, dir_cache_time, attr_timeout, allow_other, volname, devname, write_back_cache, option, daemon, daemon_wait, daemon_timeout, allow_root, vfs_cache_max_size, vfs_write_back, vfs_cache_mode, vfs_read_ahead, vfs_read_chunk_size, default_permissions, uid, gid, umask, dir_perms, file_perms, allow_non_empty, cache_dir, direct_io, poll_interval, vfs_cache_max_age, vfs_cache_min_free_space, exclude, include, max_size, min_size, max_depth, ignore_case, no_modtime, no_checksum, no_seek, links, max_read_ahead, vfs_read_chunk_size_limit, vfs_read_chunk_streams, vfs_fast_fingerprint, async_read, vfs_refresh, vfs_case_insensitive, vfs_block_norm_dupes, vfs_links, vfs_used_is_size, vfs_metadata_extension, vfs_write_wait, vfs_read_wait, vfs_cache_poll_interval, vfs_disk_space_total_size } => {
             let opts: HashMap<String, String> = opt.iter()
                 .filter_map(|kv| kv.split_once('='))
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -203,7 +218,7 @@ fn main() -> anyhow::Result<()> {
             mntrs::cmd::mount::mount(
                 &storage, &mountpoint, &opts, read_only,
                 dir_cache_time, attr_timeout, allow_other, &volname, devname.as_deref(), write_back_cache, &option,
-                daemon, daemon_wait, daemon_timeout, allow_root, vfs_cache_max_size, vfs_write_back, &vfs_cache_mode, vfs_read_ahead, vfs_read_chunk_size, default_permissions, uid, gid, umask, dir_perms, file_perms, allow_non_empty, cache_dir.as_deref(), direct_io, poll_interval, vfs_cache_max_age, vfs_cache_min_free_space, exclude, include, max_size, min_size, max_depth, ignore_case, no_modtime, no_checksum, no_seek, links, max_read_ahead, vfs_fast_fingerprint, async_read, vfs_refresh, vfs_case_insensitive, vfs_block_norm_dupes, vfs_write_wait, vfs_read_wait, vfs_cache_poll_interval, vfs_disk_space_total_size,
+                daemon, daemon_wait, daemon_timeout, allow_root, vfs_cache_max_size, vfs_write_back, &vfs_cache_mode, vfs_read_ahead, vfs_read_chunk_size, default_permissions, uid, gid, umask, dir_perms, file_perms, allow_non_empty, cache_dir.as_deref(), direct_io, poll_interval, vfs_cache_max_age, vfs_cache_min_free_space, exclude, include, max_size, min_size, max_depth, ignore_case, no_modtime, no_checksum, no_seek, links, max_read_ahead, vfs_read_chunk_size_limit, vfs_read_chunk_streams, vfs_fast_fingerprint, async_read, vfs_refresh, vfs_case_insensitive, vfs_block_norm_dupes, vfs_links, vfs_used_is_size, vfs_metadata_extension, vfs_write_wait, vfs_read_wait, vfs_cache_poll_interval, vfs_disk_space_total_size,
             )?;
         }
         Commands::Unmount { target } => {
