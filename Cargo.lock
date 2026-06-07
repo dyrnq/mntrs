@@ -1210,6 +1210,7 @@ dependencies = [
  "fuser",
  "futures",
  "libc",
+ "once_cell",
  "opendal",
  "tokio",
  "tracing",
