@@ -10,13 +10,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Mount storage to a local directory
     Mount {
         storage: String,
         mountpoint: String,
         #[arg(long = "opt", value_name = "KEY=VAL", num_args = 0..)]
         opt: Vec<String>,
     },
-    Unmount { target: String },
+    /// Unmount a mounted directory (use "all" or "-a" to unmount all)
+    Unmount {
+        target: String,
+    },
+    /// List active mounts
     List,
 }
 
@@ -32,8 +37,12 @@ fn main() -> anyhow::Result<()> {
                 .collect();
             mntrs::cmd::mount::mount(&storage, &mountpoint, &opts)?;
         }
-        Commands::Unmount { target } => todo!("unmount {target}"),
-        Commands::List => todo!("list mounts"),
+        Commands::Unmount { target } => {
+            mntrs::cmd::unmount::unmount(&target)?;
+        }
+        Commands::List => {
+            mntrs::cmd::list::list()?;
+        }
     }
     Ok(())
 }
