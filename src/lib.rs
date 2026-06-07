@@ -616,11 +616,12 @@ impl Filesystem for MntrsFs {
                 }));
                 off = e;
             }
-            let mut all_data = Vec::new();
+            let results: Vec<_> = rt().block_on(futures::future::join_all(tasks));
+            let mut all_data = Vec::with_capacity(fetch_size as usize);
             let mut ok = true;
-            for t in tasks {
-                match rt().block_on(t) {
-                    Ok(Ok(data)) => all_data.extend_from_slice(&data),
+            for r in &results {
+                match r {
+                    Ok(Ok(data)) => all_data.extend_from_slice(data),
                     _ => { ok = false; break; }
                 }
             }
