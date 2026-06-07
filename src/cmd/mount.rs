@@ -7,6 +7,7 @@ use std::fs::{self, OpenOptions, File};
 use std::io::{Write, BufRead, BufReader};
 use std::process::Command;
 use opendal::Operator;
+use opendal::layers::TimeoutLayer;
 use opendal::services::S3;
 use fuser::MountOption;
 use once_cell::sync::OnceCell;
@@ -131,6 +132,10 @@ async fn build_s3(url: &url::Url, opts: &HashMap<String, String>) -> Result<Oper
     if let Some(sk) = opts.get("secret-key") { builder = builder.secret_access_key(sk); }
     if let Some(region) = opts.get("region") { builder = builder.region(region); }
 
-    let op: Operator = Operator::new(builder)?.finish();
+    let op: Operator = Operator::new(builder)?
+        .layer(TimeoutLayer::new()
+            .with_io_timeout(std::time::Duration::from_secs(5))
+            .with_timeout(std::time::Duration::from_secs(10)))
+        .finish();
     Ok(op)
 }
