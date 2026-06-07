@@ -10,7 +10,7 @@ pub fn unmount(target: &str) -> Result<()> {
         if mounts.is_empty() {
             return Err(anyhow!("no mntrs mounts found"));
         }
-        for (_, mountpoint) in &mounts {
+        for m in &mounts { let mountpoint = &m.mountpoint;
             eprintln!("unmounting {mountpoint}");
             let _ = fuse_unmount(mountpoint);
         }
@@ -23,8 +23,8 @@ pub fn unmount(target: &str) -> Result<()> {
         target.to_string()
     } else {
         // try to match by storage URL
-        if let Some(m) = mounts.iter().find(|(s, _)| s == target) {
-            m.1.clone()
+        if let Some(m) = mounts.iter().find(|m| m.storage == target) {
+            m.mountpoint.clone()
         } else {
             return Err(anyhow!("mount point '{}' does not exist", target));
         }

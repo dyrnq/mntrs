@@ -24,7 +24,16 @@ fn mounts_db() -> String {
     format!("{}/.local/share/mntrs/mounts.txt", home)
 }
 
-pub fn read_mounts() -> Vec<(String, String)> {
+pub struct MountInfo {
+    pub storage: String,
+    pub mountpoint: String,
+    pub pid: String,
+    pub user: String,
+    pub read_only: bool,
+    pub backend: String,
+}
+
+pub fn read_mounts() -> Vec<MountInfo> {
     let path = mounts_db();
     let file = match File::open(&path) {
         Ok(f) => f,
@@ -34,13 +43,21 @@ pub fn read_mounts() -> Vec<(String, String)> {
     reader.lines()
         .filter_map(|l| l.ok())
         .filter_map(|l| {
-            let idx = l.find(' ')?;
-            Some((l[..idx].to_string(), l[idx+1..].to_string()))
+            let parts: Vec<&str> = l.split('|').collect();
+            if parts.len() < 6 { return None; }
+            Some(MountInfo {
+                storage: parts[0].to_string(),
+                mountpoint: parts[1].to_string(),
+                pid: parts[2].to_string(),
+                user: parts[3].to_string(),
+                read_only: parts[4] == "ro",
+                backend: parts[5].to_string(),
+            })
         })
         .collect()
 }
 
-fn record_mount(storage: &str, mountpoint: &str) {
+fn record_mount(storage: &str, mountpoint: &str, read_only: bool) {
     let path = mounts_db();
     let dir = Path::new(&path).parent().unwrap();
     let _ = fs::create_dir_all(dir);
@@ -51,7 +68,11 @@ fn record_mount(storage: &str, mountpoint: &str) {
             .collect();
         let _ = fs::write(&path, filtered.join("\n") + "\n");
     }
-    let line = format!("{} {}\n", storage, mountpoint);
+    let pid = std::process::id().to_string();
+    let user = std::env::var("USER").unwrap_or_else(|_| "?".into());
+    let ro = if read_only { "ro" } else { "rw" };
+    let backend = storage.split(':').next().unwrap_or("?");
+    let line = format!("{}|{}|{}|{}|{}|{}\n", storage, mountpoint, pid, user, ro, backend);
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = f.write_all(line.as_bytes());
     }
@@ -97,7 +118,7 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
         MountOption::Exec,
     ])?;
 
-    record_mount(storage_url, mountpoint);
+    record_mount(storage_url, mountpoint, read_only);
 
     CLEANUP_MP.set(mountpoint.to_string()).ok();
     unsafe { libc::atexit(cleanup); }
