@@ -8,7 +8,7 @@ use std::io::{Write, BufRead, BufReader};
 use std::process::Command;
 use opendal::Operator;
 use opendal::layers::TimeoutLayer;
-use opendal::services::S3;
+use opendal::services::{S3, Gcs, Azblob, HdfsNative};
 use fuser::MountOption;
 use once_cell::sync::OnceCell;
 use std::sync::OnceLock;
@@ -107,34 +107,61 @@ extern "C" fn handler(_: i32) {
     std::process::exit(0);
 }
 
+fn apply_operator(builder: impl opendal::Builder) -> Result<Operator> {
+    let op: Operator = Operator::new(builder)?
+        .layer(TimeoutLayer::new().with_io_timeout(std::time::Duration::from_secs(5)))
+        .finish();
+    Ok(op)
+}
+
 async fn build_operator(storage_url: &str, opts: &HashMap<String, String>) -> Result<Operator> {
     let url = url::Url::parse(storage_url)
         .map_err(|e| anyhow!("invalid storage URL '{storage_url}': {e}"))?;
-    let scheme = url.scheme();
-
-    match scheme {
+    match url.scheme() {
         "s3" => build_s3(&url, opts).await,
-        _ => Err(anyhow!("unsupported storage scheme '{scheme}'; supported: s3, hdfs, gs, azblob")),
+        "gs" | "gcs" => build_gcs(&url, opts).await,
+        "azblob" => build_azblob(&url, opts).await,
+        "hdfs" | "hdfs-native" => build_hdfs_native(&url, opts).await,
+        s => Err(anyhow!("unsupported scheme '{s}'; try s3://, gs://, azblob://, hdfs://")),
     }
 }
 
 async fn build_s3(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
-    let bucket = url.host_str()
-        .ok_or_else(|| anyhow!("missing bucket name in s3 URL, expected s3://bucket"))?;
+    let bucket = url.host_str().ok_or_else(|| anyhow!("missing bucket"))?;
+    let mut builder = S3::default().bucket(bucket);
+    let p = url.path().trim_start_matches('/');
+    if !p.is_empty() { builder = builder.root(p); }
+    if let Some(v) = opts.get("endpoint") { builder = builder.endpoint(v); }
+    if let Some(v) = opts.get("access-key") { builder = builder.access_key_id(v); }
+    if let Some(v) = opts.get("secret-key") { builder = builder.secret_access_key(v); }
+    if let Some(v) = opts.get("region") { builder = builder.region(v); }
+    apply_operator(builder)
+}
 
-    let mut builder = S3::default();
-    builder = builder.bucket(bucket);
+async fn build_gcs(url: &url::Url, _opts: &HashMap<String, String>) -> Result<Operator> {
+    let bucket = url.host_str().ok_or_else(|| anyhow!("missing bucket"))?;
+    let mut builder = Gcs::default().bucket(bucket);
+    let p = url.path().trim_start_matches('/');
+    if !p.is_empty() { builder = builder.root(p); }
+    apply_operator(builder)
+}
 
-    let prefix = url.path().trim_start_matches('/');
-    if !prefix.is_empty() { builder = builder.root(prefix); }
-    if let Some(ep) = opts.get("endpoint") { builder = builder.endpoint(ep); }
-    if let Some(ak) = opts.get("access-key") { builder = builder.access_key_id(ak); }
-    if let Some(sk) = opts.get("secret-key") { builder = builder.secret_access_key(sk); }
-    if let Some(region) = opts.get("region") { builder = builder.region(region); }
+async fn build_azblob(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+    let container = url.host_str().ok_or_else(|| anyhow!("missing container"))?;
+    let mut builder = Azblob::default().container(container);
+    let p = url.path().trim_start_matches('/');
+    if !p.is_empty() { builder = builder.root(p); }
+    if let Some(v) = opts.get("account-name") { builder = builder.account_name(v); }
+    if let Some(v) = opts.get("account-key") { builder = builder.account_key(v); }
+    apply_operator(builder)
+}
 
-    let op: Operator = Operator::new(builder)?
-        .layer(TimeoutLayer::new()
-            .with_io_timeout(std::time::Duration::from_secs(5)))
-        .finish();
-    Ok(op)
+async fn build_hdfs_native(url: &url::Url, _opts: &HashMap<String, String>) -> Result<Operator> {
+    let namenode = url.host_str().ok_or_else(|| anyhow!("missing namenode"))?;
+    let port = url.port().unwrap_or(8020);
+    let addr = format!("{}:{}", namenode, port);
+    let mut builder = HdfsNative::default().name_node(&addr);
+    let p = url.path().trim_start_matches('/');
+    if !p.is_empty() { builder = builder.root(p); }
+    apply_operator(builder)
 }
