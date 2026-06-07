@@ -44,7 +44,7 @@ pub fn read_mounts() -> Vec<MountInfo> {
     reader.lines()
         .map_while(Result::ok)
         .filter_map(|l| {
-            let parts: Vec<&str> = l.split('|').collect();
+            let parts: Vec<&str> = l.split('\0').collect();
             if parts.len() < 6 { return None; }
             Some(MountInfo {
                 storage: parts[0].to_string(),
@@ -65,7 +65,7 @@ fn record_mount(storage: &str, mountpoint: &str, read_only: bool) {
     // Remove existing entry for this mountpoint
     if let Ok(content) = fs::read_to_string(&path) {
         let filtered: Vec<&str> = content.lines()
-            .filter(|l| !l.contains(mountpoint))
+            .filter(|l| l.split('\0').nth(1) != Some(mountpoint) )
             .collect();
         if let Err(e) = fs::write(&path, filtered.join("\n") + "\n") { tracing::debug!(error=%e, "mounts db write failed"); }
     }
@@ -73,7 +73,7 @@ fn record_mount(storage: &str, mountpoint: &str, read_only: bool) {
     let user = std::env::var("USER").unwrap_or_else(|_| "?".into());
     let ro = if read_only { "ro" } else { "rw" };
     let backend = storage.split(':').next().unwrap_or("?");
-    let line = format!("{}|{}|{}|{}|{}|{}\n", storage, mountpoint, pid, user, ro, backend);
+    let line = format!("{}\0{}\0{}\0{}\0{}\0{}\n", storage, mountpoint, pid, user, ro, backend);
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path)
         && let Err(e) = f.write_all(line.as_bytes()) { tracing::debug!(error=%e, "mounts db append failed"); }
 }
@@ -83,7 +83,7 @@ fn remove_mount(mountpoint: &str) {
     let path = mounts_db();
     if let Ok(content) = fs::read_to_string(&path) {
         let filtered: Vec<&str> = content.lines()
-            .filter(|l| !l.contains(mountpoint))
+            .filter(|l| l.split('\0').nth(1) != Some(mountpoint) )
             .collect();
         if let Err(e) = fs::write(&path, filtered.join("\n")) { tracing::debug!(error=%e, "mounts db cleanup failed"); }
     }
