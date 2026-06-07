@@ -31,10 +31,11 @@ pub struct MntrsFs {
     inodes: Mutex<HashMap<u64, (String, FileType, u64)>>,
     dir_cache: Mutex<HashMap<String, (std::time::Instant, Vec<(String, EntryMode)>)>>,
     cache_dir: PathBuf,
-    handles: Mutex<HashMap<u64, (String, bool)>>,
+    handles: Mutex<HashMap<u64, (String, bool, Option<std::time::Instant>)>>, // +dirty_since
     pub dir_cache_ttl: Duration,
     pub attr_ttl: Duration,
     pub volname: String,
+    
 }
 
 fn make_attr(ino: u64, size: u64, kind: FileType) -> FileAttr {
@@ -55,7 +56,7 @@ fn path_hash(path: &str) -> u64 {
     (h & 0x7FFFFFFFFFFFFFFF).max(2)
 }
 
-fn cache_path(cache_dir: &PathBuf, path: &str) -> PathBuf {
+pub fn cache_path(cache_dir: &PathBuf, path: &str) -> PathBuf {
     cache_dir.join(format!("{:020x}", path_hash(path)))
 }
 
@@ -180,14 +181,14 @@ impl Filesystem for MntrsFs {
         let parent_path = self.resolve(parent.into()).map(|(p, _, _)| p).unwrap_or_default();
         let full_path = if parent_path.is_empty() { name.to_string() } else { format!("{}/{}", parent_path, name) };
         let ino = self.alloc_ino(&full_path, FileType::RegularFile, 0);
-        self.handles.lock().unwrap().insert(ino, (full_path.clone(), false));
+        self.handles.lock().unwrap().insert(ino, (full_path.clone(), false, None));
         reply.created(&self.attr_ttl, &make_attr(ino, 0, FileType::RegularFile), Generation(0), FileHandle(ino), FopenFlags::empty());
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         let ino: u64 = ino.into();
         if let Some((path, FileType::RegularFile, _)) = self.resolve(ino) {
-            self.handles.lock().unwrap().insert(ino, (path, false));
+            self.handles.lock().unwrap().insert(ino, (path, false, None));
         }
         reply.opened(FileHandle(ino), FopenFlags::empty());
     }
@@ -213,7 +214,7 @@ impl Filesystem for MntrsFs {
 
     fn write(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64, data: &[u8], _write_flags: WriteFlags, _flags: OpenFlags, _lock_owner: Option<LockOwner>, reply: ReplyWrite) {
         let fh_val: u64 = fh.into();
-        let path = match self.handles.lock().unwrap().get(&fh_val).cloned() {
+        let path = match self.handles.lock().unwrap().get(&fh_val).map(|(p, d, _)| (p.clone(), *d)) {
             Some((p, _)) => p,
             None => { reply.error(Errno::ENOENT); return; }
         };
@@ -227,7 +228,7 @@ impl Filesystem for MntrsFs {
             let mut f = file; f.seek(SeekFrom::Start(offset))?; f.write_all(data)?; f.flush()?; Ok(())
         })();
         match result {
-            Ok(()) => { self.handles.lock().unwrap().insert(fh_val, (path, true)); reply.written(data.len() as u32); }
+            Ok(()) => { self.handles.lock().unwrap().insert(fh_val, (path, true, Some(std::time::Instant::now()))); reply.written(data.len() as u32); }
             Err(_) => reply.error(Errno::EIO),
         }
     }
@@ -274,7 +275,7 @@ impl Filesystem for MntrsFs {
         reply.error(Errno::ENODATA);
     }
 
-    fn setattr(&self, _req: &Request, ino: INodeNo, _mode: Option<u32>, _uid: Option<u32>, _gid: Option<u32>, size: Option<u64>, _atime: Option<TimeOrNow>, _mtime: Option<TimeOrNow>, _ctime: Option<SystemTime>, _fh: Option<FileHandle>, _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>, _bkuptime: Option<SystemTime>, _flags: Option<fuser::BsdFileFlags>, reply: ReplyAttr) {
+    fn setattr(&self, _req: &Request, ino: INodeNo, mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, size: Option<u64>, _atime: Option<TimeOrNow>, _mtime: Option<TimeOrNow>, _ctime: Option<SystemTime>, _fh: Option<FileHandle>, _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>, _bkuptime: Option<SystemTime>, _flags: Option<fuser::BsdFileFlags>, reply: ReplyAttr) {
         let ino: u64 = ino.into();
         if let Some((p, kind, _)) = self.resolve(ino) {
             if let Some(s) = size {
@@ -282,7 +283,14 @@ impl Filesystem for MntrsFs {
                 if cpath.exists() { let _ = fs::write(&cpath, &[] as &[u8]); }
                 self.alloc_ino(&p, kind, s);
             }
-            reply.attr(&self.attr_ttl, &make_attr(ino, size.unwrap_or(0), kind));
+            // mode/uid/gid — just record them for now (S3 has no chmod)
+            let mut perm = if kind == FileType::Directory { 0o755u16 } else { 0o644u16 };
+            if let Some(m) = mode { perm = (m & 0o7777) as u16; }
+            let mut attr = make_attr(ino, size.unwrap_or(0), kind);
+            attr.perm = perm;
+            if let Some(u) = uid { attr.uid = u; }
+            if let Some(g) = gid { attr.gid = g; }
+            reply.attr(&self.attr_ttl, &attr);
         } else {
             reply.error(Errno::ENOENT);
         }
