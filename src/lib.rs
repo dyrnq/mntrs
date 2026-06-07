@@ -380,8 +380,8 @@ fn writeback_worker(op: Arc<Operator>, queue: Arc<Mutex<VecDeque<(String, PathBu
             let r = rt().block_on(async { op.write(&p, data.clone()).await });
             match r {
                 Ok(_) => {
-                    let _ = fs::remove_file(&cache_path);
-                    let _ = fs::remove_file(cache_path.with_extension("dirty"));
+                    if let Err(e) = fs::remove_file(&cache_path) { tracing::debug!(error=%e, path=?cache_path, "writeback ok remove failed"); }
+                    if let Err(e) = fs::remove_file(cache_path.with_extension("dirty")) { tracing::debug!(error=%e, "writeback dirty remove failed"); }
                     break;
                 }
                 Err(e) if attempt < 2 => {
@@ -399,7 +399,7 @@ fn writeback_worker(op: Arc<Operator>, queue: Arc<Mutex<VecDeque<(String, PathBu
 impl Filesystem for MntrsFs {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
         self.alloc_ino("", FileType::Directory, 4096);
-        let _ = fs::create_dir_all(&self.cache_dir);
+        if let Err(e) = fs::create_dir_all(&self.cache_dir) { tracing::warn!(error=%e, "create_dir_all failed for cache"); }
         // Enable readdirplus for stat+readdir in one round-trip
         let _ = config.add_capabilities(fuser::InitFlags::FUSE_DO_READDIRPLUS);
         // Recover writeback queue from dirty sidecars
@@ -414,7 +414,7 @@ impl Filesystem for MntrsFs {
                             self.writeback_queue.lock().unwrap().push_back((remote, cache_path));
                         }
                     }
-                    let _ = fs::remove_file(&p);
+                    if let Err(e) = fs::remove_file(&p) { tracing::warn!(error=%e, path=?p, "dirty recovery remove failed"); }
                 }
             }
         }
@@ -620,15 +620,11 @@ impl Filesystem for MntrsFs {
                     // Store pre-fetched data in local cache
                     let cpath = crate::cache_path(&cdir, &p);
                     use std::io::{Write, Seek};
-                    if let Some(parent) = cpath.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
+                    if let Some(parent) = cpath.parent()
+                        && let Err(e) = std::fs::create_dir_all(parent) { tracing::debug!(error=%e, "readahead create_dir failed"); }
                     if let Ok(mut f) = std::fs::OpenOptions::new()
                         .create(true).truncate(false).write(true).read(true).open(&cpath)
-                    {
-                        let _ = f.seek(std::io::SeekFrom::Start(next));
-                        let _ = f.write_all(&bytes[..bytes.len().min(ahead as usize)]);
-                    }
+                        && (f.seek(std::io::SeekFrom::Start(next)).is_err() || f.write_all(&bytes[..bytes.len().min(ahead as usize)]).is_err()) { tracing::debug!("readahead write failed"); }
                     Ok::<_, opendal::Error>(())
                 });
             });
@@ -693,7 +689,7 @@ impl Filesystem for MntrsFs {
         let name = name.to_string_lossy();
         let dir_path = format!("{}/", name.trim_end_matches('/'));
         let op = self.op.clone(); let p = dir_path.clone();
-        let _ = rt().block_on(async move { op.delete(&p).await });
+        let p2 = p.clone(); if rt().block_on(async move { op.delete(&p2).await }).is_err() { tracing::debug!(path=%p, "rmdir delete failed"); }
         reply.ok();
     }
 
@@ -702,9 +698,8 @@ impl Filesystem for MntrsFs {
         let dst = newname.to_string_lossy().to_string();
         let op = self.op.clone();
         rt().block_on(async move {
-            if op.copy(&src, &dst).await.is_ok() {
-                let _ = op.delete(&src).await;
-            }
+            if op.copy(&src, &dst).await.is_ok()
+                && op.delete(&src).await.is_err() { tracing::debug!(path=%src, "rename delete failed"); }
         });
         reply.ok();
     }
@@ -772,7 +767,7 @@ impl Filesystem for MntrsFs {
         if let Some((p, kind, _)) = self.resolve(ino) {
             if let Some(s) = size {
                 let cpath = cache_path(&self.cache_dir, &p);
-                if cpath.exists() { let _ = fs::write(&cpath, &[] as &[u8]); }
+                if cpath.exists() && let Err(e) = fs::write(&cpath, &[] as &[u8]) { tracing::debug!(error=%e, path=?cpath, "setattr truncate failed"); }
                 self.alloc_ino(&p, kind, s);
             }
             // mode/uid/gid — just record them for now (S3 has no chmod)
@@ -791,10 +786,10 @@ impl Filesystem for MntrsFs {
     fn unlink(&self, _req: &Request, _parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let name = name.to_string_lossy();
         let op = self.op.clone(); let p = name.to_string();
-        let _ = rt().block_on(async move { op.delete(&p).await });
+        let p2 = p.clone(); if rt().block_on(async move { op.delete(&p2).await }).is_err() { tracing::debug!(path=%p, "unlink remote failed"); }
         // Also remove from local cache
         let cpath = cache_path(&self.cache_dir, &name);
-        let _ = fs::remove_file(&cpath);
+        if let Err(e) = fs::remove_file(&cpath) { tracing::debug!(error=%e, path=?cpath, "unlink cache remove failed"); }
         self.disk_cache_index.remove(&name as &str);
         reply.ok();
     }
@@ -813,7 +808,7 @@ impl Filesystem for MntrsFs {
             if cpath.exists() {
                 // Write sidecar for crash recovery
                 let sidecar = cpath.with_extension("dirty");
-                let _ = fs::write(&sidecar, path.as_bytes());
+                if let Err(e) = fs::write(&sidecar, path.as_bytes()) { tracing::warn!(error=%e, path=?sidecar, "sidecar write failed"); }
                 self.writeback_queue.lock().unwrap().push_back((path, cpath));
             }
         }

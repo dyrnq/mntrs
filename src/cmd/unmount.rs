@@ -12,10 +12,10 @@ pub fn unmount(target: &str) -> Result<()> {
         }
         for m in &mounts { let mountpoint = &m.mountpoint;
             eprintln!("unmounting {mountpoint}");
-            let _ = fuse_unmount(mountpoint);
+            if let Err(e) = fuse_unmount(mountpoint) { tracing::debug!(error=%e, mountpoint, "unmount all skip failed"); }
         }
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let _ = fs::remove_file(format!("{}/.local/share/mntrs/mounts.txt", home));
+        if let Err(e) = fs::remove_file(format!("{}/.local/share/mntrs/mounts.txt", home)) { tracing::debug!(error=%e, "unmount all db remove failed"); }
         return Ok(());
     }
 
@@ -39,7 +39,7 @@ pub fn unmount(target: &str) -> Result<()> {
         let filtered: Vec<&str> = content.lines()
             .filter(|l| !l.contains(&mountpoint))
             .collect();
-        let _ = fs::write(&db, filtered.join("\n"));
+        if let Err(e) = fs::write(&db, filtered.join("\n")) { tracing::debug!(error=%e, "unmount db cleanup failed"); }
     }
     Ok(())
 }

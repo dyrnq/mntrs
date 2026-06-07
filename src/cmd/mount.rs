@@ -73,22 +73,21 @@ pub fn read_mounts() -> Vec<MountInfo> {
 fn record_mount(storage: &str, mountpoint: &str, read_only: bool) {
     let path = mounts_db();
     let dir = Path::new(&path).parent().unwrap();
-    let _ = fs::create_dir_all(dir);
+    if let Err(e) = fs::create_dir_all(dir) { tracing::debug!(error=%e, "mounts db dir create failed"); }
     // Remove existing entry for this mountpoint
     if let Ok(content) = fs::read_to_string(&path) {
         let filtered: Vec<&str> = content.lines()
             .filter(|l| !l.contains(mountpoint))
             .collect();
-        let _ = fs::write(&path, filtered.join("\n") + "\n");
+        if let Err(e) = fs::write(&path, filtered.join("\n") + "\n") { tracing::debug!(error=%e, "mounts db write failed"); }
     }
     let pid = std::process::id().to_string();
     let user = std::env::var("USER").unwrap_or_else(|_| "?".into());
     let ro = if read_only { "ro" } else { "rw" };
     let backend = storage.split(':').next().unwrap_or("?");
     let line = format!("{}|{}|{}|{}|{}|{}\n", storage, mountpoint, pid, user, ro, backend);
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = f.write_all(line.as_bytes());
-    }
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path)
+        && let Err(e) = f.write_all(line.as_bytes()) { tracing::debug!(error=%e, "mounts db append failed"); }
 }
 
 #[allow(dead_code)]
@@ -98,7 +97,7 @@ fn remove_mount(mountpoint: &str) {
         let filtered: Vec<&str> = content.lines()
             .filter(|l| !l.contains(mountpoint))
             .collect();
-        let _ = fs::write(&path, filtered.join("\n"));
+        if let Err(e) = fs::write(&path, filtered.join("\n")) { tracing::debug!(error=%e, "mounts db cleanup failed"); }
     }
 }
 
@@ -113,7 +112,7 @@ extern "C" fn cleanup() {
             let filtered: Vec<&str> = content.lines()
                 .filter(|l| !l.contains(mp.as_str()))
                 .collect();
-            let _ = fs::write(&path, filtered.join("\n"));
+            if let Err(e) = fs::write(&path, filtered.join("\n")) { tracing::debug!(error=%e, "mounts db cleanup failed"); }
         }
     }
 }
@@ -361,24 +360,23 @@ fn daemonize(mountpoint: &str, wait_pipe: Option<i32>) -> Result<()> {
     if let Some(fd) = wait_pipe {
         DAEMON_PIPE_WR.set(fd).ok();
     }
-    let _ = std::env::set_current_dir("/");
+    if let Err(e) = std::env::set_current_dir("/") { tracing::debug!(error=%e, "daemon chdir failed"); }
     // Use rustix for safe fd operations
     let devnull = rustix::fs::open("/dev/null", rustix::fs::OFlags::RDWR, rustix::fs::Mode::empty())
         .unwrap_or_else(|_| {
             // Safety: fd 0 is always valid (stdin)
             unsafe { rustix::fd::OwnedFd::from_raw_fd(std::os::fd::RawFd::from(0)) }
         });
-    let _ = rustix::stdio::dup2_stdin(&devnull);
-    let _ = rustix::stdio::dup2_stdout(&devnull);
-    let _ = rustix::stdio::dup2_stderr(&devnull);
+    if rustix::stdio::dup2_stdin(&devnull).is_err() { tracing::debug!("daemon dup2 stdin failed"); }
+    if rustix::stdio::dup2_stdout(&devnull).is_err() { tracing::debug!("daemon dup2 stdout failed"); }
+    if rustix::stdio::dup2_stderr(&devnull).is_err() { tracing::debug!("daemon dup2 stderr failed"); }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let pid_dir = format!("{}/.local/share/mntrs", home);
-    let _ = fs::create_dir_all(&pid_dir);
+    if let Err(e) = fs::create_dir_all(&pid_dir) { tracing::debug!(error=%e, "pid dir create failed"); }
     let pid = std::process::id();
     let pid_path = format!("{}/{}.pid", pid_dir, mountpoint.replace('/', "_"));
-    if let Ok(mut f) = File::create(&pid_path) {
-        let _ = writeln!(f, "{}", pid);
-    }
+    if let Ok(mut f) = File::create(&pid_path)
+        && writeln!(f, "{}", pid).is_err() { tracing::debug!("pid file write failed"); }
     Ok(())
 }
 
