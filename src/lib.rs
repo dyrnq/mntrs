@@ -1,6 +1,7 @@
 pub mod cmd;
 
 use std::collections::HashMap;
+use std::time::Instant;
 use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -25,7 +26,10 @@ const FUSE_ROOT_INO: u64 = 1;
 pub struct MntrsFs {
     pub op: Arc<Operator>,
     inodes: Mutex<HashMap<u64, (String, FileType, u64)>>,
+    dir_cache: Mutex<HashMap<String, (Instant, Vec<(String, EntryMode)>)>>,
 }
+
+const DIR_CACHE_TTL: Duration = Duration::from_secs(10);
 
 fn make_attr(ino: u64, size: u64, kind: FileType) -> FileAttr {
     let now = UNIX_EPOCH;
@@ -85,7 +89,16 @@ impl MntrsFs {
     }
 
     fn list_op(&self, path: &str) -> Vec<(String, EntryMode)> {
-        rt().block_on(async {
+        {
+            let cache = self.dir_cache.lock().unwrap();
+            if let Some((t, entries)) = cache.get(path) {
+                if t.elapsed() < DIR_CACHE_TTL {
+                    return entries.clone();
+                }
+            }
+        }
+
+        let result = rt().block_on(async {
             let op = self.op.clone();
             let p = path.to_string();
             let mut lister = op.lister(&p).await.ok()?;
@@ -96,7 +109,11 @@ impl MntrsFs {
                 out.push((name, mode));
             }
             Some(out)
-        }).unwrap_or_default()
+        }).unwrap_or_default();
+
+        let mut cache = self.dir_cache.lock().unwrap();
+        cache.insert(path.to_string(), (Instant::now(), result.clone()));
+        result
     }
 }
 

@@ -63,10 +63,8 @@ static CLEANUP_MP: OnceLock<String> = OnceLock::new();
 
 extern "C" fn cleanup() {
     if let Some(mp) = CLEANUP_MP.get() {
-        // Unmount
         let _ = Command::new("fusermount3").arg("-u").arg(mp).status()
             .or_else(|_| Command::new("fusermount").arg("-u").arg(mp).status());
-        // Remove registry entry
         let path = mounts_db();
         if let Ok(content) = fs::read_to_string(&path) {
             let filtered: Vec<&str> = content.lines()
@@ -82,6 +80,7 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
     let fs = MntrsFs {
         op: Arc::new(op),
         inodes: std::sync::Mutex::new(std::collections::HashMap::new()),
+        dir_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let mount_path = Path::new(mountpoint);
@@ -92,23 +91,18 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
 
     record_mount(storage_url, mountpoint);
 
-    // Register atexit + signal handlers for clean exit
     CLEANUP_MP.set(mountpoint.to_string()).ok();
     unsafe { libc::atexit(cleanup); }
-
-    // Register signal handlers too (for SIGTERM/SIGINT — atexit also runs)
     unsafe {
         libc::signal(libc::SIGINT, handler as libc::sighandler_t);
         libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
     }
 
     std::mem::forget(session);
-
     loop { std::thread::sleep(std::time::Duration::from_secs(3600)); }
 }
 
 extern "C" fn handler(_: i32) {
-    // Just exit — atexit cleanup will run
     std::process::exit(0);
 }
 
