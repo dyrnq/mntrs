@@ -44,6 +44,13 @@ fn record_mount(storage: &str, mountpoint: &str) {
     let path = mounts_db();
     let dir = Path::new(&path).parent().unwrap();
     let _ = fs::create_dir_all(dir);
+    // Remove existing entry for this mountpoint
+    if let Ok(content) = fs::read_to_string(&path) {
+        let filtered: Vec<&str> = content.lines()
+            .filter(|l| !l.contains(mountpoint))
+            .collect();
+        let _ = fs::write(&path, filtered.join("\n") + "\n");
+    }
     let line = format!("{} {}\n", storage, mountpoint);
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = f.write_all(line.as_bytes());
