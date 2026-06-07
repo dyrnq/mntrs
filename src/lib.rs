@@ -71,6 +71,7 @@ pub struct MntrsFs {
     mem_cache: dashmap::DashMap<u64, bytes::Bytes>,
     attr_cache: dashmap::DashMap<String, (FileType, u64, std::time::Instant)>,
     out_of_space: std::sync::atomic::AtomicBool,
+    pub storage_class: Option<String>,
     
 }
 

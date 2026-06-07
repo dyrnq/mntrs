@@ -174,6 +174,8 @@ enum Commands {
         /// Metadata file extension
         #[arg(long)]
         vfs_metadata_extension: Option<String>,
+        #[arg(long)]
+        storage_class: Option<String>,
         /// Write wait timeout in seconds (default: 5)
         #[arg(long, default_value = "5")]
         vfs_write_wait: u64,
@@ -210,7 +212,7 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
     match cli.command {
-        Commands::Mount { storage, mountpoint, opt, read_only, dir_cache_time, attr_timeout, allow_other, volname, devname, write_back_cache, option, daemon, daemon_wait, daemon_timeout, allow_root, vfs_cache_max_size, vfs_write_back, vfs_cache_mode, vfs_read_ahead, vfs_read_chunk_size, default_permissions, uid, gid, umask, dir_perms, file_perms, allow_non_empty, cache_dir, direct_io, poll_interval, vfs_cache_max_age, vfs_cache_min_free_space, exclude, include, max_size, min_size, max_depth, ignore_case, no_modtime, no_checksum, no_seek, links, max_read_ahead, vfs_read_chunk_size_limit, vfs_read_chunk_streams, vfs_fast_fingerprint, async_read, vfs_refresh, vfs_case_insensitive, vfs_block_norm_dupes, vfs_links, vfs_used_is_size, vfs_metadata_extension, vfs_write_wait, vfs_read_wait, vfs_cache_poll_interval, vfs_disk_space_total_size } => {
+        Commands::Mount { storage, mountpoint, opt, read_only, dir_cache_time, attr_timeout, allow_other, volname, devname, write_back_cache, option, daemon, daemon_wait, daemon_timeout, allow_root, vfs_cache_max_size, vfs_write_back, vfs_cache_mode, vfs_read_ahead, vfs_read_chunk_size, default_permissions, uid, gid, umask, dir_perms, file_perms, allow_non_empty, cache_dir, direct_io, poll_interval, vfs_cache_max_age, vfs_cache_min_free_space, exclude, include, max_size, min_size, max_depth, ignore_case, no_modtime, no_checksum, no_seek, links, max_read_ahead, vfs_read_chunk_size_limit, vfs_read_chunk_streams, vfs_fast_fingerprint, async_read, vfs_refresh, vfs_case_insensitive, vfs_block_norm_dupes, vfs_links, vfs_used_is_size, vfs_metadata_extension, storage_class, vfs_write_wait, vfs_read_wait, vfs_cache_poll_interval, vfs_disk_space_total_size } => {
             let opts: HashMap<String, String> = opt.iter()
                 .filter_map(|kv| kv.split_once('='))
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -218,7 +220,7 @@ fn main() -> anyhow::Result<()> {
             mntrs::cmd::mount::mount(
                 &storage, &mountpoint, &opts, read_only,
                 dir_cache_time, attr_timeout, allow_other, &volname, devname.as_deref(), write_back_cache, &option,
-                daemon, daemon_wait, daemon_timeout, allow_root, vfs_cache_max_size, vfs_write_back, &vfs_cache_mode, vfs_read_ahead, vfs_read_chunk_size, default_permissions, uid, gid, umask, dir_perms, file_perms, allow_non_empty, cache_dir.as_deref(), direct_io, poll_interval, vfs_cache_max_age, vfs_cache_min_free_space, exclude, include, max_size, min_size, max_depth, ignore_case, no_modtime, no_checksum, no_seek, links, max_read_ahead, vfs_read_chunk_size_limit, vfs_read_chunk_streams, vfs_fast_fingerprint, async_read, vfs_refresh, vfs_case_insensitive, vfs_block_norm_dupes, vfs_links, vfs_used_is_size, vfs_metadata_extension, vfs_write_wait, vfs_read_wait, vfs_cache_poll_interval, vfs_disk_space_total_size,
+                daemon, daemon_wait, daemon_timeout, allow_root, vfs_cache_max_size, vfs_write_back, &vfs_cache_mode, vfs_read_ahead, vfs_read_chunk_size, default_permissions, uid, gid, umask, dir_perms, file_perms, allow_non_empty, cache_dir.as_deref(), direct_io, poll_interval, vfs_cache_max_age, vfs_cache_min_free_space, exclude, include, max_size, min_size, max_depth, ignore_case, no_modtime, no_checksum, no_seek, links, max_read_ahead, vfs_read_chunk_size_limit, vfs_read_chunk_streams, vfs_fast_fingerprint, async_read, vfs_refresh, vfs_case_insensitive, vfs_block_norm_dupes, vfs_links, vfs_used_is_size, vfs_metadata_extension, storage_class.as_deref(), vfs_write_wait, vfs_read_wait, vfs_cache_poll_interval, vfs_disk_space_total_size,
             )?;
         }
         Commands::Unmount { target } => {
