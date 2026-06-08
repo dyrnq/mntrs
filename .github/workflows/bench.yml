@@ -60,7 +60,7 @@ jobs:
           sleep 3
 
       - name: Run benchmark
-        run: MNTRS_BIN=./target/release/mntrs bash bench/run_all.sh 2>&1 | tee bench-result.txt
+        run: MNTRS_BIN=./target/release/mntrs RCLONE_MNT=/tmp/rclone-mnt ENDPOINT=http://localhost:9000 BUCKET=bench-bucket ACCESS_KEY=minioadmin SECRET_KEY=minioadmin bash bench/run_all.sh 2>&1 | tee bench-result.txt
 
       - name: Upload results
         uses: actions/upload-artifact@v4
