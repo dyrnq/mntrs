@@ -4,8 +4,8 @@
 //! These tests mount a real FUSE filesystem and verify read/write/stat operations.
 
 use std::process::Command;
-use std::time::Duration;
 use std::thread;
+use std::time::Duration;
 
 const MINIO_ENDPOINT: &str = "http://localhost:9000";
 const MINIO_ACCESS: &str = "minioadmin";
@@ -15,19 +15,28 @@ const MNTRS_MNT: &str = "/tmp/mntrs-fuse-test";
 
 fn mntrs_mount(read_only: bool) {
     let _ = Command::new("fusermount3")
-        .arg("-u").arg(MNTRS_MNT)
+        .arg("-u")
+        .arg(MNTRS_MNT)
         .status();
     let _ = std::fs::create_dir_all(MNTRS_MNT);
 
     let mut cmd = Command::new(MNTRS_BIN);
     cmd.args([
-        "mount", "s3://test-bucket", MNTRS_MNT,
-        "--opt", &format!("endpoint={}", MINIO_ENDPOINT),
-        "--opt", &format!("access-key={}", MINIO_ACCESS),
-        "--opt", &format!("secret-key={}", MINIO_SECRET),
-        "--opt", "region=us-east-1",
+        "mount",
+        "s3://test-bucket",
+        MNTRS_MNT,
+        "--opt",
+        &format!("endpoint={}", MINIO_ENDPOINT),
+        "--opt",
+        &format!("access-key={}", MINIO_ACCESS),
+        "--opt",
+        &format!("secret-key={}", MINIO_SECRET),
+        "--opt",
+        "region=us-east-1",
     ]);
-    if read_only { cmd.arg("--read-only"); }
+    if read_only {
+        cmd.arg("--read-only");
+    }
 
     let child = cmd.spawn().expect("mntrs mount failed to start");
     thread::sleep(Duration::from_secs(3));
@@ -48,7 +57,8 @@ fn mntrs_mount(read_only: bool) {
 
 fn mntrs_unmount() {
     let _ = Command::new("fusermount3")
-        .arg("-u").arg(MNTRS_MNT)
+        .arg("-u")
+        .arg(MNTRS_MNT)
         .status();
 }
 
@@ -86,7 +96,10 @@ fn fuse_df_shows_space() {
         .output()
         .expect("df failed");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("mntrs") || stdout.contains("1.0P"), "df should show mntrs mount");
+    assert!(
+        stdout.contains("mntrs") || stdout.contains("1.0P"),
+        "df should show mntrs mount"
+    );
     mntrs_unmount();
 }
 
@@ -107,10 +120,7 @@ fn fuse_readdirplus_enabled() {
 fn fuse_cat_existing_file() {
     mntrs_mount(true);
     // Try to cat any file in the root
-    let ls = Command::new("ls")
-        .arg(MNTRS_MNT)
-        .output()
-        .unwrap();
+    let ls = Command::new("ls").arg(MNTRS_MNT).output().unwrap();
     let first = String::from_utf8_lossy(&ls.stdout)
         .lines()
         .next()
@@ -121,8 +131,10 @@ fn fuse_cat_existing_file() {
             .arg(format!("{}/{}", MNTRS_MNT, first))
             .output()
             .expect("cat failed");
-        assert!(output.status.success() || output.status.code() == Some(1),
-            "cat should succeed or file-not-found (1)");
+        assert!(
+            output.status.success() || output.status.code() == Some(1),
+            "cat should succeed or file-not-found (1)"
+        );
     }
     mntrs_unmount();
 }
@@ -156,7 +168,11 @@ fn fuse_statfs_via_df() {
 fn fuse_head_small_file() {
     mntrs_mount(true);
     let ls = Command::new("ls").arg(MNTRS_MNT).output().unwrap();
-    let first = String::from_utf8_lossy(&ls.stdout).lines().next().unwrap_or("").to_string();
+    let first = String::from_utf8_lossy(&ls.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string();
     if !first.is_empty() {
         let output = Command::new("head")
             .args(["-c", "100", &format!("{}/{}", MNTRS_MNT, first)])
@@ -176,18 +192,28 @@ fn fuse_sha256_matches() {
     }
     mntrs_mount(true);
     let ls = Command::new("ls").arg(MNTRS_MNT).output().unwrap();
-    let first = String::from_utf8_lossy(&ls.stdout).lines().next().unwrap_or("").to_string();
+    let first = String::from_utf8_lossy(&ls.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string();
     if !first.is_empty() {
         let mntrs_sha = Command::new("sha256sum")
             .arg(format!("{}/{}", MNTRS_MNT, first))
-            .output().unwrap();
+            .output()
+            .unwrap();
         let rclone_sha = Command::new("sha256sum")
             .arg(format!("{}/{}", rclone_mnt, first))
-            .output().unwrap();
+            .output()
+            .unwrap();
         if mntrs_sha.status.success() && rclone_sha.status.success() {
             assert_eq!(
-                String::from_utf8_lossy(&mntrs_sha.stdout).split_whitespace().next(),
-                String::from_utf8_lossy(&rclone_sha.stdout).split_whitespace().next(),
+                String::from_utf8_lossy(&mntrs_sha.stdout)
+                    .split_whitespace()
+                    .next(),
+                String::from_utf8_lossy(&rclone_sha.stdout)
+                    .split_whitespace()
+                    .next(),
                 "sha256 mismatch between mntrs and rclone"
             );
         }

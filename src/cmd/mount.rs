@@ -259,10 +259,7 @@ fn cache_dir_for_mount(mountpoint: &str) -> String {
     format!("/tmp/mntrs-csi-cache/{}", suffix)
 }
 
-pub fn build_operator_sync(
-    storage_url: &str,
-    opts: &HashMap<String, String>,
-) -> Result<Operator> {
+pub fn build_operator_sync(storage_url: &str, opts: &HashMap<String, String>) -> Result<Operator> {
     rt_block_on(build_operator(storage_url, opts))
 }
 

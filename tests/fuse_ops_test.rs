@@ -45,7 +45,13 @@ fn cache_path_different_cache_dirs() {
 
 #[test]
 fn path_hash_always_positive() {
-    for p in &["/", "/a/b/c", "x", "", "very/long/path/with/many/components"] {
+    for p in &[
+        "/",
+        "/a/b/c",
+        "x",
+        "",
+        "very/long/path/with/many/components",
+    ] {
         let h = path_hash(p);
         assert!(h >= 2, "hash for '{p}' should be >= 2, got {h}");
     }

@@ -396,7 +396,8 @@ fn main() -> anyhow::Result<()> {
             mntrs::cmd::list::list()?;
         }
         Commands::Serve { storage, port, opt } => {
-            let opts: HashMap<String, String> = opt.iter()
+            let opts: HashMap<String, String> = opt
+                .iter()
                 .filter_map(|kv| kv.split_once("="))
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
