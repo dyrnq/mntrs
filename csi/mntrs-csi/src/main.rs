@@ -114,19 +114,39 @@ impl controller_server::Controller for ControllerService {
         let capacity = req.capacity_range.map(|r| r.required_bytes).unwrap_or(0);
         let params = req.parameters;
 
+        let pvc_name = params.get("csi.storage.k8s.io/pvc/name")
+            .cloned().unwrap_or_else(|| name.clone());
+        let pvc_ns = params.get("csi.storage.k8s.io/pvc/namespace")
+            .cloned().unwrap_or_else(|| "default".to_string());
+
         let storage = params.get("storage")
             .or_else(|| params.get("storageUrl"))
             .cloned()
             .unwrap_or_else(|| format!("memory://{}", name));
 
-        let volume_id = encode_volume_id(&storage);
-        tracing::info!(volume_id, storage, capacity, "create_volume");
+        // Apply pathPattern if present
+        let storage_url = if let Some(pattern) = params.get("pathPattern") {
+            if !pattern.is_empty() {
+                let suffix = expand_path_pattern(pattern, &pvc_name, &pvc_ns);
+                format!("{}/{}", storage.trim_end_matches('/'), suffix.trim_start_matches('/'))
+            } else {
+                storage.clone()
+            }
+        } else {
+            storage.clone()
+        };
+
+        let volume_id = encode_volume_id(&storage_url);
+        let mut ctx = params.clone();
+        ctx.insert("storage".to_string(), storage_url.clone());
+
+        tracing::info!(volume_id, storage=%storage_url, capacity, pvc=%pvc_name, ns=%pvc_ns, "create_volume");
 
         Ok(Response::new(CreateVolumeResponse {
             volume: Some(Volume {
                 volume_id: volume_id.clone(),
                 capacity_bytes: capacity as i64,
-                volume_context: params.clone(),
+                volume_context: ctx,
                 ..Default::default()
             }),
         }))
@@ -285,6 +305,11 @@ impl node_server::Node for NodeService {
         let _ = std::fs::create_dir_all(&staging_path);
 
         tracing::info!(volume_id, storage=%storage_url, staging=%staging_path, "staging FUSE mount");
+        let mut opts = opts;
+        if let Some(cache_base) = std::env::var("MNTRS_CACHE_DIR").ok() {
+            let vol_cache = format!("{}/{}", cache_base, encode_volume_id(&storage_url));
+            opts.insert("cache-dir".to_string(), vol_cache);
+        }
         mount_internal(&storage_url, &staging_path, &opts, read_only)
             .map_err(|e| Status::internal(format!("stage mount failed: {e}")))?;
 
@@ -414,6 +439,7 @@ impl node_server::Node for NodeService {
                 r#type: Some(node_service_capability::Type::Rpc(
                     node_service_capability::Rpc {
                         r#type: node_service_capability::rpc::Type::StageUnstageVolume as i32,
+                        // MULTI_NODE_MULTI_WRITER: not in CSI v1 spec
                     },
                 )),
             }],
@@ -465,6 +491,19 @@ fn wait_for_mount(path: &str, timeout: std::time::Duration) -> Result<(), Status
     Err(Status::deadline_exceeded(format!(
         "mountpoint {} not ready after {:?}", path, timeout
     )))
+}
+
+
+/// Expand pathPattern placeholders like ${.PVC.namespace}/${.PVC.name}
+fn expand_path_pattern(
+    pattern: &str,
+    pvc_name: &str,
+    pvc_namespace: &str,
+) -> String {
+    pattern
+        .replace("${.PVC.namespace}", pvc_namespace)
+        .replace("${.PVC.name}", pvc_name)
+        .replace("${.PVC.namespace}/${.PVC.name}", &format!("{}/{}", pvc_namespace, pvc_name))
 }
 
 fn parse_volume_context(
