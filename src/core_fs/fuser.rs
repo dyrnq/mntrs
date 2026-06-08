@@ -200,7 +200,7 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
                     // For each directory entry, do a lookup to get full attr
                     let attr = self.inner.lookup(ino.into(), &entry.name).ok();
                     let fattr = attr.as_ref().map(from_core_attr).unwrap_or_else(|| {
-                        let mut a = CoreFileAttr {
+                        let a = CoreFileAttr {
                             ino: entry.ino,
                             size: 0,
                             blocks: 0,
@@ -272,7 +272,7 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        let flags: u32 = _flags.bits() as u32; match self.inner.open(ino.into(), flags) {
+        match self.inner.open(ino.into(), _flags.0 as u32) {
             Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
             Err(e) => reply.error(io_err_to_fuse_errno(e)),
         }

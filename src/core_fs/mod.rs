@@ -65,6 +65,7 @@ pub struct CoreVolumeStat {
 ///
 /// Platform adapters (fuser, winfsp) implement the conversion to their
 /// respective error/reply types.
+#[allow(clippy::too_many_arguments)]
 pub trait CoreFilesystem: Send + Sync {
     /// Initialize the filesystem (called once at mount time).
     fn init(&self) -> std::io::Result<()>;

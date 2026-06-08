@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 pub mod cmd;
+pub mod core_fs;
 
 use std::collections::VecDeque;
 use std::ffi::OsStr;
@@ -1389,5 +1390,201 @@ impl Filesystem for MntrsFs {
     ) {
         self.handles.remove(&fh.into());
         reply.ok();
+    }
+}
+
+use crate::core_fs::{CoreFileAttr, CoreFileType, CoreDirEntry, CoreVolumeStat, CoreFilesystem};
+
+impl CoreFilesystem for MntrsFs {
+    fn init(&self) -> std::io::Result<()> {
+        self.alloc_ino("", FileType::Directory, 4096);
+        Ok(())
+    }
+
+    fn access(&self, _ino: u64, _mask: u32) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn lookup(&self, parent: u64, name: &str) -> std::io::Result<CoreFileAttr> {
+        if name == "." || name == ".." {
+            let p = if name == "." { parent } else { 1 };
+            return Ok(to_core_attr(&self.make_attr(p, 4096, FileType::Directory, SystemTime::UNIX_EPOCH)));
+        }
+        let parent_path = self.resolve(parent).map(|(p, _, _, _)| p).unwrap_or_default();
+        let full_path = if parent_path.is_empty() { name.to_string() } else { format!("{}/{}", parent_path, name) };
+        let (kind, size, mtime) = self.stat_op(&full_path).ok_or(std::io::ErrorKind::NotFound)?;
+        let ino = self.alloc_ino(&full_path, kind, size);
+        Ok(to_core_attr(&self.make_attr(ino, size, kind, mtime.unwrap_or(SystemTime::UNIX_EPOCH))))
+    }
+
+    fn getattr(&self, ino: u64) -> std::io::Result<CoreFileAttr> {
+        if ino == 1 {
+            return Ok(to_core_attr(&self.make_attr(1, 4096, FileType::Directory, SystemTime::UNIX_EPOCH)));
+        }
+        if let Some((path, kind, size, _)) = self.resolve(ino) {
+            let (_, _, mtime) = self.stat_op(&path).unwrap_or((kind, size, None));
+            Ok(to_core_attr(&self.make_attr(ino, size, kind, mtime.unwrap_or(SystemTime::UNIX_EPOCH))))
+        } else {
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "ino not found"))
+        }
+    }
+
+    fn setattr(&self, ino: u64, _mode: Option<u32>, _uid: Option<u32>, _gid: Option<u32>, size: Option<u64>, _atime: Option<SystemTime>, _mtime: Option<SystemTime>) -> std::io::Result<CoreFileAttr> {
+        if let Some((_p, kind, _, _)) = self.resolve(ino) {
+            if let Some(s) = size { self.alloc_ino(&_p, kind, s); }
+            Ok(to_core_attr(&self.make_attr(ino, size.unwrap_or(0), kind, SystemTime::now())))
+        } else {
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "ino not found"))
+        }
+    }
+
+    fn readdir(&self, ino: u64) -> std::io::Result<Vec<CoreDirEntry>> {
+        if ino != 1 { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not root")); }
+        let path = self.resolve(ino).map(|(p, _, _, _)| p).unwrap_or_default();
+        let mut entries = vec![
+            CoreDirEntry { ino: 1, kind: CoreFileType::Directory, name: ".".to_string() },
+            CoreDirEntry { ino: 1, kind: CoreFileType::Directory, name: "..".to_string() },
+        ];
+        for (name, mode, size, _mtime) in self.list_op(&path) {
+            let kind = match mode { EntryMode::DIR => CoreFileType::Directory, _ => CoreFileType::RegularFile };
+            let cp = if path.is_empty() { name.clone() } else { format!("{}/{}", path, name) };
+            let ino = self.alloc_ino(&cp, match kind { CoreFileType::Directory => FileType::Directory, _ => FileType::RegularFile }, size);
+            entries.push(CoreDirEntry { ino, kind, name });
+        }
+        Ok(entries)
+    }
+
+    fn open(&self, ino: u64, _flags: u32) -> std::io::Result<u64> {
+        let path = self.resolve(ino).map(|(p, _, _, _)| p).unwrap_or_default();
+        self.handles.insert(ino, FileHandleState::Read { path, last_offset: 0, chunk_size: self.read_chunk_size.max(131072) });
+        Ok(ino)
+    }
+
+    fn read(&self, ino: u64, _fh: u64, offset: u64, size: u32) -> std::io::Result<Vec<u8>> {
+        let (path, file_size) = self.resolve(ino).map(|(p, _, s, _)| (p, s)).ok_or(std::io::ErrorKind::NotFound)?;
+        if offset >= file_size { return Ok(vec![]); }
+        let cap = file_size - offset;
+        let fetch_size = self.read_chunk_size.max(size as u64).min(cap);
+        if let Some(entry) = self.mem_cache.get(&ino) {
+            let data = entry.value();
+            let start = offset as usize;
+            let end = (start + size as usize).min(data.len());
+            return if start < data.len() { Ok(data[start..end].to_vec()) } else { Ok(vec![]) };
+        }
+        if !self.direct_io {
+            let cpath = crate::cache_path(&self.cache_dir, &path);
+            if cpath.exists()
+                && let Ok(data) = std::fs::read(&cpath)
+            {
+                let b = bytes::Bytes::from(data);
+                let start = offset as usize;
+                let end = (start + size as usize).min(b.len());
+                let result = if start < b.len() { b[start..end].to_vec() } else { vec![] };
+                self.mem_cache_insert(ino, b);
+                return Ok(result);
+            }
+        }
+        let op = self.op.clone();
+        let p = path.clone();
+        match rt().block_on(async move { op.read_with(&p).range(offset..offset + fetch_size).await }) {
+            Ok(buf) => {
+                let b: bytes::Bytes = buf.to_vec().into();
+                let len = (b.len() as u32).min(size) as usize;
+                let data = b[..len].to_vec();
+                self.mem_cache_insert(ino, b);
+                Ok(data)
+            }
+            Err(_) => Err(std::io::Error::other("read failed")),
+        }
+    }
+
+    fn write(&self, _ino: u64, _fh: u64, _offset: u64, _data: &[u8]) -> std::io::Result<u32> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "write not implemented"))
+    }
+    fn flush(&self, _ino: u64, _fh: u64) -> std::io::Result<()> { Ok(()) }
+    fn release(&self, _ino: u64, fh: u64) -> std::io::Result<()> { self.handles.remove(&fh); Ok(()) }
+
+    fn create(&self, _parent: u64, name: &str, _mode: u32) -> std::io::Result<CoreFileAttr> {
+        let parent_path = self.resolve(_parent).map(|(p, _, _, _)| p).unwrap_or_default();
+        let full_path = if parent_path.is_empty() { name.to_string() } else { format!("{}/{}", parent_path, name) };
+        let op = self.op.clone(); let p = full_path.clone();
+        rt().block_on(async move { op.write(&p, Vec::<u8>::new()).await }).map_err(|_| std::io::Error::other("create failed"))?;
+        let (kind, size, mtime) = self.stat_op(&full_path).unwrap_or((FileType::RegularFile, 0, None));
+        let ino = self.alloc_ino(&full_path, kind, size);
+        Ok(to_core_attr(&self.make_attr(ino, size, kind, mtime.unwrap_or(SystemTime::UNIX_EPOCH))))
+    }
+
+    fn mkdir(&self, _parent: u64, name: &str) -> std::io::Result<CoreFileAttr> {
+        let parent_path = self.resolve(_parent).map(|(p, _, _, _)| p).unwrap_or_default();
+        let full_path = if parent_path.is_empty() { name.to_string() } else { format!("{}/{}", parent_path, name) };
+        let dir_path = format!("{}/", full_path.trim_end_matches('/'));
+        let op = self.op.clone(); let p = dir_path.clone();
+        rt().block_on(async move { op.create_dir(&p).await }).map_err(|_| std::io::Error::other("mkdir failed"))?;
+        let ino = self.alloc_ino(&full_path, FileType::Directory, 4096);
+        Ok(to_core_attr(&self.make_attr(ino, 4096, FileType::Directory, SystemTime::now())))
+    }
+
+    fn unlink(&self, _parent: u64, name: &str) -> std::io::Result<()> {
+        let op = self.op.clone(); let p = name.to_string();
+        rt().block_on(async move { op.delete(&p).await }).map_err(|_| std::io::Error::other("unlink failed"))?;
+        let cpath = crate::cache_path(&self.cache_dir, name);
+        let _ = std::fs::remove_file(&cpath);
+        self.disk_cache_index.remove(name);
+        Ok(())
+    }
+
+    fn rmdir(&self, _parent: u64, name: &str) -> std::io::Result<()> {
+        let dir_path = format!("{}/", name.trim_end_matches('/'));
+        let op = self.op.clone(); let p = dir_path.clone();
+        rt().block_on(async move { op.delete(&p).await }).map_err(|_| std::io::Error::other("rmdir failed"))?;
+        Ok(())
+    }
+
+    fn rename(&self, _parent: u64, name: &str, _newparent: u64, newname: &str) -> std::io::Result<()> {
+        let op = self.op.clone(); let src = name.to_string(); let dst = newname.to_string();
+        rt().block_on(async move { if op.copy(&src, &dst).await.is_ok() { let _ = op.delete(&src).await; } });
+        Ok(())
+    }
+
+    fn statfs(&self, _ino: u64) -> std::io::Result<CoreVolumeStat> {
+        let bs = 4096u32;
+        let total = if self.disk_total_size > 0 { self.disk_total_size / bs as u64 } else { 256 * 1024 * 1024 };
+        Ok(CoreVolumeStat { total_blocks: total, free_blocks: total, avail_blocks: total, total_inodes: 1_000_000_000, free_inodes: 1_000_000_000, block_size: bs, max_name_len: 255 })
+    }
+
+    fn opendir(&self, _ino: u64) -> std::io::Result<u64> { Ok(0) }
+    fn releasedir(&self, _ino: u64, _fh: u64) -> std::io::Result<()> { Ok(()) }
+
+    fn getxattr(&self, ino: u64, name: &str) -> std::io::Result<Vec<u8>> {
+        if let Some((p, _, _, _)) = self.resolve(ino) {
+            let op = self.op.clone(); let p2 = p.clone();
+            match rt().block_on(async move { op.stat(&p2).await }) {
+                Ok(meta) => match name {
+                    "user.etag" | "s3.etag" => meta.etag().map(|e| e.as_bytes().to_vec()).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no etag")),
+                    "user.content-type" | "s3.content-type" => meta.content_type().map(|c| c.as_bytes().to_vec()).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no content-type")),
+                    _ => Err(std::io::Error::new(std::io::ErrorKind::NotFound, "xattr not found")),
+                },
+                Err(_) => Err(std::io::Error::other("stat failed")),
+            }
+        } else { Err(std::io::Error::new(std::io::ErrorKind::NotFound, "ino not found")) }
+    }
+
+    fn listxattr(&self, ino: u64) -> std::io::Result<Vec<Vec<u8>>> {
+        if let Some((_, kind, _, _)) = self.resolve(ino) {
+            if kind == FileType::Directory { return Ok(vec![]); }
+            Ok(vec![b"user.etag".to_vec(), b"user.content-type".to_vec()])
+        } else { Err(std::io::Error::new(std::io::ErrorKind::NotFound, "ino not found")) }
+    }
+
+    fn forget(&self, _ino: u64, _nlookup: u64) {}
+}
+
+fn to_core_attr(a: &FileAttr) -> CoreFileAttr {
+    CoreFileAttr {
+        ino: a.ino.into(), size: a.size, blocks: a.blocks,
+        atime: a.atime, mtime: a.mtime, ctime: a.ctime, crtime: a.crtime,
+        kind: match a.kind { FileType::Directory => CoreFileType::Directory, _ => CoreFileType::RegularFile },
+        perm: a.perm, nlink: a.nlink, uid: a.uid, gid: a.gid,
+        rdev: a.rdev, blksize: a.blksize, flags: a.flags,
     }
 }

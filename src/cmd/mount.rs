@@ -331,7 +331,12 @@ pub fn mount(
     for opt in fuse_options {
         cfg.mount_options.push(MountOption::CUSTOM(opt.clone()));
     }
-    let session = fuser::spawn_mount2(fs, mount_path, &cfg)?;
+    let adapter = crate::core_fs::fuser::FuserAdapter::new(
+        fs,
+        std::time::Duration::from_secs(dir_cache_time),
+        std::time::Duration::from_secs(attr_timeout),
+    );
+    let session = fuser::spawn_mount2(adapter, mount_path, &cfg)?;
 
     record_mount(storage_url, mountpoint, read_only);
 
