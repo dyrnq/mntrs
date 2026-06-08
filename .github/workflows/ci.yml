@@ -25,13 +25,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --workspace
 
       - name: Test
-        run: cargo test
+        run: cargo test --workspace
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -47,13 +47,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --workspace
 
       - name: Test
-        run: cargo test
+        run: cargo test --workspace
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -69,13 +69,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --workspace
 
       - name: Test
-        run: cargo test
+        run: cargo test --workspace
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Format check
         run: cargo fmt --all -- --check
