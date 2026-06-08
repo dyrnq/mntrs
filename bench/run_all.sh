@@ -4,8 +4,8 @@
 set -e
 
 ENDPOINT="${ENDPOINT:-http://localhost:9000}"
-ACCESS_KEY="${ACCESS_KEY:-u5SybesIDVX9b6Pk}"
-SECRET_KEY="${SECRET_KEY:-lOpH1v7kdM6H8NkPu1H2R6gLc9jcsmWM}"
+ACCESS_KEY="${ACCESS_KEY:-${ACCESS_KEY:-minioadmin}}"
+SECRET_KEY="${SECRET_KEY:-${SECRET_KEY:-minioadmin}}"
 BUCKET="${BUCKET:-maven-repo}"
 REGION="${REGION:-us-east-1}"
 MNTRS_BIN="${MNTRS_BIN:-./target/release/mntrs}"
