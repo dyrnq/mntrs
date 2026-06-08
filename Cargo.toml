@@ -28,7 +28,7 @@ winfsp = "0.13"
 widestring = "1"
 
 [workspace]
-members = ["."]
+members = [".", "csi/mntrs-csi"]
 
 [[bin]]
 name = "mntrs"
