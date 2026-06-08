@@ -130,7 +130,7 @@ extern "C" fn cleanup() {
 /// Uses defaults for all the FUSE tuning parameters.
 /// Check if a path is already a mount point by checking /proc/mounts.
 #[cfg(target_os = "linux")]
-fn is_mount_point(path: &str) -> bool {
+pub fn is_mount_point(path: &str) -> bool {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
     let canonical_str = canonical.to_string_lossy();
     if let Ok(content) = std::fs::read_to_string("/proc/mounts") {
