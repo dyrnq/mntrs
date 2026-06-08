@@ -1325,6 +1325,18 @@ impl Filesystem for MntrsFs {
         if rt().block_on(async move { op.delete(&p2).await }).is_err() {
             tracing::debug!(path=%p, "rmdir delete failed");
         }
+        // Clean cache entries
+        let prefix = format!("{:020x}_", crate::path_hash(&full_path));
+        if let Ok(entries) = fs::read_dir(&self.cache_dir) {
+            for e in entries.flatten() {
+                if let Some(name) = e.file_name().to_str()
+                    && name.starts_with(&prefix)
+                {
+                    let _ = fs::remove_file(e.path());
+                }
+            }
+        }
+        self.disk_cache_index.remove(&full_path as &str);
         self.inodes.remove(&path_hash(&full_path));
         self.attr_cache.remove(&full_path);
         reply.ok();
@@ -1367,6 +1379,20 @@ impl Filesystem for MntrsFs {
                 tracing::debug!(path=%src_clone, "rename delete failed");
             }
         });
+        let cpath = cache_path(&self.cache_dir, &src);
+        let _ = fs::remove_file(&cpath);
+        // Clean block-level cache for src
+        let prefix = format!("{:020x}_", crate::path_hash(&src));
+        if let Ok(entries) = fs::read_dir(&self.cache_dir) {
+            for e in entries.flatten() {
+                if let Some(name) = e.file_name().to_str()
+                    && name.starts_with(&prefix)
+                {
+                    let _ = fs::remove_file(e.path());
+                }
+            }
+        }
+        self.disk_cache_index.remove(&src as &str);
         self.inodes.remove(&path_hash(&src));
         self.attr_cache.remove(&src);
         reply.ok();
@@ -1517,6 +1543,17 @@ impl Filesystem for MntrsFs {
         let cpath = cache_path(&self.cache_dir, &full_path);
         if let Err(e) = fs::remove_file(&cpath) {
             tracing::debug!(error=%e, path=?cpath, "unlink cache remove failed");
+        }
+        // Clean block-level cache entries
+        let prefix = format!("{:020x}_", crate::path_hash(&full_path));
+        if let Ok(entries) = fs::read_dir(&self.cache_dir) {
+            for e in entries.flatten() {
+                if let Some(name) = e.file_name().to_str()
+                    && name.starts_with(&prefix)
+                {
+                    let _ = fs::remove_file(e.path());
+                }
+            }
         }
         self.disk_cache_index.remove(&full_path as &str);
         self.inodes.remove(&path_hash(&full_path));
@@ -1873,22 +1910,55 @@ impl CoreFilesystem for MntrsFs {
     }
 
     fn unlink(&self, _parent: u64, name: &str) -> std::io::Result<()> {
+        let parent_path = self
+            .resolve(_parent)
+            .map(|(p, _, _, _)| p)
+            .unwrap_or_default();
+        let full_path = if parent_path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}/{}", parent_path, name)
+        };
         let op = self.op.clone();
-        let p = name.to_string();
+        let p = full_path.clone();
         rt().block_on(async move { op.delete(&p).await })
             .map_err(|_| std::io::Error::other("unlink failed"))?;
-        let cpath = crate::cache_path(&self.cache_dir, name);
+        let cpath = crate::cache_path(&self.cache_dir, &full_path);
         let _ = std::fs::remove_file(&cpath);
-        self.disk_cache_index.remove(name);
+        // Clean block-level cache entries
+        let prefix = format!("{:020x}_", crate::path_hash(&full_path));
+        if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
+            for e in entries.flatten() {
+                if let Some(name) = e.file_name().to_str()
+                    && name.starts_with(&prefix)
+                {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+        self.disk_cache_index.remove(&full_path);
+        self.inodes.remove(&crate::path_hash(&full_path));
+        self.attr_cache.remove(&full_path);
         Ok(())
     }
 
     fn rmdir(&self, _parent: u64, name: &str) -> std::io::Result<()> {
-        let dir_path = format!("{}/", name.trim_end_matches('/'));
+        let parent_path = self
+            .resolve(_parent)
+            .map(|(p, _, _, _)| p)
+            .unwrap_or_default();
+        let full_path = if parent_path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}/{}", parent_path, name)
+        };
+        let dir_path = format!("{}/", full_path.trim_end_matches('/'));
         let op = self.op.clone();
         let p = dir_path.clone();
         rt().block_on(async move { op.delete(&p).await })
             .map_err(|_| std::io::Error::other("rmdir failed"))?;
+        self.inodes.remove(&crate::path_hash(&full_path));
+        self.attr_cache.remove(&full_path);
         Ok(())
     }
 
@@ -1899,14 +1969,33 @@ impl CoreFilesystem for MntrsFs {
         _newparent: u64,
         newname: &str,
     ) -> std::io::Result<()> {
+        let parent_path = self
+            .resolve(_parent)
+            .map(|(p, _, _, _)| p)
+            .unwrap_or_default();
+        let newparent_path = self
+            .resolve(_newparent)
+            .map(|(p, _, _, _)| p)
+            .unwrap_or_default();
+        let src = if parent_path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}/{}", parent_path, name)
+        };
+        let dst = if newparent_path.is_empty() {
+            newname.to_string()
+        } else {
+            format!("{}/{}", newparent_path, newname)
+        };
         let op = self.op.clone();
-        let src = name.to_string();
-        let dst = newname.to_string();
+        let src_clone = src.clone();
         rt().block_on(async move {
-            if op.copy(&src, &dst).await.is_ok() {
-                let _ = op.delete(&src).await;
+            if op.copy(&src_clone, &dst).await.is_ok() {
+                let _ = op.delete(&src_clone).await;
             }
         });
+        self.inodes.remove(&crate::path_hash(&src));
+        self.attr_cache.remove(&src);
         Ok(())
     }
 
@@ -1981,7 +2070,19 @@ impl CoreFilesystem for MntrsFs {
         }
     }
 
-    fn forget(&self, _ino: u64, _nlookup: u64) {}
+    fn forget(&self, _ino: u64, _nlookup: u64) {
+        // FUSE forget: kernel no longer needs this inode.
+        // Clean up our local state to prevent leakage.
+        let ino = _ino;
+        // Don't forget root inode
+        if ino == 1 {
+            return;
+        }
+        if let Some((path, _, _, _)) = self.resolve(ino) {
+            self.inodes.remove(&ino);
+            self.attr_cache.remove(&path);
+        }
+    }
 }
 
 fn to_core_attr(a: &FileAttr) -> CoreFileAttr {
