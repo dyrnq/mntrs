@@ -84,3 +84,4 @@ jobs:
           if [ -s regression.txt ]; then
             echo "::warning::Performance regression detected!"
           fi
+          echo "Benchmark completed (exit code ignored)"
