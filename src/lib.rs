@@ -107,7 +107,15 @@ pub struct MntrsFs {
     pub disk_total_size: u64,
     writeback_queue: Arc<Mutex<VecDeque<(String, PathBuf)>>>,
     mem_cache: dashmap::DashMap<u64, bytes::Bytes>,
-    attr_cache: dashmap::DashMap<String, (FileType, u64, std::time::Instant)>,
+    attr_cache: dashmap::DashMap<
+        String,
+        (
+            FileType,
+            u64,
+            Option<std::time::SystemTime>,
+            std::time::Instant,
+        ),
+    >,
     #[allow(clippy::type_complexity)]
     disk_cache_index: dashmap::DashMap<String, (u64, std::time::SystemTime)>,
     out_of_space: std::sync::atomic::AtomicBool,
@@ -211,12 +219,12 @@ impl MntrsFs {
         ino
     }
 
-    fn stat_op(&self, path: &str) -> Option<(FileType, u64)> {
+    fn stat_op(&self, path: &str) -> Option<(FileType, u64, Option<SystemTime>)> {
         // Check attr cache first
         if let Some(entry) = self.attr_cache.get(path) {
-            let (kind, size, ts) = entry.value();
+            let (kind, size, mtime, ts) = entry.value();
             if ts.elapsed() < self.stat_cache_ttl {
-                return Some((*kind, *size));
+                return Some((*kind, *size, *mtime));
             }
         }
         let result = rt().block_on(async {
@@ -228,7 +236,12 @@ impl MntrsFs {
                         EntryMode::DIR => FileType::Directory,
                         _ => FileType::RegularFile,
                     };
-                    Some((kind, meta.content_length()))
+                    let mtime = if self.use_server_modtime {
+                        meta.last_modified().map(SystemTime::from)
+                    } else {
+                        None
+                    };
+                    Some((kind, meta.content_length(), mtime))
                 }
                 Err(_) => {
                     if self.no_implicit_dir {
@@ -239,31 +252,19 @@ impl MntrsFs {
                     if let Ok(mut l) = op2.lister(&p2).await
                         && l.next().await.is_some()
                     {
-                        return Some((FileType::Directory, 4096));
+                        return Some((FileType::Directory, 4096, None));
                     }
                     None
                 }
             }
         });
-        if let Some((kind, size)) = result {
-            self.attr_cache
-                .insert(path.to_string(), (kind, size, std::time::Instant::now()));
+        if let Some((kind, size, mtime)) = result {
+            self.attr_cache.insert(
+                path.to_string(),
+                (kind, size, mtime, std::time::Instant::now()),
+            );
         }
         result
-    }
-
-    fn stat_mtime(&self, path: &str) -> Option<SystemTime> {
-        if !self.use_server_modtime {
-            return None;
-        }
-        rt().block_on(async {
-            let op = self.op.clone();
-            let p = path.to_string();
-            match op.stat(&p).await {
-                Ok(meta) => meta.last_modified().map(SystemTime::from),
-                Err(_) => None,
-            }
-        })
     }
 
     fn list_op(&self, path: &str) -> Vec<(String, EntryMode)> {
@@ -575,12 +576,12 @@ impl Filesystem for MntrsFs {
         } else {
             format!("{}/{}", parent_path, name2)
         };
-        if let Some((kind, size)) = self.stat_op(&full_path) {
-            reply.entry(
-                &self.attr_ttl,
-                &self.make_attr(self.alloc_ino(&full_path, kind, size), size, kind),
-                Generation(0),
-            );
+        if let Some((kind, size, mtime)) = self.stat_op(&full_path) {
+            let mut attr = self.make_attr(self.alloc_ino(&full_path, kind, size), size, kind);
+            if let Some(mt) = mtime {
+                attr.mtime = mt;
+            }
+            reply.entry(&self.attr_ttl, &attr, Generation(0));
         } else if self.case_insensitive {
             // Fallback: search directory listing for case-insensitive match
             let entries = self.list_op(&parent_path);
@@ -597,12 +598,12 @@ impl Filesystem for MntrsFs {
                     EntryMode::DIR => FileType::Directory,
                     _ => FileType::RegularFile,
                 };
-                let size = self.stat_op(&mp).map(|(_, s)| s).unwrap_or(0);
-                reply.entry(
-                    &self.attr_ttl,
-                    &self.make_attr(self.alloc_ino(&mp, kind, size), size, kind),
-                    Generation(0),
-                );
+                let (_, size, mtime) = self.stat_op(&mp).unwrap_or((kind, 0, None));
+                let mut attr = self.make_attr(self.alloc_ino(&mp, kind, size), size, kind);
+                if let Some(mt) = mtime {
+                    attr.mtime = mt;
+                }
+                reply.entry(&self.attr_ttl, &attr, Generation(0));
             } else {
                 reply.error(Errno::ENOENT);
             }
@@ -620,12 +621,11 @@ impl Filesystem for MntrsFs {
             );
             return;
         }
-        if let Some((path, kind, size)) = self.resolve(ino) {
+        if let Some((path, kind, _)) = self.resolve(ino) {
+            let (_, size, mtime) = self.stat_op(&path).unwrap_or((kind, 0, None));
             let mut attr = self.make_attr(ino, size, kind);
-            if self.use_server_modtime
-                && let Some(mtime) = self.stat_mtime(&path)
-            {
-                attr.mtime = mtime;
+            if let Some(mt) = mtime {
+                attr.mtime = mt;
             }
             reply.attr(&self.attr_ttl, &attr);
         } else {
@@ -692,7 +692,7 @@ impl Filesystem for MntrsFs {
             } else {
                 format!("{}/{}", path, name)
             };
-            let size = self.stat_op(&cp).map(|(_, s)| s).unwrap_or(0);
+            let (_, size, _mtime) = self.stat_op(&cp).unwrap_or((*kind, 0, None));
             if reply.add(
                 INodeNo(self.alloc_ino(&cp, *kind, size)),
                 (i + 1) as u64,
@@ -743,8 +743,12 @@ impl Filesystem for MntrsFs {
             } else {
                 format!("{}/{}", path, name)
             };
-            let ino = self.alloc_ino(&cp, *kind, 0);
-            let attr = self.make_attr(ino, 0, *kind);
+            let (_kind, size, mtime) = self.stat_op(&cp).unwrap_or((*kind, 0, None));
+            let ino = self.alloc_ino(&cp, *kind, size);
+            let mut attr = self.make_attr(ino, size, *kind);
+            if let Some(mt) = mtime {
+                attr.mtime = mt;
+            }
             if reply.add(
                 INodeNo(ino),
                 (i + 1) as u64,
