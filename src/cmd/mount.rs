@@ -258,6 +258,13 @@ fn cache_dir_for_mount(mountpoint: &str) -> String {
     format!("/tmp/mntrs-csi-cache/{}", suffix)
 }
 
+pub fn build_operator_sync(
+    storage_url: &str,
+    opts: &HashMap<String, String>,
+) -> Result<Operator> {
+    rt_block_on(build_operator(storage_url, opts))
+}
+
 pub fn unmount_internal(mountpoint: &str) -> anyhow::Result<()> {
     // Phase 0: note cache dir for cleanup after unmount
     let _cache_dir = cache_dir_for_mount(mountpoint);
