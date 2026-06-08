@@ -594,9 +594,13 @@ fn apply_operator_with_tls(
     opts: &std::collections::HashMap<String, String>,
 ) -> Result<Operator> {
     // Check for curl-compatible TLS flags: --opt cacert=... --opt cert=...
-    let has_tls = opts.contains_key("cacert") || opts.contains_key("cert");
+    let insecure = opts.contains_key("insecure");
+    let has_tls = insecure || opts.contains_key("cacert") || opts.contains_key("cert");
     let op = if has_tls {
         let mut rb = reqwest::Client::builder();
+        if insecure {
+            rb = rb.danger_accept_invalid_certs(true);
+        }
         if let Some(path) = opts.get("cacert") {
             let buf = std::fs::read(path).map_err(|e| anyhow!("read cacert '{}': {}", path, e))?;
             let ca = reqwest::Certificate::from_pem(&buf).map_err(|e| anyhow!("invalid cacert '{}': {}", path, e))?;
