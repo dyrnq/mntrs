@@ -1,0 +1,127 @@
+//! Prefetcher with backpressure — inspired by mountpoint-s3's PartQueue + BackpressureController.
+//!
+//! Each open file handle can have a background downloader that fills a bounded queue.
+//! When the queue is full, the downloader spins (light backpressure).
+//! When the reader needs data, it pops from the queue.
+
+use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+use bytes::Bytes;
+
+/// A chunk of data downloaded from remote.
+#[derive(Clone)]
+pub struct Part {
+    pub offset: u64,
+    pub data: Bytes,
+}
+
+/// Bounded queue with spin-sleep backpressure.
+pub struct PartQueue {
+    parts: VecDeque<Part>,
+    max_bytes: u64,
+    current_bytes: u64,
+    finished: bool,
+    error: Option<String>,
+}
+
+impl PartQueue {
+    pub fn new(max_bytes: u64) -> Self {
+        Self {
+            parts: VecDeque::new(),
+            max_bytes,
+            current_bytes: 0,
+            finished: false,
+            error: None,
+        }
+    }
+
+    pub fn push(&mut self, part: Part) -> Result<(), String> {
+        while self.current_bytes + part.data.len() as u64 > self.max_bytes {
+            if self.finished {
+                return Err("prefetcher finished".to_string());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        self.current_bytes += part.data.len() as u64;
+        self.parts.push_back(part);
+        Ok(())
+    }
+
+    pub fn pop(&mut self, offset: u64) -> Option<Part> {
+        loop {
+            if let Some(front) = self.parts.front() {
+                if front.offset <= offset && offset < front.offset + front.data.len() as u64 {
+                    let part = self.parts.pop_front().unwrap();
+                    self.current_bytes -= part.data.len() as u64;
+                    return Some(part);
+                }
+                if front.offset > offset {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                let _stale = self.parts.pop_front().unwrap();
+                self.current_bytes -= _stale.data.len() as u64;
+                continue;
+            }
+            if self.finished || self.error.is_some() {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    pub fn set_finished(&mut self) { self.finished = true; }
+    pub fn set_error(&mut self, err: String) { self.error = Some(err); }
+}
+
+/// Background downloader that fills a PartQueue.
+pub struct HandlePrefetcher {
+    queue: Arc<Mutex<PartQueue>>,
+}
+
+impl HandlePrefetcher {
+    pub fn new(
+        op: opendal::Operator,
+        path: String,
+        file_size: u64,
+        max_queue_bytes: u64,
+        chunk_size: u64,
+    ) -> Self {
+        let queue = Arc::new(Mutex::new(PartQueue::new(max_queue_bytes)));
+        let q = queue.clone();
+        std::thread::spawn(move || {
+            let mut offset = 0u64;
+            while offset < file_size {
+                let end = (offset + chunk_size).min(file_size);
+                let result = crate::rt().block_on(async {
+                    op.read_with(&path).range(offset..end).await
+                });
+                match result {
+                    Ok(buf) => {
+                        let part = Part { offset, data: Bytes::from(buf.to_vec()) };
+                        let mut qlock = q.lock().unwrap();
+                        if qlock.push(part).is_err() { break; }
+                        offset = end;
+                    }
+                    Err(e) => {
+                        let mut qlock = q.lock().unwrap();
+                        qlock.set_error(format!("prefetch read failed: {e}"));
+                        break;
+                    }
+                }
+            }
+            q.lock().unwrap().set_finished();
+        });
+        Self { queue }
+    }
+
+    pub fn pop(&self, offset: u64) -> Option<Part> {
+        self.queue.lock().unwrap().pop(offset)
+    }
+}
+
+impl std::fmt::Debug for HandlePrefetcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HandlePrefetcher").finish()
+    }
+}

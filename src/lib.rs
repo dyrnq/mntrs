@@ -2,6 +2,7 @@
 pub mod cmd;
 pub mod core_fs;
 pub mod path;
+pub mod prefetcher;
 
 use std::collections::VecDeque;
 use std::ffi::OsStr;
@@ -44,6 +45,7 @@ enum FileHandleState {
         path: String,
         last_offset: u64,
         chunk_size: u64,
+        prefetcher: Option<std::sync::Arc<prefetcher::HandlePrefetcher>>,
     },
     Write {
         path: String,
@@ -141,6 +143,23 @@ fn opendal_timestamp_to_system_time(ts: impl Into<std::time::SystemTime>) -> std
     }
 }
 impl MntrsFs {
+    fn maybe_create_prefetcher(&self, ino: u64, path: &str) -> Option<std::sync::Arc<prefetcher::HandlePrefetcher>> {
+        if self.read_chunk_streams > 1 {
+            let file_size = self.resolve(ino).map(|(_, _, s, _)| s).unwrap_or(0);
+            if file_size > 0 {
+                let chunk = self.read_chunk_size.max(131072);
+                let max_queue = chunk * self.read_chunk_streams as u64;
+                return Some(std::sync::Arc::new(
+                    prefetcher::HandlePrefetcher::new(
+                        self.op.as_ref().clone(), path.to_string(),
+                        file_size, max_queue, chunk,
+                    )
+                ));
+            }
+        }
+        None
+    }
+
     fn make_attr(&self, ino: u64, size: u64, kind: FileType, mtime: SystemTime) -> FileAttr {
         let base_perm = if kind == FileType::Directory {
             self.dir_perms
@@ -869,9 +888,10 @@ impl Filesystem for MntrsFs {
             self.handles.insert(
                 ino,
                 FileHandleState::Read {
-                    path,
+                    path: path.clone(),
                     last_offset: 0,
                     chunk_size: 131072,
+                    prefetcher: self.maybe_create_prefetcher(ino, &path),
                 },
             );
         }
@@ -932,6 +952,22 @@ impl Filesystem for MntrsFs {
                 }
                 self.mem_cache_insert(ino, b);
                 return;
+            }
+        }
+        // 3.5 Try prefetcher (backpressure-aware background download)
+        let fh_val = u64::from(_fh);
+        if let Some(h) = self.handles.get(&fh_val) {
+            if let FileHandleState::Read { prefetcher: Some(p), .. } = &*h.value() {
+                if let Some(part) = p.pop(offset) {
+                    let start = (offset - part.offset) as usize;
+                    let end = (start + size as usize).min(part.data.len());
+                    if start < part.data.len() {
+                        reply.data(&part.data[start..end]);
+                    } else {
+                        reply.data(&[]);
+                    }
+                    return;
+                }
             }
         }
         // 3. Fetch from remote
@@ -1569,6 +1605,7 @@ impl CoreFilesystem for MntrsFs {
                 path,
                 last_offset: 0,
                 chunk_size: self.read_chunk_size.max(131072),
+                prefetcher: None,
             },
         );
         Ok(ino)
