@@ -127,11 +127,14 @@ jobs:
           echo "hello hdfs" | /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt || true
           /opt/hadoop/bin/hdfs dfs -ls /test || true
 
-      - name: Test mntrs HDFS mount
+      - name: Test mntrs HDFS mount (Kerberos)
         run: |
+          # kinit as testuser — needed for Kerberos-secured HDFS
+          kinit -kt /tmp/testuser.keytab testuser@TEST.LOCAL && klist
           mkdir -p /mnt/hdfs
+          export HADOOP_CONF_DIR=/opt/hadoop/etc/hadoop
           ./target/release/mntrs mount "hdfs://$HDFS_NAMENODE_ADDR" /mnt/hdfs \
-            --read-only --daemon --daemon-wait --daemon-timeout=15 2>&1 || echo "::warning::HDFS mount failed (check if mntrs has hdfs feature)"
+            --read-only --daemon --daemon-wait --daemon-timeout=15 2>&1 || echo "::warning::HDFS mount failed"
           sleep 2
           ls -la /mnt/hdfs 2>&1 || echo "::warning::mount not ready"
           if [ -d /mnt/hdfs/test ]; then
