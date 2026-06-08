@@ -2,6 +2,7 @@
 
 #![allow(clippy::all)]
 
+use mntrs::cmd::mount::{mount_internal, unmount_internal};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -208,15 +209,46 @@ impl NodeService {
 impl node_server::Node for NodeService {
     async fn node_stage_volume(
         &self,
-        _request: Request<NodeStageVolumeRequest>,
+        request: Request<NodeStageVolumeRequest>,
     ) -> Result<Response<NodeStageVolumeResponse>, Status> {
+        let req = request.into_inner();
+        let staging_path = req.staging_target_path;
+        let volume_id = req.volume_id;
+        let vol_ctx = req.volume_context;
+
+        // Already mounted? Skip
+        if is_mountpoint(&staging_path) {
+            tracing::info!(volume_id, staging=%staging_path, "stage already mounted");
+            return Ok(Response::new(NodeStageVolumeResponse::default()));
+        }
+
+        let (storage_url, read_only, opts) = parse_volume_context(&vol_ctx, &volume_id)?;
+        let _ = std::fs::create_dir_all(&staging_path);
+
+        tracing::info!(volume_id, storage=%storage_url, staging=%staging_path, "staging FUSE mount");
+        mount_internal(&storage_url, &staging_path, &opts, read_only)
+            .map_err(|e| Status::internal(format!("stage mount failed: {e}")))?;
+
+        // Wait for mount to be ready
+        wait_for_mount(&staging_path, std::time::Duration::from_secs(10))?;
+
         Ok(Response::new(NodeStageVolumeResponse::default()))
     }
 
     async fn node_unstage_volume(
         &self,
-        _request: Request<NodeUnstageVolumeRequest>,
+        request: Request<NodeUnstageVolumeRequest>,
     ) -> Result<Response<NodeUnstageVolumeResponse>, Status> {
+        let req = request.into_inner();
+        let staging_path = req.staging_target_path;
+
+        if is_mountpoint(&staging_path) {
+            tracing::info!(staging=%staging_path, "unstaging FUSE mount");
+            unmount_internal(&staging_path)
+                .map_err(|e| Status::internal(format!("unstage unmount failed: {e}")))?;
+        }
+
+        let _ = std::fs::remove_dir(&staging_path);
         Ok(Response::new(NodeUnstageVolumeResponse::default()))
     }
 
@@ -348,6 +380,60 @@ impl node_server::Node for NodeService {
 // Main
 // ============================================================
 
+
+// ============================================================
+// CSI Helpers
+// ============================================================
+
+/// Check if a path is a mountpoint
+fn is_mountpoint(path: &str) -> bool {
+    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+        mounts.lines().any(|l| l.contains(path))
+    } else {
+        false
+    }
+}
+
+/// Wait for a mountpoint to become available, with timeout
+fn wait_for_mount(path: &str, timeout: std::time::Duration) -> Result<(), Status> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if is_mountpoint(path) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err(Status::deadline_exceeded(format!(
+        "mountpoint {} not ready after {:?}", path, timeout
+    )))
+}
+
+fn parse_volume_context(
+    ctx: &HashMap<String, String>,
+    volume_id: &str,
+) -> Result<(String, bool, HashMap<String, String>), Status> {
+    let storage = ctx.get("storage")
+        .or_else(|| ctx.get("storageUrl"))
+        .or_else(|| ctx.get("storage-url"))
+        .ok_or_else(|| Status::invalid_argument("volume context missing 'storage' key"))?
+        .clone();
+
+    let read_only = ctx.get("readOnly")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    let mut opts = HashMap::new();
+    for (k, v) in ctx {
+        match k.as_str() {
+            "storage" | "storageUrl" | "storage-url" | "readOnly" | "prefix" | "path" => continue,
+            _ => { opts.insert(k.clone(), v.clone()); }
+        }
+    }
+
+    let _ = volume_id; // used for logging, not logic
+    Ok((storage, read_only, opts))
+}
+
 #[derive(Parser)]
 #[command(name = "mntrs-csi", about = "Kubernetes CSI driver for mntrs")]
 struct Cli {
@@ -388,7 +474,8 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use mntrs::cmd::mount::{mount_internal, unmount_internal};
+use std::collections::HashMap;
 
     // ============================================================
     // volume_context 解析
