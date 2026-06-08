@@ -21,6 +21,10 @@ dashmap = "6.2.1"
 bytes = "1.11.1"
 unicode-normalization = "0.1.25"
 
+[target.'cfg(windows)'.dependencies]
+winfsp = "0.13"
+widestring = "1"
+
 [workspace]
 members = ["."]
 

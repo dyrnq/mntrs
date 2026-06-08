@@ -2,16 +2,15 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, main]
   pull_request:
-    branches: [master]
+    branches: [master, main]
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
 
 jobs:
-  # === Linux: unit tests + clippy + fmt ===
+  # Linux: fuser backend
   linux:
     runs-on: ubuntu-latest
     steps:
@@ -19,44 +18,54 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build
-        run: cargo build --release
-
-      - name: Test
-        run: cargo test
-
+      - name: Install FUSE
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3
+      - name: Check
+        run: cargo check --workspace
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Format check
-        run: cargo fmt --all -- --check
+        run: cargo fmt --check
+      - name: Test
+        run: cargo test --workspace
 
-  # === macOS: compile check only (no macFUSE in CI) ===
+  # macOS: fuser backend (macFUSE)
   macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+        with:
+          components: clippy, rustfmt
+      - name: Install macFUSE
+        run: |
+          brew install --cask macfuse
+      - name: Check
+        run: cargo check --workspace
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test (unit only, no FUSE tests)
+        run: cargo test --workspace --lib
 
-      - name: Build check
-        run: cargo check
-
-      - name: Test
-        run: cargo test
-
-  # === Windows: compile check only (no WinFSP in CI) ===
+  # Windows: winfsp backend
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build check
-        run: cargo check
-
-      - name: Test
-        run: cargo test
+        with:
+          components: clippy
+      - name: Install WinFSP
+        run: |
+          # WinFSP installer — download and install silently
+          $url = "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.24065.msi"
+          $out = "$env:TEMP\winfsp.msi"
+          Invoke-WebRequest -Uri $url -OutFile $out
+          Start-Process msiexec.exe -Wait -ArgumentList "/i $out /quiet"
+      - name: Add winfsp dependency (Windows)
+        # winfsp crate is already in Cargo.toml behind [target.'cfg(windows)'.dependencies]
+        run: cargo check --workspace
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test (unit only, no WinFSP integration)
+        run: cargo test --workspace --lib
