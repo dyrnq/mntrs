@@ -25,6 +25,20 @@ use fuser::{
     ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
     Request, TimeOrNow, WriteFlags,
 };
+
+
+#[cfg(not(unix))]
+/// Stub type for non-Unix platforms — mirrors fuser::FileType variants used in shared state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileType {
+    Directory,
+    RegularFile,
+    Symlink,
+    NamedPipe,
+    BlockDevice,
+    CharDevice,
+    Socket,
+}
 use futures::StreamExt;
 use opendal::{EntryMode, Operator};
 
@@ -503,7 +517,8 @@ impl MntrsFs {
         }
         // Check free disk space if configured
         let need_free = if self.cache_min_free_space > 0 {
-            if let Ok(fs_stat) = rustix::fs::statvfs(&self.cache_dir) {
+            #[cfg(unix)]
+        if let Ok(fs_stat) = rustix::fs::statvfs(&self.cache_dir) {
                 let free = fs_stat.f_bavail.saturating_mul(fs_stat.f_frsize);
                 if free < self.cache_min_free_space {
                     Some(self.cache_min_free_space - free)
@@ -1643,6 +1658,35 @@ use crate::core_fs::{CoreDirEntry, CoreFileAttr, CoreFileType, CoreFilesystem, C
 impl CoreFilesystem for MntrsFs {
     fn init(&self) -> std::io::Result<()> {
         self.alloc_ino("", FileType::Directory, 4096);
+        // Recover writeback queue from dirty sidecars
+        if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().is_some_and(|ext| ext == "dirty") {
+                    let cache_path = p.with_extension("");
+                    if let Ok(remote) = std::fs::read_to_string(&p) {
+                        let remote = remote.trim().to_string();
+                        if !remote.is_empty() && cache_path.exists() {
+                            self.writeback_queue.lock().unwrap().push_back((
+                                0,
+                                remote,
+                                cache_path.clone(),
+                            ));
+                        }
+                    }
+                    if let Err(e) = std::fs::remove_file(&p) {
+                        tracing::warn!(error=%e, path=?p, "dirty recovery remove failed");
+                    }
+                }
+            }
+        }
+        // Spawn writeback worker thread
+        let op = self.op.clone();
+        let queue = self.writeback_queue.clone();
+        let delay = self.write_back_delay;
+        let max_age = self.cache_max_age;
+        let inodes = Arc::new(self.inodes.clone());
+        std::thread::spawn(move || crate::writeback::worker(op, inodes, queue, delay, max_age));
         Ok(())
     }
 
@@ -2000,6 +2044,15 @@ impl CoreFilesystem for MntrsFs {
             self.stat_op(&full_path)
                 .unwrap_or((FileType::RegularFile, 0, None));
         let ino = self.alloc_ino(&full_path, kind, size);
+        // Insert Write handle so follow-up write() can find the path
+        self.handles.insert(
+            ino,
+            FileHandleState::Write {
+                path: full_path,
+                dirty: false,
+                dirty_since: None,
+            },
+        );
         Ok(to_core_attr(&self.make_attr(
             ino,
             size,
