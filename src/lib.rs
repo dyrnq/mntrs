@@ -1779,15 +1779,32 @@ impl CoreFilesystem for MntrsFs {
 
     fn open(&self, ino: u64, _flags: u32) -> std::io::Result<u64> {
         let path = self.resolve(ino).map(|(p, _, _, _)| p).unwrap_or_default();
-        self.handles.insert(
-            ino,
-            FileHandleState::Read {
-                path,
-                last_offset: 0,
-                chunk_size: self.read_chunk_size.max(131072),
-                prefetcher: None,
-            },
-        );
+        // Check if flags contain write access (O_WRONLY=1, O_RDWR=2)
+        let is_write = if cfg!(unix) {
+            (_flags & 0x3) != 0
+        } else {
+            false
+        };
+        if is_write {
+            self.handles.insert(
+                ino,
+                FileHandleState::Write {
+                    path,
+                    dirty: false,
+                    dirty_since: None,
+                },
+            );
+        } else {
+            self.handles.insert(
+                ino,
+                FileHandleState::Read {
+                    path,
+                    last_offset: 0,
+                    chunk_size: self.read_chunk_size.max(131072),
+                    prefetcher: None,
+                },
+            );
+        }
         Ok(ino)
     }
 
@@ -1846,12 +1863,118 @@ impl CoreFilesystem for MntrsFs {
     }
 
     fn write(&self, _ino: u64, _fh: u64, _offset: u64, _data: &[u8]) -> std::io::Result<u32> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "write not implemented",
-        ))
+        let fh_val = _fh;
+        let path = self
+            .handles
+            .get(&fh_val)
+            .map(|r| r.value().path().to_string())
+            .ok_or(std::io::ErrorKind::NotFound)?;
+
+        if self.direct_io {
+            let op = self.op.clone();
+            let p = path.clone();
+            let d = _data.to_vec();
+            rt().block_on(async move { op.write(&p, d).await })
+                .map_err(|_| std::io::Error::other("write failed"))?;
+            return Ok(_data.len() as u32);
+        }
+
+        // Check out_of_space backpressure
+        if self.out_of_space.load(std::sync::atomic::Ordering::Relaxed) {
+            self.evict_lru();
+            if self.out_of_space.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "out of space",
+                ));
+            }
+        }
+
+        let block_idx = _offset / CACHE_BLOCK_SIZE;
+        let cpath = crate::cache_block_path(&self.cache_dir, &path, block_idx);
+        if let Some(parent) = cpath.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let written = _data.len() as u32;
+        let result = (|| -> std::io::Result<()> {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .read(true)
+                .open(&cpath)?;
+            self.disk_cache_index.insert(
+                path.clone(),
+                (_data.len() as u64, std::time::SystemTime::now()),
+            );
+            let end = _offset + _data.len() as u64;
+            let current_len = file.metadata()?.len();
+            if end > current_len {
+                file.set_len(end)?;
+            }
+            let mut f = file;
+            f.seek(std::io::SeekFrom::Start(_offset))?;
+            f.write_all(_data)?;
+            f.flush()?;
+            Ok(())
+        })();
+
+        self.evict_lru();
+        result?;
+
+        self.handles.insert(
+            fh_val,
+            crate::FileHandleState::Write {
+                path: path.clone(),
+                dirty: true,
+                dirty_since: Some(std::time::Instant::now()),
+            },
+        );
+        Ok(written)
     }
     fn flush(&self, _ino: u64, _fh: u64) -> std::io::Result<()> {
+        // Look up the handle to find the path and dirty state
+        let fh_val = _fh;
+        let (path, dirty) = {
+            let entry = self.handles.get(&fh_val).map(|r| r.clone());
+            if let Some(crate::FileHandleState::Write {
+                path: p, dirty: d, ..
+            }) = entry
+            {
+                (p, d)
+            } else {
+                return Ok(());
+            }
+        };
+        if dirty {
+            let block_idx = 0;
+            let cpath = crate::cache_block_path(&self.cache_dir, &path, block_idx);
+            if cpath.exists() {
+                // Write sidecar for crash recovery
+                let sidecar = cpath.with_extension("dirty");
+                if let Err(e) = std::fs::write(&sidecar, path.as_bytes()) {
+                    tracing::warn!(error=%e, path=?sidecar, "sidecar write failed");
+                }
+                self.writeback_queue
+                    .lock()
+                    .unwrap()
+                    .push_back((_ino, path.clone(), cpath));
+            }
+            // Wait for writeback to complete
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            loop {
+                let pending = self.writeback_queue.lock().unwrap().len();
+                if pending == 0 {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!("fsync timeout waiting for writeback");
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
         Ok(())
     }
     fn release(&self, _ino: u64, fh: u64) -> std::io::Result<()> {
