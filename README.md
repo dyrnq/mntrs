@@ -1,6 +1,6 @@
 # mntrs
 
-> Mount remote storage (S3, GCS, HDFS, Azure Blob, etc.) to local directory via FUSE.
+> Mount remote storage (S3, GCS, HDFS, Azure Blob, etc.) via FUSE.
 >
 > Linux / macOS / Windows (WinFSP) / Kubernetes (CSI)
 
@@ -15,11 +15,10 @@ mntrs mount s3://my-bucket /mnt/s3 \
   --opt access-key=AKIA... \
   --opt secret-key=...
 
-# MinIO (自签名CA)
+# MinIO (self-signed CA)
 mntrs mount s3://bucket /mnt/s3 \
   --opt endpoint=https://minio.local:9000 \
-  --opt cacert=/etc/ca.crt \
-  --opt insecure
+  --opt cacert=/etc/ca.crt
 
 # HDFS
 mntrs mount hdfs://namenode:8020 /mnt/hdfs
@@ -27,7 +26,7 @@ mntrs mount hdfs://namenode:8020 /mnt/hdfs
 # GCS
 mntrs mount gs://my-bucket /mnt/gcs
 
-# 卸载
+# Unmount
 mntrs unmount /mnt/s3
 ```
 
@@ -35,15 +34,11 @@ mntrs unmount /mnt/s3
 
 ## Installation
 
-### From source
-
 ```bash
+# From source
 cargo install --path .
-```
 
-### Docker
-
-```bash
+# Docker
 docker build -f csi/Dockerfile -t mntrs .
 ```
 
@@ -74,25 +69,25 @@ docker build -f csi/Dockerfile -t mntrs .
 
 ### Storage Options
 
-所有 `--opt key=value` 透传给后端。常用参数：
+All `--opt key=value` pairs are passed through to the backend.
 
-| Key | 说明 | 示例 |
-|-----|------|------|
-| `endpoint` | 服务端点 | `https://s3.custom.com` |
-| `access-key` | 访问密钥 | `AKIA...` |
-| `secret-key` | 秘密密钥 | `...` |
-| `region` | 区域 | `us-east-1` |
+| Key | Description | Example |
+|-----|-------------|---------|
+| `endpoint` | Service endpoint | `https://s3.custom.com` |
+| `access-key` | Access key | `AKIA...` |
+| `secret-key` | Secret key | `...` |
+| `region` | Region | `us-east-1` |
 
-### TLS / SSL (curl 兼容)
+### TLS / SSL (curl compatible)
 
-| Opt | 对应 curl | 说明 |
-|-----|-----------|------|
-| `cacert=<path>` | `--cacert` | CA 证书（自签名） |
-| `cert=<path>` | `--cert` | 客户端证书（mTLS） |
-| `key=<path>` | `--key` | 客户端私钥 |
-| `pass=<phrase>` | `--pass` | 私钥密码 |
-| `cert-type=<type>` | `--cert-type` | 证书类型: PEM/DER/P12 |
-| `insecure` | `-k` | 跳过证书验证 |
+| Opt | curl equivalent | Description |
+|-----|-----------------|-------------|
+| `cacert=<path>` | `--cacert` | CA certificate (self-signed) |
+| `cert=<path>` | `--cert` | Client certificate (mTLS) |
+| `key=<path>` | `--key` | Client private key |
+| `pass=<phrase>` | `--pass` | Private key password |
+| `cert-type=<type>` | `--cert-type` | Cert type: PEM/DER/P12 |
+| `insecure` | `-k` | Skip certificate verification |
 
 ```bash
 # mTLS
@@ -110,7 +105,7 @@ mntrs mount s3://bucket /mnt/s3 \
   --opt cert-type=P12 \
   --opt pass=secret
 
-# 跳过验证（内网）
+# Skip verification (internal network)
 mntrs mount s3://bucket /mnt/s3 \
   --opt endpoint=https://minio.local:9000 \
   --opt insecure
@@ -119,15 +114,15 @@ mntrs mount s3://bucket /mnt/s3 \
 ### HDFS Kerberos
 
 ```bash
-# native Kerberos
+# Native Kerberos
 mntrs mount hdfs://namenode:8020 /mnt/hdfs \
   --opt dfs.namenode.kerberos.principal=hdfs/_HOST@REALM \
   --opt dfs.namenode.kerberos.keytab=/etc/krb5.keytab
 
-# HA 集群
+# HA cluster
 mntrs mount hdfs://namenode1:8020,namenode2:8020 /mnt/hdfs
 
-# JNI (需 --features hdfs-jni)
+# JNI (requires --features hdfs-jni)
 mntrs mount hdfs-jni://namenode:8020 /mnt/hdfs \
   --opt kerberos-ticket-cache-path=/tmp/krb5cc \
   --opt user=hdfs
@@ -135,43 +130,43 @@ mntrs mount hdfs-jni://namenode:8020 /mnt/hdfs \
 
 ### Caching
 
-| Flag | Default | 说明 |
-|------|---------|------|
-| `--vfs-cache-max-size` | 1024 MB | 磁盘缓存上限 |
-| `--mem-limit` | 256 MB | 内存缓存上限 |
-| `--dir-cache-time` | 10s | 目录缓存 TTL |
-| `--attr-timeout` | 1s | 属性缓存 TTL |
-| `--stat-cache-ttl` | 1s | stat 缓存 TTL |
-| `--poll-interval` | 60s | 远程轮询间隔 |
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--vfs-cache-max-size` | 1024 MB | Disk cache upper limit |
+| `--mem-limit` | 256 MB | Memory cache upper limit |
+| `--dir-cache-time` | 10s | Directory cache TTL |
+| `--attr-timeout` | 1s | Attribute cache TTL |
+| `--stat-cache-ttl` | 1s | Stat cache TTL |
+| `--poll-interval` | 60s | Remote poll interval |
 | `--vfs-cache-mode` | writes | off/writes/full |
-| `--no-modtime` | false | 不读写修改时间 |
-| `--use-server-modtime` | false | 用服务端 mtime |
-| `--vfs-cache-min-free-space` | 100 MB | 缓存最小剩余空间 |
-| `--vfs-cache-max-age` | 3600s | 缓存文件最大年龄 |
+| `--no-modtime` | false | Disable mtime read/write |
+| `--use-server-modtime` | false | Use server-side mtime |
+| `--vfs-cache-min-free-space` | 100 MB | Min free space before eviction |
+| `--vfs-cache-max-age` | 3600s | Max cache file age |
 
-缓存分 3 级: **mem → disk → remote**。8MB 块级索引，重启后缓存自动恢复。
+Three cache levels: **mem → disk → remote**. 8MB block-level indexing. Cache survives restarts.
 
 ### Performance
 
-| Flag | Default | 说明 |
-|------|---------|------|
-| `--vfs-read-chunk-size` | 0 (auto) | 读块大小 |
-| `--vfs-read-ahead` | 131072 | 预读字节数 |
-| `--vfs-read-chunk-streams` | 1 | 并发读流数 |
-| `--async-read` | false | 异步读 |
-| `--vfs-fast-fingerprint` | false | 快速指纹 (size+mtime) |
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--vfs-read-chunk-size` | 0 (auto) | Read chunk size |
+| `--vfs-read-ahead` | 131072 | Read-ahead bytes |
+| `--vfs-read-chunk-streams` | 1 | Concurrent read streams |
+| `--async-read` | false | Async reads |
+| `--vfs-fast-fingerprint` | false | Fast fingerprint (size+mtime) |
 
-Prefetcher 后台预取 + 自适应翻倍（顺序读翻倍至 8MB）+ backpressure。
+Background prefetcher with adaptive doubling (up to 8MB on sequential reads) + backpressure.
 
 ### Write
 
-写时缓存到本地，异步写回远程（5s 延迟）。支持：
+Local write cache with async write-back (5s delay). Supports:
 
-- 指数退避重试（3 次）
-- Crash recovery（`.dirty` sidecar）
-- PendingUploadHook（上传后更新 inode）
-- fsync 语义（flush 等待队列清空）
-- Multipart upload（OpenDAL Writer 自动分片 >5GB）
+- Exponential backoff retry (3 attempts)
+- Crash recovery (`.dirty` sidecar)
+- PendingUploadHook (updates inode after upload)
+- fsync semantics (flush waits for queue drain)
+- Multipart upload (OpenDAL Writer auto-chunks >5GB)
 
 ### Daemon
 
@@ -188,15 +183,13 @@ mntrs install systemd
 
 ### Kubernetes CSI
 
-`csi/mntrs-csi/` — 纯 Rust CSI driver，支持 Identity / Controller / Node 服务。
+`csi/mntrs-csi/` — Pure Rust CSI driver with Identity / Controller / Node services.
 
 ```bash
-# 部署 (见 csi/deploy/kubernetes/1.20/)
 kubectl apply -f csi/deploy/kubernetes/1.20/
 ```
 
 ```yaml
-# PV 示例
 apiVersion: v1
 kind: PersistentVolume
 spec:
@@ -211,12 +204,12 @@ spec:
 
 ### Windows (WinFSP)
 
-`#[cfg(windows)]` 条件编译。需安装 WinFSP 2.1+。
+`#[cfg(windows)]` conditional compilation. Requires WinFSP 2.1+.
 
 ```bash
-mntrs mount s3://bucket X:     # 指定盘符
-mntrs mount s3://bucket *       # 自动分配
-mntrs mount s3://bucket C:\mnt\s3  # NTFS 目录
+mntrs mount s3://bucket X:           # Drive letter
+mntrs mount s3://bucket *            # Auto-assign
+mntrs mount s3://bucket C:\mnt\s3    # NTFS directory
 ```
 
 ---
@@ -227,22 +220,23 @@ mntrs mount s3://bucket C:\mnt\s3  # NTFS 目录
 src/
   lib.rs              MntrsFs core + fuser impl + CoreFilesystem impl
   main.rs             CLI entry
-  path.rs             路径归一化
-  prefetcher.rs       后台预取 + PartQueue backpressure
-  writeback.rs        异步写回 + PendingUploadHook
-  cmd/mount.rs        多后端路由 + TLS
-  cmd/unmount.rs      卸载
+  path.rs             Path normalization
+  prefetcher.rs       Background prefetcher + PartQueue backpressure
+  writeback.rs        Async write-back + PendingUploadHook
+  cmd/mount.rs        Multi-backend routing + TLS
+  cmd/unmount.rs      Unmount
   core_fs/
     mod.rs            CoreFilesystem trait
     fuser.rs          Linux/macOS FUSE adapter
     winfsp.rs         Windows WinFSP adapter (cfg windows)
 
-tests/                46 tests
-  cache_test.rs       9 (纯函数)
-  vfs_test.rs         11 (statfs/read/cache)
-  hdfs_integration    5 (HDFS路由/Kerberos/HA)
-  csi_integration     10 (CSI gRPC)
-  winfsp_integration  11 (WinFSP mount)
+tests/                71+ tests (Linux)
+  cache_test          9 (pure functions)
+  vfs_test            22 (statfs/read/cache)
+  hdfs_integration    9 (HDFS routing/Kerberos/HA)
+  csi_integration     14 (CSI gRPC)
+  platform            7 (Linux/macOS/Windows)
+  winfsp_integration  15 (WinFSP mount, cfg windows)
 ```
 
 ---
@@ -261,13 +255,13 @@ cargo build --features hdfs-jni
 cargo build --package mntrs-csi
 ```
 
-CI 矩阵 (GitHub Actions):
+### CI Matrix (GitHub Actions)
 
-| Workflow | 环境 | 内容 |
-|----------|------|------|
+| Workflow | Environment | Scope |
+|----------|-------------|-------|
 | ci-core | Linux | FUSE + CSI build + test + clippy + fmt |
 | ci-hdfs | Linux | Java + libhdfs3 + --features hdfs-jni |
-| ci-windows | Windows | WinFSP + release build + integration test |
+| ci-windows | Windows | WinFSP + release build + integration |
 | bench | Linux | vs rclone benchmark |
 | integration | Linux | KDC + miniDFS + csi-sanity |
 
