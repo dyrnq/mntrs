@@ -23,7 +23,7 @@ jobs:
 
       - name: Install WinFSP
         shell: pwsh
-        run: choco install -y winfsp
+        run: choco install -y winfsp protoc
 
       - name: BuildBuild (release)
         run: cargo check -p mntrs-csi
