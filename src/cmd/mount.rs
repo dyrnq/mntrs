@@ -186,75 +186,75 @@ pub fn mount_internal(
         mountpoint,
         opts,
         read_only,
-        false,            // network_mode
-        10,               // dir_cache_time
-        1,                // attr_timeout
-        10,               // type_cache_ttl
-        1,                // stat_cache_ttl
-        true,             // allow_other (CSI: Pods access as non-root)
-        false,            // debug_fuse
-        "mntrs-csi",      // volname
-        None,             // devname
-        false,            // write_back_cache
-        &[],              // fuse_options
-        &[],              // fuse_flags
-        true,             // daemon
-        false,            // daemon_wait
-        10,               // daemon_timeout
-        false,            // allow_root
-        false,            // allow_idmap
-        1024,             // vfs_cache_max_size
-        256,              // mem_limit
-        5,                // vfs_write_back
-        "writes",         // vfs_cache_mode
-        131072,           // vfs_read_ahead
-        0,                // vfs_read_chunk_size
-        false,            // default_permissions
-        None,             // uid
-        None,             // gid
-        None,             // umask
-        None,             // dir_perms
-        None,             // file_perms
-        None,             // link_perms
-        false,            // allow_non_empty
+        false,                    // network_mode
+        10,                       // dir_cache_time
+        1,                        // attr_timeout
+        10,                       // type_cache_ttl
+        1,                        // stat_cache_ttl
+        true,                     // allow_other (CSI: Pods access as non-root)
+        false,                    // debug_fuse
+        "mntrs-csi",              // volname
+        None,                     // devname
+        false,                    // write_back_cache
+        &[],                      // fuse_options
+        &[],                      // fuse_flags
+        true,                     // daemon
+        false,                    // daemon_wait
+        10,                       // daemon_timeout
+        false,                    // allow_root
+        false,                    // allow_idmap
+        1024,                     // vfs_cache_max_size
+        256,                      // mem_limit
+        5,                        // vfs_write_back
+        "writes",                 // vfs_cache_mode
+        131072,                   // vfs_read_ahead
+        0,                        // vfs_read_chunk_size
+        false,                    // default_permissions
+        None,                     // uid
+        None,                     // gid
+        None,                     // umask
+        None,                     // dir_perms
+        None,                     // file_perms
+        None,                     // link_perms
+        false,                    // allow_non_empty
         Some(cache_dir.as_str()), // cache_dir (CSI isolated)
-        false,            // direct_io
-        60,               // poll_interval
-        3600,             // vfs_cache_max_age
-        100,              // vfs_cache_min_free_space
-        vec![],           // exclude
-        vec![],           // include
-        None,             // max_size
-        None,             // min_size
-        None,             // max_depth
-        false,            // ignore_case
-        false,            // no_modtime
-        false,            // use_server_modtime
-        false,            // no_checksum
-        false,            // no_seek
-        false,            // links
-        false,            // noapple_double
-        false,            // noapple_xattr,
-        None,             // hash_filter
-        false,            // mount_case_insensitive
-        131072,           // max_read_ahead
-        0,                // vfs_read_chunk_size_limit
-        1,                // vfs_read_chunk_streams
-        false,            // vfs_fast_fingerprint
-        false,            // async_read
-        false,            // vfs_refresh
-        false,            // vfs_case_insensitive
-        false,            // no_implicit_dir
-        false,            // vfs_block_norm_dupes
-        false,            // vfs_links
-        false,            // vfs_used_is_size
-        None,             // vfs_metadata_extension
-        None,             // storage_class
-        5,                // vfs_write_wait
-        5,                // vfs_read_wait
-        60,               // vfs_cache_poll_interval
-        0,                // vfs_handle_caching
-        1024,             // vfs_disk_space_total_size
+        false,                    // direct_io
+        60,                       // poll_interval
+        3600,                     // vfs_cache_max_age
+        100,                      // vfs_cache_min_free_space
+        vec![],                   // exclude
+        vec![],                   // include
+        None,                     // max_size
+        None,                     // min_size
+        None,                     // max_depth
+        false,                    // ignore_case
+        false,                    // no_modtime
+        false,                    // use_server_modtime
+        false,                    // no_checksum
+        false,                    // no_seek
+        false,                    // links
+        false,                    // noapple_double
+        false,                    // noapple_xattr,
+        None,                     // hash_filter
+        false,                    // mount_case_insensitive
+        131072,                   // max_read_ahead
+        0,                        // vfs_read_chunk_size_limit
+        1,                        // vfs_read_chunk_streams
+        false,                    // vfs_fast_fingerprint
+        false,                    // async_read
+        false,                    // vfs_refresh
+        false,                    // vfs_case_insensitive
+        false,                    // no_implicit_dir
+        false,                    // vfs_block_norm_dupes
+        false,                    // vfs_links
+        false,                    // vfs_used_is_size
+        None,                     // vfs_metadata_extension
+        None,                     // storage_class
+        5,                        // vfs_write_wait
+        5,                        // vfs_read_wait
+        60,                       // vfs_cache_poll_interval
+        0,                        // vfs_handle_caching
+        1024,                     // vfs_disk_space_total_size
     )
 }
 
@@ -505,7 +505,9 @@ pub fn mount(
     let mut cfg: fuser::Config = Default::default();
     if debug_fuse {
         #[cfg(target_os = "linux")]
-        unsafe { std::env::set_var("FUSE_DEBUG", "1"); }
+        unsafe {
+            std::env::set_var("FUSE_DEBUG", "1");
+        }
     }
     // Check /etc/fuse.conf for user_allow_other when --allow-other is used
     #[cfg(target_os = "linux")]

@@ -342,7 +342,8 @@ fn main() -> anyhow::Result<()> {
             vfs_cache_poll_interval,
             vfs_handle_caching,
             vfs_disk_space_total_size,
-        .. } => {
+            ..
+        } => {
             let opts: HashMap<String, String> = opt
                 .iter()
                 .filter_map(|kv| kv.split_once('='))
