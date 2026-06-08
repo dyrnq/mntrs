@@ -10,6 +10,39 @@ on:
     - cron: '0 2 * * 1'  # every Monday 02:00 UTC
 
 jobs:
+
+  fuse-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      minio:
+        image: minio/minio:latest
+        command: server /data
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        ports:
+          - 9000:9000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install FUSE
+        run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev
+
+      - name: Build mntrs
+        run: cargo build
+
+      - name: Create MinIO test bucket
+        run: |
+          curl -sf -X PUT http://localhost:9000/test-bucket 2>/dev/null || echo "bucket may exist"
+          echo "test" > /tmp/hello.txt
+          pip3 install awscli 2>/dev/null || true
+
+      - name: Run FUSE integration tests
+        run: cargo test --test fuse_integration_test -- --test-threads=1 --nocapture
+
   bench:
     runs-on: ubuntu-latest
     timeout-minutes: 10
