@@ -518,7 +518,6 @@ pub fn mount(
     for opt in fuse_options {
         cfg.mount_options.push(MountOption::CUSTOM(opt.clone()));
     }
-    record_mount(storage_url, mountpoint, read_only);
 
     #[cfg(not(windows))]
     {
@@ -529,6 +528,7 @@ pub fn mount(
             std::time::Duration::from_secs(attr_timeout),
         );
         let session = fuser::spawn_mount2(adapter, mount_path, &cfg)?;
+        record_mount(storage_url, mountpoint, read_only);
         if daemon_wait {
             unblock_parent();
         }
