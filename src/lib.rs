@@ -245,6 +245,31 @@ pub fn cache_path(cache_dir: &Path, path: &str) -> PathBuf {
     cache_dir.join(format!("{:020x}", path_hash(path)))
 }
 
+/// Cache file path for a specific block. Encodes block_idx for restart recovery.
+pub fn cache_block_path(cache_dir: &Path, path: &str, block_idx: u64) -> PathBuf {
+    cache_dir.join(format!("{:020x}_{:010x}.block", path_hash(path), block_idx))
+}
+
+/// Scan cache dir for block files and rebuild disk_cache_index.
+/// Loaded at startup so cache is warm across restarts.
+pub fn load_cache_index(cache_dir: &Path) -> Vec<(String, u64, u64, std::time::SystemTime)> {
+    let mut entries = Vec::new();
+    let Ok(dir) = std::fs::read_dir(cache_dir) else { return entries; };
+    for entry in dir.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Parse "hash_blockidx.block" format
+        if let Some(rest) = name.strip_suffix(".block")
+            && let Some(block_str) = rest.split('_').nth(1)
+            && let Ok(block_idx) = u64::from_str_radix(block_str, 16)
+            && let Ok(meta) = entry.metadata()
+            && let Ok(mtime) = meta.modified()
+        {
+            entries.push((name, block_idx, meta.len(), mtime));
+        }
+    }
+    entries
+}
+
 impl MntrsFs {
     fn resolve(&self, ino: u64) -> Option<(String, FileType, u64, Option<std::time::SystemTime>)> {
         self.inodes.get(&ino).map(|r| r.clone())
@@ -502,6 +527,12 @@ impl Filesystem for MntrsFs {
         }
         // Enable readdirplus for stat+readdir in one round-trip
         let _ = config.add_capabilities(fuser::InitFlags::FUSE_DO_READDIRPLUS);
+        // Recover disk cache index for restart warm cache
+        let cached_blocks = load_cache_index(&self.cache_dir);
+        if !cached_blocks.is_empty() {
+            tracing::info!(count = cached_blocks.len(), "disk cache blocks recovered for restart");
+        }
+
         // Recover writeback queue from dirty sidecars
         if let Ok(entries) = fs::read_dir(&self.cache_dir) {
             for e in entries.flatten() {
@@ -879,9 +910,9 @@ impl Filesystem for MntrsFs {
             }
             return;
         }
-        // 2. Check disk cache (with checksum validation)
+        // 2. Check disk cache (with checksum validation, block-level)
         if !self.direct_io {
-            let cpath = cache_path(&self.cache_dir, &path);
+            let cpath = cache_block_path(&self.cache_dir, &path, block_idx);
             if cpath.exists()
                 && let Ok(data) = fs::read(&cpath)
             {
@@ -914,7 +945,7 @@ impl Filesystem for MntrsFs {
         // 3.5 Try prefetcher (backpressure-aware background download)
         let fh_val = u64::from(_fh);
         if let Some(h) = self.handles.get(&fh_val)
-            && let FileHandleState::Read { prefetcher: Some(p), .. } = h.value()
+            && let FileHandleState::Read { prefetcher: Some(p), .. } = &*h.value()
             && let Some(part) = p.pop(offset) {
                 let start = (offset - part.offset) as usize;
                 let end = (start + size as usize).min(part.data.len());
@@ -1600,7 +1631,7 @@ impl CoreFilesystem for MntrsFs {
             };
         }
         if !self.direct_io {
-            let cpath = crate::cache_path(&self.cache_dir, &path);
+            let cpath = crate::cache_block_path(&self.cache_dir, &path, block_idx);
             if cpath.exists()
                 && let Ok(data) = std::fs::read(&cpath)
             {
