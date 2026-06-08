@@ -196,3 +196,68 @@ fn test_csi_cache_dir_isolation() {
 
     assert_ne!(cache1, cache2, "different mountpoints must have different cache dirs");
 }
+
+
+// ============================================================
+// mount_internal 高级参数测试
+// ============================================================
+
+/// mount_internal with allow_other flag
+#[test]
+fn test_csi_mount_with_allow_other() {
+    let tmp = std::env::temp_dir().join(format!("csi-mount-ao-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let opts = std::collections::HashMap::from([
+        ("allow_other".to_string(), "true".to_string()),
+    ]);
+    let result = mntrs::cmd::mount::mount_internal(
+        "s3://bucket", tmp.to_str().unwrap(), &opts, false,
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+    assert!(result.is_err(), "s3://bucket without creds should fail gracefully");
+}
+
+/// mount_internal with cache_dir override
+#[test]
+fn test_csi_mount_cache_dir_override() {
+    let tmp = std::env::temp_dir().join(format!("csi-cache-override-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let cache = std::env::temp_dir().join("csi-custom-cache");
+    let opts = std::collections::HashMap::from([
+        ("cache_dir".to_string(), cache.to_string_lossy().to_string()),
+    ]);
+    let result = mntrs::cmd::mount::mount_internal(
+        "s3://bucket", tmp.to_str().unwrap(), &opts, false,
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::remove_dir_all(&cache);
+    assert!(result.is_err(), "should fail gracefully");
+}
+
+/// mount_internal with read_only flag
+#[test]
+fn test_csi_mount_read_only() {
+    let tmp = std::env::temp_dir().join(format!("csi-mount-ro-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let result = mntrs::cmd::mount::mount_internal(
+        "s3://bucket", tmp.to_str().unwrap(),
+        &std::collections::HashMap::new(), true,
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+    assert!(result.is_err(), "should fail gracefully");
+}
+
+/// mount_internal with vfs_cache_mode
+#[test]
+fn test_csi_mount_cache_mode() {
+    let tmp = std::env::temp_dir().join(format!("csi-cache-mode-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let opts = std::collections::HashMap::from([
+        ("vfs_cache_mode".to_string(), "full".to_string()),
+    ]);
+    let result = mntrs::cmd::mount::mount_internal(
+        "s3://bucket", tmp.to_str().unwrap(), &opts, false,
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+    assert!(result.is_err(), "should fail gracefully");
+}

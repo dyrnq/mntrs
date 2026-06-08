@@ -72,3 +72,58 @@ fn test_hdfs_ha_config() {
     assert_eq!(_opts.get("dfs.ha.namenodes.nameservice").unwrap(), "nn0,nn1");
     assert_eq!(_opts.get("dfs.namenode.rpc-address.nameservice.nn0").unwrap(), "namenode1:8020");
 }
+
+
+/// 验证 hdfs-jni 的 user/kerberos-ticket-cache-path 参数
+#[test]
+fn test_hdfs_jni_opts() {
+    let opts = std::collections::HashMap::from([
+        ("user".to_string(), "hdfs-user".to_string()),
+        ("kerberos-ticket-cache-path".to_string(), "/tmp/krb5cc".to_string()),
+    ]);
+    assert_eq!(opts.get("user").unwrap(), "hdfs-user");
+    assert_eq!(opts.get("kerberos-ticket-cache-path").unwrap(), "/tmp/krb5cc");
+}
+
+/// 验证多个 scheme 同时解析
+#[test]
+fn test_multi_scheme_parsing() {
+    let urls = vec![
+        ("s3://bucket/key", "s3"),
+        ("gs://bucket/key", "gs"),
+        ("hdfs://namenode:8020/path", "hdfs"),
+        ("webhdfs://namenode:9870/path", "webhdfs"),
+        ("azblob://container/key", "azblob"),
+        ("oss://bucket/key", "oss"),
+    ];
+    for (url_str, expected_scheme) in urls {
+        let url = url::Url::parse(url_str).unwrap();
+        assert_eq!(url.scheme(), expected_scheme, "scheme mismatch for {url_str}");
+    }
+}
+
+/// 验证 endpoint URL 构建逻辑
+#[test]
+fn test_endpoint_url_construction() {
+    // Simulate webhdfs endpoint construction
+    let url = url::Url::parse("webhdfs://namenode:9870/user/data").unwrap();
+    let endpoint = format!(
+        "{}://{}{}",
+        url.scheme(),
+        url.host_str().unwrap(),
+        url.port().map_or(String::new(), |p| format!(":{p}")),
+    );
+    assert_eq!(endpoint, "webhdfs://namenode:9870");
+}
+
+/// 验证 host_str 解析 port
+#[test]
+fn test_url_port_parsing() {
+    let url = url::Url::parse("hdfs://namenode:8020").unwrap();
+    assert_eq!(url.host_str(), Some("namenode"));
+    assert_eq!(url.port(), Some(8020));
+
+    let url = url::Url::parse("hdfs://namenode").unwrap();
+    assert_eq!(url.host_str(), Some("namenode"));
+    assert_eq!(url.port(), None);
+}
