@@ -11,6 +11,40 @@ use tonic::{Request, Response, Status};
 use tonic::transport::Server;
 
 mod csi;
+
+// ============================================================
+// VolumeID Encoding — bucket:prefix → volume_id
+// ============================================================
+
+/// Encode bucket + prefix into a volume ID
+fn encode_volume_id(storage_url: &str) -> String {
+    // Replace special chars to make a valid K8s volume ID
+    storage_url
+        .replace("://", "-")
+        .replace('/', "-")
+        .replace(':', "-")
+}
+
+/// Decode volume ID back to storage URL  
+fn decode_volume_id(volume_id: &str) -> String {
+    // Reverse: restore s3://bucket/prefix format
+    // Simple heuristic: first '-' after scheme becomes '://'
+    if let Some(idx) = volume_id.find('-') {
+        let scheme = &volume_id[..idx];
+        let rest = &volume_id[idx+1..];
+        format!("{}:{}", scheme, rest.replace('-', "/"))
+    } else {
+        volume_id.to_string()
+    }
+}
+
+
+// ============================================================
+// gRPC Logging Interceptor
+// ============================================================
+
+// gRPC logging: each service method already has tracing::info! at entry
+
 use csi::*;
 
 // ============================================================
@@ -73,15 +107,39 @@ pub struct ControllerService;
 impl controller_server::Controller for ControllerService {
     async fn create_volume(
         &self,
-        _request: Request<CreateVolumeRequest>,
+        request: Request<CreateVolumeRequest>,
     ) -> Result<Response<CreateVolumeResponse>, Status> {
-        Err(Status::unimplemented("create_volume not supported"))
+        let req = request.into_inner();
+        let name = req.name;
+        let capacity = req.capacity_range.map(|r| r.required_bytes).unwrap_or(0);
+        let params = req.parameters;
+
+        let storage = params.get("storage")
+            .or_else(|| params.get("storageUrl"))
+            .cloned()
+            .unwrap_or_else(|| format!("memory://{}", name));
+
+        let volume_id = encode_volume_id(&storage);
+        tracing::info!(volume_id, storage, capacity, "create_volume");
+
+        Ok(Response::new(CreateVolumeResponse {
+            volume: Some(Volume {
+                volume_id: volume_id.clone(),
+                capacity_bytes: capacity as i64,
+                volume_context: params.clone(),
+                ..Default::default()
+            }),
+        }))
     }
 
     async fn delete_volume(
         &self,
-        _request: Request<DeleteVolumeRequest>,
+        request: Request<DeleteVolumeRequest>,
     ) -> Result<Response<DeleteVolumeResponse>, Status> {
+        let volume_id = request.into_inner().volume_id;
+        let storage_url = decode_volume_id(&volume_id);
+        tracing::info!(volume_id, storage=%storage_url, "delete_volume — S3 bucket/prefix not deleted (safe by default)");
+        // Never delete the actual S3 bucket — only remove CSI metadata
         Ok(Response::new(DeleteVolumeResponse::default()))
     }
 
@@ -223,6 +281,7 @@ impl node_server::Node for NodeService {
         }
 
         let (storage_url, read_only, opts) = parse_volume_context(&vol_ctx, &volume_id)?;
+        let _volume_id = encode_volume_id(&storage_url);
         let _ = std::fs::create_dir_all(&staging_path);
 
         tracing::info!(volume_id, storage=%storage_url, staging=%staging_path, "staging FUSE mount");
