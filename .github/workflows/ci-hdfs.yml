@@ -24,7 +24,7 @@ jobs:
       - name: Install Java + HDFS
         run: |
           sudo apt-get update && sudo apt-get install -y \
-            libfuse3-dev fuse3 default-jdk libhdfs3-dev
+            libfuse3-dev fuse3 default-jdk
           echo "JAVA_HOME=/usr/lib/jvm/default-java" >> $GITHUB_ENV
 
       - name: Build (with hdfs-jni feature)
