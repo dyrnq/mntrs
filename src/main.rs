@@ -27,6 +27,9 @@ enum Commands {
         /// Mount as read-only
         #[arg(long)]
         read_only: bool,
+        /// Mount as network drive instead of fixed disk (Windows only)
+        #[arg(long)]
+        network_mode: bool,
         /// Directory cache TTL in seconds (default: 10)
         #[arg(long, default_value = "10")]
         dir_cache_time: u64,
@@ -42,6 +45,9 @@ enum Commands {
         ///     Use with --uid/--gid to control file ownership.
         #[arg(long, verbatim_doc_comment)]
         allow_other: bool,
+        /// Debug FUSE (print FUSE kernel requests)
+        #[arg(long)]
+        debug_fuse: bool,
         /// Volume name (shown in mount table)
         #[arg(long, default_value = "mntrs")]
         volname: String,
@@ -54,6 +60,9 @@ enum Commands {
         /// Raw FUSE option (repeatable), e.g. -o allow_other
         #[arg(short = 'o', long = "option", value_name = "OPT", num_args = 0..)]
         option: Vec<String>,
+        /// Additional FUSE flags to pass to kernel (repeatable)
+        #[arg(long = "fuse-flag", value_name = "FLAG", num_args = 0..)]
+        fuse_flag: Vec<String>,
         /// Run as a background daemon (detach from terminal)
         #[arg(long)]
         daemon: bool,
@@ -66,6 +75,12 @@ enum Commands {
         /// Allow root user to access the mount
         #[arg(long)]
         allow_root: bool,
+        /// Allow UID/GID id mapping (Windows only)
+        #[arg(long)]
+        allow_idmap: bool,
+        /// Permissions for symlinks (octal, default: 0777)
+        #[arg(long, default_value = "777")]
+        link_perms: u32,
         /// Max local cache size in MB (default: 1024, 0 to disable)
         #[arg(long, default_value = "1024")]
         vfs_cache_max_size: u64,
@@ -258,19 +273,23 @@ fn main() -> anyhow::Result<()> {
             mountpoint,
             opt,
             read_only,
+            network_mode,
             dir_cache_time,
             attr_timeout,
             type_cache_ttl,
             stat_cache_ttl,
             allow_other,
+            debug_fuse,
             volname,
             devname,
             write_back_cache,
             option,
+            fuse_flag,
             daemon,
             daemon_wait,
             daemon_timeout,
             allow_root,
+            allow_idmap,
             vfs_cache_max_size,
             mem_limit,
             vfs_write_back,
@@ -283,6 +302,7 @@ fn main() -> anyhow::Result<()> {
             umask,
             dir_perms,
             file_perms,
+            link_perms,
             allow_non_empty,
             cache_dir,
             direct_io,
@@ -322,7 +342,7 @@ fn main() -> anyhow::Result<()> {
             vfs_cache_poll_interval,
             vfs_handle_caching,
             vfs_disk_space_total_size,
-        } => {
+        .. } => {
             let opts: HashMap<String, String> = opt
                 .iter()
                 .filter_map(|kv| kv.split_once('='))
@@ -333,19 +353,23 @@ fn main() -> anyhow::Result<()> {
                 &mountpoint,
                 &opts,
                 read_only,
+                network_mode,
                 dir_cache_time,
                 attr_timeout,
                 type_cache_ttl,
                 stat_cache_ttl,
                 allow_other,
+                debug_fuse,
                 &volname,
                 devname.as_deref(),
                 write_back_cache,
                 &option,
+                &fuse_flag,
                 daemon,
                 daemon_wait,
                 daemon_timeout,
                 allow_root,
+                allow_idmap,
                 vfs_cache_max_size,
                 mem_limit,
                 vfs_write_back,
@@ -358,6 +382,7 @@ fn main() -> anyhow::Result<()> {
                 umask,
                 dir_perms,
                 file_perms,
+                Some(link_perms),
                 allow_non_empty,
                 cache_dir.as_deref(),
                 direct_io,

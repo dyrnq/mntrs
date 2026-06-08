@@ -141,6 +141,7 @@ pub struct MntrsFs {
     pub umask: Option<u32>,
     pub dir_perms: u16,
     pub file_perms: u16,
+    pub link_perms: u16,
     pub direct_io: bool,
     pub poll_interval: Duration,
     pub cache_max_age: Duration,
@@ -1926,15 +1927,17 @@ impl CoreFilesystem for MntrsFs {
         let path = self.resolve(ino).map(|(p, _, _, _)| p).unwrap_or_default();
 
         // If handle caching is active, check for existing write handle for this inode
-        if self.handle_caching > std::time::Duration::ZERO {
-            if let Some(entry) = self.handles.get(&ino) {
-                if let crate::FileHandleState::Write { path: existing_path, cache_fd: Some(_fd), .. } = entry.value() {
-                    if *existing_path == path {
-                        // Reuse existing cached handle
-                        return Ok(ino);
-                    }
-                }
-            }
+        if self.handle_caching > std::time::Duration::ZERO
+            && let Some(entry) = self.handles.get(&ino)
+            && let crate::FileHandleState::Write {
+                path: existing_path,
+                cache_fd: Some(_fd),
+                ..
+            } = entry.value()
+            && *existing_path == path
+        {
+            // Reuse existing cached handle
+            return Ok(ino);
         }
 
         // Check if flags contain write access (O_WRONLY=1, O_RDWR=2)
@@ -2245,7 +2248,10 @@ impl CoreFilesystem for MntrsFs {
         if self.handle_caching > std::time::Duration::ZERO && !was_dirty {
             // Keep handle alive for handle_caching duration so reopen can reuse cache fd
             let fd_to_keep = self.handles.get(&fh).and_then(|e| {
-                if let crate::FileHandleState::Write { cache_fd: Some(fd), .. } = e.value() {
+                if let crate::FileHandleState::Write {
+                    cache_fd: Some(fd), ..
+                } = e.value()
+                {
                     Some(fd.clone())
                 } else {
                     None
@@ -2688,6 +2694,7 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         umask: None,
         dir_perms: 0o755,
         file_perms: 0o644,
+        link_perms: 0o777,
         direct_io: false,
         poll_interval: std::time::Duration::from_secs(60),
         cache_max_age: std::time::Duration::from_secs(3600),

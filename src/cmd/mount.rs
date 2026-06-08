@@ -186,19 +186,23 @@ pub fn mount_internal(
         mountpoint,
         opts,
         read_only,
+        false,            // network_mode
         10,               // dir_cache_time
         1,                // attr_timeout
         10,               // type_cache_ttl
         1,                // stat_cache_ttl
         true,             // allow_other (CSI: Pods access as non-root)
+        false,            // debug_fuse
         "mntrs-csi",      // volname
         None,             // devname
         false,            // write_back_cache
         &[],              // fuse_options
+        &[],              // fuse_flags
         true,             // daemon
         false,            // daemon_wait
         10,               // daemon_timeout
         false,            // allow_root
+        false,            // allow_idmap
         1024,             // vfs_cache_max_size
         256,              // mem_limit
         5,                // vfs_write_back
@@ -211,8 +215,9 @@ pub fn mount_internal(
         None,             // umask
         None,             // dir_perms
         None,             // file_perms
+        None,             // link_perms
         false,            // allow_non_empty
-        Some(&cache_dir), // cache_dir (CSI isolated)
+        Some(cache_dir.as_str()), // cache_dir (CSI isolated)
         false,            // direct_io
         60,               // poll_interval
         3600,             // vfs_cache_max_age
@@ -321,19 +326,23 @@ pub fn mount(
     mountpoint: &str,
     opts: &HashMap<String, String>,
     read_only: bool,
+    _network_mode: bool,
     dir_cache_time: u64,
     attr_timeout: u64,
     _type_cache_ttl: u64,
     stat_cache_ttl: u64,
     allow_other: bool,
+    debug_fuse: bool,
     volname: &str,
     devname: Option<&str>,
     write_back_cache: bool,
     fuse_options: &[String],
+    fuse_flags: &[String],
     daemon: bool,
     daemon_wait: bool,
     _daemon_timeout: u64,
     allow_root: bool,
+    _allow_idmap: bool,
     vfs_cache_max_size: u64,
     mem_limit: u64,
     vfs_write_back: u64,
@@ -346,6 +355,7 @@ pub fn mount(
     umask: Option<u32>,
     dir_perms: Option<u32>,
     file_perms: Option<u32>,
+    link_perms: Option<u32>,
     allow_non_empty: bool,
     cache_dir: Option<&str>,
     direct_io: bool,
@@ -415,6 +425,7 @@ pub fn mount(
         umask,
         dir_perms: dir_perms.unwrap_or(0o755) as u16,
         file_perms: file_perms.unwrap_or(0o644) as u16,
+        link_perms: link_perms.unwrap_or(0o777) as u16,
         direct_io,
         poll_interval: std::time::Duration::from_secs(poll_interval.max(1)),
         cache_max_age: std::time::Duration::from_secs(vfs_cache_max_age),
@@ -492,6 +503,10 @@ pub fn mount(
     let mount_path = Path::new(mountpoint);
     #[cfg(not(windows))]
     let mut cfg: fuser::Config = Default::default();
+    if debug_fuse {
+        #[cfg(target_os = "linux")]
+        unsafe { std::env::set_var("FUSE_DEBUG", "1"); }
+    }
     // Check /etc/fuse.conf for user_allow_other when --allow-other is used
     #[cfg(target_os = "linux")]
     if allow_other && unsafe { libc::geteuid() != 0 } {
@@ -513,6 +528,11 @@ pub fn mount(
     #[cfg(not(windows))]
     if allow_other || allow_root {
         cfg.acl = fuser::SessionACL::All;
+    }
+    #[cfg(windows)]
+    if allow_idmap {
+        cfg.mount_options
+            .push(fuser::MountOption::CUSTOM("allow_idmap".to_string()));
     }
     #[cfg(not(windows))]
     {
@@ -558,6 +578,9 @@ pub fn mount(
         }
         for opt in fuse_options {
             cfg.mount_options.push(MountOption::CUSTOM(opt.clone()));
+        }
+        for flag in fuse_flags {
+            cfg.mount_options.push(MountOption::CUSTOM(flag.clone()));
         }
     }
 
