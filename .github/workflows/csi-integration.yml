@@ -1,6 +1,10 @@
 name: CSI Integration Test (k3s + HDFS)
 
 on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch: '0 6 * * 0'
 
 jobs:

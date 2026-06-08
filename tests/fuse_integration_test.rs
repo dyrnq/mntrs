@@ -14,6 +14,7 @@ const MNTRS_BIN: &str = "./target/debug/mntrs";
 const MNTRS_MNT: &str = "/tmp/mntrs-fuse-test";
 
 fn mntrs_mount(read_only: bool) {
+    let _ = Command::new("curl").args(["-sf", "-X", "PUT", &format!("{}/test-bucket", MINIO_ENDPOINT)]).status();
     let _ = Command::new("fusermount3")
         .arg("-u")
         .arg(MNTRS_MNT)
@@ -39,7 +40,7 @@ fn mntrs_mount(read_only: bool) {
     }
 
     let mut child = cmd.spawn().expect("mntrs mount failed to start");
-    thread::sleep(Duration::from_secs(3));
+    thread::sleep(Duration::from_secs(5));
 
     // Verify mount
     let status = Command::new("mount")
