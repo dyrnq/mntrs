@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
+use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::fs;
 
 pub fn unmount(target: &str) -> Result<()> {
     let mounts = crate::cmd::mount::read_mounts();
@@ -10,12 +10,17 @@ pub fn unmount(target: &str) -> Result<()> {
         if mounts.is_empty() {
             return Err(anyhow!("no mntrs mounts found"));
         }
-        for m in &mounts { let mountpoint = &m.mountpoint;
+        for m in &mounts {
+            let mountpoint = &m.mountpoint;
             eprintln!("unmounting {mountpoint}");
-            if let Err(e) = fuse_unmount(mountpoint) { tracing::debug!(error=%e, mountpoint, "unmount all skip failed"); }
+            if let Err(e) = fuse_unmount(mountpoint) {
+                tracing::debug!(error=%e, mountpoint, "unmount all skip failed");
+            }
         }
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        if let Err(e) = fs::remove_file(format!("{}/.local/share/mntrs/mounts.txt", home)) { tracing::debug!(error=%e, "unmount all db remove failed"); }
+        if let Err(e) = fs::remove_file(format!("{}/.local/share/mntrs/mounts.txt", home)) {
+            tracing::debug!(error=%e, "unmount all db remove failed");
+        }
         return Ok(());
     }
 
@@ -36,10 +41,13 @@ pub fn unmount(target: &str) -> Result<()> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let db = format!("{}/.local/share/mntrs/mounts.txt", home);
     if let Ok(content) = fs::read_to_string(&db) {
-        let filtered: Vec<&str> = content.lines()
+        let filtered: Vec<&str> = content
+            .lines()
             .filter(|l| !l.contains(&mountpoint))
             .collect();
-        if let Err(e) = fs::write(&db, filtered.join("\n")) { tracing::debug!(error=%e, "unmount db cleanup failed"); }
+        if let Err(e) = fs::write(&db, filtered.join("\n")) {
+            tracing::debug!(error=%e, "unmount db cleanup failed");
+        }
     }
     Ok(())
 }
@@ -50,7 +58,10 @@ fn fuse_unmount(mountpoint: &str) -> Result<()> {
         .arg(mountpoint)
         .status()
         .or_else(|_| {
-            Command::new("fusermount").arg("-u").arg(mountpoint).status()
+            Command::new("fusermount")
+                .arg("-u")
+                .arg(mountpoint)
+                .status()
         });
 
     match result {
@@ -58,9 +69,10 @@ fn fuse_unmount(mountpoint: &str) -> Result<()> {
             eprintln!("unmounted {mountpoint}");
             Ok(())
         }
-        Ok(status) => {
-            Err(anyhow!("fusermount failed with exit code {}", status.code().unwrap_or(-1)))
-        }
+        Ok(status) => Err(anyhow!(
+            "fusermount failed with exit code {}",
+            status.code().unwrap_or(-1)
+        )),
         Err(e) => Err(anyhow!("failed to run fusermount: {e}")),
     }
 }

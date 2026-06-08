@@ -1,4 +1,4 @@
-use mntrs::{path_hash, fnmatch};
+use mntrs::{fnmatch, path_hash};
 
 #[test]
 fn path_hash_is_stable() {

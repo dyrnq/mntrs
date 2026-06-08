@@ -6,13 +6,21 @@ pub fn list() -> Result<()> {
         println!("no active mntrs mounts");
         return Ok(());
     }
-    println!("{:40} {:30} {:>8} {:10} {:4} {:8}", "Storage", "Mountpoint", "PID", "User", "Mode", "Type");
+    println!(
+        "{:40} {:30} {:>8} {:10} {:4} {:8}",
+        "Storage", "Mountpoint", "PID", "User", "Mode", "Type"
+    );
     println!("{}", "-".repeat(105));
     for m in &mounts {
-        println!("{:40} {:30} {:>8} {:10} {:4} {:8}",
-            m.storage, m.mountpoint, m.pid, m.user,
+        println!(
+            "{:40} {:30} {:>8} {:10} {:4} {:8}",
+            m.storage,
+            m.mountpoint,
+            m.pid,
+            m.user,
             if m.read_only { "ro" } else { "rw" },
-            m.backend);
+            m.backend
+        );
     }
     Ok(())
 }
