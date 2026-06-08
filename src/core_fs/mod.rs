@@ -149,6 +149,7 @@ pub trait CoreFilesystem: Send + Sync {
     fn access(&self, ino: u64, mask: u32) -> std::io::Result<()>;
 }
 
+#[cfg(unix)]
 pub mod fuser;
 
 #[cfg(windows)]
