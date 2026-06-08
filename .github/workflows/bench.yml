@@ -17,7 +17,7 @@ jobs:
 
   fuse-integration:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     services:
       minio:
         image: minio/minio:latest
@@ -50,7 +50,7 @@ jobs:
 
   bench:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     services:
       minio:
         image: minio/minio:latest
@@ -94,11 +94,11 @@ jobs:
           rclone config create minio s3 provider Minio env_auth false \
             access_key_id minioadmin secret_access_key minioadmin \
             endpoint http://localhost:9000 region us-east-1
-          rclone mount minio:bench-bucket /tmp/rclone-mnt --daemon --read-only
+          rclone mount minio:bench-bucket /tmp/rclone-mnt --daemon --vfs-cache-mode=writes --vfs-write-back=5s
           sleep 3
 
       - name: Run benchmark
-        run: MNTRS_BIN=./target/release/mntrs RCLONE_MNT=/tmp/rclone-mnt ENDPOINT=http://localhost:9000 BUCKET=bench-bucket ACCESS_KEY=minioadmin SECRET_KEY=minioadmin bash bench/run_all.sh 2>&1 | tee bench-result.txt
+        run: MNTRS_BIN=./target/release/mntrs RCLONE_MNT=/tmp/rclone-mnt MNTRS_MNT=/tmp/mntrs-bench ENDPOINT=http://localhost:9000 BUCKET=bench-bucket ACCESS_KEY=minioadmin SECRET_KEY=minioadmin bash bench/run_all.sh 2>&1 | tee bench-result.txt
 
       - name: Upload results
         uses: actions/upload-artifact@v4

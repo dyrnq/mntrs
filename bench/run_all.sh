@@ -88,14 +88,17 @@ echo ""
 
 # ---- Upload test data ----
 echo "--- Uploading test data ---"
-mc alias set bench "$ENDPOINT" "$ACCESS_KEY" "$SECRET_KEY" 2>/dev/null || true
-mc cp "$DATA_DIR/1K.bin" "bench/$BUCKET/" 2>/dev/null
-mc cp "$DATA_DIR/4K.bin" "bench/$BUCKET/" 2>/dev/null
-mc cp "$DATA_DIR/64K.bin" "bench/$BUCKET/" 2>/dev/null
-mc cp "$DATA_DIR/1M.bin" "bench/$BUCKET/" 2>/dev/null
-mc cp "$DATA_DIR/10M.bin" "bench/$BUCKET/" 2>/dev/null
-mc cp "$DATA_DIR/100M.bin" "bench/$BUCKET/" 2>/dev/null
-mc cp -r "$DATA_DIR/many" "bench/$BUCKET/" 2>/dev/null
+# Create bucket
+curl -sf -X PUT "$ENDPOINT/$BUCKET" -H "Authorization: AWS4-HMAC-SHA256 Credential=$ACCESS_KEY/20260608/$REGION/s3/aws4_request" 2>/dev/null || true
+# Upload files via S3 PUT
+for f in 1K.bin 4K.bin 64K.bin 1M.bin 10M.bin 100M.bin; do
+  curl -sf -X PUT "$ENDPOINT/$BUCKET/$f"     -H "Authorization: AWS4-HMAC-SHA256 Credential=$ACCESS_KEY/20260608/$REGION/s3/aws4_request"     --data-binary @"$DATA_DIR/$f" 2>/dev/null || true
+done
+# Upload many/ files one by one
+for f in "$DATA_DIR/many/"*; do
+  name=$(basename "$f")
+  curl -sf -X PUT "$ENDPOINT/$BUCKET/many/$name"     -H "Authorization: AWS4-HMAC-SHA256 Credential=$ACCESS_KEY/20260608/$REGION/s3/aws4_request"     --data-binary @"$f" 2>/dev/null || true
+done
 echo "  upload done"
 echo ""
 

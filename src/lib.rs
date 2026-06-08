@@ -28,11 +28,14 @@ use fuser::{
 /// Returns ENOATTR (macOS) or ENODATA (Linux) depending on platform.
 fn xattr_not_found() -> Errno {
     #[cfg(target_os = "linux")]
-    { Errno::ENODATA }
+    {
+        Errno::ENODATA
+    }
     #[cfg(target_os = "macos")]
-    { Errno::ENOATTR }
+    {
+        Errno::ENOATTR
+    }
 }
-
 
 #[cfg(not(unix))]
 /// Stub type for non-Unix platforms — mirrors fuser::FileType variants used in shared state.
