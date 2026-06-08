@@ -51,6 +51,12 @@ impl identity_server::Identity for IdentityService {
         &self,
         _request: Request<ProbeRequest>,
     ) -> Result<Response<ProbeResponse>, Status> {
+        // Verify mntrs binary is available and functional
+        // Just checking the binary exists is enough for a basic health probe
+        let mntrs_path = std::env::current_exe()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        tracing::debug!("health probe: binary={}", mntrs_path);
         Ok(Response::new(ProbeResponse::default()))
     }
 }

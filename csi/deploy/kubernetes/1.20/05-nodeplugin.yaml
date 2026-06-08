@@ -54,6 +54,14 @@ spec:
             - name: CSI_ENDPOINT
               value: unix://plugin/csi.sock
           imagePullPolicy: Always
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - "ls /plugin/csi.sock > /dev/null 2>&1 || exit 1"
+            initialDelaySeconds: 10
+            periodSeconds: 30
           lifecycle:
             postStart:
               exec:
