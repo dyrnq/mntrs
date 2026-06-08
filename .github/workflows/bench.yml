@@ -16,12 +16,13 @@ jobs:
     services:
       minio:
         image: minio/minio:latest
+        command: server /data
         env:
           MINIO_ROOT_USER: minioadmin
           MINIO_ROOT_PASSWORD: minioadmin
         ports:
           - 9000:9000
-        options: --health-cmd "curl -f http://localhost:9000/minio/health/live" --health-interval 5s
+        options: --health-cmd "curl -sf http://localhost:9000/minio/health/live || exit 1" --health-interval 5s
 
     steps:
       - uses: actions/checkout@v4
