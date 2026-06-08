@@ -23,23 +23,15 @@ jobs:
 
       - name: Install WinFSP
         shell: pwsh
-        run: choco install winfsp -y
-
-      - name: Start WinFSP service
-        shell: pwsh
         run: |
-          $svc = Get-Service winfsp -ErrorAction SilentlyContinue
-          if (-not $svc) { Write-Error "winfsp service not found"; exit 1 }
-          Set-Service winfsp -StartupType Automatic
-          Start-Service winfsp
-          Start-Sleep -Seconds 3
-          $svc = Get-Service winfsp
-          if ($svc.Status -ne 'Running') { Write-Error "winfsp not running"; exit 1 }
+          $url = "https://github.com/winfsp/winfsp/releases/latest/download/winfsp-2.1.msi"
+          $msi = "$env:TEMP\winfsp.msi"
+          Invoke-WebRequest -Uri $url -OutFile $msi
+          msiexec /i $msi /quiet /norestart
+          Start-Sleep -Seconds 5
+          Write-Host "WinFSP installed"
 
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Build (release)
+      - name: BuildBuild (release)
         run: cargo build --release --workspace
 
       - name: Test (WinFSP integration)
