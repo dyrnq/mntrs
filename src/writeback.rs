@@ -53,10 +53,13 @@ pub fn worker(
         // Read and sort all blocks by block index
         let mut blocks: Vec<(u64, Vec<u8>)> = Vec::with_capacity(tasks.len());
         for (_, _, cache_path) in &tasks {
-            let name = cache_path.file_name()
+            let name = cache_path
+                .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
-            let block_idx = name.rsplit('_').nth(1)
+            let block_idx = name
+                .rsplit('_')
+                .nth(1)
                 .and_then(|s| u64::from_str_radix(s, 16).ok())
                 .unwrap_or(0);
             match fs::read(cache_path) {
@@ -115,7 +118,8 @@ pub fn worker(
             data_with_csum.extend_from_slice(&crc.to_le_bytes());
             let first_path = &tasks[0].2;
             if let Some(parent) = first_path.parent() {
-                let hash_name = first_path.file_name()
+                let hash_name = first_path
+                    .file_name()
                     .and_then(|n| n.to_str())
                     .and_then(|n| n.split('_').next())
                     .unwrap_or("");
