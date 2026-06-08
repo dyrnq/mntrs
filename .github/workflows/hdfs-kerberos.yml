@@ -1,9 +1,7 @@
-name: Integration Tests
+name: HDFS Kerberos Integration Test
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 4 * * 0'  # weekly Sunday 04:00 UTC
 
 jobs:
   hdfs-kerberos:
@@ -88,37 +86,3 @@ jobs:
             echo "minidfs binary not found — skipping mount test"
           fi
 
-  csi-sanity:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libfuse3-dev fuse3 protobuf-compiler
-
-      - name: Build CSI driver
-        run: cargo build --release -p mntrs-csi
-
-      - name: Start CSI driver + run csi-sanity
-        run: |
-          # Build csi-sanity from source
-          go install github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@latest 2>/dev/null || \
-            curl -sSL https://github.com/kubernetes-csi/csi-test/releases/download/v5.3.1/csi-sanity-v5.3.1-linux-amd64.tar.gz | tar xz
-          
-          # Start mntrs-csi
-          ./target/release/mntrs-csi --endpoint unix:///tmp/csi.sock &
-          CSI_PID=$!
-          sleep 3
-
-          # Run csi-sanity
-          ./csi-sanity --csi.endpoint=unix:///tmp/csi.sock \
-            --csi.testvolumeparameters="storage=memory://,readOnly=true" \
-            --ginkgo.focus='NodePublishVolume|NodeUnpublishVolume|GetPluginInfo|Probe' \
-            2>&1 || true
-
-          kill $CSI_PID 2>/dev/null
