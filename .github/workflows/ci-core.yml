@@ -27,7 +27,10 @@ jobs:
       - name: Build
         run: cargo build --release --workspace
 
-      - name: Test
+      - name: Build CSI plugin
+        run: cargo build --release --package mntrs-csi
+
+      - name: Test (all)
         run: cargo test --workspace
 
       - name: Clippy

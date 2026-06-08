@@ -114,6 +114,8 @@ pub struct MntrsFs {
     pub case_insensitive: bool,
     pub no_implicit_dir: bool,
     pub use_server_modtime: bool,
+    pub no_apple_double: bool,
+    pub no_apple_xattr: bool,
     pub block_norm_dupes: bool,
     pub write_wait: Duration,
     pub read_wait: Duration,
@@ -1299,6 +1301,10 @@ impl Filesystem for MntrsFs {
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, _size: u32, reply: ReplyXattr) {
         let ino: u64 = ino.into();
         let name = name.to_string_lossy();
+        if self.no_apple_xattr && (name.starts_with("com.apple.") || name == "system.posix_acl_access") {
+            reply.error(Errno::ENODATA);
+            return;
+        }
         if let Some((path, kind, _, _)) = self.resolve(ino) {
             if kind == FileType::Directory {
                 reply.error(Errno::ENODATA);

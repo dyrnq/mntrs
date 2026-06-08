@@ -226,8 +226,8 @@ pub fn mount_internal(
         false,  // no_checksum
         false,  // no_seek
         false,  // links
-        false,  // noapple_double
-        false,  // noapple_xattr
+        noapple_double,
+        noapple_xattr,
         false,  // mount_case_insensitive
         131072, // max_read_ahead
         0,      // vfs_read_chunk_size_limit
@@ -355,8 +355,8 @@ pub fn mount(
     _no_checksum: bool,
     _no_seek: bool,
     _links: bool,
-    _noapple_double: bool,
-    _noapple_xattr: bool,
+    noapple_double: bool,
+    noapple_xattr: bool,
     _mount_case_insensitive: bool,
     _max_read_ahead: u64,
     vfs_read_chunk_size_limit: u64,
@@ -492,11 +492,11 @@ pub fn mount(
     }
     #[cfg(target_os = "macos")]
     {
-        if _noapple_double {
+        if noapple_double {
             cfg.mount_options
                 .push(MountOption::CUSTOM("noappledouble".to_string()));
         }
-        if _noapple_xattr {
+        if noapple_xattr {
             cfg.mount_options
                 .push(MountOption::CUSTOM("noapplexattr".to_string()));
         }
