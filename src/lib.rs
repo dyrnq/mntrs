@@ -527,9 +527,18 @@ fn writeback_worker(
         };
         let op = op.clone();
         let p = remote_path.clone();
-        // Retry up to 3 times with exponential backoff
+                // Retry up to 3 times with exponential backoff
         for attempt in 0..3 {
-            let r = rt().block_on(async { op.write(&p, data.clone()).await });
+            // Use Writer for streaming upload (supports multipart for >5GB via S3 backend)
+            let r = rt().block_on(async {
+                match op.writer(&p).await {
+                    Ok(mut w) => {
+                        w.write(bytes::Bytes::from(data.clone())).await?;
+                        w.close().await
+                    }
+                    Err(e) => Err(e),
+                }
+            });
             match r {
                 Ok(_) => {
                     if let Err(e) = fs::remove_file(&cache_path) {
