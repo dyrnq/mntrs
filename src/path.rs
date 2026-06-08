@@ -38,7 +38,7 @@ pub fn parse_windows_target(target: &str) -> std::io::Result<winfsp::host::Mount
         }
     }
     if t == "*" {
-        return Ok(MountPoint::MountPointAuto);
+        return Ok(MountPoint::NextFreeDrive);
     }
     Ok(MountPoint::MountPoint(std::path::PathBuf::from(t)))
 }

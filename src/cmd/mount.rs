@@ -128,6 +128,12 @@ extern "C" fn cleanup() {
 /// Simplified mount entry point for CSI plugin.
 /// Uses defaults for all the FUSE tuning parameters.
 /// Check if a path is already a mount point by checking /proc/mounts.
+#[cfg(windows)]
+pub fn is_mount_point(_path: &str) -> bool {
+    // On Windows, WinFSP handles mount point detection internally
+    false
+}
+
 ///
 /// Check if a path is already a mount point on macOS.
 #[cfg(target_os = "macos")]
@@ -919,6 +925,7 @@ fn daemonize(mountpoint: &str, wait_pipe: Option<i32>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn unblock_parent() {
     if let Some(&fd) = DAEMON_PIPE_WR.get() {
         // Safety: fd was created by pipe() and is valid
@@ -927,6 +934,9 @@ fn unblock_parent() {
         }
     }
 }
+
+#[cfg(windows)]
+fn unblock_parent() {}
 
 async fn build_oss(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
     let bucket = url.host_str().ok_or_else(|| anyhow!("missing bucket"))?;

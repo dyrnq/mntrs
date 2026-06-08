@@ -22,7 +22,7 @@
 
 use std::ffi::c_void;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use widestring::U16CStr;
 use windows::Win32::Foundation::STATUS_INVALID_DEVICE_REQUEST;
@@ -31,7 +31,7 @@ use winfsp::filesystem::{
     DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext,
     ModificationDescriptor, OpenFileInfo, VolumeInfo,
 };
-use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
+use winfsp_sys::FILE_ACCESS_RIGHTS;
 
 // Win32 file attribute constants (same as win32 API)
 const FILE_ATTRIBUTE_READONLY: u32 = 0x00000001;
@@ -256,8 +256,8 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         &self,
         context: &Self::FileContext,
         new_size: u64,
-        _file_info: &mut FileInfo,
         _set_allocation_size: bool,
+        _file_info: &mut FileInfo,
     ) -> Result<()> {
         // CoreFilesystem::setattr with size=Some(new_size)
         self.inner
@@ -284,7 +284,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         &self,
         _context: &Self::FileContext,
         _security_information: u32,
-        _modification_descriptor: &ModificationDescriptor,
+        _modification_descriptor: ModificationDescriptor,
     ) -> Result<()> {
         Err(STATUS_INVALID_DEVICE_REQUEST.into())
     }
@@ -308,7 +308,10 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         // VolumeParams::pass_query_directory_filename is enabled).
         Err(STATUS_INVALID_DEVICE_REQUEST.into())
     }
+}
 
+#[cfg(feature = "async-io")]
+impl<F: CoreFilesystem + 'static> winfsp::filesystem::AsyncFileSystemContext for WinFspAdapter<F> {
     fn spawn_task(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
         std::thread::spawn(|| {
             tokio::runtime::Runtime::new()
