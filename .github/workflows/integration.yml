@@ -43,7 +43,7 @@ jobs:
           KRB5CONF
 
           # Create KDC database
-          sudo krb5_newrealm <<< "adminpasswordadminpassword"
+          printf 'adminpassword\nadminpassword\n' | sudo krb5_newrealm
           # Add principals
           sudo kadmin.local -q "addprinc -randkey hdfs/localhost@TEST.LOCAL"
           sudo kadmin.local -q "addprinc -randkey testuser@TEST.LOCAL"

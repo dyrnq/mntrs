@@ -59,8 +59,10 @@ fn mntrs_mount(read_only: bool) {
         panic!("mntrs mount did not appear in mount table");
     }
 
-    // Store PID for cleanup
+    // Store PID for cleanup, then intentionally leak the handle
+    // (the mount daemon is meant to live past this function)
     std::fs::write("/tmp/mntrs-fuse-test.pid", child.id().to_string()).unwrap();
+    std::mem::forget(child);
 }
 
 fn mntrs_unmount() {

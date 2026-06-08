@@ -18,30 +18,53 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  # === Linux: full build + test + clippy + fmt + CSI ===
-  linux:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install FUSE
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3 protobuf-compiler
+      - name: Build workspace
+        run: cargo build --workspace
+      - name: Build CSI plugin
+        run: cargo build --package mntrs-csi
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install FUSE
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3 protobuf-compiler
+      - name: Test (all)
+        run: cargo test --workspace --lib
+
+  clippy:
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-
       - name: Install FUSE
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3 protobuf-compiler
-
-      - name: Build
-        run: cargo build --workspace
-
-      - name: Build CSI plugin
-        run: cargo build --package mntrs-csi
-
-      - name: Test (all)
-        run: cargo test --workspace --lib
-
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  fmt:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
       - name: Format check
         run: cargo fmt --all -- --check
