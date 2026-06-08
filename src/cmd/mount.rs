@@ -589,12 +589,38 @@ pub fn mount(
     }
 }
 
-fn apply_operator(builder: impl opendal::Builder) -> Result<Operator> {
-    let op: Operator = Operator::new(builder)?
-        .layer(TimeoutLayer::new().with_io_timeout(std::time::Duration::from_secs(30)))
-        .layer(RetryLayer::new().with_max_times(3).with_factor(2.0))
-        .layer(ConcurrentLimitLayer::new(16))
-        .finish();
+fn apply_operator_with_tls(
+    builder: impl opendal::Builder,
+    opts: &std::collections::HashMap<String, String>,
+) -> Result<Operator> {
+    // Check for curl-compatible TLS flags: --opt cacert=... --opt cert=...
+    let has_tls = opts.contains_key("cacert") || opts.contains_key("cert");
+    let op = if has_tls {
+        let mut rb = reqwest::Client::builder();
+        if let Some(path) = opts.get("cacert") {
+            let buf = std::fs::read(path).map_err(|e| anyhow!("read cacert '{}': {}", path, e))?;
+            let ca = reqwest::Certificate::from_pem(&buf).map_err(|e| anyhow!("invalid cacert '{}': {}", path, e))?;
+            rb = rb.add_root_certificate(ca);
+        }
+        if let Some(cert_path) = opts.get("cert") {
+            let buf = std::fs::read(cert_path).map_err(|e| anyhow!("read cert '{}': {}", cert_path, e))?;
+            let identity = reqwest::Identity::from_pem(&buf).map_err(|e| anyhow!("invalid cert: {}", e))?;
+            rb = rb.identity(identity);
+        }
+        let client = rb.build().map_err(|e| anyhow!("build TLS client: {}", e))?;
+        Operator::new(builder)?
+            .layer(opendal::layers::HttpClientLayer::new(opendal::raw::HttpClient::with(client)))
+            .layer(TimeoutLayer::new().with_io_timeout(std::time::Duration::from_secs(30)))
+            .layer(RetryLayer::new().with_max_times(3).with_factor(2.0))
+            .layer(ConcurrentLimitLayer::new(16))
+            .finish()
+    } else {
+        Operator::new(builder)?
+            .layer(TimeoutLayer::new().with_io_timeout(std::time::Duration::from_secs(30)))
+            .layer(RetryLayer::new().with_max_times(3).with_factor(2.0))
+            .layer(ConcurrentLimitLayer::new(16))
+            .finish()
+    };
     Ok(op)
 }
 
@@ -642,17 +668,17 @@ async fn build_s3(url: &url::Url, opts: &HashMap<String, String>) -> Result<Oper
     if let Some(v) = opts.get("region") {
         builder = builder.region(v);
     }
-    apply_operator(builder)
+    apply_operator_with_tls(builder, opts)
 }
 
-async fn build_gcs(url: &url::Url, _opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_gcs(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
     let bucket = url.host_str().ok_or_else(|| anyhow!("missing bucket"))?;
     let mut builder = Gcs::default().bucket(bucket);
     let p = url.path().trim_start_matches('/');
     if !p.is_empty() {
         builder = builder.root(p);
     }
-    apply_operator(builder)
+    apply_operator_with_tls(builder, opts)
 }
 
 async fn build_azblob(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
@@ -668,7 +694,7 @@ async fn build_azblob(url: &url::Url, opts: &HashMap<String, String>) -> Result<
     if let Some(v) = opts.get("account-key") {
         builder = builder.account_key(v);
     }
-    apply_operator(builder)
+    apply_operator_with_tls(builder, opts)
 }
 
 async fn build_hdfs_native(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
@@ -689,7 +715,7 @@ async fn build_hdfs_native(url: &url::Url, opts: &HashMap<String, String>) -> Re
     if !opts.is_empty() {
         builder = builder.options(opts.clone());
     }
-    apply_operator(builder)
+    apply_operator_with_tls(builder, opts)
 }
 
 /// Build HDFS operator using JNI-based libhdfs (requires Java).
@@ -714,7 +740,7 @@ async fn build_hdfs_jni(url: &url::Url, opts: &HashMap<String, String>) -> Resul
             _ => tracing::warn!("ignored unsupported hdfs-jni option: {k}={v}"),
         }
     }
-    apply_operator(builder)
+    apply_operator_with_tls(builder, opts)
 }
 
 /// Build WebHDFS operator (HDFS REST API gateway).
@@ -737,7 +763,7 @@ async fn build_webhdfs(url: &url::Url, opts: &HashMap<String, String>) -> Result
             _ => tracing::warn!("ignored unsupported webhdfs option: {k}={v}"),
         }
     }
-    apply_operator(builder)
+    apply_operator_with_tls(builder, opts)
 }
 
 static DAEMON_PIPE_WR: OnceLock<i32> = OnceLock::new();
@@ -822,7 +848,7 @@ async fn build_oss(url: &url::Url, opts: &HashMap<String, String>) -> Result<Ope
     if let Some(v) = opts.get("secret-key") {
         builder = builder.access_key_secret(v);
     }
-    apply_operator(builder)
+    apply_operator_with_tls(builder, opts)
 }
 
 async fn build_cos(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
@@ -841,7 +867,7 @@ async fn build_cos(url: &url::Url, opts: &HashMap<String, String>) -> Result<Ope
     if let Some(v) = opts.get("secret-key") {
         builder = builder.secret_key(v);
     }
-    apply_operator(builder)
+    apply_operator_with_tls(builder, opts)
 }
 
 async fn build_obs(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
@@ -860,7 +886,7 @@ async fn build_obs(url: &url::Url, opts: &HashMap<String, String>) -> Result<Ope
     if let Some(v) = opts.get("secret-key") {
         builder = builder.secret_access_key(v);
     }
-    apply_operator(builder)
+    apply_operator_with_tls(builder, opts)
 }
 
 async fn build_b2(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
@@ -876,7 +902,7 @@ async fn build_b2(url: &url::Url, opts: &HashMap<String, String>) -> Result<Oper
     if let Some(v) = opts.get("application-key") {
         builder = builder.application_key(v);
     }
-    apply_operator(builder)
+    apply_operator_with_tls(builder, opts)
 }
 
 async fn build_vercel_blob(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
@@ -888,7 +914,7 @@ async fn build_vercel_blob(url: &url::Url, opts: &HashMap<String, String>) -> Re
     if let Some(v) = opts.get("token") {
         builder = builder.token(v);
     }
-    apply_operator(builder)
+    apply_operator_with_tls(builder, opts)
 }
 
 async fn build_aliyun_drive(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
@@ -912,18 +938,18 @@ async fn build_aliyun_drive(url: &url::Url, opts: &HashMap<String, String>) -> R
     if let Some(v) = opts.get("drive-type") {
         builder = builder.drive_type(v);
     }
-    apply_operator(builder)
+    apply_operator_with_tls(builder, opts)
 }
 
-async fn build_fs(url: &url::Url, _opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_fs(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
     let root = url.path().to_string();
     let builder = Fs::default().root(&root);
-    apply_operator(builder)
+    apply_operator_with_tls(builder, opts)
 }
 
 async fn build_memory(_url: &url::Url, _opts: &HashMap<String, String>) -> Result<Operator> {
     let builder = Memory::default();
-    apply_operator(builder)
+    apply_operator_with_tls(builder, _opts)
 }
 
 extern "C" fn handler(_: i32) {

@@ -1,3 +1,4 @@
+#![allow(clippy::zombie_processes)]
 //! CSI plugin 集成测试。
 //!
 //! 通过 Unix socket 直接调用 mntrs-csi 的 gRPC 接口。
@@ -25,7 +26,7 @@ fn start_csi_server() -> (Child, String) {
 
     let child = Command::new(&csi_path)
         .arg("--node-id=test-node")
-        .arg(&format!("--endpoint=unix://{}", socket))
+        .arg(format!("--endpoint=unix://{}", socket))
         .spawn()
         .unwrap_or_else(|_| {
             panic!("failed to start mntrs-csi at {:?}; build it first: cargo build --package mntrs-csi", csi_path)
@@ -42,6 +43,7 @@ fn start_csi_server() -> (Child, String) {
 }
 
 /// 发送 gRPC 请求并返回响应 body
+#[allow(dead_code)]
 fn grpc_call(socket: &str, service: &str, method: &str, body: &[u8]) -> Vec<u8> {
     use std::os::unix::net::UnixStream;
 
@@ -68,6 +70,7 @@ fn grpc_call(socket: &str, service: &str, method: &str, body: &[u8]) -> Vec<u8> 
 // ============================================================
 
 #[test]
+#[allow(clippy::zombie_processes)]
 fn test_csi_identity_get_plugin_info() {
     let (_child, socket) = start_csi_server();
     std::thread::sleep(Duration::from_millis(500));
@@ -79,6 +82,7 @@ fn test_csi_identity_get_plugin_info() {
 }
 
 #[test]
+#[allow(clippy::zombie_processes)]
 fn test_csi_identity_probe() {
     let (_child, socket) = start_csi_server();
     std::thread::sleep(Duration::from_millis(500));

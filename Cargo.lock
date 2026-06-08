@@ -1802,6 +1802,7 @@ dependencies = [
  "libc",
  "once_cell",
  "opendal",
+ "reqwest",
  "rustix",
  "tokio",
  "tracing",
