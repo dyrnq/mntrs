@@ -466,6 +466,24 @@ pub fn mount(
 
     let mount_path = Path::new(mountpoint);
     let mut cfg: fuser::Config = Default::default();
+    // Check /etc/fuse.conf for user_allow_other when --allow-other is used
+    #[cfg(target_os = "linux")]
+    if allow_other && unsafe { libc::geteuid() != 0 } {
+        let fuse_conf = std::path::Path::new("/etc/fuse.conf");
+        if fuse_conf.exists() {
+            if let Ok(content) = std::fs::read_to_string(fuse_conf) {
+                if !content.lines().any(|l| l.trim() == "user_allow_other") {
+                    return Err(anyhow!(
+                        "--allow-other requires 'user_allow_other' in /etc/fuse.conf. "
+                    ));
+                }
+            }
+        } else {
+            return Err(anyhow!(
+                "--allow-other requires /etc/fuse.conf with 'user_allow_other'. "
+            ));
+        }
+    }
     if allow_other || allow_root {
         cfg.acl = fuser::SessionACL::All;
     }
