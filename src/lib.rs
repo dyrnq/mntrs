@@ -1051,6 +1051,25 @@ impl Filesystem for MntrsFs {
             }
             return;
         }
+        // 1.5 Check file-level cache (single cache file per handle)
+        if !self.direct_io {
+            let cpath = cache_path(&self.cache_dir, &path);
+            if cpath.exists()
+                && let Ok(data) = fs::read(&cpath)
+            {
+                let start = offset as usize;
+                let end = (start + size as usize).min(data.len());
+                let result = if start < data.len() {
+                    data[start..end].to_vec()
+                } else {
+                    vec![]
+                };
+                let b = bytes::Bytes::from(data);
+                self.mem_cache_insert(ino, block_idx, b);
+                reply.data(&result);
+                return;
+            }
+        }
         // 2. Check disk cache (with checksum validation, block-level)
         if !self.direct_io {
             let cpath = cache_block_path(&self.cache_dir, &path, block_idx);
@@ -1985,6 +2004,23 @@ impl CoreFilesystem for MntrsFs {
             };
         }
         if !self.direct_io {
+            // Try file-level cache first (single cache file per handle)
+            let fcpath = crate::cache_path(&self.cache_dir, &path);
+            if fcpath.exists()
+                && let Ok(data) = std::fs::read(&fcpath)
+            {
+                let b = bytes::Bytes::from(data);
+                let start = offset as usize;
+                let end = (start + size as usize).min(b.len());
+                let result = if start < b.len() {
+                    b[start..end].to_vec()
+                } else {
+                    vec![]
+                };
+                self.mem_cache_insert(ino, offset / CACHE_BLOCK_SIZE, b);
+                return Ok(result);
+            }
+            // Fallback to block-level cache
             let cpath = crate::cache_block_path(&self.cache_dir, &path, block_idx);
             if cpath.exists()
                 && let Ok(data) = std::fs::read(&cpath)
