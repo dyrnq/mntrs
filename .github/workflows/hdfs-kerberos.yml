@@ -77,11 +77,11 @@ jobs:
             curl -sL --retry 3 "https://archive.apache.org/dist/hadoop/common/hadoop-${HADOOP_VER}/hadoop-${HADOOP_VER}.tar.gz" -o /tmp/hadoop.tgz
           }
           sudo tar xzf /tmp/hadoop.tgz -C /opt/
-          sudo ln -sf /opt/hadoop-${HADOOP_VER} /opt/hadoop
+          sudo ln -sf /opt/hadoop-${HADOOP_VER} /opt/hadoop 2>/dev/null || true
           echo "HADOOP_HOME=/opt/hadoop" >> $GITHUB_ENV
           echo "/opt/hadoop/bin" >> $GITHUB_PATH
           # Configure pseudo-distributed mode
-          cat > /opt/hadoop/etc/hadoop/core-site.xml << XML
+          sudo tee /opt/hadoop/etc/hadoop/core-site.xml > /dev/null << XML
           <configuration>
             <property><name>fs.defaultFS</name><value>hdfs://localhost:9000</value></property>
             <property><name>hadoop.security.authentication</name><value>kerberos</value></property>
@@ -89,7 +89,7 @@ jobs:
             <property><name>hadoop.security.auth_to_local</name><value>DEFAULT</value></property>
           </configuration>
           XML
-          cat > /opt/hadoop/etc/hadoop/hdfs-site.xml << XML
+          sudo tee /opt/hadoop/etc/hadoop/hdfs-site.xml > /dev/null << XML
           <configuration>
             <property><name>dfs.replication</name><value>1</value></property>
             <property><name>dfs.namenode.kerberos.principal</name><value>hdfs/localhost@TEST.LOCAL</value></property>
@@ -98,7 +98,10 @@ jobs:
           </configuration>
           XML
           cp /tmp/hdfs.keytab /opt/hadoop/etc/hadoop/hdfs.keytab
-          chmod 600 /opt/hadoop/etc/hadoop/hdfs.keytab
+          sudo chmod 600 /opt/hadoop/etc/hadoop/hdfs.keytab
+          # Ensure JAVA_HOME is set for Hadoop
+          echo "export JAVA_HOME=$(readlink -f /usr/bin/java | sed s:/bin/java::)" | sudo tee -a /opt/hadoop/etc/hadoop/hadoop-env.sh > /dev/null
+          echo "export HADOOP_OPTS=-Djava.security.krb5.conf=/etc/krb5.conf" | sudo tee -a /opt/hadoop/etc/hadoop/hadoop-env.sh > /dev/null
           # Setup passwordless SSH for localhost
           ssh-keygen -t rsa -P "" -f ~/.ssh/id_rsa 2>/dev/null
           cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
