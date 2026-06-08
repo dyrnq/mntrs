@@ -58,7 +58,7 @@ fn fnmatch_edge_cases() {
 #[test]
 fn cache_path_is_stable() {
     use mntrs::cache_path;
-        let tmp = std::env::temp_dir();
+    let tmp = std::env::temp_dir();
     let p = cache_path(&tmp, "hello/world");
     let name = p.file_name().unwrap().to_str().unwrap();
     assert_eq!(name.len(), 20);
@@ -68,7 +68,7 @@ fn cache_path_is_stable() {
 #[test]
 fn cache_path_deterministic() {
     use mntrs::cache_path;
-        assert_eq!(
+    assert_eq!(
         cache_path(std::path::Path::new("/a"), "x"),
         cache_path(std::path::Path::new("/a"), "x")
     );

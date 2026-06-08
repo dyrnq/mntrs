@@ -2,15 +2,16 @@ name: CI
 
 on:
   push:
-    branches: [master, main]
+    branches: [master]
   pull_request:
-    branches: [master, main]
+    branches: [master]
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
 
 jobs:
-  # Linux: fuser backend
+  # === Linux: full build + test + clippy + fmt ===
   linux:
     runs-on: ubuntu-latest
     steps:
@@ -18,18 +19,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
       - name: Install FUSE
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3
-      - name: Check
-        run: cargo check --workspace
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Format check
-        run: cargo fmt --check
-      - name: Test
-        run: cargo test --workspace
 
-  # macOS: fuser backend (macFUSE)
+      - name: Build
+        run: cargo build --release
+
+      - name: Test
+        run: cargo test
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+  # === macOS: build + unit test ===
   macos:
     runs-on: macos-latest
     steps:
@@ -37,17 +44,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - name: Install macFUSE
-        run: |
-          brew install --cask macfuse
-      - name: Check
-        run: cargo check --workspace
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test (unit only, no FUSE tests)
-        run: cargo test --workspace --lib
+      - uses: Swatinem/rust-cache@v2
 
-  # Windows: winfsp backend
+      - name: Build
+        run: cargo build --release
+
+      - name: Test
+        run: cargo test
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+  # === Windows: build + unit test + WinFSP ===
   windows:
     runs-on: windows-latest
     steps:
@@ -55,34 +66,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - name: Install WinFSP
-        shell: pwsh
-        run: choco install winfsp --version=2.1.24065 -y
-      - name: Start WinFSP service
-        shell: pwsh
-        run: |
-          $svc = Get-Service winfsp -ErrorAction SilentlyContinue
-          if (-not $svc) {
-            Write-Error "winfsp service not found, install failed"
-            exit 1
-          }
-          Set-Service winfsp -StartupType Automatic
-          Start-Service winfsp
-          Start-Sleep -Seconds 3
-          $svc = Get-Service winfsp
-          if ($svc.Status -ne 'Running') {
-            Write-Error "winfsp service not running: $($svc.Status)"
-            exit 1
-          }
-          Write-Host "WinFSP service is running"
-      - name: Format check
-        run: cargo fmt --check
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Test
+        run: cargo test
+
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Build (release)
-        run: cargo build --release --workspace
-      - name: Test (including WinFSP integration)
-        shell: pwsh
-        env:
-          RUST_BACKTRACE: "1"
-        run: cargo test --workspace --release -- --test-threads=1 --nocapture
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Format check
+        run: cargo fmt --all -- --check

@@ -3,8 +3,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use opendal::services::Memory;
 use opendal::Operator;
+use opendal::services::Memory;
 
 use mntrs::MntrsFs;
 use mntrs::core_fs::CoreFilesystem;
@@ -74,7 +74,8 @@ fn rt_block_on<F, T>(f: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
-    static RT: once_cell::sync::OnceCell<tokio::runtime::Runtime> = once_cell::sync::OnceCell::new();
+    static RT: once_cell::sync::OnceCell<tokio::runtime::Runtime> =
+        once_cell::sync::OnceCell::new();
     let rt = RT.get_or_init(|| tokio::runtime::Runtime::new().expect("tokio rt"));
     rt.block_on(f)
 }

@@ -4,7 +4,9 @@ use fuser::MountOption;
 use once_cell::sync::OnceCell;
 use opendal::Operator;
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
-use opendal::services::{AliyunDrive, Azblob, B2, Cos, Fs, Gcs, HdfsNative, Memory, Obs, Oss, S3, VercelBlob};
+use opendal::services::{
+    AliyunDrive, Azblob, B2, Cos, Fs, Gcs, HdfsNative, Memory, Obs, Oss, S3, VercelBlob,
+};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -356,9 +358,7 @@ pub fn mount(
         use std::sync::Arc;
         let target = parse_windows_target(mountpoint)
             .map_err(|e| anyhow::anyhow!("invalid Windows mount target '{mountpoint}': {e}"))?;
-        let host = winfsp::host::FileSystemHost::new(
-            WinFspAdapter::new(Arc::new(fs)),
-        )?;
+        let host = winfsp::host::FileSystemHost::new(WinFspAdapter::new(Arc::new(fs)))?;
         let _mp = host.mount(target)?;
         // Blocking: WinFSP runs on the calling thread
         host.start()?;
