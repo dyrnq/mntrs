@@ -282,6 +282,16 @@ pub fn load_cache_index(cache_dir: &Path) -> Vec<(String, u64, u64, std::time::S
     entries
 }
 
+fn validate_path_component(name: &str) -> Result<(), Errno> {
+    if name.is_empty() { return Err(Errno::ENOENT); }
+    if name == "." || name == ".." { return Err(Errno::EEXIST); }
+    if name.contains('/') || name.contains(' ') {
+        tracing::warn!(name, "path component contains separator or null");
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+
 impl MntrsFs {
     fn resolve(&self, ino: u64) -> Option<(String, FileType, u64, Option<std::time::SystemTime>)> {
         self.inodes.get(&ino).map(|r| r.clone())
@@ -616,6 +626,7 @@ impl Filesystem for MntrsFs {
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name = name.to_string_lossy().to_string();
+        if let Err(e) = validate_path_component(&name) { reply.error(e); return; }
         let name2 = name.clone();
         let parent: u64 = parent.into();
         if name == "." || name == ".." {
