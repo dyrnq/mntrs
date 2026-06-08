@@ -2,3 +2,5 @@
 *.bak.*
 .bak.*
 graphify-out/
+graphify-out/
+TODO.md
