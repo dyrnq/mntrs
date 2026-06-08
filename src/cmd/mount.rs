@@ -467,6 +467,7 @@ pub fn mount(
         None
     };
 
+    #[cfg(not(windows))]
     if daemon {
         daemonize(mountpoint, wait_pipe.map(|(_, w)| w))?;
         // After daemonize returns (in grandchild), close read end if we inherited it
@@ -803,8 +804,10 @@ async fn build_webhdfs(url: &url::Url, opts: &HashMap<String, String>) -> Result
     apply_operator_with_tls(builder, opts)
 }
 
+#[cfg(not(windows))]
 static DAEMON_PIPE_WR: OnceLock<i32> = OnceLock::new();
 
+#[cfg(not(windows))]
 fn daemonize(mountpoint: &str, wait_pipe: Option<i32>) -> Result<()> {
     // fork/setsid require unsafe — rustix intentionally doesn't wrap them
     match unsafe { libc::fork() } {

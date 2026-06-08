@@ -30,6 +30,7 @@ fuser = "0.17"
 [target.'cfg(windows)'.dependencies]
 winfsp = "0.13"
 winfsp-sys = "0.12"
+windows = { version = "0.61", features = ["Win32_Foundation"] }
 widestring = "1"
 
 [features]
