@@ -71,10 +71,10 @@ jobs:
           cd /tmp
           git clone --depth 1 https://github.com/Kimahriman/hdfs-native.git
           cd hdfs-native
-          cargo test --no-run --test minidfs 2>&1 || true
-          # If minidfs binary exists, run it
-          if [ -f target/debug/deps/minidfs-* ]; then
-            target/debug/deps/minidfs-* --kerberos &
+          cargo build --example simple 2>&1 || true
+          # If simple example binary exists, run it
+          if [ -f target/debug/examples/simple ]; then
+            target/debug/examples/simple --kerberos &
             MINIDFS_PID=$!
             sleep 5
             
@@ -93,7 +93,7 @@ jobs:
             fusermount3 -u /tmp/hdfs-mnt
             kill $MNTRS_PID $MINIDFS_PID 2>/dev/null
           else
-            echo "minidfs binary not found — skipping mount test"
+            echo "hdfs-native simple example not found — skipping mount test"
           fi
 
   csi-sanity:
