@@ -31,7 +31,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y krb5-user libgssapi-krb5-2 libfuse3-dev fuse3 default-jdk
+        run: sudo apt-get update && sudo apt-get install -y krb5-user libgssapi-krb5-2 libfuse3-dev fuse3 default-jdk openssh-server openssh-client
 
       - name: Configure Kerberos
         run: |
@@ -64,16 +64,48 @@ jobs:
       - name: Build mntrs (with HDFS)
         run: cargo build --release -p mntrs --features hdfs-jni
 
-      - name: Setup HDFS (single-node)
-        uses: beyondstorage/setup-hdfs@master
-        with:
-          hdfs-version: "3.3.1"
+      - name: Setup Hadoop single-node
+        run: |
+          HADOOP_VER="3.3.6"
+          HADOOP_URL="https://dlcdn.apache.org/hadoop/common/hadoop-${HADOOP_VER}/hadoop-${HADOOP_VER}.tar.gz"
+          echo "Downloading Hadoop ${HADOOP_VER}..."
+          curl -sL --retry 3 "$HADOOP_URL" -o /tmp/hadoop.tgz || {
+            echo "::warning::Apache CDN failed, trying mirror..."
+            curl -sL --retry 3 "https://archive.apache.org/dist/hadoop/common/hadoop-${HADOOP_VER}/hadoop-${HADOOP_VER}.tar.gz" -o /tmp/hadoop.tgz
+          }
+          sudo tar xzf /tmp/hadoop.tgz -C /opt/
+          sudo ln -sf /opt/hadoop-${HADOOP_VER} /opt/hadoop
+          echo "HADOOP_HOME=/opt/hadoop" >> $GITHUB_ENV
+          echo "/opt/hadoop/bin" >> $GITHUB_PATH
+          # Configure pseudo-distributed mode
+          cat > /opt/hadoop/etc/hadoop/core-site.xml << XML
+          <configuration>
+            <property><name>fs.defaultFS</name><value>hdfs://localhost:9000</value></property>
+          </configuration>
+          XML
+          cat > /opt/hadoop/etc/hadoop/hdfs-site.xml << XML
+          <configuration>
+            <property><name>dfs.replication</name><value>1</value></property>
+          </configuration>
+          XML
+          # Setup passwordless SSH for localhost
+          ssh-keygen -t rsa -P "" -f ~/.ssh/id_rsa 2>/dev/null
+          cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          ssh-keyscan -H localhost >> ~/.ssh/known_hosts 2>/dev/null
+          # Format Namenode
+          /opt/hadoop/bin/hdfs namenode -format -force 2>&1 | tail -1
+          # Start HDFS
+          /opt/hadoop/sbin/start-dfs.sh 2>&1
+          sleep 5
+          # Verify
+          /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | head -5
+          HDFS_NAMENODE_ADDR="localhost:9000"
+          echo "HDFS_NAMENODE_ADDR=localhost:9000" >> $GITHUB_ENV
 
       - name: Verify HDFS is running
         run: |
           echo "HDFS NameNode: $HDFS_NAMENODE_ADDR"
-          curl -sf "$HDFS_NAMENODE_ADDR" || echo "HDFS web UI not reachable (OK)"
-          # Create test dir via HDFS CLI
           hdfs dfs -mkdir -p /test || true
           echo "hello hdfs" | hdfs dfs -put - /test/hello.txt || true
           hdfs dfs -ls /test || true
