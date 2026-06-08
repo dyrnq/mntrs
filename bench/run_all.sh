@@ -1,7 +1,7 @@
 #!/bin/bash
 # mntrs vs rclone comprehensive benchmark (100+ tests, ~5 min)
 # Usage: ./bench/run_all.sh
-set -euo pipefail
+set -uo pipefail
 
 ENDPOINT="${ENDPOINT:-http://localhost:9000}"
 ACCESS_KEY="${ACCESS_KEY:-minioadmin}"
@@ -105,8 +105,8 @@ echo ""
 # ---- Warmup ----
 ls "$MNTRS_MNT"/ >/dev/null 2>&1
 ls "$RCLONE_MNT"/ >/dev/null 2>&1
-cat "$MNTRS_MNT/1K.bin" >/dev/null 2>&1
-cat "$RCLONE_MNT/1K.bin" >/dev/null 2>&1
+cat "$MNTRS_MNT/1K.bin" >/dev/null 2>&1 || true
+cat "$RCLONE_MNT/1K.bin" >/dev/null 2>&1 || true
 
 # ============================================================
 # Test categories
