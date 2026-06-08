@@ -128,6 +128,23 @@ extern "C" fn cleanup() {
 /// Simplified mount entry point for CSI plugin.
 /// Uses defaults for all the FUSE tuning parameters.
 /// Check if a path is already a mount point by checking /proc/mounts.
+
+/// Check if a path is already a mount point on macOS.
+#[cfg(target_os = "macos")]
+pub fn is_mount_point(path: &str) -> bool {
+    use std::process::Command;
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
+    let output = Command::new("mount")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    output.lines().any(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        fields.len() >= 3 && fields[2] == canonical.to_string_lossy().as_ref()
+    })
+}
+
 #[cfg(target_os = "linux")]
 pub fn is_mount_point(path: &str) -> bool {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));

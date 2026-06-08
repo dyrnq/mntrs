@@ -25,6 +25,14 @@ use fuser::{
     ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
     Request, TimeOrNow, WriteFlags,
 };
+/// Returns ENOATTR (macOS) or ENODATA (Linux) depending on platform.
+fn xattr_not_found() -> Errno {
+    #[cfg(target_os = "linux")]
+    { Errno::ENODATA }
+    #[cfg(target_os = "macos")]
+    { Errno::ENOATTR }
+}
+
 
 #[cfg(not(unix))]
 /// Stub type for non-Unix platforms — mirrors fuser::FileType variants used in shared state.
@@ -1511,12 +1519,12 @@ impl Filesystem for MntrsFs {
         if self.no_apple_xattr
             && (name.starts_with("com.apple.") || name == "system.posix_acl_access")
         {
-            reply.error(Errno::ENODATA);
+            reply.error(xattr_not_found());
             return;
         }
         if let Some((path, kind, _, _)) = self.resolve(ino) {
             if kind == FileType::Directory {
-                reply.error(Errno::ENODATA);
+                reply.error(xattr_not_found());
                 return;
             }
             // Fetch object metadata for ETag / storage-class
@@ -1529,16 +1537,16 @@ impl Filesystem for MntrsFs {
                             reply.data(etag.as_bytes());
                             return;
                         }
-                        reply.error(Errno::ENODATA);
+                        reply.error(xattr_not_found());
                     }
                     "user.content-type" | "s3.content-type" => {
                         if let Some(ct) = meta.content_type() {
                             reply.data(ct.as_bytes());
                             return;
                         }
-                        reply.error(Errno::ENODATA);
+                        reply.error(xattr_not_found());
                     }
-                    _ => reply.error(Errno::ENODATA),
+                    _ => reply.error(xattr_not_found()),
                 },
                 Err(_) => reply.error(Errno::EIO),
             }
@@ -1550,7 +1558,7 @@ impl Filesystem for MntrsFs {
         let ino: u64 = ino.into();
         if let Some((_, kind, _, _)) = self.resolve(ino) {
             if kind == FileType::Directory {
-                reply.error(Errno::ENODATA);
+                reply.error(xattr_not_found());
                 return;
             }
             // Return known xattr names
