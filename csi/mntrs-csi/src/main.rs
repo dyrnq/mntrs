@@ -385,3 +385,62 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // ============================================================
+    // volume_context 解析
+    // ============================================================
+
+    #[test]
+    fn parse_storage_key_priority() {
+        let mut ctx = HashMap::new();
+        ctx.insert("storage".to_string(), "s3://b1".to_string());
+        ctx.insert("storageUrl".to_string(), "s3://b2".to_string());
+        ctx.insert("storage-url".to_string(), "s3://b3".to_string());
+
+        let v = ctx.get("storage")
+            .or_else(|| ctx.get("storageUrl"))
+            .or_else(|| ctx.get("storage-url"));
+        assert_eq!(v.unwrap(), "s3://b1");
+    }
+
+    #[test]
+    fn parse_storage_url_with_prefix() {
+        let mut ctx = HashMap::new();
+        ctx.insert("storage".to_string(), "s3://bucket".to_string());
+        ctx.insert("prefix".to_string(), "data/2026/".to_string());
+
+        let storage = ctx.get("storage").unwrap();
+        let prefix = ctx.get("prefix").unwrap();
+        let url = format!("{}/{}",
+            storage.trim_end_matches('/'),
+            prefix.trim_start_matches('/')
+        );
+        assert_eq!(url, "s3://bucket/data/2026/");
+    }
+
+    #[test]
+    fn parse_storage_url_no_prefix() {
+        let mut ctx = HashMap::new();
+        ctx.insert("storage".to_string(), "s3://bucket".to_string());
+        let storage = ctx.get("storage").unwrap();
+        assert_eq!(storage, "s3://bucket");
+    }
+
+    #[test]
+    fn parse_read_only_flag() {
+        let mut ctx = HashMap::new();
+        ctx.insert("readOnly".to_string(), "true".to_string());
+        let ro = ctx.get("readOnly").map(|v| v == "true").unwrap_or(false);
+        assert!(ro);
+
+        let mut ctx2 = HashMap::new();
+        ctx2.insert("readOnly".to_string(), "false".to_string());
+        let ro2 = ctx2.get("readOnly").map(|v| v == "true").unwrap_or(false);
+        assert!(!ro2);
+    }
+}
