@@ -14,7 +14,14 @@ const MNTRS_BIN: &str = "./target/debug/mntrs";
 const MNTRS_MNT: &str = "/tmp/mntrs-fuse-test";
 
 fn mntrs_mount(read_only: bool) {
-    let _ = Command::new("curl").args(["-sf", "-X", "PUT", &format!("{}/test-bucket", MINIO_ENDPOINT)]).status();
+    let _ = Command::new("curl")
+        .args([
+            "-sf",
+            "-X",
+            "PUT",
+            &format!("{}/test-bucket", MINIO_ENDPOINT),
+        ])
+        .status();
     let _ = Command::new("fusermount3")
         .arg("-u")
         .arg(MNTRS_MNT)
