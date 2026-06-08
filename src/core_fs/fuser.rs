@@ -1,7 +1,6 @@
 //! fuser adapter — bridges `CoreFilesystem` to `fuser::Filesystem`.
 
 use std::ffi::OsStr;
-use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
@@ -11,7 +10,7 @@ use fuser::{
     Request, TimeOrNow, WriteFlags,
 };
 
-use super::{CoreFileAttr, CoreFileType, CoreVolumeStat, CoreFilesystem};
+use super::{CoreFileAttr, CoreFileType, CoreFilesystem};
 
 fn to_fuse_filetype(ft: CoreFileType) -> FileType {
     match ft {
@@ -61,7 +60,7 @@ fn io_err_to_fuse_errno(e: std::io::Error) -> Errno {
         _ => {
             let code = e.raw_os_error().unwrap_or(0);
             if code > 0 {
-                Errno::new(code)
+                Errno::from_i32(code)
             } else {
                 Errno::EIO
             }
@@ -70,26 +69,26 @@ fn io_err_to_fuse_errno(e: std::io::Error) -> Errno {
 }
 
 /// Adapter that wraps a `CoreFilesystem` and implements `fuser::Filesystem`.
-pub struct FuserAdapter<F: CoreFilesystem> {
+pub struct FuserAdapter<F: CoreFilesystem + 'static> {
     pub inner: F,
     pub dir_cache_ttl: Duration,
     pub attr_ttl: Duration,
 }
 
-impl<F: CoreFilesystem> FuserAdapter<F> {
+impl<F: CoreFilesystem + 'static> FuserAdapter<F> {
     pub fn new(inner: F, dir_cache_ttl: Duration, attr_ttl: Duration) -> Self {
         Self { inner, dir_cache_ttl, attr_ttl }
     }
 }
 
-impl<F: CoreFilesystem> fuser::Filesystem for FuserAdapter<F> {
+impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
     fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> std::io::Result<()> {
         self.inner.init()
     }
 
     fn access(&self, _req: &Request, _ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
         let ino: u64 = _ino.into();
-        match self.inner.access(ino, _mask.bits()) {
+        match self.inner.access(ino, _mask.bits() as u32) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(io_err_to_fuse_errno(e)),
         }
@@ -273,7 +272,7 @@ impl<F: CoreFilesystem> fuser::Filesystem for FuserAdapter<F> {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        match self.inner.open(ino.into(), _flags.bits()) {
+        let flags: u32 = _flags.bits() as u32; match self.inner.open(ino.into(), flags) {
             Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
             Err(e) => reply.error(io_err_to_fuse_errno(e)),
         }

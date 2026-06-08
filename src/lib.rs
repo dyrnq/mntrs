@@ -215,6 +215,7 @@ impl MntrsFs {
         let ino = path_hash(path);
         self.inodes
             .entry(ino)
+            .and_modify(|v| v.2 = size)
             .or_insert((path.to_string(), kind, size));
         ino
     }
@@ -743,7 +744,13 @@ impl Filesystem for MntrsFs {
             } else {
                 format!("{}/{}", path, name)
             };
-            let (_kind, size, mtime) = self.stat_op(&cp).unwrap_or((*kind, 0, None));
+            let (size, mtime) = match self.stat_op(&cp) {
+                Some((_, s, mt)) => (s, mt),
+                None => {
+                    tracing::debug!(path = %cp, "readdirplus stat_op failed, skip");
+                    continue;
+                }
+            };
             let ino = self.alloc_ino(&cp, *kind, size);
             let mut attr = self.make_attr(ino, size, *kind);
             if let Some(mt) = mtime {
@@ -842,13 +849,19 @@ impl Filesystem for MntrsFs {
         reply: ReplyData,
     ) {
         let ino: u64 = ino.into();
-        let path = match self.resolve(ino) {
-            Some((p, _, _)) => p,
+        let (path, file_size) = match self.resolve(ino) {
+            Some((p, _, s)) => (p, s),
             None => {
                 reply.error(Errno::ENOENT);
                 return;
             }
         };
+        // EOF guard: offset past end → empty data
+        if offset >= file_size {
+            reply.data(&[]);
+            return;
+        }
+        let cap = file_size - offset;
         // 1. Check memory cache first (fast path)
         if let Some(entry) = self.mem_cache.get(&ino) {
             let data = entry.value().clone();
@@ -924,8 +937,10 @@ impl Filesystem for MntrsFs {
         let streams = self.read_chunk_streams.max(1);
         if streams > 1 && fetch_size > 128 * 1024 {
             // Multi-chunk concurrent fetch
-            let chunk_size = (fetch_size / streams as u64).max(64 * 1024);
-            let end = offset + fetch_size;
+            let clamped_fetch = fetch_size.min(cap);
+            let clamped_size = (size as u64).min(cap) as u32;
+            let chunk_size = (clamped_fetch / streams as u64).max(64 * 1024);
+            let end = offset + clamped_fetch;
             let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(streams as usize));
             let mut tasks = Vec::new();
             let mut off = offset;
@@ -957,7 +972,7 @@ impl Filesystem for MntrsFs {
             }
             if ok {
                 let b: bytes::Bytes = all_data.freeze();
-                let slice = &b[..(b.len() as u32).min(size) as usize];
+                let slice = &b[..(b.len() as u32).min(clamped_size) as usize];
                 reply.data(slice);
                 self.mem_cache_insert(ino, b);
             } else {
@@ -965,12 +980,14 @@ impl Filesystem for MntrsFs {
             }
         } else {
             // Single-chunk fetch (original path)
+            let clamped_fetch = fetch_size.min(cap);
+            let clamped_size = (size as u64).min(cap) as u32;
             match rt()
-                .block_on(async move { op.read_with(&p).range(offset..offset + fetch_size).await })
+                .block_on(async move { op.read_with(&p).range(offset..offset + clamped_fetch).await })
             {
                 Ok(buf) => {
                     let b: bytes::Bytes = buf.to_vec().into();
-                    let slice = &b[..(b.len() as u32).min(size) as usize];
+                    let slice = &b[..(b.len() as u32).min(clamped_size) as usize];
                     reply.data(slice);
                     self.mem_cache_insert(ino, b);
                 }
