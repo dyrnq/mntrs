@@ -49,12 +49,15 @@ jobs:
 
       - name: Create principals via Docker exec
         run: |
-          docker exec $(docker ps -q -f ancestor=gcavalcante8808/krb5-server) kadmin.local -q "addprinc -randkey hdfs/kdc@TEST.LOCAL"
-          docker exec $(docker ps -q -f ancestor=gcavalcante8808/krb5-server) kadmin.local -q "addprinc -randkey testuser@TEST.LOCAL"
-          docker exec $(docker ps -q -f ancestor=gcavalcante8808/krb5-server) kadmin.local -q "ktadd -k /tmp/hdfs.keytab hdfs/kdc@TEST.LOCAL"
-          docker exec $(docker ps -q -f ancestor=gcavalcante8808/krb5-server) kadmin.local -q "ktadd -k /tmp/testuser.keytab testuser@TEST.LOCAL"
-          docker cp $(docker ps -q -f ancestor=gcavalcante8808/krb5-server):/tmp/hdfs.keytab /tmp/
-          docker cp $(docker ps -q -f ancestor=gcavalcante8808/krb5-server):/tmp/testuser.keytab /tmp/
+          KDC_CID=$(docker ps -q -f ancestor=gcavalcante8808/krb5-server)
+          docker exec $KDC_CID kadmin.local -q "addprinc -randkey hdfs/localhost@TEST.LOCAL"
+          docker exec $KDC_CID kadmin.local -q "addprinc -randkey testuser@TEST.LOCAL"
+          docker exec $KDC_CID kadmin.local -q "addprinc -randkey HTTP/localhost@TEST.LOCAL"
+          docker exec $KDC_CID kadmin.local -q "ktadd -k /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL"
+          docker exec $KDC_CID kadmin.local -q "ktadd -k /tmp/hdfs.keytab HTTP/localhost@TEST.LOCAL"
+          docker exec $KDC_CID kadmin.local -q "ktadd -k /tmp/testuser.keytab testuser@TEST.LOCAL"
+          docker cp $KDC_CID:/tmp/hdfs.keytab /tmp/
+          docker cp $KDC_CID:/tmp/testuser.keytab /tmp/
 
       - name: kinit + verify
         run: |
@@ -81,13 +84,21 @@ jobs:
           cat > /opt/hadoop/etc/hadoop/core-site.xml << XML
           <configuration>
             <property><name>fs.defaultFS</name><value>hdfs://localhost:9000</value></property>
+            <property><name>hadoop.security.authentication</name><value>kerberos</value></property>
+            <property><name>hadoop.security.authorization</name><value>true</value></property>
+            <property><name>hadoop.security.auth_to_local</name><value>DEFAULT</value></property>
           </configuration>
           XML
           cat > /opt/hadoop/etc/hadoop/hdfs-site.xml << XML
           <configuration>
             <property><name>dfs.replication</name><value>1</value></property>
+            <property><name>dfs.namenode.kerberos.principal</name><value>hdfs/localhost@TEST.LOCAL</value></property>
+            <property><name>dfs.datanode.kerberos.principal</name><value>hdfs/localhost@TEST.LOCAL</value></property>
+            <property><name>dfs.web.authentication.kerberos.principal</name><value>HTTP/localhost@TEST.LOCAL</value></property>
           </configuration>
           XML
+          cp /tmp/hdfs.keytab /opt/hadoop/etc/hadoop/hdfs.keytab
+          chmod 600 /opt/hadoop/etc/hadoop/hdfs.keytab
           # Setup passwordless SSH for localhost
           ssh-keygen -t rsa -P "" -f ~/.ssh/id_rsa 2>/dev/null
           cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
@@ -95,7 +106,9 @@ jobs:
           ssh-keyscan -H localhost >> ~/.ssh/known_hosts 2>/dev/null
           # Format Namenode
           /opt/hadoop/bin/hdfs namenode -format -force 2>&1 | tail -1
-          # Start HDFS
+          # Start HDFS with Kerberos
+          export HADOOP_OPTS="-Djava.security.krb5.conf=/etc/krb5.conf"
+          kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL
           /opt/hadoop/sbin/start-dfs.sh 2>&1
           sleep 5
           # Verify
