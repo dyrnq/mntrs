@@ -32,9 +32,6 @@ jobs:
       - name: Build workspace
         run: cargo build --workspace
 
-      - name: Build CSI plugin
-        run: cargo build --package mntrs-csi
-
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
