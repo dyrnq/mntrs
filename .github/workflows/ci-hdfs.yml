@@ -26,6 +26,12 @@ jobs:
           sudo apt-get update && sudo apt-get install -y \
             libfuse3-dev fuse3 default-jdk
           echo "JAVA_HOME=/usr/lib/jvm/default-java" >> $GITHUB_ENV
+          # Find libjvm.so for LD_LIBRARY_PATH (needed by JNI test binaries)
+          JVM_LIB=$(find /usr/lib/jvm -name "libjvm.so" 2>/dev/null | head -1)
+          if [ -n "$JVM_LIB" ]; then
+            JVM_DIR=$(dirname "$JVM_LIB")
+            echo "LD_LIBRARY_PATH=$JVM_DIR:\${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
+          fi
 
       - name: Build (with hdfs-jni feature)
         run: cargo build --release --features hdfs-jni
