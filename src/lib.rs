@@ -515,7 +515,8 @@ impl MntrsFs {
             if remaining == 0 {
                 break;
             }
-            let cpath = cache_path(&self.cache_dir, &path);
+            let block_idx = 0; // flush uses block 0 (main cache location)
+            let cpath = cache_block_path(&self.cache_dir, &path, block_idx);
             let _ = fs::remove_file(&cpath);
             let _ = fs::remove_file(cpath.with_extension("meta"));
             self.disk_cache_index.remove(&path as &str);
@@ -1184,7 +1185,8 @@ impl Filesystem for MntrsFs {
                 return;
             }
         }
-        let cpath = cache_path(&self.cache_dir, &path);
+        let block_idx = offset / CACHE_BLOCK_SIZE;
+        let cpath = cache_block_path(&self.cache_dir, &path, block_idx);
         if let Some(parent) = cpath.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -1402,6 +1404,17 @@ impl Filesystem for MntrsFs {
         let ino: u64 = ino.into();
         if let Some((p, kind, _, _)) = self.resolve(ino) {
             if let Some(s) = size {
+                // Clear all block-level cache entries for this file
+                let prefix = format!("{:020x}_", path_hash(&p));
+                if let Ok(entries) = fs::read_dir(&self.cache_dir) {
+                    for e in entries.flatten() {
+                        if let Some(name) = e.file_name().to_str() {
+                            if name.starts_with(&prefix) {
+                                let _ = fs::remove_file(e.path());
+                            }
+                        }
+                    }
+                }
                 let cpath = cache_path(&self.cache_dir, &p);
                 if cpath.exists()
                     && let Err(e) = fs::write(&cpath, &[] as &[u8])
@@ -1489,7 +1502,8 @@ impl Filesystem for MntrsFs {
             }
         };
         if dirty {
-            let cpath = cache_path(&self.cache_dir, &path);
+            let block_idx = 0; // flush uses block 0 (main cache location)
+            let cpath = cache_block_path(&self.cache_dir, &path, block_idx);
             if cpath.exists() {
                 // Write sidecar for crash recovery
                 let sidecar = cpath.with_extension("dirty");
