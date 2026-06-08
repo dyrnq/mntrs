@@ -25,16 +25,13 @@ use fuser::{
     ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
     Request, TimeOrNow, WriteFlags,
 };
-/// Returns ENOATTR (macOS) or ENODATA (Linux) depending on platform.
+#[cfg(target_os = "linux")]
 fn xattr_not_found() -> Errno {
-    #[cfg(target_os = "linux")]
-    {
-        Errno::ENODATA
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Errno::ENOATTR
-    }
+    Errno::ENODATA
+}
+#[cfg(target_os = "macos")]
+fn xattr_not_found() -> Errno {
+    Errno::ENOATTR
 }
 
 #[cfg(not(unix))]
