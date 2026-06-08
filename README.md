@@ -15,14 +15,14 @@ with a unified caching, prefetching, and write-back pipeline.
 
 ## Highlights
 
-- **Block-level multi-level cache** (8 MB) — memory + disk + remote, survives restarts
+- **Single-file write cache** — per-handle cache file with `WriteAt` random write support, plus block-level read cache (8 MB)
 - **Adaptive prefetcher** with backpressure — chunk size doubles on sequential reads (up to 8 MB)
 - **Multi-chunk concurrent read** — `Semaphore`-bounded streams per FUSE read
 - **Write-back queue** with `fsync` semantics + `.dirty` sidecar crash recovery
 - **HDFS Kerberos** — three backends (native / JNI / WebHDFS)
 - **WinFSP** adapter for native Windows support
 - **Pure-Rust CSI driver** for Kubernetes with Controller + Node + Identity services
-- **CRC64 integrity** for disk cache blocks
+- **CRC64 integrity** for disk cache
 
 ---
 
@@ -195,8 +195,12 @@ Three-tier cache: **memory → disk → remote**. Block-level (8 MB) indexing. D
 | `--no-modtime` | false | Disable mtime read/write |
 | `--use-server-modtime` | false | Use server-side mtime (vs local cache) |
 | `--no-implicit-dir` | false | Disable S3 implicit dir fallback |
+| `--direct-io` | false | Bypass kernel page cache, direct FUSE access |
+| `--vfs-handle-caching` | 0s | Keep file handles open after last close for reuse |
+| `--vfs-write-back` | 5s | Max time before dirty file is uploaded |
+| `--write-back-cache` | false | Kernel write-back cache (not supported on all FUSE) |
 
-**Disk cache file format**: `{hash:020x}_{block:010x}.block` — recoverable on restart by scanning filenames.
+**Disk cache**: write uses file-level cache (`{hash}` hash name), read checks file-level first then block-level (`{hash}_{block}.block`). Recoverable on restart.
 
 ---
 
@@ -245,7 +249,7 @@ sync /mnt/s3/file.txt              # fsync → waits for write-back queue
 - **`PendingUploadHook`** updates inode size/mtime after successful upload
 - **`fsync` semantics** (flush waits up to 5 min for queue drain; CSI uses 1 hour)
 - **Multipart upload** via `op.writer()` auto-chunks >5 GB
-- **CRC64 integrity** for disk cache blocks
+- **CRC64 integrity** for disk cache
 
 ---
 
@@ -368,14 +372,17 @@ FUSE read(ino, offset, size)
   ↓ miss
 3. network stat() → attr_cache.insert
   ↓
-4. block_idx = offset / 8MB
+4. cache fd (write handle still open)? → read from fd → return
+  ↓ miss
 5. mem_cache[(ino, block_idx)]? → return block
   ↓ miss
-6. disk cache (CRC64 verify) → mem_cache insert
+6. file-level disk cache → mem_cache insert → return
   ↓ miss
-7. prefetcher PartQueue pop → return chunk
+7. block-level disk cache (CRC64 verify) → mem_cache insert → return
   ↓ miss
-8. multi-chunk fetch (Semaphore N streams) → disk + mem insert
+8. prefetcher PartQueue pop → return chunk
+  ↓ miss
+9. multi-chunk fetch (Semaphore N streams) → disk + mem insert
 ```
 
 ---
