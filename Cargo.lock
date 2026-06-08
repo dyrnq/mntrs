@@ -1821,7 +1821,7 @@ dependencies = [
  "clap",
  "mntrs",
  "opendal",
- "prost 0.13.5",
+ "prost 0.14.4",
  "prost-types 0.13.5",
  "serde",
  "serde_json",
