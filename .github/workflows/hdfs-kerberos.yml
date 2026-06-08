@@ -1,5 +1,12 @@
 name: HDFS Kerberos Integration
 
+concurrency:
+permissions:
+  contents: read
+
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 on:
   workflow_dispatch:
 
