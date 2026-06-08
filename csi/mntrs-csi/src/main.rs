@@ -300,12 +300,11 @@ impl node_server::Node for NodeService {
             return Ok(Response::new(NodeStageVolumeResponse::default()));
         }
 
-        let (storage_url, read_only, opts) = parse_volume_context(&vol_ctx, &volume_id)?;
+        let (storage_url, read_only, mut opts) = parse_volume_context(&vol_ctx, &volume_id)?;
         let _volume_id = encode_volume_id(&storage_url);
         let _ = std::fs::create_dir_all(&staging_path);
 
         tracing::info!(volume_id, storage=%storage_url, staging=%staging_path, "staging FUSE mount");
-        let mut opts = opts;
         if let Some(cache_base) = std::env::var("MNTRS_CACHE_DIR").ok() {
             let vol_cache = format!("{}/{}", cache_base, encode_volume_id(&storage_url));
             opts.insert("cache-dir".to_string(), vol_cache);
@@ -506,6 +505,16 @@ fn expand_path_pattern(
         .replace("${.PVC.namespace}/${.PVC.name}", &format!("{}/{}", pvc_namespace, pvc_name))
 }
 
+
+/// Inject MNTRS_* environment variables as mount options
+fn inject_env_opts(opts: &mut HashMap<String, String>) {
+    for (k, v) in std::env::vars() {
+        if let Some(flag) = k.strip_prefix("MNTRS_") {
+            let key = flag.to_lowercase().replace('_', "-");
+            opts.entry(key).or_insert(v);
+        }
+    }
+}
 fn parse_volume_context(
     ctx: &HashMap<String, String>,
     volume_id: &str,
