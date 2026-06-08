@@ -168,8 +168,8 @@ pub mod test_helpers {
     /// Returns the mount handle. Dropping it unmounts.
     pub fn mount_winfsp<F: CoreFilesystem + 'static>(fs: Arc<F>) -> std::io::Result<MountGuard> {
         let adapter = WinFspAdapter::new(fs);
-        let host =
-            FileSystemHost::new(winfsp::host::VolumeParams::default(), adapter).map_err(|e| {
+        let mut host = FileSystemHost::new(winfsp::host::VolumeParams::default(), adapter)
+            .map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("FileSystemHost::new: {e}"),

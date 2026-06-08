@@ -631,8 +631,6 @@ pub fn mount(
         vol_params.filesystem_name(volname);
         let mut host = winfsp::host::FileSystemHost::new(vol_params, adapter)?;
         let _mp = host.mount(mountpoint)?;
-        // Blocking: WinFSP runs on the calling thread
-        host.start()?;
     }
 
     // Foreground mode with --daemon-wait: parent waits for pipe close

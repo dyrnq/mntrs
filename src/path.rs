@@ -34,13 +34,13 @@ pub fn parse_windows_target(target: &str) -> std::io::Result<winfsp::host::Mount
     if t.len() == 2 && t.as_bytes()[1] == b':' {
         let letter = t.as_bytes()[0];
         if letter.is_ascii_alphabetic() {
-            return Ok(MountPoint::MountPoint(letter as char));
+            return Ok(MountPoint::from(std::ffi::OsStr::new(&t[..2])));
         }
     }
     if t == "*" {
         return Ok(MountPoint::NextFreeDrive);
     }
-    Ok(MountPoint::MountPoint(std::path::PathBuf::from(t)))
+    Ok(MountPoint::from(std::path::Path::new(t)))
 }
 
 #[cfg(test)]

@@ -276,7 +276,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
     }
 }
 
-#[cfg(feature = "async-io")]
+#[cfg(all(feature = "async-io", windows))]
 impl<F: CoreFilesystem + 'static> winfsp::filesystem::AsyncFileSystemContext for WinFspAdapter<F> {
     fn spawn_task(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
         std::thread::spawn(|| {
