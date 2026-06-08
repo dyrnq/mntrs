@@ -4,7 +4,7 @@ use fuser::MountOption;
 use once_cell::sync::OnceCell;
 use opendal::Operator;
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
-use opendal::services::{AliyunDrive, Azblob, B2, Cos, Gcs, HdfsNative, Obs, Oss, S3, VercelBlob};
+use opendal::services::{AliyunDrive, Azblob, B2, Cos, Fs, Gcs, HdfsNative, Obs, Oss, S3, VercelBlob};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -426,6 +426,7 @@ async fn build_operator(storage_url: &str, opts: &HashMap<String, String>) -> Re
         "obs" => build_obs(&url, opts).await,
         "b2" => build_b2(&url, opts).await,
         "vercel" | "vercel-blob" => build_vercel_blob(&url, opts).await,
+        "fs" | "file" => build_fs(&url, opts).await,
         "aliyun" | "aliyun-drive" => build_aliyun_drive(&url, opts).await,
         s => Err(anyhow!(
             "unsupported scheme '{s}'; try s3://, gs://, azblob://, hdfs://, oss://, cos://, obs://, b2://"
@@ -665,6 +666,12 @@ async fn build_aliyun_drive(url: &url::Url, opts: &HashMap<String, String>) -> R
     if let Some(v) = opts.get("drive-type") {
         builder = builder.drive_type(v);
     }
+    apply_operator(builder)
+}
+
+async fn build_fs(url: &url::Url, _opts: &HashMap<String, String>) -> Result<Operator> {
+    let root = url.path().to_string();
+    let builder = Fs::default().root(&root);
     apply_operator(builder)
 }
 
