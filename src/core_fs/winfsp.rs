@@ -23,13 +23,13 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use winfsp::FspError;
 
 use widestring::U16CStr;
 use windows::Win32::Foundation::STATUS_INVALID_DEVICE_REQUEST;
 use winfsp::Result;
 use winfsp::filesystem::{
-    DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext,
-    ModificationDescriptor, OpenFileInfo, VolumeInfo,
+    FileInfo, FileSecurity, FileSystemContext, ModificationDescriptor, OpenFileInfo, VolumeInfo,
 };
 use winfsp_sys::FILE_ACCESS_RIGHTS;
 
@@ -77,19 +77,26 @@ fn core_volume_to_volume_info(v: &CoreVolumeStat, out: &mut VolumeInfo) {
     out.free_size = v.free_blocks * v.block_size as u64;
 }
 
-/// map std::io::ErrorKind to winfsp NTSTATUS
-fn io_err_to_status(e: std::io::Error) -> windows::core::Error {
+/// map std::io::Error to winfsp::Result error type
+fn io_err_to_status(e: std::io::Error) -> winfsp::FspError {
     match e.kind() {
-        std::io::ErrorKind::NotFound => windows::Win32::Foundation::STATUS_OBJECT_NAME_NOT_FOUND,
-        std::io::ErrorKind::PermissionDenied => windows::Win32::Foundation::STATUS_ACCESS_DENIED,
-        std::io::ErrorKind::AlreadyExists => {
-            windows::Win32::Foundation::STATUS_OBJECT_NAME_COLLISION
+        std::io::ErrorKind::NotFound => {
+            FspError::NTSTATUS(windows::Win32::Foundation::STATUS_OBJECT_NAME_NOT_FOUND.0)
         }
-        std::io::ErrorKind::InvalidInput => windows::Win32::Foundation::STATUS_INVALID_PARAMETER,
-        std::io::ErrorKind::StorageFull => windows::Win32::Foundation::STATUS_DISK_FULL,
-        _ => windows::Win32::Foundation::STATUS_UNSUCCESSFUL,
+        std::io::ErrorKind::PermissionDenied => {
+            FspError::NTSTATUS(windows::Win32::Foundation::STATUS_ACCESS_DENIED.0)
+        }
+        std::io::ErrorKind::AlreadyExists => {
+            FspError::NTSTATUS(windows::Win32::Foundation::STATUS_OBJECT_NAME_COLLISION.0)
+        }
+        std::io::ErrorKind::InvalidInput => {
+            FspError::NTSTATUS(windows::Win32::Foundation::STATUS_INVALID_PARAMETER.0)
+        }
+        std::io::ErrorKind::StorageFull => {
+            FspError::NTSTATUS(windows::Win32::Foundation::STATUS_DISK_FULL.0)
+        }
+        _ => FspError::NTSTATUS(windows::Win32::Foundation::STATUS_UNSUCCESSFUL.0),
     }
-    .into()
 }
 
 /// A per-handle context for WinFSP.
@@ -155,47 +162,6 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         let attr = self.inner.getattr(context.ino).map_err(io_err_to_status)?;
         core_attr_to_file_info(&attr, file_info);
         Ok(())
-    }
-
-    fn read_directory(
-        &self,
-        _context: &Self::FileContext,
-        _pattern: Option<&U16CStr>,
-        marker: DirMarker<'_>,
-        buffer: &mut [u8],
-    ) -> Result<u32> {
-        let ino = _context.ino;
-        let entries = self.inner.readdir(ino).map_err(io_err_to_status)?;
-        let mut dir_info = DirInfo::new(buffer, &marker)?;
-        for entry in &entries {
-            if !dir_info.can_add() {
-                break;
-            }
-            let is_dir = entry.kind == CoreFileType::Directory;
-            let file_attrs = if is_dir {
-                FILE_ATTRIBUTE_DIRECTORY
-            } else {
-                FILE_ATTRIBUTE_NORMAL
-            };
-            // WinFSP DirInfo::add needs the name as U16CStr
-            let name_wide = widestring::U16String::from_str(&entry.name);
-            // Safety: DirInfo::add() writes into buffer; marker tracks position
-            unsafe {
-                dir_info.add(
-                    &name_wide,
-                    entry.ino,
-                    file_attrs as u32,
-                    0, // allocation size hint
-                    0, // file size hint
-                    0, // creation time hint
-                    0, // last access hint
-                    0, // last write hint
-                    0, // change time hint
-                    0, // ea size
-                )?;
-            }
-        }
-        Ok(dir_info.bytes_written())
     }
 
     fn read(&self, context: &Self::FileContext, buffer: &mut [u8], offset: u64) -> Result<u32> {

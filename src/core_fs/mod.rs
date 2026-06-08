@@ -160,14 +160,13 @@ pub mod winfsp;
 #[cfg(windows)]
 pub mod test_helpers {
     use crate::core_fs::CoreFilesystem;
+    use crate::core_fs::winfsp::WinFspAdapter;
     use std::sync::Arc;
+    use winfsp::host::{FileSystemHost, MountPoint};
 
     /// Mount a CoreFilesystem on a Windows drive letter (auto-assigned).
     /// Returns the mount handle. Dropping it unmounts.
     pub fn mount_winfsp<F: CoreFilesystem + 'static>(fs: Arc<F>) -> std::io::Result<MountGuard> {
-        use crate::core_fs::winfsp::WinFspAdapter;
-        use winfsp::host::{FileSystemHost, MountPoint};
-
         let adapter = WinFspAdapter::new(fs);
         let host =
             FileSystemHost::new(winfsp::host::VolumeParams::default(), adapter).map_err(|e| {
