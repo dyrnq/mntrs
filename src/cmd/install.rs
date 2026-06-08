@@ -14,7 +14,9 @@ Wants=network-online.target
 Type=simple
 ExecStart=/usr/bin/mntrs mount %i /mnt/%i
 ExecStop=/usr/bin/fusermount3 -u /mnt/%i
-Restart=no
+ExecStopPost=/usr/bin/fusermount3 -uz /mnt/%i
+Restart=always
+RestartSec=5s
 Environment=HOME=%h
 StandardOutput=journal
 StandardError=journal
