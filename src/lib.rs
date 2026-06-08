@@ -6,6 +6,7 @@ pub mod prefetcher;
 pub mod writeback;
 
 /// Shared inode table type for writeback callback.
+pub const CACHE_BLOCK_SIZE: u64 = 8 * 1024 * 1024;
 pub type Inodes = Arc<dashmap::DashMap<u64, (String, FileType, u64, Option<SystemTime>)>>;
 
 use std::collections::VecDeque;
@@ -119,7 +120,7 @@ pub struct MntrsFs {
     pub cache_poll_interval: Duration,
     pub disk_total_size: u64,
     writeback_queue: Arc<Mutex<VecDeque<(u64, String, PathBuf)>>>,
-    mem_cache: dashmap::DashMap<u64, bytes::Bytes>,
+    mem_cache: dashmap::DashMap<(u64, u64), bytes::Bytes>,
     attr_cache: dashmap::DashMap<
         String,
         (
@@ -401,7 +402,7 @@ impl MntrsFs {
         result
     }
 
-    fn mem_cache_insert(&self, ino: u64, data: bytes::Bytes) {
+    fn mem_cache_insert(&self, ino: u64, block_idx: u64, data: bytes::Bytes) {
         let size = data.len() as u64;
         let new_total = self
             .mem_used
@@ -410,7 +411,7 @@ impl MntrsFs {
         if new_total > self.mem_limit {
             // Evict oldest entries from mem_cache until under limit
             let mut to_free = new_total.saturating_sub(self.mem_limit);
-            let mut victims: Vec<u64> = Vec::new();
+            let mut victims: Vec<(u64, u64)> = Vec::new();
             for entry in self.mem_cache.iter() {
                 if to_free == 0 {
                     break;
@@ -425,7 +426,7 @@ impl MntrsFs {
                 }
             }
         }
-        self.mem_cache.insert(ino, data);
+        self.mem_cache.insert((ino, block_idx), data);
     }
 
     fn evict_lru(&self) {
@@ -866,7 +867,8 @@ impl Filesystem for MntrsFs {
         }
         let cap = file_size - offset;
         // 1. Check memory cache first (fast path)
-        if let Some(entry) = self.mem_cache.get(&ino) {
+        let block_idx = offset / CACHE_BLOCK_SIZE;
+        if let Some(entry) = self.mem_cache.get(&(ino, block_idx)) {
             let data = entry.value().clone();
             let start = offset as usize;
             let end = (start + size as usize).min(data.len());
@@ -902,7 +904,7 @@ impl Filesystem for MntrsFs {
                     } else {
                         reply.data(&[]);
                     }
-                    self.mem_cache_insert(ino, b);
+                    self.mem_cache_insert(ino, offset / CACHE_BLOCK_SIZE, b);
                     return;
                 } else {
                     tracing::warn!(path=?cpath, "cache checksum mismatch, re-fetching");
@@ -1004,7 +1006,7 @@ impl Filesystem for MntrsFs {
                 let b: bytes::Bytes = all_data.freeze();
                 let slice = &b[..(b.len() as u32).min(clamped_size) as usize];
                 reply.data(slice);
-                self.mem_cache_insert(ino, b);
+                self.mem_cache_insert(ino, offset / CACHE_BLOCK_SIZE, b);
             } else {
                 reply.error(Errno::EIO);
             }
@@ -1019,7 +1021,7 @@ impl Filesystem for MntrsFs {
                     let b: bytes::Bytes = buf.to_vec().into();
                     let slice = &b[..(b.len() as u32).min(clamped_size) as usize];
                     reply.data(slice);
-                    self.mem_cache_insert(ino, b);
+                    self.mem_cache_insert(ino, offset / CACHE_BLOCK_SIZE, b);
                 }
                 Err(_) => reply.error(Errno::EIO),
             }
@@ -1586,7 +1588,8 @@ impl CoreFilesystem for MntrsFs {
         }
         let cap = file_size - offset;
         let fetch_size = self.read_chunk_size.max(size as u64).min(cap);
-        if let Some(entry) = self.mem_cache.get(&ino) {
+        let block_idx = offset / CACHE_BLOCK_SIZE;
+        if let Some(entry) = self.mem_cache.get(&(ino, block_idx)) {
             let data = entry.value();
             let start = offset as usize;
             let end = (start + size as usize).min(data.len());
@@ -1609,7 +1612,7 @@ impl CoreFilesystem for MntrsFs {
                 } else {
                     vec![]
                 };
-                self.mem_cache_insert(ino, b);
+                self.mem_cache_insert(ino, offset / CACHE_BLOCK_SIZE, b);
                 return Ok(result);
             }
         }
@@ -1622,7 +1625,7 @@ impl CoreFilesystem for MntrsFs {
                 let b: bytes::Bytes = buf.to_vec().into();
                 let len = (b.len() as u32).min(size) as usize;
                 let data = b[..len].to_vec();
-                self.mem_cache_insert(ino, b);
+                self.mem_cache_insert(ino, offset / CACHE_BLOCK_SIZE, b);
                 Ok(data)
             }
             Err(_) => Err(std::io::Error::other("read failed")),
