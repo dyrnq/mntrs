@@ -77,7 +77,11 @@ pub struct FuserAdapter<F: CoreFilesystem + 'static> {
 
 impl<F: CoreFilesystem + 'static> FuserAdapter<F> {
     pub fn new(inner: F, dir_cache_ttl: Duration, attr_ttl: Duration) -> Self {
-        Self { inner, dir_cache_ttl, attr_ttl }
+        Self {
+            inner,
+            dir_cache_ttl,
+            attr_ttl,
+        }
     }
 }
 
@@ -141,7 +145,10 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
             TimeOrNow::SpecificTime(t) => t,
             TimeOrNow::Now => SystemTime::now(),
         });
-        match self.inner.setattr(ino.into(), mode, uid, gid, size, atime, mtime) {
+        match self
+            .inner
+            .setattr(ino.into(), mode, uid, gid, size, atime, mtime)
+        {
             Ok(attr) => {
                 let fattr = from_core_attr(&attr);
                 reply.attr(&self.attr_ttl, &fattr);
@@ -243,7 +250,14 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         }
     }
 
-    fn releasedir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
+    fn releasedir(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _flags: OpenFlags,
+        reply: ReplyEmpty,
+    ) {
         match self.inner.releasedir(ino.into(), _fh.into()) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(io_err_to_fuse_errno(e)),
@@ -265,7 +279,13 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
             Ok(attr) => {
                 let ino = attr.ino;
                 let fattr = from_core_attr(&attr);
-                reply.created(&self.attr_ttl, &fattr, Generation(0), FileHandle(ino), FopenFlags::empty());
+                reply.created(
+                    &self.attr_ttl,
+                    &fattr,
+                    Generation(0),
+                    FileHandle(ino),
+                    FopenFlags::empty(),
+                );
             }
             Err(e) => reply.error(io_err_to_fuse_errno(e)),
         }
@@ -313,7 +333,14 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         }
     }
 
-    fn flush(&self, _req: &Request, ino: INodeNo, fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
+    fn flush(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
         match self.inner.flush(ino.into(), fh.into()) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(io_err_to_fuse_errno(e)),
@@ -336,7 +363,15 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         }
     }
 
-    fn mkdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
+    fn mkdir(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
         let name = name.to_string_lossy();
         match self.inner.mkdir(parent.into(), &name) {
             Ok(attr) => {
@@ -355,10 +390,22 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         }
     }
 
-    fn rename(&self, _req: &Request, _parent: INodeNo, name: &OsStr, _newparent: INodeNo, newname: &OsStr, _flags: fuser::RenameFlags, reply: ReplyEmpty) {
+    fn rename(
+        &self,
+        _req: &Request,
+        _parent: INodeNo,
+        name: &OsStr,
+        _newparent: INodeNo,
+        newname: &OsStr,
+        _flags: fuser::RenameFlags,
+        reply: ReplyEmpty,
+    ) {
         let name = name.to_string_lossy();
         let newname = newname.to_string_lossy();
-        match self.inner.rename(_parent.into(), &name, _newparent.into(), &newname) {
+        match self
+            .inner
+            .rename(_parent.into(), &name, _newparent.into(), &newname)
+        {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(io_err_to_fuse_errno(e)),
         }

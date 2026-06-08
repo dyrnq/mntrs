@@ -122,7 +122,8 @@ pub trait CoreFilesystem: Send + Sync {
     fn rmdir(&self, parent: u64, name: &str) -> std::io::Result<()>;
 
     /// Rename a file or directory.
-    fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> std::io::Result<()>;
+    fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str)
+    -> std::io::Result<()>;
 
     /// Get volume statistics.
     fn statfs(&self, ino: u64) -> std::io::Result<CoreVolumeStat>;

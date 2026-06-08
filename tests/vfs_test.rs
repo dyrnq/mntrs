@@ -1,4 +1,4 @@
-use mntrs::{path_hash, fnmatch, cache_path};
+use mntrs::{cache_path, fnmatch, path_hash};
 use std::path::Path;
 
 // ============================================================
@@ -12,7 +12,11 @@ fn statfs_reports_positive_blocks() {
     let block_size: u64 = 4096;
     let total_blocks: u64 = 256 * 1024 * 1024;
     let total_space = total_blocks as u128 * block_size as u128;
-    assert!(total_space >= 1024u128 * 1024 * 1024 * 1024, "total space should be >= 1TB, got {}", total_space);
+    assert!(
+        total_space >= 1024u128 * 1024 * 1024 * 1024,
+        "total space should be >= 1TB, got {}",
+        total_space
+    );
 }
 
 // ============================================================
@@ -76,7 +80,8 @@ fn fnmatch_exclude_pattern() {
 fn fnmatch_include_overrides() {
     // If include is set, only matching files pass
     let files = ["a.txt", "b.rs", "c.txt"];
-    let included: Vec<_> = files.iter()
+    let included: Vec<_> = files
+        .iter()
         .filter(|f| fnmatch("*.txt", f, false))
         .collect();
     assert_eq!(included.len(), 2);
@@ -95,7 +100,11 @@ fn fnmatch_question_mark_single_char() {
 fn path_hash_non_zero() {
     let h = path_hash("/some/path");
     assert!(h >= 2, "path_hash must be >= 2 (0 and 1 reserved for FUSE)");
-    assert_eq!(h, path_hash("/some/path"), "path_hash must be deterministic");
+    assert_eq!(
+        h,
+        path_hash("/some/path"),
+        "path_hash must be deterministic"
+    );
 }
 
 #[test]

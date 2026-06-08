@@ -25,16 +25,16 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use widestring::U16CStr;
+use windows::Win32::Foundation::STATUS_INVALID_DEVICE_REQUEST;
 use winfsp::error::Result;
 use winfsp::filesystem::{
-    DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, ModificationDescriptor,
-    OpenFileInfo, VolumeInfo,
+    DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext,
+    ModificationDescriptor, OpenFileInfo, VolumeInfo,
 };
 use winfsp_sys::{
     FILE_ACCESS_RIGHTS, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_READONLY, FILE_FLAGS_AND_ATTRIBUTES,
 };
-use windows::Win32::Foundation::STATUS_INVALID_DEVICE_REQUEST;
 
 use super::{CoreFileAttr, CoreFileType, CoreFilesystem, CoreVolumeStat};
 
@@ -79,7 +79,9 @@ fn io_err_to_status(e: std::io::Error) -> windows::core::Error {
     match e.kind() {
         std::io::ErrorKind::NotFound => windows::Win32::Foundation::STATUS_OBJECT_NAME_NOT_FOUND,
         std::io::ErrorKind::PermissionDenied => windows::Win32::Foundation::STATUS_ACCESS_DENIED,
-        std::io::ErrorKind::AlreadyExists => windows::Win32::Foundation::STATUS_OBJECT_NAME_COLLISION,
+        std::io::ErrorKind::AlreadyExists => {
+            windows::Win32::Foundation::STATUS_OBJECT_NAME_COLLISION
+        }
         std::io::ErrorKind::InvalidInput => windows::Win32::Foundation::STATUS_INVALID_PARAMETER,
         std::io::ErrorKind::StorageFull => windows::Win32::Foundation::STATUS_DISK_FULL,
         _ => windows::Win32::Foundation::STATUS_UNSUCCESSFUL,
@@ -146,11 +148,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         let _ = self.inner.release(_context.ino, _context.ino);
     }
 
-    fn get_file_info(
-        &self,
-        context: &Self::FileContext,
-        file_info: &mut FileInfo,
-    ) -> Result<()> {
+    fn get_file_info(&self, context: &Self::FileContext, file_info: &mut FileInfo) -> Result<()> {
         let attr = self.inner.getattr(context.ino).map_err(io_err_to_status)?;
         core_attr_to_file_info(&attr, file_info);
         Ok(())
@@ -184,27 +182,25 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                     &name_wide,
                     entry.ino,
                     file_attrs as u32,
-                    0,       // allocation size hint
-                    0,       // file size hint
-                    0,       // creation time hint
-                    0,       // last access hint
-                    0,       // last write hint
-                    0,       // change time hint
-                    0,       // ea size
+                    0, // allocation size hint
+                    0, // file size hint
+                    0, // creation time hint
+                    0, // last access hint
+                    0, // last write hint
+                    0, // change time hint
+                    0, // ea size
                 )?;
             }
         }
         Ok(dir_info.bytes_written())
     }
 
-    fn read(
-        &self,
-        context: &Self::FileContext,
-        buffer: &mut [u8],
-        offset: u64,
-    ) -> Result<u32> {
+    fn read(&self, context: &Self::FileContext, buffer: &mut [u8], offset: u64) -> Result<u32> {
         let size = buffer.len() as u32;
-        let data = self.inner.read(context.ino, context.ino, offset, size).map_err(io_err_to_status)?;
+        let data = self
+            .inner
+            .read(context.ino, context.ino, offset, size)
+            .map_err(io_err_to_status)?;
         let n = data.len().min(buffer.len());
         buffer[..n].copy_from_slice(&data[..n]);
         Ok(n as u32)
@@ -219,7 +215,9 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         _constrained_io: bool,
         _file_info: &mut FileInfo,
     ) -> Result<u32> {
-        self.inner.write(context.ino, context.ino, offset, buffer).map_err(io_err_to_status)
+        self.inner
+            .write(context.ino, context.ino, offset, buffer)
+            .map_err(io_err_to_status)
     }
 
     fn rename(
@@ -231,7 +229,9 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
     ) -> Result<()> {
         let src = file_name.to_string_lossy().replace('\\', "/");
         let dst = new_file_name.to_string_lossy().replace('\\', "/");
-        self.inner.rename(1, &src, 1, &dst).map_err(io_err_to_status)
+        self.inner
+            .rename(1, &src, 1, &dst)
+            .map_err(io_err_to_status)
     }
 
     fn set_basic_info(
@@ -257,7 +257,8 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         _set_allocation_size: bool,
     ) -> Result<()> {
         // CoreFilesystem::setattr with size=Some(new_size)
-        self.inner.setattr(context.ino, None, None, None, Some(new_size), None, None)
+        self.inner
+            .setattr(context.ino, None, None, None, Some(new_size), None, None)
             .map_err(io_err_to_status)?;
         Ok(())
     }
@@ -287,16 +288,14 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
 
     fn flush(&self, context: Option<&Self::FileContext>, _file_info: &mut FileInfo) -> Result<()> {
         if let Some(ctx) = context {
-            self.inner.flush(ctx.ino, ctx.ino).map_err(io_err_to_status)?;
+            self.inner
+                .flush(ctx.ino, ctx.ino)
+                .map_err(io_err_to_status)?;
         }
         Ok(())
     }
 
-    fn get_dir_info_by_name(
-        &self,
-        _file_name: &U16CStr,
-        _file_info: &mut FileInfo,
-    ) -> Result<()> {
+    fn get_dir_info_by_name(&self, _file_name: &U16CStr, _file_info: &mut FileInfo) -> Result<()> {
         // Windows uses get_security_by_name for lookup before open.
         // get_dir_info_by_name is called during read_directory pattern matching.
         // Use getattr since we have the path.
