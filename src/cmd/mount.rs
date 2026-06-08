@@ -149,6 +149,7 @@ pub fn mount(storage_url: &str, mountpoint: &str, opts: &HashMap<String, String>
         vfs_refresh,
         case_insensitive: vfs_case_insensitive,
         no_implicit_dir,
+        use_server_modtime: false,
         block_norm_dupes: vfs_block_norm_dupes,
         write_wait: std::time::Duration::from_secs(vfs_write_wait),
         read_wait: std::time::Duration::from_secs(vfs_read_wait),

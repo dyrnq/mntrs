@@ -95,6 +95,7 @@ pub struct MntrsFs {
     pub vfs_refresh: bool,
     pub case_insensitive: bool,
     pub no_implicit_dir: bool,
+    pub use_server_modtime: bool,
     pub block_norm_dupes: bool,
     pub write_wait: Duration,
     pub read_wait: Duration,
