@@ -26,10 +26,10 @@ jobs:
         run: choco install -y winfsp
 
       - name: BuildBuild (release)
-        run: cargo build --release --workspace
+        run: cargo build --workspace
 
       - name: Test (WinFSP integration)
         shell: pwsh
         env:
           RUST_BACKTRACE: "1"
-        run: cargo test --workspace --release -- --test-threads=1 --nocapture
+        run: cargo test --workspace -- --test-threads=1 --nocapture

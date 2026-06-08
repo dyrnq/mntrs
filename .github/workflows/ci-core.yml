@@ -25,10 +25,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3 protobuf-compiler
 
       - name: Build
-        run: cargo build --release --workspace
+        run: cargo build --workspace
 
       - name: Build CSI plugin
-        run: cargo build --release --package mntrs-csi
+        run: cargo build --package mntrs-csi
 
       - name: Test (all)
         run: cargo test --workspace
