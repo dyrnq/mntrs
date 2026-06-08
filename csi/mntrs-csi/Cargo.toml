@@ -23,7 +23,7 @@ opendal = { version = "0.57", features = ["services-s3"] }
 tower = "0.5.3"
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-build = "0.14"
 
 [[bin]]
 name = "mntrs-csi"
