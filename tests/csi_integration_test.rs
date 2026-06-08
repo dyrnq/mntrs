@@ -24,7 +24,7 @@ fn start_csi_server() -> (Child, String) {
     let csi_path = exe_dir.join(CSI_BINARY);
 
     let child = Command::new(&csi_path)
-        .arg("--nodeid=test-node")
+        .arg("--node-id=test-node")
         .arg(&format!("--endpoint=unix://{}", socket))
         .spawn()
         .unwrap_or_else(|_| {
@@ -43,10 +43,9 @@ fn start_csi_server() -> (Child, String) {
 
 /// 发送 gRPC 请求并返回响应 body
 fn grpc_call(socket: &str, service: &str, method: &str, body: &[u8]) -> Vec<u8> {
-    use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
-    let mut stream = UnixStream::connect(socket)
+    let stream = UnixStream::connect(socket)
         .expect("failed to connect to CSI socket");
 
     // HTTP/2 prior knowledge: send a simple HTTP/1.1 POST (gRPC-web format)
