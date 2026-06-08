@@ -1,0 +1,63 @@
+name: CI - macOS
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  build-test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install FUSE
+        run: brew install macfuse protobuf
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Build workspace
+        run: cargo build --workspace
+
+      - name: Build CSI plugin
+        run: cargo build --package mntrs-csi
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Unit tests (lib only)
+        run: cargo test --workspace --lib
+
+      - name: Build release
+        run: cargo build --release --package mntrs
+
+      - name: Smoke test — memory mount + read/write
+        run: |
+          mkdir -p /tmp/mntrs-macos-test
+          cargo run --release -- mount memory:// /tmp/mntrs-macos-test --volname mntrs-test 2>&1 &
+          MNTRS_PID=$!
+          sleep 5
+          echo "hello from macos" > /tmp/mntrs-macos-test/test.txt
+          cat /tmp/mntrs-macos-test/test.txt
+          ls -la /tmp/mntrs-macos-test/
+          echo "macOS memory mount read/write OK"
+          kill $MNTRS_PID 2>/dev/null
+          sleep 2
+          fusermount -u /tmp/mntrs-macos-test 2>/dev/null || umount /tmp/mntrs-macos-test 2>/dev/null || true
