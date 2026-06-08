@@ -11,6 +11,7 @@ use opendal::services::{
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
+#[cfg(not(windows))]
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::Path;
 use std::process::Command;
@@ -448,6 +449,7 @@ pub fn mount(
     };
 
     // Create pipe for daemon_wait parent-child synchronization
+    #[cfg(not(windows))]
     let wait_pipe = if daemon_wait {
         match rustix::pipe::pipe() {
             Ok((r, w)) => {
@@ -832,7 +834,10 @@ fn daemonize(mountpoint: &str, wait_pipe: Option<i32>) -> Result<()> {
     )
     .unwrap_or_else(|_| {
         // Safety: fd 0 is always valid (stdin)
-        unsafe { rustix::fd::OwnedFd::from_raw_fd(std::os::fd::RawFd::from(0)) }
+        #[cfg(not(windows))]
+        unsafe {
+            rustix::fd::OwnedFd::from_raw_fd(std::os::fd::RawFd::from(0))
+        }
     });
     if rustix::stdio::dup2_stdin(&devnull).is_err() {
         tracing::debug!("daemon dup2 stdin failed");

@@ -2043,6 +2043,35 @@ impl CoreFilesystem for MntrsFs {
         Ok(())
     }
     fn release(&self, _ino: u64, fh: u64) -> std::io::Result<()> {
+        // On release, trigger writeback for dirty handles
+        if let Some(entry) = self.handles.get(&fh)
+            && let crate::FileHandleState::Write {
+                path, dirty: true, ..
+            } = entry.value()
+        {
+            let hash_prefix = format!("{:020x}_", crate::path_hash(path));
+            let mut pushed = 0u64;
+            if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if let Some(name) = p.file_name().and_then(|n| n.to_str())
+                        && name.starts_with(&hash_prefix)
+                        && name.ends_with(".block")
+                    {
+                        let sidecar = p.with_extension("dirty");
+                        let _ = std::fs::write(&sidecar, path.as_bytes());
+                        self.writeback_queue
+                            .lock()
+                            .unwrap()
+                            .push_back((_ino, path.clone(), p));
+                        pushed += 1;
+                    }
+                }
+            }
+            if pushed > 0 {
+                tracing::debug!(path=%path, blocks=pushed, "release queued writeback");
+            }
+        }
         self.handles.remove(&fh);
         Ok(())
     }
