@@ -666,7 +666,7 @@ async fn build_azblob(url: &url::Url, opts: &HashMap<String, String>) -> Result<
     apply_operator(builder)
 }
 
-async fn build_hdfs_native(url: &url::Url, _opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_hdfs_native(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
     let namenode = url.host_str().ok_or_else(|| anyhow!("missing namenode"))?;
     let port = url.port().unwrap_or(8020);
     let addr = format!("{}:{}", namenode, port);
@@ -674,6 +674,15 @@ async fn build_hdfs_native(url: &url::Url, _opts: &HashMap<String, String>) -> R
     let p = url.path().trim_start_matches('/');
     if !p.is_empty() {
         builder = builder.root(p);
+    }
+    // Pass through all options to hdfs-native client.
+    // This enables Kerberos, HA, and other advanced HDFS configurations:
+    //   --opt dfs.namenode.kerberos.principal=hdfs/_HOST@REALM
+    //   --opt dfs.namenode.kerberos.keytab=/etc/krb5.keytab
+    //   --opt dfs.ha.namenodes.nameservice=nn0,nn1
+    //   --opt dfs.namenode.rpc-address.nameservice.nn0=namenode1:8020
+    if !opts.is_empty() {
+        builder = builder.options(opts.clone());
     }
     apply_operator(builder)
 }
