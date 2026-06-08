@@ -26,7 +26,6 @@ use fuser::{
     Request, TimeOrNow, WriteFlags,
 };
 
-
 #[cfg(not(unix))]
 /// Stub type for non-Unix platforms — mirrors fuser::FileType variants used in shared state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -518,7 +517,7 @@ impl MntrsFs {
         // Check free disk space if configured
         let need_free = if self.cache_min_free_space > 0 {
             #[cfg(unix)]
-        if let Ok(fs_stat) = rustix::fs::statvfs(&self.cache_dir) {
+            if let Ok(fs_stat) = rustix::fs::statvfs(&self.cache_dir) {
                 let free = fs_stat.f_bavail.saturating_mul(fs_stat.f_frsize);
                 if free < self.cache_min_free_space {
                     Some(self.cache_min_free_space - free)
@@ -1992,18 +1991,46 @@ impl CoreFilesystem for MntrsFs {
             }
         };
         if dirty {
-            let cpath = crate::cache_block_path(&self.cache_dir, &path, 0);
-            if cpath.exists() {
-                let sidecar = cpath.with_extension("dirty");
-                if let Err(e) = std::fs::write(&sidecar, path.as_bytes()) {
-                    tracing::warn!(error=%e, path=?sidecar, "sidecar write failed");
+            // Push all dirty blocks for this file into writeback queue
+            let hash_prefix = format!("{:020x}_", crate::path_hash(&path));
+            let mut pushed = 0u64;
+            if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if let Some(name) = p.file_name().and_then(|n| n.to_str())
+                        && name.starts_with(&hash_prefix)
+                        && name.ends_with(".block")
+                    {
+                        let sidecar = p.with_extension("dirty");
+                        if let Err(e) = std::fs::write(&sidecar, path.as_bytes()) {
+                            tracing::warn!(error=%e, path=?sidecar, "sidecar write failed");
+                        }
+                        self.writeback_queue
+                            .lock()
+                            .unwrap()
+                            .push_back((_ino, path.clone(), p));
+                        pushed += 1;
+                    }
                 }
-                self.writeback_queue
-                    .lock()
-                    .unwrap()
-                    .push_back((_ino, path.clone(), cpath));
             }
-            // Mark handle clean; writeback happens asynchronously — no lock wait
+            if pushed == 0 {
+                // Fallback: push block 0 for backward compat
+                let cpath = crate::cache_block_path(&self.cache_dir, &path, 0);
+                if cpath.exists() {
+                    let sidecar = cpath.with_extension("dirty");
+                    if let Err(e) = std::fs::write(&sidecar, path.as_bytes()) {
+                        tracing::warn!(error=%e, path=?sidecar, "sidecar write failed");
+                    }
+                    self.writeback_queue
+                        .lock()
+                        .unwrap()
+                        .push_back((_ino, path.clone(), cpath));
+                }
+            }
+            if pushed > 1 {
+                tracing::debug!(path=%path, blocks=pushed, "flush queued all blocks for writeback");
+            }
+            // Mark handle clean; writeback happens asynchronously
             self.handles.insert(
                 _fh,
                 crate::FileHandleState::Write {
