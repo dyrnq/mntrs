@@ -1,155 +1,118 @@
-# mntrs vs rclone VFS 架构对比
+# mntrs vs mountpoint-s3 / geesefs / goofys 架构亮点对比
 
-> 基于 rclone master (2026-06) 的 vfs/vfscache + lib/multipart 分析
+> 基于源码分析 (2026-06)
 
 ---
 
 ## 1. 总览
 
-| 维度 | rclone | mntrs | 差距 |
-|------|--------|-------|------|
-| 语言 | Go | Rust | — |
-| 缓存目录 | 分两级: cache + meta | 单层 `~/.cache/mntrs/<hash>` | mntrs 缺元数据持久化 |
-| 写回队列 | 优先级堆 + 指数退避重试 | VecDeque + 3 次退避重试 | 缺少优先级/持久化 |
-| 下载器 | `Downloaders` (range-aware) | 直接 `op.read_with().range()` | 无 range 合并 |
-| 多段上传 | `lib/multipart` (通用) | 不支持 | ❌ |
-| 并发读 | Single / Multi-chunk(streams) | 同上 | 无 backpressure |
-| 内存缓存 | 无（直接 disk） | DashMap<ino, Bytes> | 有内存缓存优势 |
-| 指纹 | `objectFingerprint` (ETag+ModTime+Size) | `vfs_fast_fingerprint` (size+mtime) | 弱一些但够用 |
-| LRU 清理 | 有（后台 cleaner goroutine） | `evict_lru()` 在 write 时触发 | 无后台 cleaner |
+| 项目 | 语言 | 行数 | 定位 |
+|------|------|------|------|
+| **mountpoint-s3** | Rust | ~9600 | AWS 官方 S3 FUSE，只读+写入 |
+| **geesefs** | Go | ~8000 | Yandex 维护，goofys 分支，多后端 |
+| **goofys** | Go | ~3000 | 原始 S3 FUSE，已基本不维护 |
+| **mntrs** | Rust | ~2300 | 轻量多后端 FUSE + WinFSP |
 
-## 2. 写路径对比
+---
 
-### rclone
-```
-write()
-  → 本地 cache 文件 write_at
-  → 标记 dirty
-  → writeback 队列 (优先级堆)
-    → 到期或 flush 触发 upload
-    → 多次退避重试 (maxUploadDelay=5min)
-    → 成功后清除 dirty 标记
-```
+## 2. 亮点矩阵
 
-### mntrs
-```
-write()
-  → 本地 cache 文件 write_at
-  → handles[ino] = Write { dirty: true }
-  → writeback_queue (VecDeque)
-    → 3 次退避重试 (固定间隔)
-    → flush 时写入 sidecar
-```
+| 亮点 | mountpoint-s3 | geesefs | goofys | mntrs |
+|------|:---:|:---:|:---:|:---:|
+| DataCache 多级缓存 | 三级 (mem/disk/S3 Express) | BufferPool | x | 单层 disk |
+| Prefetch 自适应预读 | CRT flow-control window | v | x | 单线程 |
+| Backpressure 内存限流 | MemoryLimiter | cgroup-aware | x | AtomicU64 |
+| Multipart upload | 原子+增量 | v | x | x |
+| Metablock 结构化 inode | InodeKind/Lookup/Expiry | NodeId 状态机 | x | DashMap |
+| Cluster failover | x | gRPC recovery | x | x |
+| Upload checksums | CRC32C | x | x | x |
+| Panic logger | x | v | v | x |
+| cgroup 内存检测 | x | v | x | x |
+| ReadDirectory N+1 免 stat | list 自带 size | v | x | list_op 已修 |
 
-**差距**:
-- rclone 用 `container/heap` 实现到期时间排序，`WriteBack` 有独立的 timer goroutine
-- mntrs 用 `VecDeque` 先进先出，没有优先级、没有更新机制
-- rclone 写失败后持久保留在队列中；mntrs 3 次失败直接丢弃
+---
 
-## 3. 读路径对比
+## 3. 可借鉴的亮点
 
-### rclone
-```
-read()
-  → Item.FindMissing() 确定缺失 range
-  → Downloaders.Download(r) 调度下载
-    → 多个 downloader goroutine 并发抓取不同 range
-    → WriteAtNoOverwrite() 写入缓存文件
-    → 通过 waiter channel 通知 reader
-  → 从缓存文件 read_at
-```
+### P0: Multipart Upload (来自 mountpoint-s3 + rclone)
 
-### mntrs
-```
-read()
-  → mem_cache 命中? → 返回
-  → disk_cache 命中? → 读文件, 写 mem_cache
-  → 远程 fetch
-    → single: 单块 range read
-    → multi: concurrent fetch (semaphore 限流)
-  → 写入 mem_cache + disk_cache
-```
+mountpoint-s3 有 atomic（小文件直接 PutObject）和 incremental（大文件 AppendUpload）两种 uploader。
+geesefs 也有类似机制。
 
-**差距**:
-- rclone 的 `Downloaders` 支持**range 粒度的按需下载**——只拉缺失部分
-- mntrs 每次都整块拉取（哪怕 cache 已有一部分）
-- rclone 有 `FindMissing()` 方法避免重复下载
-- mntrs 没有 backpressure：并发读的 `semaphore` 只控制 goroutine 数量，不控制字节量
+**mntrs 现状**：flush 时整个文件写回，>5GB 会失败。
 
-## 4. 多段上传 (Multipart Upload)
+**借鉴点**：
+- mountpoint-s3 的 Uploader 支持流式 PutObject + 重试队列
+- incremental.rs 里按 chunk 追加上传
+- 失败后 UploadAlreadyTerminated 状态管理
 
-### rclone
-```go
-// lib/multipart 提供通用模板
-func UploadMultipart(ctx, src, in, opt)
-  → Open.OpenChunkWriter() 初始化
-  → 并行读源、并发上传 chunk
-  → 支持 concurrency 限流、pacer 令牌
-  → 失败时 abort 清理 (LeavePartsOnError 可选)
-```
+### P1: DataCache 多级 + 结构化 (来自 mountpoint-s3)
 
-### mntrs
-- **目前完全不支持**多段上传
-- 小文件：`op.write(&p, data)` 整个写入
-- 大文件：先写 cache → flush 时 `op.write(&p, data)` 整个写
-- 超过 5GB 的文件会在写回时失败（S3 单次 PutObject 上限）
+mountpoint-s3 的 DataCache trait 有三层：InMemoryDataCache -> DiskDataCache -> ExpressDataCache。
+每层用 MultilevelDataCache 串联。分块存储（block_size），每个 block 带 checksum。
 
-**影响**：
-- ❌ 无法上传 >5GB 文件
-- ❌ 大文件写回时没有进度
-- ❌ 不能使用 S3 UploadPart - CopyPart 做服务端拷贝
+**mntrs 现状**：单层 disk_cache + mem_cache，无 checksum，无 block 划分。
 
-## 5. 改进建议 (按优先级)
+**借鉴点**：
+- get_block/put_block 接口设计
+- ManagedCacheDir 管理缓存目录的创建/清理
+- ChecksummedBytes 校验数据完整性
 
-### P0: 多段上传支持 (高)
-为 `flush → writeback` 路径加上 multipart uploader。
+### P2: Metablock 结构化 inode (来自 mountpoint-s3)
 
-**做法**：
-```rust
-// src/multipart.rs
-trait ChunkWriter {
-    fn write_chunk(&self, part_num: u32, data: Vec<u8>) -> Result<()>;
-    fn complete(&self) -> Result<()>;
-    fn abort(&self) -> Result<()>;
-}
-```
+mountpoint-s3 的 Metablock trait 把 inode 操作（lookup/getattr/readdir/create/delete）抽象成一套独立的 trait。
+InodeStat / InodeKind / Lookup 类型定义清晰。
 
-利用 OpenDAL 的 `Writer` 或直接 S3 API。写回队列检测文件 >5GB 时走 multipart 路径。
+**mntrs 现状**：MntrsFs 直接 impl fuser::Filesystem，所有逻辑混在一起。
 
-**改动量**: ~300 行新文件 + 修改 writeback 路径。
+**借鉴点**：如果把 Metablock 概念引入 mntrs，可以用作 CoreFilesystem 的底层实现——inode 操作不再依赖 fuser 类型。
 
-### P1: 缓存元数据持久化
-rclone 用 JSON 文件存每个 cache item 的 `Info`（mtime、size、range bitmap）。
+### P3: Atomic upload + 写时校验 (来自 mountpoint-s3)
 
-mntrs 重启后 cache 目录不认——所有缓存文件被浪费。
+mountpoint-s3 的 UploadRequest 支持 PutObject + 重试 + checksum 校验。
+Uploader 内部用 PagedPool 管理内存缓冲。
 
-**做法**：`disk_cache_index` 持久化到 `~/.cache/mntrs/meta.json`，启动时加载。
-**改动量**: ~100 行。
+**mntrs 现状**：writeback 队列直接调 op.write()。
 
-### P2: 下载器 range 合并
-当前每次 read 都发一个新 range 请求。如果多个 reader 读同一个文件的不同部分，range 不合并。
+**借鉴点**：
+- 写回时计算 CRC32C（mountpoint-s3 的 ChecksumHasher）
+- UploadRequestParams 的存储类/加密/校验参数
 
-**做法**：对每个 open handle 维护 `Downloaders`，用 `FindMissing` 去重。
-**改动量**: ~200 行新文件。
+### P4: 故障恢复 gRPC (来自 geesefs)
 
-### P3: 写回队列优先级
-`WriteBack` 用优先级堆按到期时间排序。当前 FIFO 无法处理不同文件的写回延迟。
+geesefs 的 cluster_recovery.go 实现了 RecoveryServer，可以通过 gRPC 远程 unmount。
+用于集群环境中的故障迁移。
 
-**做法**：`BinaryHeap<(Instant, String)>` 替换 `VecDeque`。
-**改动量**: ~50 行。
+**mntrs 现状**：只有本地信号处理。
 
-## 6. 不改的
+**借鉴点**：CSI plugin 可以监听远程 unmount 请求，用于节点故障时清理 mount。
 
-| 特性 | 理由 |
-|------|------|
-| rclone 的 vfs 层 VFS/Cache/Item 三层分离 | mntrs `MntrsFs` 一身兼，当前够用 |
-| rclone 的 `ranges.Ranges` bitmap | 当前整块 cache，不需要按 range 追踪 |
-| OpenDAL 本身支持 retry/timeout/concurrency | 已有 `RetryLayer` `TimeoutLayer` `ConcurrentLimitLayer` |
-| 内存缓存 | rclone 没有，但 mntrs 有 `mem_cache` 且有效（DashMap + AtomicU64 限流） |
+### P5: BufferPool + cgroup 感知 (来自 geesefs)
 
-## 7. 一句话总结
+geesefs 的 BufferPool 检测 cgroup 内存限制，自动调整缓存上限。
+在容器环境中自动适配。
 
-> mntrs 的核心差距在**多段上传**和**缓存持久化**。写回+读路径的 range 粒度优化是 P2。
-> 当前 single-chunk fetch + 自适应翻倍 + concurrent streams 的读模型对 99% 场景已经够用。
->
-> 建议先做 **P0 multipart upload**（~300 行），然后是 **P1 缓存元数据持久化**（~100 行）。
+**mntrs 现状**：mem_limit 是 CLI 参数，无自动检测。
+
+**借鉴点**：在 MntrsFs 初始化时检测 cgroup 内存限制，自动设置 mem_limit。
+
+### P6: Panic Logger (来自 geesefs + goofys)
+
+geesefs 和 goofys 都有 panic logger——崩溃前把堆栈写入文件。
+K8s 容器 crash 后日志可能丢失，panic logger 确保现场保留。
+
+**借鉴点**：std::panic::set_hook 写入 /tmp/mntrs-csi-panic.log。
+
+---
+
+## 4. 推荐优先级
+
+| 优先级 | 功能 | 参考 | 行数 | 价值 |
+|--------|------|------|------|------|
+| P0 | Multipart Upload | mountpoint-s3 + rclone | ~300 | 修 >5GB 写回 |
+| P1a | 缓存 checksum | mountpoint-s3 | ~100 | 数据完整性 |
+| P1b | cgroup 内存自动检测 | geesefs | ~50 | 容器友好 |
+| P1c | Panic Logger | geesefs/goofys | ~30 | 崩溃排查 |
+| P2 | Metablock 结构化 inode | mountpoint-s3 | ~400 | 代码组织 |
+| P3 | 故障恢复 gRPC | geesefs | ~200 | 集群场景 |
+| P4 | DataCache 多级 | mountpoint-s3 | ~500 | 性能 |
