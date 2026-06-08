@@ -1978,6 +1978,7 @@ dependencies = [
  "opendal-service-oss",
  "opendal-service-s3",
  "opendal-service-vercel-blob",
+ "opendal-service-webdav",
  "opendal-service-webhdfs",
 ]
 
@@ -2262,6 +2263,22 @@ dependencies = [
  "quick-xml 0.39.4",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "opendal-service-webdav"
+version = "0.57.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9edadbbf8311e4d382400a5c6021bbfcc850f472a60995897bdc5cbf2d1cabd"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "http",
+ "log",
+ "mea",
+ "opendal-core",
+ "quick-xml 0.39.4",
+ "serde",
 ]
 
 [[package]]

@@ -5,7 +5,7 @@ use once_cell::sync::OnceCell;
 use opendal::Operator;
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
 use opendal::services::{
-    AliyunDrive, Azblob, B2, Cos, Fs, Gcs, HdfsNative, Memory, Obs, Oss, S3, VercelBlob,
+    AliyunDrive, Azblob, B2, Cos, Fs, Gcs, HdfsNative, Memory, Obs, Oss, S3, VercelBlob, Webdav,
 };
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -658,6 +658,7 @@ async fn build_operator(storage_url: &str, opts: &HashMap<String, String>) -> Re
         "vercel" | "vercel-blob" => build_vercel_blob(&url, opts).await,
         "fs" | "file" => build_fs(&url, opts).await,
         "memory" | "mem" => build_memory(&url, opts).await,
+        "webdav" | "dav" => build_webdav(&url, opts).await,
         "aliyun" | "aliyun-drive" => build_aliyun_drive(&url, opts).await,
         s => Err(anyhow!(
             "unsupported scheme '{s}'; try s3://, gs://, azblob://, hdfs://, hdfs-jni://, webhdfs://, oss://, cos://, obs://, b2://"
@@ -970,4 +971,15 @@ async fn build_memory(_url: &url::Url, _opts: &HashMap<String, String>) -> Resul
 
 extern "C" fn handler(_: i32) {
     std::process::exit(0);
+}
+
+async fn build_webdav(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+    let endpoint = format!("{}://{}", url.scheme(), url.host_str().unwrap_or("localhost"));
+    let mut builder = Webdav::default().endpoint(&endpoint);
+    let p = url.path();
+    if !p.is_empty() && p != "/" { builder = builder.root(p); }
+    if let Some(v) = opts.get("username") { builder = builder.username(v); }
+    if let Some(v) = opts.get("password") { builder = builder.password(v); }
+    if let Some(v) = opts.get("token") { builder = builder.token(v); }
+    apply_operator_with_tls(builder, opts)
 }
