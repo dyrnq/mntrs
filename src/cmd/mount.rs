@@ -565,6 +565,7 @@ pub fn mount(
             fs,
             std::time::Duration::from_secs(dir_cache_time),
             std::time::Duration::from_secs(attr_timeout),
+            direct_io,
         );
         let session = fuser::spawn_mount2(adapter, mount_path, &cfg)?;
         record_mount(storage_url, mountpoint, read_only);

@@ -73,14 +73,16 @@ pub struct FuserAdapter<F: CoreFilesystem + 'static> {
     pub inner: F,
     pub dir_cache_ttl: Duration,
     pub attr_ttl: Duration,
+    pub direct_io: bool,
 }
 
 impl<F: CoreFilesystem + 'static> FuserAdapter<F> {
-    pub fn new(inner: F, dir_cache_ttl: Duration, attr_ttl: Duration) -> Self {
+    pub fn new(inner: F, dir_cache_ttl: Duration, attr_ttl: Duration, direct_io: bool) -> Self {
         Self {
             inner,
             dir_cache_ttl,
             attr_ttl,
+            direct_io,
         }
     }
 }
@@ -279,12 +281,17 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
             Ok(attr) => {
                 let ino = attr.ino;
                 let fattr = from_core_attr(&attr);
+                let flags = if self.direct_io {
+                    FopenFlags::FOPEN_DIRECT_IO
+                } else {
+                    FopenFlags::empty()
+                };
                 reply.created(
                     &self.attr_ttl,
                     &fattr,
                     Generation(0),
                     FileHandle(ino),
-                    FopenFlags::empty(),
+                    flags,
                 );
             }
             Err(e) => reply.error(io_err_to_fuse_errno(e)),
@@ -292,8 +299,13 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let flags = if self.direct_io {
+            FopenFlags::FOPEN_DIRECT_IO
+        } else {
+            FopenFlags::empty()
+        };
         match self.inner.open(ino.into(), _flags.0 as u32) {
-            Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
+            Ok(fh) => reply.opened(FileHandle(fh), flags),
             Err(e) => reply.error(io_err_to_fuse_errno(e)),
         }
     }
