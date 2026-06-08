@@ -4,6 +4,9 @@ pub mod core_fs;
 pub mod path;
 pub mod prefetcher;
 
+/// Shared inode table type for writeback callback.
+pub type Inodes = Arc<dashmap::DashMap<u64, (String, FileType, u64, Option<SystemTime>)>>;
+
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fs;
@@ -114,7 +117,7 @@ pub struct MntrsFs {
     pub read_wait: Duration,
     pub cache_poll_interval: Duration,
     pub disk_total_size: u64,
-    writeback_queue: Arc<Mutex<VecDeque<(String, PathBuf)>>>,
+    writeback_queue: Arc<Mutex<VecDeque<(u64, String, PathBuf)>>>,
     mem_cache: dashmap::DashMap<u64, bytes::Bytes>,
     attr_cache: dashmap::DashMap<
         String,
@@ -489,7 +492,8 @@ impl MntrsFs {
 
 fn writeback_worker(
     op: Arc<Operator>,
-    queue: Arc<Mutex<VecDeque<(String, PathBuf)>>>,
+    inodes: Inodes,
+    queue: Arc<Mutex<VecDeque<(u64, String, PathBuf)>>>,
     delay: Duration,
     max_age: Duration,
 ) {
@@ -498,7 +502,7 @@ fn writeback_worker(
             let mut q = queue.lock().unwrap();
             q.pop_front()
         };
-        let (remote_path, cache_path) = match task {
+        let (_ino, remote_path, cache_path) = match task {
             Some(t) => t,
             None => {
                 thread::sleep(Duration::from_secs(1));
@@ -541,6 +545,11 @@ fn writeback_worker(
             });
             match r {
                 Ok(_) => {
+                    let new_size = data.len() as u64;
+                    inodes.entry(_ino).and_modify(|v| {
+                        v.2 = new_size;
+                        v.3 = Some(std::time::SystemTime::now());
+                    });
                     if let Err(e) = fs::remove_file(&cache_path) {
                         tracing::debug!(error=%e, path=?cache_path, "writeback ok remove failed");
                     }
@@ -581,7 +590,7 @@ impl Filesystem for MntrsFs {
                             self.writeback_queue
                                 .lock()
                                 .unwrap()
-                                .push_back((remote, cache_path));
+                                .push_back((0, remote, cache_path.clone()));
                         }
                     }
                     if let Err(e) = fs::remove_file(&p) {
@@ -595,7 +604,8 @@ impl Filesystem for MntrsFs {
         let queue = self.writeback_queue.clone();
         let delay = self.write_back_delay;
         let max_age = self.cache_max_age;
-        thread::spawn(move || writeback_worker(op, queue, delay, max_age));
+        let inodes = Arc::new(self.inodes.clone());
+        thread::spawn(move || writeback_worker(op, inodes, queue, delay, max_age));
         // Pre-populate root directory cache on mount if --vfs-refresh
         if self.vfs_refresh {
             let _ = self.list_op("");
@@ -965,18 +975,18 @@ impl Filesystem for MntrsFs {
         }
         // 3.5 Try prefetcher (backpressure-aware background download)
         let fh_val = u64::from(_fh);
-        if let Some(h) = self.handles.get(&fh_val) {
-            if let FileHandleState::Read { prefetcher: Some(p), .. } = &*h.value() {
-                if let Some(part) = p.pop(offset) {
-                    let start = (offset - part.offset) as usize;
-                    let end = (start + size as usize).min(part.data.len());
-                    if start < part.data.len() {
-                        reply.data(&part.data[start..end]);
-                    } else {
-                        reply.data(&[]);
-                    }
-                    return;
+        if let Some(h) = self.handles.get(&fh_val)
+            && let FileHandleState::Read { prefetcher: Some(p), .. } = h.value()
+        {
+            if let Some(part) = p.pop(offset) {
+                let start = (offset - part.offset) as usize;
+                let end = (start + size as usize).min(part.data.len());
+                if start < part.data.len() {
+                    reply.data(&part.data[start..end]);
+                } else {
+                    reply.data(&[]);
                 }
+                return;
             }
         }
         // 3. Fetch from remote
@@ -1446,7 +1456,19 @@ impl Filesystem for MntrsFs {
                 self.writeback_queue
                     .lock()
                     .unwrap()
-                    .push_back((path, cpath));
+                    .push_back((_ino.into(), path, cpath));
+            }
+        }
+        if dirty {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            loop {
+                let pending = self.writeback_queue.lock().unwrap().len();
+                if pending == 0 { break; }
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!("fsync timeout waiting for writeback");
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
         reply.ok();
