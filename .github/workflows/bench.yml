@@ -1,0 +1,75 @@
+name: Benchmark
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * 1'  # every Monday 02:00 UTC
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      minio:
+        image: minio/minio:latest
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        ports:
+          - 9000:9000
+        options: --health-cmd "curl -f http://localhost:9000/minio/health/live" --health-interval 5s
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install FUSE
+        run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev
+
+      - name: Build mntrs
+        run: cargo build --release
+
+      - name: Setup MinIO test bucket
+        run: |
+          curl -sSL https://dl.min.io/client/mc/release/linux-amd64/mc -o mc && chmod +x mc
+          ./mc alias set local http://localhost:9000 minioadmin minioadmin
+          ./mc mb local/bench-bucket --ignore-existing
+          echo "test content" | ./mc pipe local/bench-bucket/test.txt
+
+      - name: Setup rclone for comparison
+        run: |
+          curl -sSL https://downloads.rclone.org/rclone-current-linux-amd64.deb -o rclone.deb
+          sudo dpkg -i rclone.deb
+          mkdir -p /tmp/rclone-mnt
+          rclone config create minio s3 provider Minio env_auth false \
+            access_key_id minioadmin secret_access_key minioadmin \
+            endpoint http://localhost:9000 region us-east-1
+          rclone mount minio:bench-bucket /tmp/rclone-mnt --daemon --read-only
+          sleep 3
+
+      - name: Run benchmark
+        run: MNTRS_BIN=./target/release/mntrs bash bench/run_all.sh 2>&1 | tee bench-result.txt
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-result
+          path: bench-result.txt
+
+      - name: Check regressions
+        run: |
+          echo "=== Benchmark Results ==="
+          cat bench-result.txt
+          echo ""
+          # Check if any test shows mntrs >2x slower than rclone
+          if grep -E '^.*\|.*\|.*$' bench-result.txt | awk -F'|' '{
+            split($2, a, "m"); split($3, b, "m");
+            mntrs_ms = a[1]*60 + a[2]; rclone_ms = b[1]*60 + b[2];
+            if (mntrs_ms > rclone_ms * 2) {
+              print "REGRESSION: "$1" mntrs="mntrs_ms"ms rclone="rclone_ms"ms"
+            }
+          }' | tee regression.txt
+          if [ -s regression.txt ]; then
+            echo "::warning::Performance regression detected!"
+          fi
