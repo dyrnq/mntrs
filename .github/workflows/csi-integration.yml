@@ -129,7 +129,7 @@ jobs:
             volumes:
             - name: binary
               hostPath:
-                path: /home/runner/work/mntrs/mntrs/target/release/mntrs-csi
+                path: ${{ github.workspace }}/target/release/mntrs-csi
                 type: File
           POD
           kubectl wait --for=condition=Ready pod/mntrs-csi-test --timeout=60s
