@@ -30,8 +30,8 @@ enum Commands {
         /// Mount as network drive instead of fixed disk (Windows only)
         #[arg(long)]
         network_mode: bool,
-        /// Directory cache TTL in seconds (default: 10)
-        #[arg(long, default_value = "10")]
+        /// Directory cache TTL in seconds (default: 300, matches rclone 5m)
+        #[arg(long, default_value = "300")]
         dir_cache_time: u64,
         /// Attribute cache TTL in seconds (default: 1)
         #[arg(long, default_value = "1")]
@@ -81,8 +81,8 @@ enum Commands {
         /// Permissions for symlinks (octal, default: 0777)
         #[arg(long, default_value = "777")]
         link_perms: u32,
-        /// Max local cache size in MB (default: 1024, 0 to disable)
-        #[arg(long, default_value = "1024")]
+        /// Max local cache size in MB (default: 0 = off, matches rclone)
+        #[arg(long, default_value = "0")]
         vfs_cache_max_size: u64,
         #[arg(long, default_value = "256")]
         mem_limit: u64,
@@ -90,13 +90,13 @@ enum Commands {
         #[arg(long, default_value = "5")]
         vfs_write_back: u64,
         /// VFS cache mode: off, writes, full (default: writes)
-        #[arg(long, default_value = "writes")]
+        #[arg(long, default_value = "off")]
         vfs_cache_mode: String,
-        /// Read-ahead size in bytes (0 to disable, default: 131072)
-        #[arg(long, default_value = "131072")]
-        vfs_read_ahead: u64,
-        /// Read chunk size in bytes (0 for unlimited, default: 0)
+        /// Read-ahead size in bytes (default: 0 = off, matches rclone)
         #[arg(long, default_value = "0")]
+        vfs_read_ahead: u64,
+        /// Read chunk size in bytes (default: 128MiB, matches rclone)
+        #[arg(long, default_value = "134217728")]
         vfs_read_chunk_size: u64,
         /// Enable kernel permission checking (default_permissions FUSE flag)
         #[arg(long)]
@@ -131,8 +131,8 @@ enum Commands {
         /// Max age of cached files in seconds (default: 3600, 0 to disable)
         #[arg(long, default_value = "3600")]
         vfs_cache_max_age: u64,
-        /// Minimum free disk space before triggering cache eviction (MB, default: 100)
-        #[arg(long, default_value = "100")]
+        /// Minimum free disk space before triggering cache eviction (MB, default: 0 = off, matches rclone)
+        #[arg(long, default_value = "0")]
         vfs_cache_min_free_space: u64,
         /// Glob pattern to exclude (repeatable)
         #[arg(long = "exclude", value_name = "PATTERN", num_args = 0..)]
@@ -167,8 +167,8 @@ enum Commands {
         /// Translate symlinks
         #[arg(long)]
         links: bool,
-        /// macOS: ignore Apple Double files (._ prefix)
-        #[arg(long)]
+        /// macOS: ignore Apple Double files (._ prefix, rclone defaults to true)
+        #[arg(long, default_value_t = true)]
         noapple_double: bool,
         /// macOS: ignore Apple extended attributes
         #[arg(long)]
@@ -185,8 +185,8 @@ enum Commands {
         /// Read chunk size limit in bytes (default: 0 = unlimited)
         #[arg(long, default_value = "0")]
         vfs_read_chunk_size_limit: u64,
-        /// Number of parallel read streams (default: 1)
-        #[arg(long, default_value = "1")]
+        /// Number of parallel read streams (default: 0 = serial, matches rclone)
+        #[arg(long, default_value = "0")]
         vfs_read_chunk_streams: u32,
         /// Use fast fingerprint (size+mtime) instead of checksums
         #[arg(long)]
@@ -216,11 +216,11 @@ enum Commands {
         vfs_metadata_extension: Option<String>,
         #[arg(long)]
         storage_class: Option<String>,
-        /// Write wait timeout in seconds (default: 5)
-        #[arg(long, default_value = "5")]
+        /// Write wait timeout in seconds (default: 1, matches rclone)
+        #[arg(long, default_value = "1")]
         vfs_write_wait: u64,
-        /// Read wait timeout in seconds (default: 5)
-        #[arg(long, default_value = "5")]
+        /// Read wait timeout in seconds (default: 1, matches rclone)
+        #[arg(long, default_value = "1")]
         vfs_read_wait: u64,
         /// Cache poll interval in seconds (default: 60)
         #[arg(long, default_value = "60")]
@@ -228,8 +228,8 @@ enum Commands {
         /// Time in seconds to keep file handles open after last close for reuse (0 to disable, default: 0)
         #[arg(long, default_value = "0")]
         vfs_handle_caching: u64,
-        /// Total disk space to report in statfs (TB, default: 1024)
-        #[arg(long, default_value = "1024")]
+        /// Total disk space to report in statfs (TB, default: 0 = off, matches rclone)
+        #[arg(long, default_value = "0")]
         vfs_disk_space_total_size: u64,
     },
     /// Unmount a mounted directory (use "all" to unmount all)
