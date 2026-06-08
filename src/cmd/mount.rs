@@ -1,5 +1,6 @@
 use crate::MntrsFs;
 use anyhow::{Result, anyhow};
+#[cfg(not(windows))]
 use fuser::MountOption;
 use once_cell::sync::OnceCell;
 use opendal::Operator;
@@ -478,6 +479,7 @@ pub fn mount(
     }
 
     let mount_path = Path::new(mountpoint);
+    #[cfg(not(windows))]
     let mut cfg: fuser::Config = Default::default();
     // Check /etc/fuse.conf for user_allow_other when --allow-other is used
     #[cfg(target_os = "linux")]
@@ -497,6 +499,7 @@ pub fn mount(
             ));
         }
     }
+    #[cfg(not(windows))]
     if allow_other || allow_root {
         cfg.acl = fuser::SessionACL::All;
     }
