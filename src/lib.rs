@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 pub mod cmd;
 pub mod core_fs;
+pub mod path;
 
 use std::collections::VecDeque;
 use std::ffi::OsStr;

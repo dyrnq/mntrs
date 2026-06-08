@@ -331,17 +331,37 @@ pub fn mount(
     for opt in fuse_options {
         cfg.mount_options.push(MountOption::CUSTOM(opt.clone()));
     }
-    let adapter = crate::core_fs::fuser::FuserAdapter::new(
-        fs,
-        std::time::Duration::from_secs(dir_cache_time),
-        std::time::Duration::from_secs(attr_timeout),
-    );
-    let session = fuser::spawn_mount2(adapter, mount_path, &cfg)?;
-
     record_mount(storage_url, mountpoint, read_only);
 
-    if daemon_wait {
-        unblock_parent();
+    #[cfg(not(windows))]
+    {
+        use crate::core_fs::fuser::FuserAdapter;
+        let adapter = FuserAdapter::new(
+            fs,
+            std::time::Duration::from_secs(dir_cache_time),
+            std::time::Duration::from_secs(attr_timeout),
+        );
+        let session = fuser::spawn_mount2(adapter, mount_path, &cfg)?;
+        if daemon_wait {
+            unblock_parent();
+        }
+        // Prevent session drop on thread exit (keeps FUSE mounted)
+        std::mem::forget(session);
+    }
+
+    #[cfg(windows)]
+    {
+        use crate::core_fs::winfsp::WinFspAdapter;
+        use crate::path::parse_windows_target;
+        use std::sync::Arc;
+        let target = parse_windows_target(mountpoint)
+            .map_err(|e| anyhow::anyhow!("invalid Windows mount target '{mountpoint}': {e}"))?;
+        let host = winfsp::host::FileSystemHost::new(
+            WinFspAdapter::new(Arc::new(fs)),
+        )?;
+        let _mp = host.mount(target)?;
+        // Blocking: WinFSP runs on the calling thread
+        host.start()?;
     }
 
     // Foreground mode with --daemon-wait: parent waits for pipe close
@@ -379,7 +399,6 @@ pub fn mount(
         libc::signal(libc::SIGTERM, handler as *const () as libc::sighandler_t);
     }
 
-    std::mem::forget(session);
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
     }
