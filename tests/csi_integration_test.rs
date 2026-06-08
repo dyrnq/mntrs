@@ -8,8 +8,8 @@
 //!   cargo build --package mntrs-csi
 
 use std::path::Path;
-use std::time::Duration;
 use std::process::{Child, Command};
+use std::time::Duration;
 
 const CSI_BINARY: &str = "mntrs-csi";
 
@@ -47,13 +47,12 @@ fn start_csi_server() -> (Child, String) {
 fn grpc_call(socket: &str, service: &str, method: &str, body: &[u8]) -> Vec<u8> {
     use std::os::unix::net::UnixStream;
 
-    let stream = UnixStream::connect(socket)
-        .expect("failed to connect to CSI socket");
+    let stream = UnixStream::connect(socket).expect("failed to connect to CSI socket");
 
     // HTTP/2 prior knowledge: send a simple HTTP/1.1 POST (gRPC-web format)
     // CSI spec v1 uses gRPC, which requires HTTP/2.
     // For testing, we use a simple unary call via HTTP/1.1 upgrade or direct proto framing.
-    // 
+    //
     // Simpler approach: use tonic client from a separate thread.
     // But tonic needs a tokio runtime. We use a simple blocking HTTP client instead.
     //
@@ -163,7 +162,11 @@ fn test_csi_volume_context_parsing() {
     let storage_url = if prefix.is_empty() {
         storage.clone()
     } else {
-        format!("{}/{}", storage.trim_end_matches('/'), prefix.trim_start_matches('/'))
+        format!(
+            "{}/{}",
+            storage.trim_end_matches('/'),
+            prefix.trim_start_matches('/')
+        )
     };
 
     assert_eq!(storage_url, "s3://my-bucket/k8s-pv/data");
@@ -175,15 +178,14 @@ fn test_csi_mount_idempotency() {
     let _ = std::fs::create_dir_all(&tmp);
 
     let opts = std::collections::HashMap::new();
-    let result = mntrs::cmd::mount::mount_internal(
-        "memory://",
-        tmp.to_str().unwrap(),
-        &opts,
-        false,
-    );
+    let result =
+        mntrs::cmd::mount::mount_internal("memory://", tmp.to_str().unwrap(), &opts, false);
     let _ = std::fs::remove_dir_all(&tmp);
 
-    assert!(result.is_err(), "memory:// scheme should fail (not a valid scheme)");
+    assert!(
+        result.is_err(),
+        "memory:// scheme should fail (not a valid scheme)"
+    );
 }
 
 #[test]
@@ -191,12 +193,20 @@ fn test_csi_cache_dir_isolation() {
     let tmp1 = std::env::temp_dir().join("csi-cache-1");
     let tmp2 = std::env::temp_dir().join("csi-cache-2");
 
-    let cache1 = format!("/tmp/mntrs-csi-cache/{}", tmp1.to_string_lossy().replace('/', "_"));
-    let cache2 = format!("/tmp/mntrs-csi-cache/{}", tmp2.to_string_lossy().replace('/', "_"));
+    let cache1 = format!(
+        "/tmp/mntrs-csi-cache/{}",
+        tmp1.to_string_lossy().replace('/', "_")
+    );
+    let cache2 = format!(
+        "/tmp/mntrs-csi-cache/{}",
+        tmp2.to_string_lossy().replace('/', "_")
+    );
 
-    assert_ne!(cache1, cache2, "different mountpoints must have different cache dirs");
+    assert_ne!(
+        cache1, cache2,
+        "different mountpoints must have different cache dirs"
+    );
 }
-
 
 // ============================================================
 // mount_internal 高级参数测试
@@ -207,14 +217,14 @@ fn test_csi_cache_dir_isolation() {
 fn test_csi_mount_with_allow_other() {
     let tmp = std::env::temp_dir().join(format!("csi-mount-ao-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
-    let opts = std::collections::HashMap::from([
-        ("allow_other".to_string(), "true".to_string()),
-    ]);
-    let result = mntrs::cmd::mount::mount_internal(
-        "s3://bucket", tmp.to_str().unwrap(), &opts, false,
-    );
+    let opts = std::collections::HashMap::from([("allow_other".to_string(), "true".to_string())]);
+    let result =
+        mntrs::cmd::mount::mount_internal("s3://bucket", tmp.to_str().unwrap(), &opts, false);
     let _ = std::fs::remove_dir_all(&tmp);
-    assert!(result.is_err(), "s3://bucket without creds should fail gracefully");
+    assert!(
+        result.is_err(),
+        "s3://bucket without creds should fail gracefully"
+    );
 }
 
 /// mount_internal with cache_dir override
@@ -223,12 +233,12 @@ fn test_csi_mount_cache_dir_override() {
     let tmp = std::env::temp_dir().join(format!("csi-cache-override-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
     let cache = std::env::temp_dir().join("csi-custom-cache");
-    let opts = std::collections::HashMap::from([
-        ("cache_dir".to_string(), cache.to_string_lossy().to_string()),
-    ]);
-    let result = mntrs::cmd::mount::mount_internal(
-        "s3://bucket", tmp.to_str().unwrap(), &opts, false,
-    );
+    let opts = std::collections::HashMap::from([(
+        "cache_dir".to_string(),
+        cache.to_string_lossy().to_string(),
+    )]);
+    let result =
+        mntrs::cmd::mount::mount_internal("s3://bucket", tmp.to_str().unwrap(), &opts, false);
     let _ = std::fs::remove_dir_all(&tmp);
     let _ = std::fs::remove_dir_all(&cache);
     assert!(result.is_err(), "should fail gracefully");
@@ -240,8 +250,10 @@ fn test_csi_mount_read_only() {
     let tmp = std::env::temp_dir().join(format!("csi-mount-ro-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
     let result = mntrs::cmd::mount::mount_internal(
-        "s3://bucket", tmp.to_str().unwrap(),
-        &std::collections::HashMap::new(), true,
+        "s3://bucket",
+        tmp.to_str().unwrap(),
+        &std::collections::HashMap::new(),
+        true,
     );
     let _ = std::fs::remove_dir_all(&tmp);
     assert!(result.is_err(), "should fail gracefully");
@@ -252,12 +264,10 @@ fn test_csi_mount_read_only() {
 fn test_csi_mount_cache_mode() {
     let tmp = std::env::temp_dir().join(format!("csi-cache-mode-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
-    let opts = std::collections::HashMap::from([
-        ("vfs_cache_mode".to_string(), "full".to_string()),
-    ]);
-    let result = mntrs::cmd::mount::mount_internal(
-        "s3://bucket", tmp.to_str().unwrap(), &opts, false,
-    );
+    let opts =
+        std::collections::HashMap::from([("vfs_cache_mode".to_string(), "full".to_string())]);
+    let result =
+        mntrs::cmd::mount::mount_internal("s3://bucket", tmp.to_str().unwrap(), &opts, false);
     let _ = std::fs::remove_dir_all(&tmp);
     assert!(result.is_err(), "should fail gracefully");
 }

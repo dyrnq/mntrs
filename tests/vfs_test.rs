@@ -127,7 +127,6 @@ fn cache_path_format() {
     assert!(name.chars().all(|c| c.is_ascii_hexdigit()), "should be hex");
 }
 
-
 // ============================================================
 // mount_internal — verify parameter handling
 // ============================================================
@@ -166,7 +165,10 @@ fn mount_internal_empty_mountpoint_fails() {
 fn unmount_internal_nonexistent_does_not_panic() {
     let result = mntrs::cmd::mount::unmount_internal("/tmp/mntrs-nonexistent-mount");
     // Should return Ok (graceful handling)
-    assert!(result.is_ok(), "unmount of nonexistent path should be graceful");
+    assert!(
+        result.is_ok(),
+        "unmount of nonexistent path should be graceful"
+    );
 }
 
 /// path_hash returns same hash for same path
@@ -202,14 +204,20 @@ fn cache_block_path_includes_block_idx() {
     let p = mntrs::cache_block_path(&tmp, "hello/world", 42);
     let name = p.file_name().unwrap().to_str().unwrap();
     assert!(name.ends_with(".block"), "should end with .block");
-    assert!(name.contains("_000000002a"), "should contain block index 42 in hex");
+    assert!(
+        name.contains("_000000002a"),
+        "should contain block index 42 in hex"
+    );
 }
 
 /// load_cache_index returns empty for non-existent cache dir
 #[test]
 fn load_cache_index_empty_for_nonexistent_dir() {
     let entries = mntrs::load_cache_index(&std::env::temp_dir().join("__nonexistent_cache_dir__"));
-    assert!(entries.is_empty(), "should return empty list for nonexistent dir");
+    assert!(
+        entries.is_empty(),
+        "should return empty list for nonexistent dir"
+    );
 }
 
 /// fnmatch with various patterns
@@ -239,4 +247,3 @@ fn fnmatch_path_separator() {
     assert!(fnmatch("a/b/c", "a/b/c", false));
     assert!(!fnmatch("a/b/c", "a/b/d", false));
 }
-

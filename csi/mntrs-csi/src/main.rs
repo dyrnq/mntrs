@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use clap::Parser;
-use tonic::{Request, Response, Status};
 use tonic::transport::Server;
+use tonic::{Request, Response, Status};
 
 mod csi;
 
@@ -31,13 +31,12 @@ fn decode_volume_id(volume_id: &str) -> String {
     // Simple heuristic: first '-' after scheme becomes '://'
     if let Some(idx) = volume_id.find('-') {
         let scheme = &volume_id[..idx];
-        let rest = &volume_id[idx+1..];
+        let rest = &volume_id[idx + 1..];
         format!("{}:{}", scheme, rest.replace('-', "/"))
     } else {
         volume_id.to_string()
     }
 }
-
 
 // ============================================================
 // gRPC Logging Interceptor
@@ -114,12 +113,17 @@ impl controller_server::Controller for ControllerService {
         let capacity = req.capacity_range.map(|r| r.required_bytes).unwrap_or(0);
         let params = req.parameters;
 
-        let pvc_name = params.get("csi.storage.k8s.io/pvc/name")
-            .cloned().unwrap_or_else(|| name.clone());
-        let pvc_ns = params.get("csi.storage.k8s.io/pvc/namespace")
-            .cloned().unwrap_or_else(|| "default".to_string());
+        let pvc_name = params
+            .get("csi.storage.k8s.io/pvc/name")
+            .cloned()
+            .unwrap_or_else(|| name.clone());
+        let pvc_ns = params
+            .get("csi.storage.k8s.io/pvc/namespace")
+            .cloned()
+            .unwrap_or_else(|| "default".to_string());
 
-        let storage = params.get("storage")
+        let storage = params
+            .get("storage")
             .or_else(|| params.get("storageUrl"))
             .cloned()
             .unwrap_or_else(|| format!("memory://{}", name));
@@ -128,7 +132,11 @@ impl controller_server::Controller for ControllerService {
         let storage_url = if let Some(pattern) = params.get("pathPattern") {
             if !pattern.is_empty() {
                 let suffix = expand_path_pattern(pattern, &pvc_name, &pvc_ns);
-                format!("{}/{}", storage.trim_end_matches('/'), suffix.trim_start_matches('/'))
+                format!(
+                    "{}/{}",
+                    storage.trim_end_matches('/'),
+                    suffix.trim_start_matches('/')
+                )
             } else {
                 storage.clone()
             }
@@ -279,7 +287,9 @@ pub struct NodeService {
 
 impl NodeService {
     pub fn new() -> Self {
-        Self { mounts: Mutex::new(HashMap::new()) }
+        Self {
+            mounts: Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -345,38 +355,54 @@ impl node_server::Node for NodeService {
         let vol_ctx = req.volume_context;
         let read_only = req.readonly;
 
-        let storage = vol_ctx.get("storage")
+        let storage = vol_ctx
+            .get("storage")
             .or_else(|| vol_ctx.get("storageUrl"))
             .or_else(|| vol_ctx.get("storage-url"))
             .ok_or_else(|| Status::invalid_argument("missing volume context: storage"))?;
 
-        let prefix = vol_ctx.get("prefix").or_else(|| vol_ctx.get("path")).map(|s| s.as_str()).unwrap_or("");
+        let prefix = vol_ctx
+            .get("prefix")
+            .or_else(|| vol_ctx.get("path"))
+            .map(|s| s.as_str())
+            .unwrap_or("");
         let storage_url = if prefix.is_empty() {
             storage.clone()
         } else {
-            format!("{}/{}", storage.trim_end_matches('/'), prefix.trim_start_matches('/'))
+            format!(
+                "{}/{}",
+                storage.trim_end_matches('/'),
+                prefix.trim_start_matches('/')
+            )
         };
 
         let target = std::path::Path::new(&target_path);
         if let Err(e) = std::fs::create_dir_all(target) {
-            return Err(Status::internal(format!("create_dir_all {target_path}: {e}")));
+            return Err(Status::internal(format!(
+                "create_dir_all {target_path}: {e}"
+            )));
         }
 
         let mut opts = HashMap::new();
         for (k, v) in &vol_ctx {
             match k.as_str() {
                 "storage" | "storageUrl" | "storage-url" | "prefix" | "path" => continue,
-                _ => { opts.insert(k.clone(), v.clone()); }
+                _ => {
+                    opts.insert(k.clone(), v.clone());
+                }
             }
         }
 
         match mntrs::cmd::mount::mount_internal(&storage_url, &target_path, &opts, read_only) {
             Ok(()) => {
                 let mut mounts = self.mounts.lock().unwrap();
-                mounts.insert(volume_id.clone(), MountState {
-                    storage_url: storage_url.clone(),
-                    mountpoint: target_path.clone(),
-                });
+                mounts.insert(
+                    volume_id.clone(),
+                    MountState {
+                        storage_url: storage_url.clone(),
+                        mountpoint: target_path.clone(),
+                    },
+                );
                 tracing::info!(volume_id, storage=%storage_url, target=%target_path, "volume mounted");
                 Ok(Response::new(NodePublishVolumeResponse::default()))
             }
@@ -464,7 +490,6 @@ impl node_server::Node for NodeService {
 // Main
 // ============================================================
 
-
 // ============================================================
 // CSI Helpers
 // ============================================================
@@ -488,25 +513,24 @@ fn wait_for_mount(path: &str, timeout: std::time::Duration) -> Result<(), Status
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     Err(Status::deadline_exceeded(format!(
-        "mountpoint {} not ready after {:?}", path, timeout
+        "mountpoint {} not ready after {:?}",
+        path, timeout
     )))
 }
 
-
 /// Expand pathPattern placeholders like ${.PVC.namespace}/${.PVC.name}
-fn expand_path_pattern(
-    pattern: &str,
-    pvc_name: &str,
-    pvc_namespace: &str,
-) -> String {
+fn expand_path_pattern(pattern: &str, pvc_name: &str, pvc_namespace: &str) -> String {
     pattern
         .replace("${.PVC.namespace}", pvc_namespace)
         .replace("${.PVC.name}", pvc_name)
-        .replace("${.PVC.namespace}/${.PVC.name}", &format!("{}/{}", pvc_namespace, pvc_name))
+        .replace(
+            "${.PVC.namespace}/${.PVC.name}",
+            &format!("{}/{}", pvc_namespace, pvc_name),
+        )
 }
 
-
 /// Inject MNTRS_* environment variables as mount options
+#[allow(dead_code)]
 fn inject_env_opts(opts: &mut HashMap<String, String>) {
     for (k, v) in std::env::vars() {
         if let Some(flag) = k.strip_prefix("MNTRS_") {
@@ -519,21 +543,22 @@ fn parse_volume_context(
     ctx: &HashMap<String, String>,
     volume_id: &str,
 ) -> Result<(String, bool, HashMap<String, String>), Status> {
-    let storage = ctx.get("storage")
+    let storage = ctx
+        .get("storage")
         .or_else(|| ctx.get("storageUrl"))
         .or_else(|| ctx.get("storage-url"))
         .ok_or_else(|| Status::invalid_argument("volume context missing 'storage' key"))?
         .clone();
 
-    let read_only = ctx.get("readOnly")
-        .map(|v| v == "true")
-        .unwrap_or(false);
+    let read_only = ctx.get("readOnly").map(|v| v == "true").unwrap_or(false);
 
     let mut opts = HashMap::new();
     for (k, v) in ctx {
         match k.as_str() {
             "storage" | "storageUrl" | "storage-url" | "readOnly" | "prefix" | "path" => continue,
-            _ => { opts.insert(k.clone(), v.clone()); }
+            _ => {
+                opts.insert(k.clone(), v.clone());
+            }
         }
     }
 
@@ -557,7 +582,8 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let node_id = cli.node_id;
 
-    let socket_path = cli.endpoint
+    let socket_path = cli
+        .endpoint
         .strip_prefix("unix://")
         .or_else(|| cli.endpoint.strip_prefix("unix:"))
         .unwrap_or(&cli.endpoint)
@@ -581,8 +607,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use mntrs::cmd::mount::{mount_internal, unmount_internal};
-use std::collections::HashMap;
+    use std::collections::HashMap;
 
     // ============================================================
     // volume_context 解析
@@ -595,7 +620,8 @@ use std::collections::HashMap;
         ctx.insert("storageUrl".to_string(), "s3://b2".to_string());
         ctx.insert("storage-url".to_string(), "s3://b3".to_string());
 
-        let v = ctx.get("storage")
+        let v = ctx
+            .get("storage")
             .or_else(|| ctx.get("storageUrl"))
             .or_else(|| ctx.get("storage-url"));
         assert_eq!(v.unwrap(), "s3://b1");
@@ -609,7 +635,8 @@ use std::collections::HashMap;
 
         let storage = ctx.get("storage").unwrap();
         let prefix = ctx.get("prefix").unwrap();
-        let url = format!("{}/{}",
+        let url = format!(
+            "{}/{}",
             storage.trim_end_matches('/'),
             prefix.trim_start_matches('/')
         );
@@ -637,4 +664,3 @@ use std::collections::HashMap;
         assert!(!ro2);
     }
 }
-

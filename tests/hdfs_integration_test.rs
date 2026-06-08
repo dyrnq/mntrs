@@ -16,8 +16,14 @@ fn test_hdfs_native_opts_passthrough() {
     // mount.rs 中的 build_hdfs_native 接受 opts
     // 验证 Kerberos 参数能否通过 opts 传入
     let _opts = HashMap::from([
-        ("dfs.namenode.kerberos.principal".to_string(), "hdfs/_HOST@REALM".to_string()),
-        ("dfs.namenode.kerberos.keytab".to_string(), "/etc/krb5.keytab".to_string()),
+        (
+            "dfs.namenode.kerberos.principal".to_string(),
+            "hdfs/_HOST@REALM".to_string(),
+        ),
+        (
+            "dfs.namenode.kerberos.keytab".to_string(),
+            "/etc/krb5.keytab".to_string(),
+        ),
     ]);
 
     // 验证 HdfsNative::options() 接受 opts
@@ -63,26 +69,48 @@ fn test_webhdfs_scheme_routing() {
 fn test_hdfs_ha_config() {
     // HA 模式下传入多个 namenode
     let _opts = HashMap::from([
-        ("dfs.ha.namenodes.nameservice".to_string(), "nn0,nn1".to_string()),
-        ("dfs.namenode.rpc-address.nameservice.nn0".to_string(), "namenode1:8020".to_string()),
-        ("dfs.namenode.rpc-address.nameservice.nn1".to_string(), "namenode2:8020".to_string()),
+        (
+            "dfs.ha.namenodes.nameservice".to_string(),
+            "nn0,nn1".to_string(),
+        ),
+        (
+            "dfs.namenode.rpc-address.nameservice.nn0".to_string(),
+            "namenode1:8020".to_string(),
+        ),
+        (
+            "dfs.namenode.rpc-address.nameservice.nn1".to_string(),
+            "namenode2:8020".to_string(),
+        ),
     ]);
 
     // 验证 opts 包含 HA 配置
-    assert_eq!(_opts.get("dfs.ha.namenodes.nameservice").unwrap(), "nn0,nn1");
-    assert_eq!(_opts.get("dfs.namenode.rpc-address.nameservice.nn0").unwrap(), "namenode1:8020");
+    assert_eq!(
+        _opts.get("dfs.ha.namenodes.nameservice").unwrap(),
+        "nn0,nn1"
+    );
+    assert_eq!(
+        _opts
+            .get("dfs.namenode.rpc-address.nameservice.nn0")
+            .unwrap(),
+        "namenode1:8020"
+    );
 }
-
 
 /// 验证 hdfs-jni 的 user/kerberos-ticket-cache-path 参数
 #[test]
 fn test_hdfs_jni_opts() {
     let opts = std::collections::HashMap::from([
         ("user".to_string(), "hdfs-user".to_string()),
-        ("kerberos-ticket-cache-path".to_string(), "/tmp/krb5cc".to_string()),
+        (
+            "kerberos-ticket-cache-path".to_string(),
+            "/tmp/krb5cc".to_string(),
+        ),
     ]);
     assert_eq!(opts.get("user").unwrap(), "hdfs-user");
-    assert_eq!(opts.get("kerberos-ticket-cache-path").unwrap(), "/tmp/krb5cc");
+    assert_eq!(
+        opts.get("kerberos-ticket-cache-path").unwrap(),
+        "/tmp/krb5cc"
+    );
 }
 
 /// 验证多个 scheme 同时解析
@@ -98,7 +126,11 @@ fn test_multi_scheme_parsing() {
     ];
     for (url_str, expected_scheme) in urls {
         let url = url::Url::parse(url_str).unwrap();
-        assert_eq!(url.scheme(), expected_scheme, "scheme mismatch for {url_str}");
+        assert_eq!(
+            url.scheme(),
+            expected_scheme,
+            "scheme mismatch for {url_str}"
+        );
     }
 }
 

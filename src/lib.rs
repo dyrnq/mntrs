@@ -150,18 +150,23 @@ fn opendal_timestamp_to_system_time(ts: impl Into<std::time::SystemTime>) -> std
     }
 }
 impl MntrsFs {
-    fn maybe_create_prefetcher(&self, ino: u64, path: &str) -> Option<std::sync::Arc<prefetcher::HandlePrefetcher>> {
+    fn maybe_create_prefetcher(
+        &self,
+        ino: u64,
+        path: &str,
+    ) -> Option<std::sync::Arc<prefetcher::HandlePrefetcher>> {
         if self.read_chunk_streams > 1 {
             let file_size = self.resolve(ino).map(|(_, _, s, _)| s).unwrap_or(0);
             if file_size > 0 {
                 let chunk = self.read_chunk_size.max(131072);
                 let max_queue = chunk * self.read_chunk_streams as u64;
-                return Some(std::sync::Arc::new(
-                    prefetcher::HandlePrefetcher::new(
-                        self.op.as_ref().clone(), path.to_string(),
-                        file_size, max_queue, chunk,
-                    )
-                ));
+                return Some(std::sync::Arc::new(prefetcher::HandlePrefetcher::new(
+                    self.op.as_ref().clone(),
+                    path.to_string(),
+                    file_size,
+                    max_queue,
+                    chunk,
+                )));
             }
         }
         None
@@ -266,7 +271,9 @@ pub fn cache_block_path(cache_dir: &Path, path: &str, block_idx: u64) -> PathBuf
 /// Loaded at startup so cache is warm across restarts.
 pub fn load_cache_index(cache_dir: &Path) -> Vec<(String, u64, u64, std::time::SystemTime)> {
     let mut entries = Vec::new();
-    let Ok(dir) = std::fs::read_dir(cache_dir) else { return entries; };
+    let Ok(dir) = std::fs::read_dir(cache_dir) else {
+        return entries;
+    };
     for entry in dir.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         // Parse "hash_blockidx.block" format
@@ -283,8 +290,12 @@ pub fn load_cache_index(cache_dir: &Path) -> Vec<(String, u64, u64, std::time::S
 }
 
 fn validate_path_component(name: &str) -> Result<(), Errno> {
-    if name.is_empty() { return Err(Errno::ENOENT); }
-    if name == "." || name == ".." { return Err(Errno::EEXIST); }
+    if name.is_empty() {
+        return Err(Errno::ENOENT);
+    }
+    if name == "." || name == ".." {
+        return Err(Errno::EEXIST);
+    }
     if name.contains('/') || name.contains(' ') {
         tracing::warn!(name, "path component contains separator or null");
         return Err(Errno::EINVAL);
@@ -554,7 +565,10 @@ impl Filesystem for MntrsFs {
         // Recover disk cache index + attr_cache for restart warm cache
         let cached_blocks = load_cache_index(&self.cache_dir);
         if !cached_blocks.is_empty() {
-            tracing::info!(count = cached_blocks.len(), "disk cache blocks recovered for restart");
+            tracing::info!(
+                count = cached_blocks.len(),
+                "disk cache blocks recovered for restart"
+            );
         }
         // Recover attr_cache from .meta sidecars
         if let Ok(entries) = fs::read_dir(&self.cache_dir) {
@@ -563,25 +577,35 @@ impl Filesystem for MntrsFs {
                 let p = e.path();
                 if p.extension().is_some_and(|ext| ext == "meta")
                     && let Ok(content) = fs::read_to_string(&p)
-                    {
+                {
                     let parts: Vec<&str> = content.split(' ').collect();
                     if parts.len() >= 3 {
                         let remote_path = parts[0].to_string();
                         let size: u64 = parts[1].parse().unwrap_or(0);
                         let kind_byte: u8 = parts[2].parse().unwrap_or(0);
-                        let kind = if kind_byte == 1 { FileType::Directory } else { FileType::RegularFile };
+                        let kind = if kind_byte == 1 {
+                            FileType::Directory
+                        } else {
+                            FileType::RegularFile
+                        };
                         let cpath = p.with_extension("");
                         let mtime = std::fs::metadata(&cpath)
                             .ok()
                             .and_then(|m| m.modified().ok())
                             .unwrap_or(std::time::UNIX_EPOCH);
-                        self.attr_cache.insert(remote_path, (kind, size, Some(mtime), std::time::Instant::now()));
+                        self.attr_cache.insert(
+                            remote_path,
+                            (kind, size, Some(mtime), std::time::Instant::now()),
+                        );
                         recovered += 1;
                     }
                 }
             }
             if recovered > 0 {
-                tracing::info!(count = recovered, "attr_cache recovered from .meta sidecars");
+                tracing::info!(
+                    count = recovered,
+                    "attr_cache recovered from .meta sidecars"
+                );
             }
         }
 
@@ -594,10 +618,11 @@ impl Filesystem for MntrsFs {
                     if let Ok(remote) = fs::read_to_string(&p) {
                         let remote = remote.trim().to_string();
                         if !remote.is_empty() && cache_path.exists() {
-                            self.writeback_queue
-                                .lock()
-                                .unwrap()
-                                .push_back((0, remote, cache_path.clone()));
+                            self.writeback_queue.lock().unwrap().push_back((
+                                0,
+                                remote,
+                                cache_path.clone(),
+                            ));
                         }
                     }
                     if let Err(e) = fs::remove_file(&p) {
@@ -626,7 +651,10 @@ impl Filesystem for MntrsFs {
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name = name.to_string_lossy().to_string();
-        if let Err(e) = validate_path_component(&name) { reply.error(e); return; }
+        if let Err(e) = validate_path_component(&name) {
+            reply.error(e);
+            return;
+        }
         let name2 = name.clone();
         let parent: u64 = parent.into();
         if name == "." || name == ".." {
@@ -969,9 +997,7 @@ impl Filesystem for MntrsFs {
                 // Validate CRC64 checksum if present (last 8 bytes)
                 let valid = if data.len() > 8 {
                     let (body, stored_bytes) = data.split_at(data.len() - 8);
-                    let stored = u64::from_le_bytes(
-                        stored_bytes.try_into().unwrap_or([0u8; 8])
-                    );
+                    let stored = u64::from_le_bytes(stored_bytes.try_into().unwrap_or([0u8; 8]));
                     stored == 0 || stored == crc64_checksum(body)
                 } else {
                     true
@@ -995,17 +1021,21 @@ impl Filesystem for MntrsFs {
         // 3.5 Try prefetcher (backpressure-aware background download)
         let fh_val = u64::from(_fh);
         if let Some(h) = self.handles.get(&fh_val)
-            && let FileHandleState::Read { prefetcher: Some(p), .. } = h.value()
-            && let Some(part) = p.pop(offset) {
-                let start = (offset - part.offset) as usize;
-                let end = (start + size as usize).min(part.data.len());
-                if start < part.data.len() {
-                    reply.data(&part.data[start..end]);
-                } else {
-                    reply.data(&[]);
-                }
-                return;
+            && let FileHandleState::Read {
+                prefetcher: Some(p),
+                ..
+            } = h.value()
+            && let Some(part) = p.pop(offset)
+        {
+            let start = (offset - part.offset) as usize;
+            let end = (start + size as usize).min(part.data.len());
+            if start < part.data.len() {
+                reply.data(&part.data[start..end]);
+            } else {
+                reply.data(&[]);
             }
+            return;
+        }
         // 3. Fetch from remote
         // Adaptive chunking: grow on sequential read, reset on seek
         let fh_val = u64::from(_fh);
@@ -1277,8 +1307,10 @@ impl Filesystem for MntrsFs {
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let name = name.to_string_lossy();
-        let parent_path = self.resolve(parent.into())
-            .map(|(p, _, _, _)| p).unwrap_or_default();
+        let parent_path = self
+            .resolve(parent.into())
+            .map(|(p, _, _, _)| p)
+            .unwrap_or_default();
         let full_path = if parent_path.is_empty() {
             name.to_string()
         } else {
@@ -1308,10 +1340,14 @@ impl Filesystem for MntrsFs {
     ) {
         let name = name.to_string_lossy();
         let newname = newname.to_string_lossy();
-        let parent_path = self.resolve(parent.into())
-            .map(|(p, _, _, _)| p).unwrap_or_default();
-        let newparent_path = self.resolve(newparent.into())
-            .map(|(p, _, _, _)| p).unwrap_or_default();
+        let parent_path = self
+            .resolve(parent.into())
+            .map(|(p, _, _, _)| p)
+            .unwrap_or_default();
+        let newparent_path = self
+            .resolve(newparent.into())
+            .map(|(p, _, _, _)| p)
+            .unwrap_or_default();
         let src = if parent_path.is_empty() {
             name.to_string()
         } else {
@@ -1337,7 +1373,9 @@ impl Filesystem for MntrsFs {
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, _size: u32, reply: ReplyXattr) {
         let ino: u64 = ino.into();
         let name = name.to_string_lossy();
-        if self.no_apple_xattr && (name.starts_with("com.apple.") || name == "system.posix_acl_access") {
+        if self.no_apple_xattr
+            && (name.starts_with("com.apple.") || name == "system.posix_acl_access")
+        {
             reply.error(Errno::ENODATA);
             return;
         }
@@ -1419,10 +1457,10 @@ impl Filesystem for MntrsFs {
                 let prefix = format!("{:020x}_", path_hash(&p));
                 if let Ok(entries) = fs::read_dir(&self.cache_dir) {
                     for e in entries.flatten() {
-                        if let Some(name) = e.file_name().to_str() {
-                            if name.starts_with(&prefix) {
-                                let _ = fs::remove_file(e.path());
-                            }
+                        if let Some(name) = e.file_name().to_str()
+                            && name.starts_with(&prefix)
+                        {
+                            let _ = fs::remove_file(e.path());
                         }
                     }
                 }
@@ -1459,8 +1497,10 @@ impl Filesystem for MntrsFs {
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let name = name.to_string_lossy();
-        let parent_path = self.resolve(parent.into())
-            .map(|(p, _, _, _)| p).unwrap_or_default();
+        let parent_path = self
+            .resolve(parent.into())
+            .map(|(p, _, _, _)| p)
+            .unwrap_or_default();
         let full_path = if parent_path.is_empty() {
             name.to_string()
         } else {
@@ -1531,7 +1571,9 @@ impl Filesystem for MntrsFs {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
             loop {
                 let pending = self.writeback_queue.lock().unwrap().len();
-                if pending == 0 { break; }
+                if pending == 0 {
+                    break;
+                }
                 if std::time::Instant::now() >= deadline {
                     tracing::warn!("fsync timeout waiting for writeback");
                     break;
@@ -1971,9 +2013,7 @@ pub fn install_panic_logger() {
         let msg = format!("panic: {info}");
         let location = info.location().map(|l| l.to_string()).unwrap_or_default();
         let backtrace = std::backtrace::Backtrace::force_capture();
-        let report = format!(
-            "{msg}\n  at {location}\n  backtrace:\n{backtrace}\n"
-        );
+        let report = format!("{msg}\n  at {location}\n  backtrace:\n{backtrace}\n");
         // Always write to stderr
         eprintln!("{report}");
         // Also write to file
@@ -1992,9 +2032,7 @@ pub fn install_panic_logger() {
 /// Falls back to /proc/self/cgroup for container-specific path.
 pub fn detect_cgroup_memory_limit() -> Option<u64> {
     // Try cgroup v1 first (most common in K8s)
-    let cgroup_paths = [
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    ];
+    let cgroup_paths = ["/sys/fs/cgroup/memory/memory.limit_in_bytes"];
     for path in &cgroup_paths {
         if let Ok(content) = std::fs::read_to_string(path) {
             let val: u64 = content.trim().parse().ok()?;
@@ -2044,7 +2082,10 @@ impl ChecksummedBytes {
         if actual != self.checksum {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("cache checksum mismatch: expected {:#x}, got {:#x}", self.checksum, actual),
+                format!(
+                    "cache checksum mismatch: expected {:#x}, got {:#x}",
+                    self.checksum, actual
+                ),
             ));
         }
         Ok(self.data)

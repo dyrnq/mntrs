@@ -84,13 +84,18 @@ fn record_mount(storage: &str, mountpoint: &str, read_only: bool) {
     let user = std::env::var("USER").unwrap_or_else(|_| "?".into());
     let ro = if read_only { "ro" } else { "rw" };
     let backend = storage.split(':').next().unwrap_or("?");
-    lines.insert(0, format!("{}\0{}\0{}\0{}\0{}\0{}", storage, mountpoint, pid, user, ro, backend));
+    lines.insert(
+        0,
+        format!(
+            "{}\0{}\0{}\0{}\0{}\0{}",
+            storage, mountpoint, pid, user, ro, backend
+        ),
+    );
     let content = lines.join("\n") + "\n";
     if std::fs::write(&tmp, &content).is_ok() {
         let _ = std::fs::rename(&tmp, &path);
     }
 }
-
 
 fn remove_mount(mountpoint: &str) {
     let path = mounts_db();
@@ -117,8 +122,6 @@ extern "C" fn cleanup() {
         remove_mount(mp);
     }
 }
-
-
 
 /// Simplified mount entry point for CSI plugin.
 /// Uses defaults for all the FUSE tuning parameters.
@@ -177,69 +180,72 @@ pub fn mount_internal(
         }
     }
     mount(
-        storage_url, mountpoint, opts, read_only,
-        10,     // dir_cache_time
-        1,      // attr_timeout
-        10,     // type_cache_ttl
-        1,      // stat_cache_ttl
-        true,   // allow_other (CSI: Pods access as non-root)
-        "mntrs-csi",   // volname
-        None,   // devname
-        false,  // write_back_cache
-        &[],    // fuse_options
-        true,   // daemon
-        false,  // daemon_wait
-        10,     // daemon_timeout
-        false,  // allow_root
-        1024,   // vfs_cache_max_size
-        256,    // mem_limit
-        5,      // vfs_write_back
-        "writes", // vfs_cache_mode
-        131072, // vfs_read_ahead
-        0,      // vfs_read_chunk_size
-        false,  // default_permissions
-        None,   // uid
-        None,   // gid
-        None,   // umask
-        None,   // dir_perms
-        None,   // file_perms
-        false,  // allow_non_empty
+        storage_url,
+        mountpoint,
+        opts,
+        read_only,
+        10,               // dir_cache_time
+        1,                // attr_timeout
+        10,               // type_cache_ttl
+        1,                // stat_cache_ttl
+        true,             // allow_other (CSI: Pods access as non-root)
+        "mntrs-csi",      // volname
+        None,             // devname
+        false,            // write_back_cache
+        &[],              // fuse_options
+        true,             // daemon
+        false,            // daemon_wait
+        10,               // daemon_timeout
+        false,            // allow_root
+        1024,             // vfs_cache_max_size
+        256,              // mem_limit
+        5,                // vfs_write_back
+        "writes",         // vfs_cache_mode
+        131072,           // vfs_read_ahead
+        0,                // vfs_read_chunk_size
+        false,            // default_permissions
+        None,             // uid
+        None,             // gid
+        None,             // umask
+        None,             // dir_perms
+        None,             // file_perms
+        false,            // allow_non_empty
         Some(&cache_dir), // cache_dir (CSI isolated)
-        false,  // direct_io
-        60,     // poll_interval
-        3600,   // vfs_cache_max_age
-        100,    // vfs_cache_min_free_space
-        vec![], // exclude
-        vec![], // include
-        None,   // max_size
-        None,   // min_size
-        None,   // max_depth
-        false,  // ignore_case
-        false,  // no_modtime
-        false,  // use_server_modtime
-        false,  // no_checksum
-        false,  // no_seek
-        false,  // links
-        false,  // noapple_double
-        false,  // noapple_xattr,
-        false,  // mount_case_insensitive
-        131072, // max_read_ahead
-        0,      // vfs_read_chunk_size_limit
-        1,      // vfs_read_chunk_streams
-        false,  // vfs_fast_fingerprint
-        false,  // async_read
-        false,  // vfs_refresh
-        false,  // vfs_case_insensitive
-        false,  // no_implicit_dir
-        false,  // vfs_block_norm_dupes
-        false,  // vfs_links
-        false,  // vfs_used_is_size
-        None,   // vfs_metadata_extension
-        None,   // storage_class
-        5,      // vfs_write_wait
-        5,      // vfs_read_wait
-        60,     // vfs_cache_poll_interval
-        1024,   // vfs_disk_space_total_size
+        false,            // direct_io
+        60,               // poll_interval
+        3600,             // vfs_cache_max_age
+        100,              // vfs_cache_min_free_space
+        vec![],           // exclude
+        vec![],           // include
+        None,             // max_size
+        None,             // min_size
+        None,             // max_depth
+        false,            // ignore_case
+        false,            // no_modtime
+        false,            // use_server_modtime
+        false,            // no_checksum
+        false,            // no_seek
+        false,            // links
+        false,            // noapple_double
+        false,            // noapple_xattr,
+        false,            // mount_case_insensitive
+        131072,           // max_read_ahead
+        0,                // vfs_read_chunk_size_limit
+        1,                // vfs_read_chunk_streams
+        false,            // vfs_fast_fingerprint
+        false,            // async_read
+        false,            // vfs_refresh
+        false,            // vfs_case_insensitive
+        false,            // no_implicit_dir
+        false,            // vfs_block_norm_dupes
+        false,            // vfs_links
+        false,            // vfs_used_is_size
+        None,             // vfs_metadata_extension
+        None,             // storage_class
+        5,                // vfs_write_wait
+        5,                // vfs_read_wait
+        60,               // vfs_cache_poll_interval
+        1024,             // vfs_disk_space_total_size
     )
 }
 
@@ -471,12 +477,12 @@ pub fn mount(
     if allow_other && unsafe { libc::geteuid() != 0 } {
         let fuse_conf = std::path::Path::new("/etc/fuse.conf");
         if fuse_conf.exists() {
-            if let Ok(content) = std::fs::read_to_string(fuse_conf) {
-                if !content.lines().any(|l| l.trim() == "user_allow_other") {
-                    return Err(anyhow!(
-                        "--allow-other requires 'user_allow_other' in /etc/fuse.conf. "
-                    ));
-                }
+            if let Ok(content) = std::fs::read_to_string(fuse_conf)
+                && !content.lines().any(|l| l.trim() == "user_allow_other")
+            {
+                return Err(anyhow!(
+                    "--allow-other requires 'user_allow_other' in /etc/fuse.conf. "
+                ));
             }
         } else {
             return Err(anyhow!(
@@ -615,17 +621,22 @@ fn apply_operator_with_tls(
         }
         if let Some(path) = opts.get("cacert") {
             let buf = std::fs::read(path).map_err(|e| anyhow!("read cacert '{}': {}", path, e))?;
-            let ca = reqwest::Certificate::from_pem(&buf).map_err(|e| anyhow!("invalid cacert '{}': {}", path, e))?;
+            let ca = reqwest::Certificate::from_pem(&buf)
+                .map_err(|e| anyhow!("invalid cacert '{}': {}", path, e))?;
             rb = rb.add_root_certificate(ca);
         }
         if let Some(cert_path) = opts.get("cert") {
-            let buf = std::fs::read(cert_path).map_err(|e| anyhow!("read cert '{}': {}", cert_path, e))?;
-            let identity = reqwest::Identity::from_pem(&buf).map_err(|e| anyhow!("invalid cert: {}", e))?;
+            let buf = std::fs::read(cert_path)
+                .map_err(|e| anyhow!("read cert '{}': {}", cert_path, e))?;
+            let identity =
+                reqwest::Identity::from_pem(&buf).map_err(|e| anyhow!("invalid cert: {}", e))?;
             rb = rb.identity(identity);
         }
         let client = rb.build().map_err(|e| anyhow!("build TLS client: {}", e))?;
         Operator::new(builder)?
-            .layer(opendal::layers::HttpClientLayer::new(opendal::raw::HttpClient::with(client)))
+            .layer(opendal::layers::HttpClientLayer::new(
+                opendal::raw::HttpClient::with(client),
+            ))
             .layer(TimeoutLayer::new().with_io_timeout(std::time::Duration::from_secs(30)))
             .layer(RetryLayer::new().with_max_times(3).with_factor(2.0))
             .layer(ConcurrentLimitLayer::new(16))
@@ -974,12 +985,24 @@ extern "C" fn handler(_: i32) {
 }
 
 async fn build_webdav(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
-    let endpoint = format!("{}://{}", url.scheme(), url.host_str().unwrap_or("localhost"));
+    let endpoint = format!(
+        "{}://{}",
+        url.scheme(),
+        url.host_str().unwrap_or("localhost")
+    );
     let mut builder = Webdav::default().endpoint(&endpoint);
     let p = url.path();
-    if !p.is_empty() && p != "/" { builder = builder.root(p); }
-    if let Some(v) = opts.get("username") { builder = builder.username(v); }
-    if let Some(v) = opts.get("password") { builder = builder.password(v); }
-    if let Some(v) = opts.get("token") { builder = builder.token(v); }
+    if !p.is_empty() && p != "/" {
+        builder = builder.root(p);
+    }
+    if let Some(v) = opts.get("username") {
+        builder = builder.username(v);
+    }
+    if let Some(v) = opts.get("password") {
+        builder = builder.password(v);
+    }
+    if let Some(v) = opts.get("token") {
+        builder = builder.token(v);
+    }
     apply_operator_with_tls(builder, opts)
 }

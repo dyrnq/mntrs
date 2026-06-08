@@ -4,9 +4,9 @@
 //! When the queue is full, the downloader spins (light backpressure).
 //! When the reader needs data, it pops from the queue.
 
-use std::sync::{Arc, Mutex};
-use std::collections::VecDeque;
 use bytes::Bytes;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 /// A chunk of data downloaded from remote.
 #[derive(Clone)]
@@ -70,8 +70,12 @@ impl PartQueue {
         }
     }
 
-    pub fn set_finished(&mut self) { self.finished = true; }
-    pub fn set_error(&mut self, err: String) { self.error = Some(err); }
+    pub fn set_finished(&mut self) {
+        self.finished = true;
+    }
+    pub fn set_error(&mut self, err: String) {
+        self.error = Some(err);
+    }
 }
 
 /// Background downloader that fills a PartQueue.
@@ -93,14 +97,18 @@ impl HandlePrefetcher {
             let mut offset = 0u64;
             while offset < file_size {
                 let end = (offset + chunk_size).min(file_size);
-                let result = crate::rt().block_on(async {
-                    op.read_with(&path).range(offset..end).await
-                });
+                let result =
+                    crate::rt().block_on(async { op.read_with(&path).range(offset..end).await });
                 match result {
                     Ok(buf) => {
-                        let part = Part { offset, data: Bytes::from(buf.to_vec()) };
+                        let part = Part {
+                            offset,
+                            data: Bytes::from(buf.to_vec()),
+                        };
                         let mut qlock = q.lock().unwrap();
-                        if qlock.push(part).is_err() { break; }
+                        if qlock.push(part).is_err() {
+                            break;
+                        }
                         offset = end;
                     }
                     Err(e) => {
@@ -133,7 +141,11 @@ mod tests {
     #[test]
     fn test_part_queue_push_pop() {
         let mut q = PartQueue::new(1024);
-        q.push(Part { offset: 0, data: Bytes::from(vec![0u8; 100]) }).unwrap();
+        q.push(Part {
+            offset: 0,
+            data: Bytes::from(vec![0u8; 100]),
+        })
+        .unwrap();
         let part = q.pop(0).unwrap();
         assert_eq!(part.offset, 0);
         assert_eq!(part.data.len(), 100);
@@ -150,7 +162,11 @@ mod tests {
     #[test]
     fn test_part_queue_discard_stale() {
         let mut q = PartQueue::new(1024);
-        q.push(Part { offset: 0, data: Bytes::from(vec![0u8; 50]) }).unwrap();
+        q.push(Part {
+            offset: 0,
+            data: Bytes::from(vec![0u8; 50]),
+        })
+        .unwrap();
         q.set_finished();
         // Pop at offset past the front — discards stale
         let part = q.pop(100);
@@ -177,9 +193,21 @@ mod tests {
     #[test]
     fn test_part_queue_multiple_parts() {
         let mut q = PartQueue::new(1024);
-        q.push(Part { offset: 0, data: Bytes::from(vec![0u8; 100]) }).unwrap();
-        q.push(Part { offset: 100, data: Bytes::from(vec![1u8; 100]) }).unwrap();
-        q.push(Part { offset: 200, data: Bytes::from(vec![2u8; 100]) }).unwrap();
+        q.push(Part {
+            offset: 0,
+            data: Bytes::from(vec![0u8; 100]),
+        })
+        .unwrap();
+        q.push(Part {
+            offset: 100,
+            data: Bytes::from(vec![1u8; 100]),
+        })
+        .unwrap();
+        q.push(Part {
+            offset: 200,
+            data: Bytes::from(vec![2u8; 100]),
+        })
+        .unwrap();
 
         let p2 = q.pop(150).unwrap();
         assert_eq!(p2.offset, 100);

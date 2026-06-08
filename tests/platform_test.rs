@@ -15,8 +15,10 @@ fn platform_mount_internal_memory() {
     let tmp = std::env::temp_dir().join(format!("plat-mem-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
     let result = mount_internal(
-        "memory://bucket", tmp.to_str().unwrap(),
-        &std::collections::HashMap::new(), false,
+        "memory://bucket",
+        tmp.to_str().unwrap(),
+        &std::collections::HashMap::new(),
+        false,
     );
     let _ = std::fs::remove_dir_all(&tmp);
     // memory:// is not a valid real scheme, but mount_internal should handle gracefully
@@ -28,8 +30,10 @@ fn platform_mount_internal_unicode_path() {
     let tmp = std::env::temp_dir().join(format!("路径测试-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
     let result = mount_internal(
-        "s3://bucket", tmp.to_str().unwrap(),
-        &std::collections::HashMap::new(), false,
+        "s3://bucket",
+        tmp.to_str().unwrap(),
+        &std::collections::HashMap::new(),
+        false,
     );
     let _ = std::fs::remove_dir_all(&tmp);
     assert!(result.is_err());
@@ -41,8 +45,10 @@ fn platform_mount_internal_long_path() {
     let tmp = std::env::temp_dir().join(&long);
     let _ = std::fs::create_dir_all(&tmp);
     let result = mount_internal(
-        "s3://bucket", tmp.to_str().unwrap(),
-        &std::collections::HashMap::new(), false,
+        "s3://bucket",
+        tmp.to_str().unwrap(),
+        &std::collections::HashMap::new(),
+        false,
     );
     let _ = std::fs::remove_dir_all(&tmp);
     assert!(result.is_err());
@@ -60,7 +66,9 @@ mod linux_tests {
     fn linux_is_mount_point() {
         // /proc is always mounted on Linux
         assert!(mntrs::cmd::mount::is_mount_point("/proc"));
-        assert!(!mntrs::cmd::mount::is_mount_point("/nonexistent-path-12345"));
+        assert!(!mntrs::cmd::mount::is_mount_point(
+            "/nonexistent-path-12345"
+        ));
     }
 
     #[test]
@@ -72,9 +80,7 @@ mod linux_tests {
         // We just verify the code path doesn't panic
         let mut opts = std::collections::HashMap::new();
         opts.insert("allow_other".to_string(), "true".to_string());
-        let result = mount_internal(
-            "memory://bucket", tmp.to_str().unwrap(), &opts, false,
-        );
+        let result = mount_internal("memory://bucket", tmp.to_str().unwrap(), &opts, false);
         let _ = std::fs::remove_dir_all(&tmp);
         assert!(result.is_err());
     }
@@ -84,8 +90,10 @@ mod linux_tests {
         let tmp = std::env::temp_dir().join(format!("linux-ro-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         let result = mount_internal(
-            "memory://bucket", tmp.to_str().unwrap(),
-            &std::collections::HashMap::new(), true,
+            "memory://bucket",
+            tmp.to_str().unwrap(),
+            &std::collections::HashMap::new(),
+            true,
         );
         let _ = std::fs::remove_dir_all(&tmp);
         assert!(result.is_err());
@@ -97,9 +105,7 @@ mod linux_tests {
         let _ = std::fs::create_dir_all(&tmp);
         let mut opts = std::collections::HashMap::new();
         opts.insert("daemon".to_string(), "true".to_string());
-        let result = mount_internal(
-            "memory://bucket", tmp.to_str().unwrap(), &opts, false,
-        );
+        let result = mount_internal("memory://bucket", tmp.to_str().unwrap(), &opts, false);
         let _ = std::fs::remove_dir_all(&tmp);
         assert!(result.is_err());
     }
@@ -119,9 +125,7 @@ mod macos_tests {
         let _ = std::fs::create_dir_all(&tmp);
         let mut opts = std::collections::HashMap::new();
         opts.insert("noappledouble".to_string(), "true".to_string());
-        let result = mount_internal(
-            "memory://bucket", tmp.to_str().unwrap(), &opts, false,
-        );
+        let result = mount_internal("memory://bucket", tmp.to_str().unwrap(), &opts, false);
         let _ = std::fs::remove_dir_all(&tmp);
         assert!(result.is_err());
     }
@@ -132,9 +136,7 @@ mod macos_tests {
         let _ = std::fs::create_dir_all(&tmp);
         let mut opts = std::collections::HashMap::new();
         opts.insert("noapplexattr".to_string(), "true".to_string());
-        let result = mount_internal(
-            "memory://bucket", tmp.to_str().unwrap(), &opts, false,
-        );
+        let result = mount_internal("memory://bucket", tmp.to_str().unwrap(), &opts, false);
         let _ = std::fs::remove_dir_all(&tmp);
         assert!(result.is_err());
     }
@@ -145,9 +147,7 @@ mod macos_tests {
         let _ = std::fs::create_dir_all(&tmp);
         let mut opts = std::collections::HashMap::new();
         opts.insert("mount_case_insensitive".to_string(), "true".to_string());
-        let result = mount_internal(
-            "memory://bucket", tmp.to_str().unwrap(), &opts, false,
-        );
+        let result = mount_internal("memory://bucket", tmp.to_str().unwrap(), &opts, false);
         let _ = std::fs::remove_dir_all(&tmp);
         assert!(result.is_err());
     }

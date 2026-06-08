@@ -232,7 +232,10 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     mntrs::install_panic_logger();
     if let Some(limit) = mntrs::detect_cgroup_memory_limit() {
-        tracing::info!(memory_limit_mb = limit / 1024 / 1024, "detected cgroup memory limit");
+        tracing::info!(
+            memory_limit_mb = limit / 1024 / 1024,
+            "detected cgroup memory limit"
+        );
     }
     let cli = Cli::parse();
     match cli.command {

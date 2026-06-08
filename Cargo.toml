@@ -3,7 +3,7 @@ name = "mntrs"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/user/mntrs"
+repository = "https://github.com/dyrnq/mntrs"
 description = "Mount remote storage (S3, HDFS, GCS, etc.) to local directory via FUSE"
 
 [dependencies]
