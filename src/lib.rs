@@ -58,7 +58,7 @@ const FUSE_ROOT_INO: u64 = 1;
 // DIR_CACHE_TTL now comes from MntrsFs.dir_cache_ttl field
 
 /// Per-open-file-handle state
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum FileHandleState {
     Read {
         path: String,
@@ -68,10 +68,33 @@ enum FileHandleState {
     },
     Write {
         path: String,
+        cache_fd: Option<Arc<std::sync::Mutex<std::fs::File>>>,
         dirty: bool,
-        #[allow(dead_code)]
         dirty_since: Option<std::time::Instant>,
     },
+}
+
+impl Clone for FileHandleState {
+    fn clone(&self) -> Self {
+        match self {
+            FileHandleState::Read { path, last_offset, chunk_size, prefetcher } => {
+                FileHandleState::Read {
+                    path: path.clone(),
+                    last_offset: *last_offset,
+                    chunk_size: *chunk_size,
+                    prefetcher: prefetcher.clone(),
+                }
+            }
+            FileHandleState::Write { path, cache_fd, dirty, dirty_since } => {
+                FileHandleState::Write {
+                    path: path.clone(),
+                    cache_fd: cache_fd.clone(),
+                    dirty: *dirty,
+                    dirty_since: *dirty_since,
+                }
+            }
+        }
+    }
 }
 
 impl FileHandleState {
@@ -938,10 +961,23 @@ impl Filesystem for MntrsFs {
             format!("{}/{}", parent_path, name)
         };
         let ino = self.alloc_ino(&full_path, FileType::RegularFile, 0);
+        let cpath = cache_path(&self.cache_dir, &full_path);
+        if let Some(parent) = cpath.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let cache_fd = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&cpath)
+            .ok()
+            .map(|f| Arc::new(std::sync::Mutex::new(f)));
         self.handles.insert(
             ino,
             FileHandleState::Write {
                 path: full_path.clone(),
+                cache_fd,
                 dirty: false,
                 dirty_since: None,
             },
@@ -1247,40 +1283,62 @@ impl Filesystem for MntrsFs {
                 return;
             }
         }
-        let block_idx = offset / CACHE_BLOCK_SIZE;
-        let cpath = cache_block_path(&self.cache_dir, &path, block_idx);
-        if let Some(parent) = cpath.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let result = (|| -> std::io::Result<()> {
-            let file = fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .read(true)
-                .open(&cpath)?;
-            self.disk_cache_index.insert(
-                path.clone(),
-                (data.len() as u64, std::time::SystemTime::now()),
-            );
-            let end = offset + data.len() as u64;
-            let current_len = file.metadata()?.len();
-            if end > current_len {
-                file.set_len(end)?;
+        // Write via single cache fd (like rclone RWFileHandle)
+        self.disk_cache_index.insert(
+            path.clone(),
+            (data.len() as u64, std::time::SystemTime::now()),
+        );
+        let end = offset + data.len() as u64;
+
+        let cache_fd = self.handles.get(&fh_val).and_then(|e| {
+            if let FileHandleState::Write { cache_fd: Some(fd), .. } = e.value() {
+                Some(fd.clone())
+            } else {
+                None
             }
-            let mut f = file;
-            f.seek(SeekFrom::Start(offset))?;
-            f.write_all(data)?;
-            f.flush()?;
+        });
+
+        let result = (|| -> std::io::Result<()> {
+            match &cache_fd {
+                Some(fd) => {
+                    let mut f = fd.lock().unwrap();
+                    let current_len = f.metadata()?.len();
+                    if end > current_len {
+                        f.set_len(end)?;
+                    }
+                    f.seek(SeekFrom::Start(offset))?;
+                    f.write_all(data)?;
+                    f.flush()?;
+                }
+                None => {
+                    let cpath = cache_path(&self.cache_dir, &path);
+                    if let Some(parent) = cpath.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    let mut f = fs::OpenOptions::new()
+                        .create(true)
+                        .truncate(false)
+                        .write(true)
+                        .read(true)
+                        .open(&cpath)?;
+                    let current_len = f.metadata()?.len();
+                    if end > current_len {
+                        f.set_len(end)?;
+                    }
+                    f.seek(SeekFrom::Start(offset))?;
+                    f.write_all(data)?;
+                    f.flush()?;
+                }
+            }
             Ok(())
         })();
-        self.evict_lru();
         match result {
             Ok(()) => {
                 self.handles.insert(
                     fh_val,
                     FileHandleState::Write {
                         path: path.clone(),
+                        cache_fd,
                         dirty: true,
                         dirty_since: Some(std::time::Instant::now()),
                     },
@@ -1596,10 +1654,20 @@ impl Filesystem for MntrsFs {
             }) = entry
             {
                 if d {
+                    let cpath = cache_block_path(&self.cache_dir, &p, 0);
+                    let fd = std::fs::OpenOptions::new()
+                        .create(true)
+                        .truncate(false)
+                        .write(true)
+                        .read(true)
+                        .open(&cpath)
+                        .ok()
+                        .map(|f| Arc::new(std::sync::Mutex::new(f)));
                     self.handles.insert(
                         fh_val,
                         FileHandleState::Write {
                             path: p.clone(),
+                            cache_fd: fd,
                             dirty: false,
                             dirty_since: None,
                         },
@@ -1838,6 +1906,7 @@ impl CoreFilesystem for MntrsFs {
                 ino,
                 FileHandleState::Write {
                     path,
+                    cache_fd: None,
                     dirty: false,
                     dirty_since: None,
                 },
@@ -1867,6 +1936,32 @@ impl CoreFilesystem for MntrsFs {
         let cap = file_size - offset;
         let fetch_size = self.read_chunk_size.max(size as u64).min(cap);
         let block_idx = offset / CACHE_BLOCK_SIZE;
+
+        // Try read from cache fd first (write handle still open)
+        if !self.direct_io {
+            let cache_fd = self.handles.get(&_fh).and_then(|e| {
+                if let crate::FileHandleState::Read { .. } = e.value() {
+                    None
+                } else if let crate::FileHandleState::Write { cache_fd: Some(fd), .. } = e.value() {
+                    Some(fd.clone())
+                } else {
+                    None
+                }
+            });
+            if let Some(fd) = cache_fd {
+                use std::io::{Read, Seek};
+                let mut f = fd.lock().unwrap();
+                let file_len = f.metadata()?.len();
+                if offset < file_len {
+                    let read_size = (size as u64).min(file_len - offset) as usize;
+                    let mut buf = vec![0u8; read_size];
+                    f.seek(std::io::SeekFrom::Start(offset))?;
+                    f.read_exact(&mut buf)?;
+                    return Ok(buf);
+                }
+            }
+        }
+
         if let Some(entry) = self.mem_cache.get(&(ino, block_idx)) {
             let data = entry.value();
             let start = offset as usize;
@@ -1927,51 +2022,59 @@ impl CoreFilesystem for MntrsFs {
             return Ok(_data.len() as u32);
         }
 
-        // Check out_of_space backpressure
-        if self.out_of_space.load(std::sync::atomic::Ordering::Relaxed) {
-            self.evict_lru();
-            if self.out_of_space.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::StorageFull,
-                    "out of space",
-                ));
+        // Write via single cache fd (like rclone RWFileHandle)
+        let cache_fd = self.handles.get(&fh_val).and_then(|e| {
+            if let crate::FileHandleState::Write { cache_fd: Some(fd), .. } = e.value() {
+                Some(fd.clone())
+            } else {
+                None
+            }
+        });
+
+        match &cache_fd {
+            Some(fd) => {
+                use std::io::{Seek, Write};
+                let mut f = fd.lock().unwrap();
+                let end = _offset + _data.len() as u64;
+                let current_len = f.metadata()?.len();
+                if end > current_len {
+                    f.set_len(end)?;
+                }
+                f.seek(std::io::SeekFrom::Start(_offset))?;
+                f.write_all(_data)?;
+                f.flush()?;
+            }
+            None => {
+                // Fallback: open cache file directly
+                let cpath = crate::cache_path(&self.cache_dir, &path);
+                if let Some(parent) = cpath.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                use std::io::{Seek, Write};
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .read(true)
+                    .open(&cpath)?;
+                let end = _offset + _data.len() as u64;
+                let current_len = f.metadata()?.len();
+                if end > current_len {
+                    f.set_len(end)?;
+                }
+                f.seek(std::io::SeekFrom::Start(_offset))?;
+                f.write_all(_data)?;
+                f.flush()?;
             }
         }
 
-        let block_idx = _offset / CACHE_BLOCK_SIZE;
-        let cpath = crate::cache_block_path(&self.cache_dir, &path, block_idx);
-        if let Some(parent) = cpath.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
+        self.disk_cache_index.insert(
+            path.clone(),
+            (_data.len() as u64, std::time::SystemTime::now()),
+        );
         let written = _data.len() as u32;
-        let result = (|| -> std::io::Result<()> {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .read(true)
-                .open(&cpath)?;
-            self.disk_cache_index.insert(
-                path.clone(),
-                (_data.len() as u64, std::time::SystemTime::now()),
-            );
-            let end = _offset + _data.len() as u64;
-            let current_len = file.metadata()?.len();
-            if end > current_len {
-                file.set_len(end)?;
-            }
-            let mut f = file;
-            f.seek(std::io::SeekFrom::Start(_offset))?;
-            f.write_all(_data)?;
-            f.flush()?;
-            Ok(())
-        })();
 
-        self.evict_lru();
-        result?;
-
-        // Update inodes size so getattr returns correct file size
+        // Update inodes size
         let end = _offset + _data.len() as u64;
         self.inodes.entry(_ino).and_modify(|v| {
             if end > v.2 {
@@ -1983,6 +2086,7 @@ impl CoreFilesystem for MntrsFs {
             fh_val,
             crate::FileHandleState::Write {
                 path: path.clone(),
+                cache_fd,
                 dirty: true,
                 dirty_since: Some(std::time::Instant::now()),
             },
@@ -2004,50 +2108,33 @@ impl CoreFilesystem for MntrsFs {
             }
         };
         if dirty {
-            // Push all dirty blocks for this file into writeback queue
-            let hash_prefix = format!("{:020x}_", crate::path_hash(&path));
-            let mut pushed = 0u64;
-            if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
-                for e in entries.flatten() {
-                    let p = e.path();
-                    if let Some(name) = p.file_name().and_then(|n| n.to_str())
-                        && name.starts_with(&hash_prefix)
-                        && name.ends_with(".block")
-                    {
-                        let sidecar = p.with_extension("dirty");
-                        if let Err(e) = std::fs::write(&sidecar, path.as_bytes()) {
-                            tracing::warn!(error=%e, path=?sidecar, "sidecar write failed");
-                        }
-                        self.writeback_queue
-                            .lock()
-                            .unwrap()
-                            .push_back((_ino, path.clone(), p));
-                        pushed += 1;
-                    }
+            // Push single cache file to writeback queue
+            let cpath = crate::cache_path(&self.cache_dir, &path);
+            if cpath.exists() {
+                let sidecar = cpath.with_extension("dirty");
+                if let Err(e) = std::fs::write(&sidecar, path.as_bytes()) {
+                    tracing::warn!(error=%e, path=?sidecar, "sidecar write failed");
                 }
-            }
-            if pushed == 0 {
-                // Fallback: push block 0 for backward compat
-                let cpath = crate::cache_block_path(&self.cache_dir, &path, 0);
-                if cpath.exists() {
-                    let sidecar = cpath.with_extension("dirty");
-                    if let Err(e) = std::fs::write(&sidecar, path.as_bytes()) {
-                        tracing::warn!(error=%e, path=?sidecar, "sidecar write failed");
-                    }
-                    self.writeback_queue
-                        .lock()
-                        .unwrap()
-                        .push_back((_ino, path.clone(), cpath));
-                }
-            }
-            if pushed > 1 {
-                tracing::debug!(path=%path, blocks=pushed, "flush queued all blocks for writeback");
+                self.writeback_queue
+                    .lock()
+                    .unwrap()
+                    .push_back((_ino, path.clone(), cpath));
+                tracing::debug!(path=%path, "flush queued writeback");
             }
             // Mark handle clean; writeback happens asynchronously
+            let cache_fd = self.handles.get(&_fh)
+                .and_then(|e| {
+                    if let crate::FileHandleState::Write { cache_fd: Some(fd), .. } = e.value() {
+                        Some(fd.clone())
+                    } else {
+                        None
+                    }
+                });
             self.handles.insert(
                 _fh,
                 crate::FileHandleState::Write {
                     path: path.clone(),
+                    cache_fd,
                     dirty: false,
                     dirty_since: None,
                 },
@@ -2062,28 +2149,22 @@ impl CoreFilesystem for MntrsFs {
                 path, dirty: true, ..
             } = entry.value()
         {
-            let hash_prefix = format!("{:020x}_", crate::path_hash(path));
-            let mut pushed = 0u64;
-            if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
-                for e in entries.flatten() {
-                    let p = e.path();
-                    if let Some(name) = p.file_name().and_then(|n| n.to_str())
-                        && name.starts_with(&hash_prefix)
-                        && name.ends_with(".block")
-                    {
-                        let sidecar = p.with_extension("dirty");
-                        let _ = std::fs::write(&sidecar, path.as_bytes());
-                        self.writeback_queue
-                            .lock()
-                            .unwrap()
-                            .push_back((_ino, path.clone(), p));
-                        pushed += 1;
-                    }
-                }
+            let cpath = crate::cache_path(&self.cache_dir, path);
+            if cpath.exists() {
+                let sidecar = cpath.with_extension("dirty");
+                let _ = std::fs::write(&sidecar, path.as_bytes());
+                self.writeback_queue
+                    .lock()
+                    .unwrap()
+                    .push_back((_ino, path.clone(), cpath));
+                tracing::debug!(path=%path, "release queued writeback");
             }
-            if pushed > 0 {
-                tracing::debug!(path=%path, blocks=pushed, "release queued writeback");
-            }
+        }
+        // Close the cache fd before removing handle
+        if let Some(entry) = self.handles.get(&fh)
+            && let crate::FileHandleState::Write { cache_fd: Some(fd), .. } = entry.value()
+        {
+            let _ = fd;
         }
         self.handles.remove(&fh);
         Ok(())
@@ -2108,10 +2189,24 @@ impl CoreFilesystem for MntrsFs {
                 .unwrap_or((FileType::RegularFile, 0, None));
         let ino = self.alloc_ino(&full_path, kind, size);
         // Insert Write handle so follow-up write() can find the path
+        // Create cache file for write handle
+        let cpath = crate::cache_path(&self.cache_dir, &full_path);
+        if let Some(parent) = cpath.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let cache_fd = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&cpath)
+            .ok()
+            .map(|f| Arc::new(std::sync::Mutex::new(f)));
         self.handles.insert(
             ino,
             FileHandleState::Write {
                 path: full_path,
+                cache_fd,
                 dirty: false,
                 dirty_since: None,
             },
@@ -2476,4 +2571,62 @@ fn crc32c_checksum(data: &[u8]) -> u32 {
         }
     }
     crc ^ 0xFFFFFFFF
+}
+
+pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> MntrsFs {
+    MntrsFs {
+        op: Arc::new(op),
+        inodes: Default::default(),
+        dir_cache: Default::default(),
+        cache_dir,
+        handles: Default::default(),
+        dir_cache_ttl: std::time::Duration::from_secs(10),
+        attr_ttl: std::time::Duration::from_secs(1),
+        stat_cache_ttl: std::time::Duration::from_secs(10),
+        volname: "test".into(),
+        cache_max_size: 1024 * 1024 * 1024,
+        write_back_delay: std::time::Duration::from_secs(1),
+        cache_mode: "writes".into(),
+        read_ahead: 0,
+        read_chunk_size: 0,
+        read_chunk_size_limit: 0,
+        read_chunk_streams: 1,
+        uid: None,
+        gid: None,
+        umask: None,
+        dir_perms: 0o755,
+        file_perms: 0o644,
+        direct_io: false,
+        poll_interval: std::time::Duration::from_secs(60),
+        cache_max_age: std::time::Duration::from_secs(3600),
+        cache_min_free_space: 100 * 1024 * 1024,
+        exclude_patterns: vec![],
+        include_patterns: vec![],
+        max_size: None,
+        min_size: None,
+        max_depth: None,
+        ignore_case: false,
+        fast_fingerprint: false,
+        async_read: false,
+        vfs_refresh: false,
+        case_insensitive: false,
+        no_implicit_dir: false,
+        use_server_modtime: false,
+        no_apple_double: false,
+        no_apple_xattr: false,
+        hash_filter: None,
+        block_norm_dupes: false,
+        write_wait: std::time::Duration::from_secs(0),
+        read_wait: std::time::Duration::from_secs(0),
+        cache_poll_interval: std::time::Duration::from_secs(60),
+        disk_total_size: 0,
+        writeback_queue: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+        mem_cache: Default::default(),
+        attr_cache: Default::default(),
+        disk_cache_index: Default::default(),
+        out_of_space: std::sync::atomic::AtomicBool::new(false),
+        storage_class: None,
+        mem_limit: u64::MAX,
+        mem_used: std::sync::atomic::AtomicU64::new(0),
+    }
 }
