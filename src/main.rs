@@ -158,6 +158,9 @@ enum Commands {
         /// macOS: ignore Apple extended attributes
         #[arg(long)]
         noapple_xattr: bool,
+        /// Consistent hash-based sharding: k of n (e.g. --hash-filter 1/4)
+        #[arg(long, value_name = "K/N")]
+        hash_filter: Option<String>,
         /// macOS: tell OS the mount is case-insensitive
         #[arg(long)]
         mount_case_insensitive: bool,
@@ -296,6 +299,7 @@ fn main() -> anyhow::Result<()> {
             links,
             noapple_double,
             noapple_xattr,
+            hash_filter,
             mount_case_insensitive,
             max_read_ahead,
             vfs_read_chunk_size_limit,
@@ -369,6 +373,7 @@ fn main() -> anyhow::Result<()> {
                 links,
                 noapple_double,
                 noapple_xattr,
+                hash_filter,
                 mount_case_insensitive,
                 max_read_ahead,
                 vfs_read_chunk_size_limit,

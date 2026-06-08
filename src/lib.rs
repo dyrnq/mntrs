@@ -130,6 +130,7 @@ pub struct MntrsFs {
     pub use_server_modtime: bool,
     pub no_apple_double: bool,
     pub no_apple_xattr: bool,
+    pub hash_filter: Option<(usize, usize)>,
     pub block_norm_dupes: bool,
     pub write_wait: Duration,
     pub read_wait: Duration,
@@ -434,6 +435,10 @@ impl MntrsFs {
                         if matched {
                             continue;
                         }
+                    }
+                    // Skip Apple Double files on macOS
+                    if self.no_apple_double && name.starts_with("._") {
+                        continue;
                     }
                     if !self.include_patterns.is_empty() {
                         let matched = self
