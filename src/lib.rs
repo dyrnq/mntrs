@@ -505,6 +505,7 @@ impl MntrsFs {
             }
             let cpath = cache_path(&self.cache_dir, &path);
             let _ = fs::remove_file(&cpath);
+            let _ = fs::remove_file(cpath.with_extension("meta"));
             self.disk_cache_index.remove(&path as &str);
             freed += size;
             remaining = remaining.saturating_sub(size);
@@ -527,10 +528,38 @@ impl Filesystem for MntrsFs {
         }
         // Enable readdirplus for stat+readdir in one round-trip
         let _ = config.add_capabilities(fuser::InitFlags::FUSE_DO_READDIRPLUS);
-        // Recover disk cache index for restart warm cache
+        // Recover disk cache index + attr_cache for restart warm cache
         let cached_blocks = load_cache_index(&self.cache_dir);
         if !cached_blocks.is_empty() {
             tracing::info!(count = cached_blocks.len(), "disk cache blocks recovered for restart");
+        }
+        // Recover attr_cache from .meta sidecars
+        if let Ok(entries) = fs::read_dir(&self.cache_dir) {
+            let mut recovered = 0u64;
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().is_some_and(|ext| ext == "meta") {
+                    if let Ok(content) = fs::read_to_string(&p) {
+                        let parts: Vec<&str> = content.split(' ').collect();
+                        if parts.len() >= 3 {
+                            let remote_path = parts[0].to_string();
+                            let size: u64 = parts[1].parse().unwrap_or(0);
+                            let kind_byte: u8 = parts[2].parse().unwrap_or(0);
+                            let kind = if kind_byte == 1 { FileType::Directory } else { FileType::RegularFile };
+                            let cpath = p.with_extension("");
+                            let mtime = std::fs::metadata(&cpath)
+                                .ok()
+                                .and_then(|m| m.modified().ok())
+                                .unwrap_or(std::time::UNIX_EPOCH);
+                            self.attr_cache.insert(remote_path, (kind, size, Some(mtime), std::time::Instant::now()));
+                            recovered += 1;
+                        }
+                    }
+                }
+            }
+            if recovered > 0 {
+                tracing::info!(count = recovered, "attr_cache recovered from .meta sidecars");
+            }
         }
 
         // Recover writeback queue from dirty sidecars
