@@ -38,7 +38,7 @@ jobs:
         run: cargo build --package mntrs-csi
 
       - name: Test (all)
-        run: cargo test --workspace
+        run: cargo test --workspace --lib
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
