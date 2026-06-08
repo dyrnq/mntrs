@@ -1,6 +1,10 @@
 name: Integration Tests
 
 on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
   workflow_dispatch:
   schedule:
     - cron: '0 4 * * 0'  # weekly Sunday 04:00 UTC
