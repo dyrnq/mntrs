@@ -604,6 +604,9 @@ async fn build_operator(storage_url: &str, opts: &HashMap<String, String>) -> Re
         "gs" | "gcs" => build_gcs(&url, opts).await,
         "azblob" => build_azblob(&url, opts).await,
         "hdfs" | "hdfs-native" => build_hdfs_native(&url, opts).await,
+        #[cfg(feature = "hdfs-jni")]
+        "hdfs-jni" => build_hdfs_jni(&url, opts).await,
+        "webhdfs" => build_webhdfs(&url, opts).await,
         "oss" => build_oss(&url, opts).await,
         "cos" => build_cos(&url, opts).await,
         "obs" => build_obs(&url, opts).await,
@@ -613,7 +616,7 @@ async fn build_operator(storage_url: &str, opts: &HashMap<String, String>) -> Re
         "memory" | "mem" => build_memory(&url, opts).await,
         "aliyun" | "aliyun-drive" => build_aliyun_drive(&url, opts).await,
         s => Err(anyhow!(
-            "unsupported scheme '{s}'; try s3://, gs://, azblob://, hdfs://, oss://, cos://, obs://, b2://"
+            "unsupported scheme '{s}'; try s3://, gs://, azblob://, hdfs://, hdfs-jni://, webhdfs://, oss://, cos://, obs://, b2://"
         )),
     }
 }
@@ -683,6 +686,54 @@ async fn build_hdfs_native(url: &url::Url, opts: &HashMap<String, String>) -> Re
     //   --opt dfs.namenode.rpc-address.nameservice.nn0=namenode1:8020
     if !opts.is_empty() {
         builder = builder.options(opts.clone());
+    }
+    apply_operator(builder)
+}
+
+/// Build HDFS operator using JNI-based libhdfs (requires Java).
+/// Enabled with: cargo build --features hdfs-jni
+/// Supports Kerberos via --opt kerberos-ticket-cache-path and --opt user.
+#[cfg(feature = "hdfs-jni")]
+async fn build_hdfs_jni(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+    let namenode = url.host_str().ok_or_else(|| anyhow!("missing namenode"))?;
+    let port = url.port().unwrap_or(8020);
+    let addr = format!("{}:{}", namenode, port);
+    let mut builder = opendal::services::Hdfs::default().name_node(&addr);
+    let p = url.path().trim_start_matches('/');
+    if !p.is_empty() {
+        builder = builder.root(p);
+    }
+    for (k, v) in opts {
+        match k.as_str() {
+            "user" => builder = builder.user(v),
+            "kerberos-ticket-cache-path" | "kerberos_ticket_cache_path" => {
+                builder = builder.kerberos_ticket_cache_path(v);
+            }
+            _ => tracing::warn!("ignored unsupported hdfs-jni option: {k}={v}"),
+        }
+    }
+    apply_operator(builder)
+}
+
+/// Build WebHDFS operator (HDFS REST API gateway).
+async fn build_webhdfs(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+    let endpoint = format!(
+        "{}://{}{}",
+        url.scheme(),
+        url.host_str().ok_or_else(|| anyhow!("missing host"))?,
+        url.port().map_or(String::new(), |p| format!(":{p}")),
+    );
+    let mut builder = opendal::services::Webhdfs::default().endpoint(&endpoint);
+    let p = url.path().trim_start_matches('/');
+    if !p.is_empty() {
+        builder = builder.root(p);
+    }
+    for (k, v) in opts {
+        match k.as_str() {
+            "user-name" | "user_name" | "user" => builder = builder.user_name(v),
+            "delegation" => builder = builder.delegation(v),
+            _ => tracing::warn!("ignored unsupported webhdfs option: {k}={v}"),
+        }
     }
     apply_operator(builder)
 }

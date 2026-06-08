@@ -21,11 +21,15 @@ rustix = { version = "1.1.4", features = ["process", "pipe", "fs", "stdio", "eve
 dashmap = "6.2.1"
 bytes = "1.11.1"
 unicode-normalization = "0.1.25"
-opendal = { version = "0.57", features = ["services-s3", "services-gcs", "services-azblob", "services-hdfs-native", "services-oss", "services-cos", "services-obs", "services-b2", "services-vercel-blob", "services-aliyun-drive", "services-fs", "services-memory"] }
+opendal = { version = "0.57", features = ["services-s3", "services-gcs", "services-azblob", "services-hdfs-native", "services-webhdfs", "services-oss", "services-cos", "services-obs", "services-b2", "services-vercel-blob", "services-aliyun-drive", "services-fs", "services-memory"] }
 
 [target.'cfg(windows)'.dependencies]
 winfsp = "0.13"
 widestring = "1"
+
+[features]
+default = []
+hdfs-jni = ["opendal/services-hdfs"]
 
 [workspace]
 members = [".", "csi/mntrs-csi"]
