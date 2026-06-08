@@ -21,6 +21,16 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
 
+            - name: Install WinFSP
+        shell: pwsh
+        run: |
+          $url = "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25002.msi"
+          $msi = "$env:TEMP\winfsp.msi"
+          Invoke-WebRequest -Uri $url -OutFile $msi
+          msiexec /i $msi /quiet /norestart
+          Start-Sleep -Seconds 5
+          Write-Host "WinFSP v2.1 installed"
+
       - name: BuildBuild (release)
         run: cargo build --release --workspace
 
