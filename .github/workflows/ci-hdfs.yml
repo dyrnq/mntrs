@@ -24,7 +24,7 @@ jobs:
       - name: Install Java + HDFS
         run: |
           sudo apt-get update && sudo apt-get install -y \
-            libfuse3-dev fuse3 default-jdk
+            libfuse3-dev fuse3 default-jdk protobuf-compiler
           echo "JAVA_HOME=/usr/lib/jvm/default-java" >> $GITHUB_ENV
           # Find libjvm.so for LD_LIBRARY_PATH (needed by JNI test binaries)
           JVM_LIB=$(find /usr/lib/jvm -name "libjvm.so" 2>/dev/null | head -1)
