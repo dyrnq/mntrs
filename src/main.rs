@@ -210,6 +210,9 @@ enum Commands {
         /// Cache poll interval in seconds (default: 60)
         #[arg(long, default_value = "60")]
         vfs_cache_poll_interval: u64,
+        /// Time in seconds to keep file handles open after last close for reuse (0 to disable, default: 0)
+        #[arg(long, default_value = "0")]
+        vfs_handle_caching: u64,
         /// Total disk space to report in statfs (TB, default: 1024)
         #[arg(long, default_value = "1024")]
         vfs_disk_space_total_size: u64,
@@ -317,6 +320,7 @@ fn main() -> anyhow::Result<()> {
             vfs_write_wait,
             vfs_read_wait,
             vfs_cache_poll_interval,
+            vfs_handle_caching,
             vfs_disk_space_total_size,
         } => {
             let opts: HashMap<String, String> = opt
@@ -391,6 +395,7 @@ fn main() -> anyhow::Result<()> {
                 vfs_write_wait,
                 vfs_read_wait,
                 vfs_cache_poll_interval,
+                vfs_handle_caching,
                 vfs_disk_space_total_size,
             )?;
         }

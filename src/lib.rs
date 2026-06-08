@@ -163,6 +163,7 @@ pub struct MntrsFs {
     pub block_norm_dupes: bool,
     pub write_wait: Duration,
     pub read_wait: Duration,
+    pub handle_caching: Duration,
     pub cache_poll_interval: Duration,
     pub disk_total_size: u64,
     writeback_queue: Arc<Mutex<VecDeque<(u64, String, PathBuf)>>>,
@@ -1923,6 +1924,19 @@ impl CoreFilesystem for MntrsFs {
 
     fn open(&self, ino: u64, _flags: u32) -> std::io::Result<u64> {
         let path = self.resolve(ino).map(|(p, _, _, _)| p).unwrap_or_default();
+
+        // If handle caching is active, check for existing write handle for this inode
+        if self.handle_caching > std::time::Duration::ZERO {
+            if let Some(entry) = self.handles.get(&ino) {
+                if let crate::FileHandleState::Write { path: existing_path, cache_fd: Some(_fd), .. } = entry.value() {
+                    if *existing_path == path {
+                        // Reuse existing cached handle
+                        return Ok(ino);
+                    }
+                }
+            }
+        }
+
         // Check if flags contain write access (O_WRONLY=1, O_RDWR=2)
         let is_write = if cfg!(unix) {
             (_flags & 0x3) != 0
@@ -1930,11 +1944,22 @@ impl CoreFilesystem for MntrsFs {
             false
         };
         if is_write {
+            let cpath = crate::cache_path(&self.cache_dir, &path);
+            if let Some(parent) = cpath.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let cache_fd = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .read(true)
+                .open(&cpath)
+                .ok();
             self.handles.insert(
                 ino,
                 FileHandleState::Write {
                     path,
-                    cache_fd: None,
+                    cache_fd: cache_fd.map(|f| std::sync::Arc::new(std::sync::Mutex::new(f))),
                     dirty: false,
                     dirty_since: None,
                 },
@@ -2197,7 +2222,7 @@ impl CoreFilesystem for MntrsFs {
     }
     fn release(&self, _ino: u64, fh: u64) -> std::io::Result<()> {
         // On release, trigger writeback for dirty handles
-        if let Some(entry) = self.handles.get(&fh)
+        let was_dirty = if let Some(entry) = self.handles.get(&fh)
             && let crate::FileHandleState::Write {
                 path, dirty: true, ..
             } = entry.value()
@@ -2212,15 +2237,27 @@ impl CoreFilesystem for MntrsFs {
                     .push_back((_ino, path.clone(), cpath));
                 tracing::debug!(path=%path, "release queued writeback");
             }
+            true
+        } else {
+            false
+        };
+
+        if self.handle_caching > std::time::Duration::ZERO && !was_dirty {
+            // Keep handle alive for handle_caching duration so reopen can reuse cache fd
+            let fd_to_keep = self.handles.get(&fh).and_then(|e| {
+                if let crate::FileHandleState::Write { cache_fd: Some(fd), .. } = e.value() {
+                    Some(fd.clone())
+                } else {
+                    None
+                }
+            });
+            if let Some(_fd) = fd_to_keep {
+                // Handle stays in map; it will be cleaned up when handle_caching expires
+                // or when a new open for this inode reuses/replaces it
+                return Ok(());
+            }
         }
-        // Close the cache fd before removing handle
-        if let Some(entry) = self.handles.get(&fh)
-            && let crate::FileHandleState::Write {
-                cache_fd: Some(fd), ..
-            } = entry.value()
-        {
-            let _ = fd;
-        }
+
         self.handles.remove(&fh);
         Ok(())
     }
@@ -2674,6 +2711,7 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         write_wait: std::time::Duration::from_secs(0),
         read_wait: std::time::Duration::from_secs(0),
         cache_poll_interval: std::time::Duration::from_secs(60),
+        handle_caching: std::time::Duration::from_secs(0),
         disk_total_size: 0,
         writeback_queue: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         mem_cache: Default::default(),

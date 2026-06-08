@@ -248,6 +248,7 @@ pub fn mount_internal(
         5,                // vfs_write_wait
         5,                // vfs_read_wait
         60,               // vfs_cache_poll_interval
+        0,                // vfs_handle_caching
         1024,             // vfs_disk_space_total_size
     )
 }
@@ -382,6 +383,7 @@ pub fn mount(
     vfs_write_wait: u64,
     vfs_read_wait: u64,
     vfs_cache_poll_interval: u64,
+    vfs_handle_caching: u64,
     vfs_disk_space_total_size: u64,
 ) -> Result<()> {
     let op = rt_block_on(build_operator(storage_url, opts))?;
@@ -441,6 +443,7 @@ pub fn mount(
         write_wait: std::time::Duration::from_secs(vfs_write_wait),
         read_wait: std::time::Duration::from_secs(vfs_read_wait),
         cache_poll_interval: std::time::Duration::from_secs(vfs_cache_poll_interval),
+        handle_caching: std::time::Duration::from_secs(vfs_handle_caching),
         disk_total_size: vfs_disk_space_total_size * 1024 * 1024 * 1024 * 1024, // TB to bytes
         writeback_queue: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         mem_cache: dashmap::DashMap::new(),
