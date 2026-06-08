@@ -12,7 +12,10 @@ pub type Inodes = Arc<dashmap::DashMap<u64, (String, FileType, u64, Option<Syste
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fs;
+#[cfg(unix)]
 use std::io::{Seek, SeekFrom, Write};
+#[cfg(not(unix))]
+use std::io::{SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -25,12 +28,12 @@ use fuser::{
     ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
     Request, TimeOrNow, WriteFlags,
 };
-#[cfg(target_os = "linux")]
-fn xattr_not_found() -> Errno {
+#[cfg(all(unix, target_os = "linux"))]
+fn xattr_not_found() -> fuser::Errno {
     Errno::ENODATA
 }
-#[cfg(target_os = "macos")]
-fn xattr_not_found() -> Errno {
+#[cfg(all(unix, target_os = "macos"))]
+fn xattr_not_found() -> fuser::Errno {
     Errno::ENOATTR
 }
 
@@ -343,6 +346,7 @@ pub fn load_cache_index(cache_dir: &Path) -> Vec<(String, u64, u64, std::time::S
     entries
 }
 
+#[cfg(unix)]
 fn validate_path_component(name: &str) -> Result<(), Errno> {
     if name.is_empty() {
         return Err(Errno::ENOENT);
@@ -561,14 +565,20 @@ impl MntrsFs {
         // Check free disk space if configured
         let need_free = if self.cache_min_free_space > 0 {
             #[cfg(unix)]
-            if let Ok(fs_stat) = rustix::fs::statvfs(&self.cache_dir) {
-                let free = fs_stat.f_bavail.saturating_mul(fs_stat.f_frsize);
-                if free < self.cache_min_free_space {
-                    Some(self.cache_min_free_space - free)
+            {
+                if let Ok(fs_stat) = rustix::fs::statvfs(&self.cache_dir) {
+                    let free = fs_stat.f_bavail.saturating_mul(fs_stat.f_frsize);
+                    if free < self.cache_min_free_space {
+                        Some(self.cache_min_free_space - free)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
-            } else {
+            }
+            #[cfg(not(unix))]
+            {
                 None
             }
         } else {
