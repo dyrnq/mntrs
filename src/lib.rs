@@ -744,17 +744,19 @@ impl Filesystem for MntrsFs {
             return;
         }
         let path = self.resolve(ino).map(|(p, _, _, _)| p).unwrap_or_default();
-        let mut entries = vec![
-            (".".to_string(), FileType::Directory),
-            ("..".to_string(), FileType::Directory),
+        let mut entries: Vec<(String, FileType, u64, Option<SystemTime>)> = vec![
+            (".".to_string(), FileType::Directory, 4096, None),
+            ("..".to_string(), FileType::Directory, 4096, None),
         ];
-        for (name, mode, ..) in self.list_op(&path) {
+        for (name, mode, size, mtime) in self.list_op(&path) {
             entries.push((
                 name,
                 match mode {
                     EntryMode::DIR => FileType::Directory,
                     _ => FileType::RegularFile,
                 },
+                size,
+                Some(mtime),
             ));
         }
         let start = offset as usize;
@@ -762,7 +764,7 @@ impl Filesystem for MntrsFs {
             reply.ok();
             return;
         }
-        for (i, (name, kind)) in entries.iter().enumerate().skip(start) {
+        for (i, (name, kind, _size, _mtime)) in entries.iter().enumerate().skip(start) {
             let cp = if path.is_empty() {
                 name.clone()
             } else {
@@ -795,17 +797,19 @@ impl Filesystem for MntrsFs {
             return;
         }
         let path = self.resolve(ino).map(|(p, _, _, _)| p).unwrap_or_default();
-        let mut entries = vec![
-            (".".to_string(), FileType::Directory),
-            ("..".to_string(), FileType::Directory),
+        let mut entries: Vec<(String, FileType, u64, Option<SystemTime>)> = vec![
+            (".".to_string(), FileType::Directory, 4096, None),
+            ("..".to_string(), FileType::Directory, 4096, None),
         ];
-        for (name, mode, ..) in self.list_op(&path) {
+        for (name, mode, size, mtime) in self.list_op(&path) {
             entries.push((
                 name,
                 match mode {
                     EntryMode::DIR => FileType::Directory,
                     _ => FileType::RegularFile,
                 },
+                size,
+                Some(mtime),
             ));
         }
         let start = offset as usize;
@@ -813,23 +817,16 @@ impl Filesystem for MntrsFs {
             reply.ok();
             return;
         }
-        for (i, (name, kind)) in entries.iter().enumerate().skip(start) {
+        for (i, (name, kind, size, mtime)) in entries.iter().enumerate().skip(start) {
             let cp = if path.is_empty() {
                 name.clone()
             } else {
                 format!("{}/{}", path, name)
             };
-            let (size, mtime) = match self.stat_op(&cp) {
-                Some((_, s, mt)) => (s, mt),
-                None => {
-                    tracing::debug!(path = %cp, "readdirplus stat_op failed, skip");
-                    continue;
-                }
-            };
-            let ino = self.alloc_ino(&cp, *kind, size);
-            let mut attr = self.make_attr(ino, size, *kind, SystemTime::UNIX_EPOCH);
+            let ino = self.alloc_ino(&cp, *kind, *size);
+            let mut attr = self.make_attr(ino, *size, *kind, SystemTime::UNIX_EPOCH);
             if let Some(mt) = mtime {
-                attr.mtime = mt;
+                attr.mtime = *mt;
             }
             if reply.add(
                 INodeNo(ino),
