@@ -23,7 +23,7 @@ jobs:
 
       - name: Install WinFSP
         shell: pwsh
-        run: choco install winfsp --version=2.1.24065 -y
+        run: choco install winfsp -y
 
       - name: Start WinFSP service
         shell: pwsh
