@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
+#[cfg(unix)]
 use fuser::{
     AccessFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
     INodeNo, KernelConfig, LockOwner, OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
@@ -554,6 +555,7 @@ impl MntrsFs {
 
 // writeback_worker has been moved to writeback.rs — use writeback::worker()
 
+#[cfg(unix)]
 impl Filesystem for MntrsFs {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
         self.alloc_ino("", FileType::Directory, 4096);
