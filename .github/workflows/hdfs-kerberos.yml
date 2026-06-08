@@ -118,10 +118,11 @@ jobs:
 
       - name: Verify HDFS is running
         run: |
+          export HADOOP_CONF_DIR=/opt/hadoop/etc/hadoop
           echo "HDFS NameNode: $HDFS_NAMENODE_ADDR"
-          hdfs dfs -mkdir -p /test || true
-          echo "hello hdfs" | hdfs dfs -put - /test/hello.txt || true
-          hdfs dfs -ls /test || true
+          /opt/hadoop/bin/hdfs dfs -mkdir -p /test || true
+          echo "hello hdfs" | /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt || true
+          /opt/hadoop/bin/hdfs dfs -ls /test || true
 
       - name: Test mntrs HDFS mount
         run: |
