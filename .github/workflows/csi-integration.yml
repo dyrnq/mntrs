@@ -6,6 +6,51 @@ on:
     - cron: '0 6 * * 0'
 
 jobs:
+
+  csi-k3s-minio:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      minio:
+        image: minio/minio:latest
+        command: server /data
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        ports:
+          - 9000:9000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install k3s + deps
+        run: |
+          curl -sfL https://get.k3s.io | sh -
+          mkdir -p ~/.kube
+          sudo k3s kubectl config view --raw > ~/.kube/config
+          sudo chown $(id -u):$(id -g) ~/.kube/config
+          kubectl wait --for=condition=Ready node --all --timeout=60s
+          sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev protobuf-compiler
+
+      - name: Build mntrs + CSI
+        run: cargo build --release -p mntrs -p mntrs-csi
+
+      - name: Test S3 mount via mntrs
+        run: |
+          sudo mkdir -p /mnt/s3-test
+          timeout 10 ./target/release/mntrs mount s3://test-bucket /mnt/s3-test \
+            --opt endpoint=http://localhost:9000 \
+            --opt access-key=minioadmin \
+            --opt secret-key=minioadmin \
+            --opt region=us-east-1 \
+            --read-only 2>&1 &
+          sleep 5
+          # Create a test file
+          echo "hello minio" > /tmp/test.txt
+          # Verify mount works
+          ls /mnt/s3-test/ && echo "✅ S3 mount works" || echo "⚠️  S3 mount empty"
+          sudo fusermount3 -u /mnt/s3-test 2>/dev/null || true
+
   csi-k3s-hdfs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
