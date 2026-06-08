@@ -20,7 +20,7 @@ jobs:
           sudo k3s kubectl config view --raw > ~/.kube/config
           sudo chown $(id -u):$(id -g) ~/.kube/config
           kubectl wait --for=condition=Ready node --all --timeout=60s
-          sudo apt-get update && sudo apt-get install -y default-jdk fuse3 libfuse3-dev
+          sudo apt-get update && sudo apt-get install -y default-jdk fuse3 libfuse3-dev protobuf-compiler
 
       - name: Build mntrs + CSI
         run: cargo build --release -p mntrs -p mntrs-csi
