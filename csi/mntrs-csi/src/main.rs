@@ -2,6 +2,7 @@
 
 #![allow(clippy::all)]
 
+#[cfg(not(windows))]
 use mntrs::cmd::mount::{mount_internal, unmount_internal};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -393,6 +394,7 @@ impl node_server::Node for NodeService {
             }
         }
 
+        #[cfg(not(windows))]
         match mntrs::cmd::mount::mount_internal(&storage_url, &target_path, &opts, read_only) {
             Ok(()) => {
                 let mut mounts = self.mounts.lock().unwrap();
@@ -417,6 +419,7 @@ impl node_server::Node for NodeService {
         let req = request.into_inner();
         let target_path = req.target_path;
 
+        #[cfg(not(windows))]
         if let Err(e) = mntrs::cmd::mount::unmount_internal(&target_path) {
             tracing::warn!(target=%target_path, error=%e, "unmount failed");
         }

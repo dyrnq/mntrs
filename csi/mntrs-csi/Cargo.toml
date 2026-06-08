@@ -5,6 +5,7 @@ edition = "2021"
 description = "Kubernetes CSI driver for mntrs — mount S3/cloud storage as PVCs"
 
 [dependencies]
+[target.'cfg(not(windows))'.dependencies]
 mntrs = { path = "../.." }
 anyhow = "1"
 tokio = { version = "1", features = ["full", "rt-multi-thread"] }
