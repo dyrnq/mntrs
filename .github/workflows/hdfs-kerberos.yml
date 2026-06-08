@@ -77,6 +77,7 @@ jobs:
             curl -sL --retry 3 "https://archive.apache.org/dist/hadoop/common/hadoop-${HADOOP_VER}/hadoop-${HADOOP_VER}.tar.gz" -o /tmp/hadoop.tgz
           }
           sudo tar xzf /tmp/hadoop.tgz -C /opt/
+          sudo chown -R $(whoami) /opt/hadoop-${HADOOP_VER}
           sudo ln -sf /opt/hadoop-${HADOOP_VER} /opt/hadoop 2>/dev/null || true
           echo "HADOOP_HOME=/opt/hadoop" >> $GITHUB_ENV
           echo "/opt/hadoop/bin" >> $GITHUB_PATH
@@ -112,7 +113,7 @@ jobs:
           # Start HDFS with Kerberos
           export HADOOP_OPTS="-Djava.security.krb5.conf=/etc/krb5.conf"
           kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL
-          /opt/hadoop/sbin/start-dfs.sh 2>&1
+          sudo -E /opt/hadoop/sbin/start-dfs.sh 2>&1 || /opt/hadoop/sbin/start-dfs.sh 2>&1
           sleep 5
           # Verify
           /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | head -5
@@ -131,7 +132,7 @@ jobs:
         run: |
           # kinit as testuser — needed for Kerberos-secured HDFS
           kinit -kt /tmp/testuser.keytab testuser@TEST.LOCAL && klist
-          mkdir -p /mnt/hdfs
+          sudo mkdir -p /mnt/hdfs && sudo chown $(whoami) /mnt/hdfs
           export HADOOP_CONF_DIR=/opt/hadoop/etc/hadoop
           ./target/release/mntrs mount "hdfs://$HDFS_NAMENODE_ADDR" /mnt/hdfs \
             --read-only --daemon --daemon-wait --daemon-timeout=15 2>&1 || echo "::warning::HDFS mount failed"
