@@ -35,4 +35,11 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --package mntrs --lib --bins -- -D warnings 2>&1 || echo "clippy done (expect some Windows cfg gaps)"
+        shell: bash
+        run: |
+          set +e
+          cargo clippy --package mntrs --lib --bins -- -D warnings 2>&1
+          if [ $? -ne 0 ]; then
+            echo "::warning::clippy warnings on Windows (known cfg gaps), not failing"
+          fi
+          exit 0
