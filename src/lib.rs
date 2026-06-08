@@ -8,7 +8,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use fuser::{
     AccessFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
@@ -63,9 +63,9 @@ impl FileHandleState {
 #[allow(clippy::type_complexity)]
 pub struct MntrsFs {
     pub op: Arc<Operator>,
-    inodes: dashmap::DashMap<u64, (String, FileType, u64)>,
+    inodes: dashmap::DashMap<u64, (String, FileType, u64, Option<std::time::SystemTime>)>,
     dir_cache:
-        dashmap::DashMap<String, (std::time::Instant, std::sync::Arc<Vec<(String, EntryMode)>>)>,
+        dashmap::DashMap<String, (std::time::Instant, std::sync::Arc<Vec<(String, EntryMode, u64, std::time::SystemTime)>>)>,
     cache_dir: PathBuf,
     handles: dashmap::DashMap<u64, FileHandleState>,
     pub dir_cache_ttl: Duration,
@@ -122,11 +122,16 @@ pub struct MntrsFs {
     pub storage_class: Option<String>,
     pub mem_limit: u64,
     mem_used: std::sync::atomic::AtomicU64,
+
 }
 
+/// Convert OpenDAL Timestamp to std::time::SystemTime, clamped to UNIX_EPOCH.
+fn opendal_timestamp_to_system_time(ts: impl Into<std::time::SystemTime>) -> std::time::SystemTime {
+    let st: std::time::SystemTime = ts.into();
+    if st < std::time::UNIX_EPOCH { std::time::UNIX_EPOCH } else { st }
+}
 impl MntrsFs {
-    fn make_attr(&self, ino: u64, size: u64, kind: FileType) -> FileAttr {
-        let now = UNIX_EPOCH;
+    fn make_attr(&self, ino: u64, size: u64, kind: FileType, mtime: SystemTime) -> FileAttr {
         let base_perm = if kind == FileType::Directory {
             self.dir_perms
         } else {
@@ -142,10 +147,10 @@ impl MntrsFs {
             ino: INodeNo(ino),
             size,
             blocks: size.div_ceil(4096),
-            atime: now,
-            mtime: now,
-            ctime: now,
-            crtime: now,
+            atime: mtime,
+            mtime,
+            ctime: mtime,
+            crtime: mtime,
             kind,
             perm,
             nlink: if kind == FileType::Directory { 2 } else { 1 },
@@ -207,7 +212,7 @@ pub fn cache_path(cache_dir: &Path, path: &str) -> PathBuf {
 }
 
 impl MntrsFs {
-    fn resolve(&self, ino: u64) -> Option<(String, FileType, u64)> {
+    fn resolve(&self, ino: u64) -> Option<(String, FileType, u64, Option<std::time::SystemTime>)> {
         self.inodes.get(&ino).map(|r| r.clone())
     }
 
@@ -216,7 +221,7 @@ impl MntrsFs {
         self.inodes
             .entry(ino)
             .and_modify(|v| v.2 = size)
-            .or_insert((path.to_string(), kind, size));
+            .or_insert((path.to_string(), kind, size, None));
         ino
     }
 
@@ -238,7 +243,7 @@ impl MntrsFs {
                         _ => FileType::RegularFile,
                     };
                     let mtime = if self.use_server_modtime {
-                        meta.last_modified().map(SystemTime::from)
+                        meta.last_modified().map(opendal_timestamp_to_system_time)
                     } else {
                         None
                     };
@@ -268,7 +273,7 @@ impl MntrsFs {
         result
     }
 
-    fn list_op(&self, path: &str) -> Vec<(String, EntryMode)> {
+    fn list_op(&self, path: &str) -> Vec<(String, EntryMode, u64, SystemTime)> {
         {
             if let Some(entry) = self.dir_cache.get(path) {
                 let (t, entries) = entry.value();
@@ -333,7 +338,13 @@ impl MntrsFs {
                             continue;
                         }
                     }
-                    out.push((name, mode));
+                    let size = content_length;
+                    let mtime = entry
+                        .metadata()
+                        .last_modified()
+                        .map(opendal_timestamp_to_system_time)
+                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                    out.push((name, mode, size, mtime));
                 }
                 Some(out)
             })
@@ -341,7 +352,7 @@ impl MntrsFs {
         // Deduplicate by Unicode-normalized name if enabled
         if self.block_norm_dupes && !result.is_empty() {
             let mut seen = std::collections::HashSet::new();
-            result.retain(|(name, _)| {
+            result.retain(|(name, ..)| {
                 use unicode_normalization::UnicodeNormalization;
                 let norm: String = name.nfc().collect::<String>();
                 seen.insert(norm)
@@ -566,19 +577,19 @@ impl Filesystem for MntrsFs {
             let p = if name == "." { parent } else { FUSE_ROOT_INO };
             let attr = self
                 .resolve(p)
-                .map(|(_, k, s)| self.make_attr(p, s, k))
-                .unwrap_or_else(|| self.make_attr(FUSE_ROOT_INO, 4096, FileType::Directory));
+                .map(|(_, k, s, _)| self.make_attr(p, s, k, SystemTime::UNIX_EPOCH))
+                .unwrap_or_else(|| self.make_attr(FUSE_ROOT_INO, 4096, FileType::Directory, SystemTime::UNIX_EPOCH));
             reply.entry(&self.attr_ttl, &attr, Generation(0));
             return;
         }
-        let parent_path = self.resolve(parent).map(|(p, _, _)| p).unwrap_or_default();
+        let parent_path = self.resolve(parent).map(|(p, _, _, _)| p).unwrap_or_default();
         let full_path = if parent_path.is_empty() {
             name2
         } else {
             format!("{}/{}", parent_path, name2)
         };
         if let Some((kind, size, mtime)) = self.stat_op(&full_path) {
-            let mut attr = self.make_attr(self.alloc_ino(&full_path, kind, size), size, kind);
+            let mut attr = self.make_attr(self.alloc_ino(&full_path, kind, size), size, kind, mtime.unwrap_or(SystemTime::UNIX_EPOCH));
             if let Some(mt) = mtime {
                 attr.mtime = mt;
             }
@@ -587,8 +598,8 @@ impl Filesystem for MntrsFs {
             // Fallback: search directory listing for case-insensitive match
             let entries = self.list_op(&parent_path);
             let lower = name.to_lowercase();
-            if let Some((matched_name, mode)) =
-                entries.iter().find(|(n, _)| n.to_lowercase() == lower)
+            if let Some((matched_name, mode, ..)) =
+                entries.iter().find(|(n, ..)| n.to_lowercase() == lower)
             {
                 let mp = if parent_path.is_empty() {
                     matched_name.clone()
@@ -600,7 +611,7 @@ impl Filesystem for MntrsFs {
                     _ => FileType::RegularFile,
                 };
                 let (_, size, mtime) = self.stat_op(&mp).unwrap_or((kind, 0, None));
-                let mut attr = self.make_attr(self.alloc_ino(&mp, kind, size), size, kind);
+                let mut attr = self.make_attr(self.alloc_ino(&mp, kind, size), size, kind, mtime.unwrap_or(SystemTime::UNIX_EPOCH));
                 if let Some(mt) = mtime {
                     attr.mtime = mt;
                 }
@@ -618,13 +629,13 @@ impl Filesystem for MntrsFs {
         if ino == FUSE_ROOT_INO {
             reply.attr(
                 &self.attr_ttl,
-                &self.make_attr(ino, 4096, FileType::Directory),
+                &self.make_attr(ino, 4096, FileType::Directory, SystemTime::UNIX_EPOCH),
             );
             return;
         }
-        if let Some((path, kind, _)) = self.resolve(ino) {
+        if let Some((path, kind, _, _)) = self.resolve(ino) {
             let (_, size, mtime) = self.stat_op(&path).unwrap_or((kind, 0, None));
-            let mut attr = self.make_attr(ino, size, kind);
+            let mut attr = self.make_attr(ino, size, kind, mtime.unwrap_or(SystemTime::UNIX_EPOCH));
             if let Some(mt) = mtime {
                 attr.mtime = mt;
             }
@@ -668,12 +679,12 @@ impl Filesystem for MntrsFs {
             reply.error(Errno::ENOENT);
             return;
         }
-        let path = self.resolve(ino).map(|(p, _, _)| p).unwrap_or_default();
+        let path = self.resolve(ino).map(|(p, _, _, _)| p).unwrap_or_default();
         let mut entries = vec![
             (".".to_string(), FileType::Directory),
             ("..".to_string(), FileType::Directory),
         ];
-        for (name, mode) in self.list_op(&path) {
+        for (name, mode, ..) in self.list_op(&path) {
             entries.push((
                 name,
                 match mode {
@@ -719,12 +730,12 @@ impl Filesystem for MntrsFs {
             reply.error(Errno::ENOENT);
             return;
         }
-        let path = self.resolve(ino).map(|(p, _, _)| p).unwrap_or_default();
+        let path = self.resolve(ino).map(|(p, _, _, _)| p).unwrap_or_default();
         let mut entries = vec![
             (".".to_string(), FileType::Directory),
             ("..".to_string(), FileType::Directory),
         ];
-        for (name, mode) in self.list_op(&path) {
+        for (name, mode, ..) in self.list_op(&path) {
             entries.push((
                 name,
                 match mode {
@@ -752,7 +763,7 @@ impl Filesystem for MntrsFs {
                 }
             };
             let ino = self.alloc_ino(&cp, *kind, size);
-            let mut attr = self.make_attr(ino, size, *kind);
+            let mut attr = self.make_attr(ino, size, *kind, SystemTime::UNIX_EPOCH);
             if let Some(mt) = mtime {
                 attr.mtime = mt;
             }
@@ -797,7 +808,7 @@ impl Filesystem for MntrsFs {
         let name = name.to_string_lossy();
         let parent_path = self
             .resolve(parent.into())
-            .map(|(p, _, _)| p)
+            .map(|(p, _, _, _)| p)
             .unwrap_or_default();
         let full_path = if parent_path.is_empty() {
             name.to_string()
@@ -815,7 +826,7 @@ impl Filesystem for MntrsFs {
         );
         reply.created(
             &self.attr_ttl,
-            &self.make_attr(ino, 0, FileType::RegularFile),
+            &self.make_attr(ino, 0, FileType::RegularFile, SystemTime::UNIX_EPOCH),
             Generation(0),
             FileHandle(ino),
             FopenFlags::empty(),
@@ -824,7 +835,7 @@ impl Filesystem for MntrsFs {
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         let ino: u64 = ino.into();
-        if let Some((path, FileType::RegularFile, _)) = self.resolve(ino) {
+        if let Some((path, FileType::RegularFile, _, _)) = self.resolve(ino) {
             self.handles.insert(
                 ino,
                 FileHandleState::Read {
@@ -850,7 +861,7 @@ impl Filesystem for MntrsFs {
     ) {
         let ino: u64 = ino.into();
         let (path, file_size) = match self.resolve(ino) {
-            Some((p, _, s)) => (p, s),
+            Some((p, _, s, _)) => (p, s),
             None => {
                 reply.error(Errno::ENOENT);
                 return;
@@ -1138,7 +1149,7 @@ impl Filesystem for MntrsFs {
         let name = name.to_string_lossy();
         let parent_path = self
             .resolve(parent.into())
-            .map(|(p, _, _)| p)
+            .map(|(p, _, _, _)| p)
             .unwrap_or_default();
         let full_path = if parent_path.is_empty() {
             name.to_string()
@@ -1153,7 +1164,7 @@ impl Filesystem for MntrsFs {
                 let ino = self.alloc_ino(&full_path, FileType::Directory, 4096);
                 reply.entry(
                     &self.attr_ttl,
-                    &self.make_attr(ino, 4096, FileType::Directory),
+                    &self.make_attr(ino, 4096, FileType::Directory, SystemTime::UNIX_EPOCH),
                     Generation(0),
                 );
             }
@@ -1197,7 +1208,7 @@ impl Filesystem for MntrsFs {
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, _size: u32, reply: ReplyXattr) {
         let ino: u64 = ino.into();
         let name = name.to_string_lossy();
-        if let Some((path, kind, _)) = self.resolve(ino) {
+        if let Some((path, kind, _, _)) = self.resolve(ino) {
             if kind == FileType::Directory {
                 reply.error(Errno::ENODATA);
                 return;
@@ -1231,7 +1242,7 @@ impl Filesystem for MntrsFs {
     }
     fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
         let ino: u64 = ino.into();
-        if let Some((_, kind, _)) = self.resolve(ino) {
+        if let Some((_, kind, _, _)) = self.resolve(ino) {
             if kind == FileType::Directory {
                 reply.error(Errno::ENODATA);
                 return;
@@ -1269,7 +1280,7 @@ impl Filesystem for MntrsFs {
         reply: ReplyAttr,
     ) {
         let ino: u64 = ino.into();
-        if let Some((p, kind, _)) = self.resolve(ino) {
+        if let Some((p, kind, _, _)) = self.resolve(ino) {
             if let Some(s) = size {
                 let cpath = cache_path(&self.cache_dir, &p);
                 if cpath.exists()
@@ -1288,7 +1299,7 @@ impl Filesystem for MntrsFs {
             if let Some(m) = mode {
                 perm = (m & 0o7777) as u16;
             }
-            let mut attr = self.make_attr(ino, size.unwrap_or(0), kind);
+            let mut attr = self.make_attr(ino, size.unwrap_or(0), kind, SystemTime::now());
             attr.perm = perm;
             if let Some(u) = uid {
                 attr.uid = u;
