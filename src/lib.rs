@@ -538,22 +538,22 @@ impl Filesystem for MntrsFs {
             let mut recovered = 0u64;
             for e in entries.flatten() {
                 let p = e.path();
-                if p.extension().is_some_and(|ext| ext == "meta") {
-                    if let Ok(content) = fs::read_to_string(&p) {
-                        let parts: Vec<&str> = content.split(' ').collect();
-                        if parts.len() >= 3 {
-                            let remote_path = parts[0].to_string();
-                            let size: u64 = parts[1].parse().unwrap_or(0);
-                            let kind_byte: u8 = parts[2].parse().unwrap_or(0);
-                            let kind = if kind_byte == 1 { FileType::Directory } else { FileType::RegularFile };
-                            let cpath = p.with_extension("");
-                            let mtime = std::fs::metadata(&cpath)
-                                .ok()
-                                .and_then(|m| m.modified().ok())
-                                .unwrap_or(std::time::UNIX_EPOCH);
-                            self.attr_cache.insert(remote_path, (kind, size, Some(mtime), std::time::Instant::now()));
-                            recovered += 1;
-                        }
+                if p.extension().is_some_and(|ext| ext == "meta")
+                    && let Ok(content) = fs::read_to_string(&p)
+                    {
+                    let parts: Vec<&str> = content.split(' ').collect();
+                    if parts.len() >= 3 {
+                        let remote_path = parts[0].to_string();
+                        let size: u64 = parts[1].parse().unwrap_or(0);
+                        let kind_byte: u8 = parts[2].parse().unwrap_or(0);
+                        let kind = if kind_byte == 1 { FileType::Directory } else { FileType::RegularFile };
+                        let cpath = p.with_extension("");
+                        let mtime = std::fs::metadata(&cpath)
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .unwrap_or(std::time::UNIX_EPOCH);
+                        self.attr_cache.insert(remote_path, (kind, size, Some(mtime), std::time::Instant::now()));
+                        recovered += 1;
                     }
                 }
             }
@@ -974,7 +974,7 @@ impl Filesystem for MntrsFs {
         // 3.5 Try prefetcher (backpressure-aware background download)
         let fh_val = u64::from(_fh);
         if let Some(h) = self.handles.get(&fh_val)
-            && let FileHandleState::Read { prefetcher: Some(p), .. } = &*h.value()
+            && let FileHandleState::Read { prefetcher: Some(p), .. } = h.value()
             && let Some(part) = p.pop(offset) {
                 let start = (offset - part.offset) as usize;
                 let end = (start + size as usize).min(part.data.len());
