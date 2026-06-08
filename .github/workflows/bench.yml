@@ -75,17 +75,19 @@ jobs:
 
       - name: Setup MinIO test bucket
         run: |
-          # Create bucket via MinIO Admin API (no mc needed)
-          curl -sf -X PUT http://localhost:9000/bench-bucket \
-            -H "Authorization: AWS4-HMAC-SHA256 Credential=minioadmin/20260608/us-east-1/s3/aws4_request" \
-            || echo "bucket may already exist"
-          echo "test content" > /tmp/test.txt
-          # Use awscli if available, otherwise skip file upload — benchmark runs on warm cache anyway
-          pip3 install awscli 2>/dev/null && \
-            AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
-            aws --endpoint-url http://localhost:9000 s3 cp /tmp/test.txt s3://bench-bucket/test.txt \
-            || echo "awscli not available, skipping file upload"
-
+          pip3 install awscli
+          AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+            aws --endpoint-url http://localhost:9000 --no-verify-ssl s3 mb s3://bench-bucket 2>/dev/null || echo "bucket may exist"
+          # Prepare test data in dedicated directory
+          mkdir -p /tmp/bench-seed/many
+          dd if=/dev/urandom of=/tmp/bench-seed/1K.bin bs=1K count=1 2>/dev/null
+          dd if=/dev/urandom of=/tmp/bench-seed/4K.bin bs=4K count=1 2>/dev/null
+          dd if=/dev/urandom of=/tmp/bench-seed/64K.bin bs=64K count=1 2>/dev/null
+          dd if=/dev/urandom of=/tmp/bench-seed/1M.bin bs=1M count=1 2>/dev/null
+          dd if=/dev/urandom of=/tmp/bench-seed/10M.bin bs=1M count=10 2>/dev/null
+          dd if=/dev/urandom of=/tmp/bench-seed/100M.bin bs=1M count=100 2>/dev/null
+          for i in $(seq 1 500); do echo "$i" > "/tmp/bench-seed/many/file_$(printf '%04d' $i).txt"; done
+          AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin             aws --endpoint-url http://localhost:9000 --no-verify-ssl s3 sync /tmp/bench-seed/ s3://bench-bucket/ --quiet
       - name: Setup rclone for comparison
         run: |
           curl -sSL https://downloads.rclone.org/rclone-current-linux-amd64.deb -o rclone.deb

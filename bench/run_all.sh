@@ -86,20 +86,29 @@ sleep 3
 echo "  mounts ready"
 echo ""
 
-# ---- Upload test data ----
-echo "--- Uploading test data ---"
-# Create bucket
-curl -sf -X PUT "$ENDPOINT/$BUCKET" -H "Authorization: AWS4-HMAC-SHA256 Credential=$ACCESS_KEY/20260608/$REGION/s3/aws4_request" 2>/dev/null || true
-# Upload files via S3 PUT
-for f in 1K.bin 4K.bin 64K.bin 1M.bin 10M.bin 100M.bin; do
-  curl -sf -X PUT "$ENDPOINT/$BUCKET/$f"     -H "Authorization: AWS4-HMAC-SHA256 Credential=$ACCESS_KEY/20260608/$REGION/s3/aws4_request"     --data-binary @"$DATA_DIR/$f" 2>/dev/null || true
-done
-# Upload many/ files one by one
-for f in "$DATA_DIR/many/"*; do
-  name=$(basename "$f")
-  curl -sf -X PUT "$ENDPOINT/$BUCKET/many/$name"     -H "Authorization: AWS4-HMAC-SHA256 Credential=$ACCESS_KEY/20260608/$REGION/s3/aws4_request"     --data-binary @"$f" 2>/dev/null || true
-done
-echo "  upload done"
+# ---- Upload test data (skip if data already in bucket) ----
+echo "--- Checking test data ---"
+# Quick check: if 1K.bin already exists, skip upload (CI may have pre-uploaded)
+if curl -sfI "$ENDPOINT/$BUCKET/1K.bin" >/dev/null 2>&1; then
+    echo "  data already in bucket, skipping upload"
+else
+    echo "  uploading test data..."
+    pip3 install awscli 2>/dev/null || true
+    mkdir -p /tmp/bench-upload
+    cp "$DATA_DIR"/1K.bin "$DATA_DIR"/4K.bin "$DATA_DIR"/64K.bin "$DATA_DIR"/1M.bin "$DATA_DIR"/10M.bin "$DATA_DIR"/100M.bin /tmp/bench-upload/
+    cp -r "$DATA_DIR"/many /tmp/bench-upload/ 2>/dev/null || true
+    AWS_ACCESS_KEY_ID="$ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$SECRET_KEY"         aws --endpoint-url "$ENDPOINT" --no-verify-ssl s3 sync /tmp/bench-upload/ "s3://$BUCKET/" --quiet 2>/dev/null || {
+        echo "  awscli failed, trying curl fallback..."
+        for f in 1K.bin 4K.bin 64K.bin 1M.bin 10M.bin 100M.bin; do
+            curl -sf -X PUT "$ENDPOINT/$BUCKET/$f" --data-binary @"$DATA_DIR/$f" 2>/dev/null || true
+        done
+        for f in "$DATA_DIR/many/"*; do
+            name=$(basename "$f")
+            curl -sf -X PUT "$ENDPOINT/$BUCKET/many/$name" --data-binary @"$f" 2>/dev/null || true
+        done
+    }
+    echo "  upload done"
+fi
 echo ""
 
 # ---- Warmup ----
