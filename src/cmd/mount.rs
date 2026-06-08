@@ -68,36 +68,30 @@ pub fn read_mounts() -> Vec<MountInfo> {
 
 fn record_mount(storage: &str, mountpoint: &str, read_only: bool) {
     let path = mounts_db();
-    let dir = Path::new(&path).parent().unwrap();
-    if let Err(e) = fs::create_dir_all(dir) {
-        tracing::debug!(error=%e, "mounts db dir create failed");
-    }
-    // Remove existing entry for this mountpoint
-    if let Ok(content) = fs::read_to_string(&path) {
-        let filtered: Vec<&str> = content
-            .lines()
-            .filter(|l| l.split('\0').nth(1) != Some(mountpoint))
-            .collect();
-        if let Err(e) = fs::write(&path, filtered.join("\n") + "\n") {
-            tracing::debug!(error=%e, "mounts db write failed");
+    let dir = std::path::Path::new(&path).parent().unwrap();
+    let _ = std::fs::create_dir_all(dir);
+    // Atomically rewrite: tmp + rename (POSIX atomic)
+    let tmp = format!("{}.tmp.{}", path, std::process::id());
+    let mut lines = Vec::new();
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        for l in existing.lines() {
+            if l.split('\0').nth(1) != Some(mountpoint) {
+                lines.push(l.to_string());
+            }
         }
     }
     let pid = std::process::id().to_string();
     let user = std::env::var("USER").unwrap_or_else(|_| "?".into());
     let ro = if read_only { "ro" } else { "rw" };
     let backend = storage.split(':').next().unwrap_or("?");
-    let line = format!(
-        "{}\0{}\0{}\0{}\0{}\0{}\n",
-        storage, mountpoint, pid, user, ro, backend
-    );
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path)
-        && let Err(e) = f.write_all(line.as_bytes())
-    {
-        tracing::debug!(error=%e, "mounts db append failed");
+    lines.insert(0, format!("{}\0{}\0{}\0{}\0{}\0{}", storage, mountpoint, pid, user, ro, backend));
+    let content = lines.join("\n") + "\n";
+    if std::fs::write(&tmp, &content).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
     }
 }
 
-#[allow(dead_code)]
+
 fn remove_mount(mountpoint: &str) {
     let path = mounts_db();
     if let Ok(content) = fs::read_to_string(&path) {
