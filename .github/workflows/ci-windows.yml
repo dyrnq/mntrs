@@ -1,0 +1,49 @@
+name: CI - Windows
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # === Windows: build + test + WinFSP ===
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install WinFSP
+        shell: pwsh
+        run: choco install winfsp --version=2.1.24065 -y
+
+      - name: Start WinFSP service
+        shell: pwsh
+        run: |
+          $svc = Get-Service winfsp -ErrorAction SilentlyContinue
+          if (-not $svc) { Write-Error "winfsp service not found"; exit 1 }
+          Set-Service winfsp -StartupType Automatic
+          Start-Service winfsp
+          Start-Sleep -Seconds 3
+          $svc = Get-Service winfsp
+          if ($svc.Status -ne 'Running') { Write-Error "winfsp not running"; exit 1 }
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build (release)
+        run: cargo build --release --workspace
+
+      - name: Test (WinFSP integration)
+        shell: pwsh
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo test --workspace --release -- --test-threads=1 --nocapture

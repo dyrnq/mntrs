@@ -242,7 +242,17 @@ pub fn fnmatch(pattern: &str, name: &str, ignore_case: bool) -> bool {
 }
 
 pub fn cache_path(cache_dir: &Path, path: &str) -> PathBuf {
-    cache_dir.join(format!("{:020x}", path_hash(path)))
+    cache_path_block(cache_dir, path, 0)
+}
+
+/// Block-level cache path. block_index=0 means whole file (backward compatible).
+pub fn cache_path_block(cache_dir: &Path, path: &str, block_index: u64) -> PathBuf {
+    let base = format!("{:020x}", path_hash(path));
+    if block_index == 0 {
+        cache_dir.join(&base)
+    } else {
+        cache_dir.join(format!("{}_{:04x}", base, block_index))
+    }
 }
 
 /// Cache file path for a specific block. Encodes block_idx for restart recovery.
