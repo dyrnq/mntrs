@@ -17,7 +17,7 @@ use csi::*;
 // ============================================================
 
 #[derive(Debug, Default)]
-struct IdentityService;
+pub struct IdentityService;
 
 #[tonic::async_trait]
 impl identity_server::Identity for IdentityService {
@@ -66,7 +66,7 @@ impl identity_server::Identity for IdentityService {
 // ============================================================
 
 #[derive(Debug, Default)]
-struct ControllerService;
+pub struct ControllerService;
 
 #[tonic::async_trait]
 impl controller_server::Controller for ControllerService {
@@ -194,12 +194,12 @@ struct MountState {
     mountpoint: String,
 }
 
-struct NodeService {
+pub struct NodeService {
     mounts: Mutex<HashMap<String, MountState>>,
 }
 
 impl NodeService {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self { mounts: Mutex::new(HashMap::new()) }
     }
 }
@@ -388,7 +388,6 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::HashMap;
 
     // ============================================================
@@ -444,3 +443,4 @@ mod tests {
         assert!(!ro2);
     }
 }
+
