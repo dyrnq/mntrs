@@ -1971,6 +1971,16 @@ impl CoreFilesystem for MntrsFs {
         self.evict_lru();
         result?;
 
+        // Update inodes size so getattr returns correct file size
+        let end = _offset + _data.len() as u64;
+        self.inodes
+            .entry(_ino)
+            .and_modify(|v| {
+                if end > v.2 {
+                    v.2 = end;
+                }
+            });
+
         self.handles.insert(
             fh_val,
             crate::FileHandleState::Write {
