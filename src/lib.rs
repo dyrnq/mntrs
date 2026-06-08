@@ -3,6 +3,7 @@ pub mod cmd;
 pub mod core_fs;
 pub mod path;
 pub mod prefetcher;
+pub mod writeback;
 
 /// Shared inode table type for writeback callback.
 pub type Inodes = Arc<dashmap::DashMap<u64, (String, FileType, u64, Option<SystemTime>)>>;
@@ -490,85 +491,7 @@ impl MntrsFs {
     }
 }
 
-fn writeback_worker(
-    op: Arc<Operator>,
-    inodes: Inodes,
-    queue: Arc<Mutex<VecDeque<(u64, String, PathBuf)>>>,
-    delay: Duration,
-    max_age: Duration,
-) {
-    loop {
-        let task = {
-            let mut q = queue.lock().unwrap();
-            q.pop_front()
-        };
-        let (_ino, remote_path, cache_path) = match task {
-            Some(t) => t,
-            None => {
-                thread::sleep(Duration::from_secs(1));
-                continue;
-            }
-        };
-        if delay > Duration::ZERO {
-            thread::sleep(delay);
-        }
-        // Check cache max age: skip stale files
-        if max_age > Duration::ZERO
-            && let Ok(meta) = fs::metadata(&cache_path)
-            && let Ok(elapsed) = meta.modified().unwrap_or(std::time::UNIX_EPOCH).elapsed()
-            && elapsed > max_age
-        {
-            let _ = fs::remove_file(&cache_path);
-            continue;
-        }
-        let data = match fs::read(&cache_path) {
-            Ok(d) if !d.is_empty() => d,
-            _ => {
-                let _ = fs::remove_file(&cache_path);
-                // Note: disk_cache_index cleanup happens via the path in evict_lru
-                continue;
-            }
-        };
-        let op = op.clone();
-        let p = remote_path.clone();
-                // Retry up to 3 times with exponential backoff
-        for attempt in 0..3 {
-            // Use Writer for streaming upload (supports multipart for >5GB via S3 backend)
-            let r = rt().block_on(async {
-                match op.writer(&p).await {
-                    Ok(mut w) => {
-                        w.write(bytes::Bytes::from(data.clone())).await?;
-                        w.close().await
-                    }
-                    Err(e) => Err(e),
-                }
-            });
-            match r {
-                Ok(_) => {
-                    let new_size = data.len() as u64;
-                    inodes.entry(_ino).and_modify(|v| {
-                        v.2 = new_size;
-                        v.3 = Some(std::time::SystemTime::now());
-                    });
-                    if let Err(e) = fs::remove_file(&cache_path) {
-                        tracing::debug!(error=%e, path=?cache_path, "writeback ok remove failed");
-                    }
-                    if let Err(e) = fs::remove_file(cache_path.with_extension("dirty")) {
-                        tracing::debug!(error=%e, "writeback dirty remove failed");
-                    }
-                    break;
-                }
-                Err(e) if attempt < 2 => {
-                    eprintln!("[mntrs] writeback retry {}/3 for {p}: {e}", attempt + 1);
-                    thread::sleep(Duration::from_secs(1 << attempt));
-                }
-                Err(e) => {
-                    eprintln!("[mntrs] writeback failed for {p}: {e}");
-                }
-            }
-        }
-    }
-}
+// writeback_worker has been moved to writeback.rs — use writeback::worker()
 
 impl Filesystem for MntrsFs {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
@@ -605,7 +528,7 @@ impl Filesystem for MntrsFs {
         let delay = self.write_back_delay;
         let max_age = self.cache_max_age;
         let inodes = Arc::new(self.inodes.clone());
-        thread::spawn(move || writeback_worker(op, inodes, queue, delay, max_age));
+        thread::spawn(move || writeback::worker(op, inodes, queue, delay, max_age));
         // Pre-populate root directory cache on mount if --vfs-refresh
         if self.vfs_refresh {
             let _ = self.list_op("");
@@ -954,23 +877,36 @@ impl Filesystem for MntrsFs {
             }
             return;
         }
-        // 2. Check disk cache
+        // 2. Check disk cache (with checksum validation)
         if !self.direct_io {
             let cpath = cache_path(&self.cache_dir, &path);
             if cpath.exists()
                 && let Ok(data) = fs::read(&cpath)
             {
-                // Populate memory cache
-                let b = bytes::Bytes::from(data);
-                let start = offset as usize;
-                let end = (start + size as usize).min(b.len());
-                if start < b.len() {
-                    reply.data(&b[start..end]);
+                // Validate CRC64 checksum if present (last 8 bytes)
+                let valid = if data.len() > 8 {
+                    let (body, stored_bytes) = data.split_at(data.len() - 8);
+                    let stored = u64::from_le_bytes(
+                        stored_bytes.try_into().unwrap_or([0u8; 8])
+                    );
+                    stored == 0 || stored == crc64_checksum(body)
                 } else {
-                    reply.data(&[]);
+                    true
+                };
+                if valid {
+                    let b = bytes::Bytes::from(data);
+                    let start = offset as usize;
+                    let end = (start + size as usize).min(b.len());
+                    if start < b.len() {
+                        reply.data(&b[start..end]);
+                    } else {
+                        reply.data(&[]);
+                    }
+                    self.mem_cache_insert(ino, b);
+                    return;
+                } else {
+                    tracing::warn!(path=?cpath, "cache checksum mismatch, re-fetching");
                 }
-                self.mem_cache_insert(ino, b);
-                return;
             }
         }
         // 3.5 Try prefetcher (backpressure-aware background download)
@@ -1988,6 +1924,22 @@ impl ChecksummedBytes {
     pub fn data(&self) -> &[u8] {
         &self.data
     }
+}
+
+/// Simple CRC64 checksum for cache integrity validation.
+fn crc64_checksum(data: &[u8]) -> u64 {
+    let mut crc: u64 = 0xFFFFFFFFFFFFFFFF;
+    for &byte in data {
+        crc ^= byte as u64;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xD800000000000000;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    crc ^ 0xFFFFFFFFFFFFFFFF
 }
 
 /// Compute CRC32C checksum.

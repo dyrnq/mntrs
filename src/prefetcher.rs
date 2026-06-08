@@ -125,3 +125,64 @@ impl std::fmt::Debug for HandlePrefetcher {
         f.debug_struct("HandlePrefetcher").finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_part_queue_push_pop() {
+        let mut q = PartQueue::new(1024);
+        q.push(Part { offset: 0, data: Bytes::from(vec![0u8; 100]) }).unwrap();
+        let part = q.pop(0).unwrap();
+        assert_eq!(part.offset, 0);
+        assert_eq!(part.data.len(), 100);
+    }
+
+    #[test]
+    fn test_part_queue_pop_empty_finished() {
+        let mut q = PartQueue::new(1024);
+        q.set_finished();
+        let part = q.pop(0);
+        assert!(part.is_none());
+    }
+
+    #[test]
+    fn test_part_queue_discard_stale() {
+        let mut q = PartQueue::new(1024);
+        q.push(Part { offset: 0, data: Bytes::from(vec![0u8; 50]) }).unwrap();
+        q.set_finished();
+        // Pop at offset past the front — discards stale
+        let part = q.pop(100);
+        assert!(part.is_none(), "should return None after stale discard");
+        assert!(q.parts.is_empty());
+    }
+
+    #[test]
+    fn test_part_queue_finished_returns_none() {
+        let mut q = PartQueue::new(1024);
+        q.set_finished();
+        let part = q.pop(0);
+        assert!(part.is_none());
+    }
+
+    #[test]
+    fn test_part_queue_error_returns_none() {
+        let mut q = PartQueue::new(1024);
+        q.set_error("test error".to_string());
+        let part = q.pop(0);
+        assert!(part.is_none());
+    }
+
+    #[test]
+    fn test_part_queue_multiple_parts() {
+        let mut q = PartQueue::new(1024);
+        q.push(Part { offset: 0, data: Bytes::from(vec![0u8; 100]) }).unwrap();
+        q.push(Part { offset: 100, data: Bytes::from(vec![1u8; 100]) }).unwrap();
+        q.push(Part { offset: 200, data: Bytes::from(vec![2u8; 100]) }).unwrap();
+
+        let p2 = q.pop(150).unwrap();
+        assert_eq!(p2.offset, 100);
+        assert_eq!(p2.data[0], 1);
+    }
+}
