@@ -1992,10 +1992,8 @@ impl CoreFilesystem for MntrsFs {
             }
         };
         if dirty {
-            let block_idx = 0;
-            let cpath = crate::cache_block_path(&self.cache_dir, &path, block_idx);
+            let cpath = crate::cache_block_path(&self.cache_dir, &path, 0);
             if cpath.exists() {
-                // Write sidecar for crash recovery
                 let sidecar = cpath.with_extension("dirty");
                 if let Err(e) = std::fs::write(&sidecar, path.as_bytes()) {
                     tracing::warn!(error=%e, path=?sidecar, "sidecar write failed");
@@ -2005,19 +2003,15 @@ impl CoreFilesystem for MntrsFs {
                     .unwrap()
                     .push_back((_ino, path.clone(), cpath));
             }
-            // Wait for writeback to complete
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
-            loop {
-                let pending = self.writeback_queue.lock().unwrap().len();
-                if pending == 0 {
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    tracing::warn!("fsync timeout waiting for writeback");
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
+            // Mark handle clean; writeback happens asynchronously — no lock wait
+            self.handles.insert(
+                _fh,
+                crate::FileHandleState::Write {
+                    path: path.clone(),
+                    dirty: false,
+                    dirty_since: None,
+                },
+            );
         }
         Ok(())
     }
