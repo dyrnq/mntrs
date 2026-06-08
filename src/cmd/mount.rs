@@ -153,7 +153,7 @@ pub fn mount_internal(
     read_only: bool,
 ) -> anyhow::Result<()> {
     // Isolated cache dir per mount (CSI prevents disk leak across volumes)
-    let cache_suffix = mountpoint.replace('/', "_").replace(':', "_");
+    let cache_suffix = mountpoint.replace(['/', ':'], "_");
     let cache_dir = format!("/tmp/mntrs-csi-cache/{}", cache_suffix);
     let _ = std::fs::create_dir_all(&cache_dir);
 
@@ -254,13 +254,13 @@ pub fn mount_internal(
 /// Waits for writeback queue to drain (up to 5 min), then unmounts.
 /// Falls back to lazy unmount if regular unmount fails.
 fn cache_dir_for_mount(mountpoint: &str) -> String {
-    let suffix = mountpoint.replace('/', "_").replace(':', "_");
+    let suffix = mountpoint.replace(['/', ':'], "_");
     format!("/tmp/mntrs-csi-cache/{}", suffix)
 }
 
 pub fn unmount_internal(mountpoint: &str) -> anyhow::Result<()> {
     // Phase 0: note cache dir for cleanup after unmount
-    let cache_dir = cache_dir_for_mount(mountpoint);
+    let _cache_dir = cache_dir_for_mount(mountpoint);
 
     // Phase 1: wait for writeback queue to drain
     // (mntrs writeback is async; we wait for pending uploads)

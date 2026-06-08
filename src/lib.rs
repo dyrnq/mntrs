@@ -1825,3 +1825,119 @@ fn to_core_attr(a: &FileAttr) -> CoreFileAttr {
         flags: a.flags,
     }
 }
+
+/// Install a panic hook that logs to a file before crashing.
+/// Useful in container/CSI environments where stderr may be lost.
+pub fn install_panic_logger() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = format!("panic: {info}");
+        let location = info.location().map(|l| l.to_string()).unwrap_or_default();
+        let backtrace = std::backtrace::Backtrace::capture();
+        let report = format!(
+            "{msg}\n  at {location}\n  backtrace:\n{backtrace}\n"
+        );
+        // Always write to stderr
+        eprintln!("{report}");
+        // Also write to file
+        if let Ok(path) = std::env::var("MNNTRS_PANIC_LOG") {
+            let _ = std::fs::write(&path, &report);
+        } else {
+            let default_path = "/tmp/mntrs-panic.log";
+            let _ = std::fs::write(default_path, &report);
+        }
+        prev(info);
+    }));
+}
+
+/// Detect cgroup v1 memory limit (bytes). Returns None if not in a cgroup.
+/// Reads /sys/fs/cgroup/memory/memory.limit_in_bytes.
+/// Falls back to /proc/self/cgroup for container-specific path.
+pub fn detect_cgroup_memory_limit() -> Option<u64> {
+    // Try cgroup v1 first (most common in K8s)
+    let cgroup_paths = [
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ];
+    for path in &cgroup_paths {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let val: u64 = content.trim().parse().ok()?;
+            if val > 0 && val < u64::MAX {
+                return Some(val);
+            }
+        }
+    }
+    // Try cgroup v2
+    if let Ok(content) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        let trimmed = content.trim();
+        if trimmed != "max"
+            && let Ok(val) = trimmed.parse::<u64>()
+            && val > 0
+        {
+            return Some(val);
+        }
+    }
+    None
+}
+
+/// Lightweight checksummed buffer for cache integrity validation.
+/// Uses CRC32C (same as mountpoint-s3 and S3's native checksum).
+pub struct ChecksummedBytes {
+    data: bytes::Bytes,
+    checksum: u32, // CRC32C
+}
+
+impl ChecksummedBytes {
+    /// Create from raw bytes, computing checksum.
+    pub fn new(data: bytes::Bytes) -> Self {
+        let checksum = crc32c_checksum(&data);
+        Self { data, checksum }
+    }
+
+    /// Create without checksum validation (for data from trusted source).
+    pub fn new_unchecked(data: bytes::Bytes) -> Self {
+        Self { data, checksum: 0 }
+    }
+
+    /// Validate integrity and return inner data.
+    pub fn into_inner(self) -> std::io::Result<bytes::Bytes> {
+        if self.checksum == 0 {
+            return Ok(self.data);
+        }
+        let actual = crc32c_checksum(&self.data);
+        if actual != self.checksum {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("cache checksum mismatch: expected {:#x}, got {:#x}", self.checksum, actual),
+            ));
+        }
+        Ok(self.data)
+    }
+
+    /// Get checksum for serialization.
+    pub fn checksum(&self) -> u32 {
+        self.checksum
+    }
+
+    /// Get reference to data without validation.
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+/// Compute CRC32C checksum.
+fn crc32c_checksum(data: &[u8]) -> u32 {
+    // Use a simple polynomial CRC32C implementation
+    // CRC32C (Castagnoli) polynomial: 0x1EDC6F41
+    let mut crc: u32 = 0xFFFFFFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0x82F63B78;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    crc ^ 0xFFFFFFFF
+}
