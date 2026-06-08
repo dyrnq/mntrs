@@ -54,7 +54,6 @@ jobs:
       minio:
         image: minio/minio:latest
         command: server /data
-        options: --health-cmd "curl -sf http://localhost:9000/minio/health/live || exit 1" --health-interval 5s
         env:
           MINIO_ROOT_USER: minioadmin
           MINIO_ROOT_PASSWORD: minioadmin
