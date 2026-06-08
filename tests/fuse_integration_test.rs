@@ -38,7 +38,7 @@ fn mntrs_mount(read_only: bool) {
         cmd.arg("--read-only");
     }
 
-    let child = cmd.spawn().expect("mntrs mount failed to start");
+    let mut child = cmd.spawn().expect("mntrs mount failed to start");
     thread::sleep(Duration::from_secs(3));
 
     // Verify mount
