@@ -977,8 +977,7 @@ impl Filesystem for MntrsFs {
         let fh_val = u64::from(_fh);
         if let Some(h) = self.handles.get(&fh_val)
             && let FileHandleState::Read { prefetcher: Some(p), .. } = h.value()
-        {
-            if let Some(part) = p.pop(offset) {
+            && let Some(part) = p.pop(offset) {
                 let start = (offset - part.offset) as usize;
                 let end = (start + size as usize).min(part.data.len());
                 if start < part.data.len() {
@@ -988,7 +987,6 @@ impl Filesystem for MntrsFs {
                 }
                 return;
             }
-        }
         // 3. Fetch from remote
         // Adaptive chunking: grow on sequential read, reset on seek
         let fh_val = u64::from(_fh);
