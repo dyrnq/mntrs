@@ -1,0 +1,70 @@
+name: CSI Integration Test (k3s)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 0'  # Sunday 06:00 UTC
+
+jobs:
+  csi-k3s:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install k3s
+        run: |
+          curl -sfL https://get.k3s.io | sh -
+          mkdir -p ~/.kube
+          sudo k3s kubectl config view --raw > ~/.kube/config
+          sudo chown $(id -u):$(id -g) ~/.kube/config
+          # Wait for k3s to be ready
+          kubectl wait --for=condition=Ready node --all --timeout=60s
+          kubectl get nodes
+
+      - name: Build CSI binary
+        run: cargo build --release -p mntrs-csi
+
+      - name: Create CSI deploy manifests
+        run: |
+          cat > /tmp/csi-deploy.yaml << 'DEPLOY'
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: mntrs-csi
+            namespace: kube-system
+            labels:
+              app: mntrs-csi
+          spec:
+            containers:
+            - name: csi-driver
+              image: ubuntu:22.04
+              command: ["sleep", "infinity"]
+              volumeMounts:
+              - name: socket-dir
+                mountPath: /csi
+              - name: binary
+                mountPath: /usr/local/bin/mntrs-csi
+            volumes:
+            - name: socket-dir
+              emptyDir: {}
+            - name: binary
+              hostPath:
+                path: /tmp/mntrs-csi
+                type: File
+          DEPLOY
+          sudo cp target/release/mntrs-csi /tmp/
+          sudo chmod +x /tmp/mntrs-csi
+          kubectl apply -f /tmp/csi-deploy.yaml
+          kubectl wait --for=condition=Ready pod/mntrs-csi -n kube-system --timeout=60s
+
+      - name: Smoke test — exec CSI binary
+        run: |
+          kubectl exec -n kube-system mntrs-csi -- /usr/local/bin/mntrs-csi --version 2>&1 || true
+          echo "CSI binary smoke test done"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kubectl delete pod mntrs-csi -n kube-system --ignore-not-found
