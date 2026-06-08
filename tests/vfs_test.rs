@@ -1,5 +1,4 @@
 use mntrs::{cache_path, fnmatch, path_hash};
-use std::path::Path;
 
 // ============================================================
 // statfs — verify df output values are reasonable
@@ -119,9 +118,10 @@ fn path_hash_different_paths() {
 
 #[test]
 fn cache_path_format() {
-    let p = cache_path(Path::new("/tmp/cache"), "hello/world");
+    let tmp = std::env::temp_dir();
+    let p = cache_path(&tmp, "hello/world");
     let parent = p.parent().unwrap();
-    assert_eq!(parent, Path::new("/tmp/cache"));
+    assert_eq!(parent, tmp);
     let name = p.file_name().unwrap().to_str().unwrap();
     assert_eq!(name.len(), 20, "cache path filename should be 20-char hex");
     assert!(name.chars().all(|c| c.is_ascii_hexdigit()), "should be hex");

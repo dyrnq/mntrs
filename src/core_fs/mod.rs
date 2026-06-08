@@ -153,3 +153,40 @@ pub mod fuser;
 
 #[cfg(windows)]
 pub mod winfsp;
+
+/// Helper to expose MntrsFs (or any CoreFilesystem impl) for integration testing.
+/// On Windows, mounts via WinFSP; on Linux this is a no-op.
+#[cfg(windows)]
+pub mod test_helpers {
+    use std::sync::Arc;
+    use crate::core_fs::CoreFilesystem;
+
+    /// Mount a CoreFilesystem on a Windows drive letter (auto-assigned).
+    /// Returns the mount handle. Dropping it unmounts.
+    pub fn mount_winfsp<F: CoreFilesystem + 'static>(
+        fs: Arc<F>,
+    ) -> std::io::Result<MountGuard> {
+        use crate::core_fs::winfsp::WinFspAdapter;
+        use winfsp::host::{FileSystemHost, MountPoint};
+
+        let adapter = WinFspAdapter::new(fs);
+        let host = FileSystemHost::new(adapter)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("FileSystemHost::new: {e}")))?;
+        let _mp = host.mount(MountPoint::DriveLetterAuto)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("host.mount: {e}")))?;
+        Ok(MountGuard { host: Some(host) })
+    }
+
+    /// RAII guard that unmounts on drop.
+    pub struct MountGuard {
+        host: Option<FileSystemHost<WinFspAdapter<crate::MntrsFs>>>,
+    }
+
+    impl Drop for MountGuard {
+        fn drop(&mut self) {
+            if let Some(host) = self.host.take() {
+                host.stop();
+            }
+        }
+    }
+}

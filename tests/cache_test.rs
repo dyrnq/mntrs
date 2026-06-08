@@ -58,9 +58,8 @@ fn fnmatch_edge_cases() {
 #[test]
 fn cache_path_is_stable() {
     use mntrs::cache_path;
-    use std::path::Path;
-    let p = cache_path(Path::new("/tmp/cache"), "hello/world");
-    // Should produce a 20-char hex filename under cache dir
+        let tmp = std::env::temp_dir();
+    let p = cache_path(&tmp, "hello/world");
     let name = p.file_name().unwrap().to_str().unwrap();
     assert_eq!(name.len(), 20);
     assert!(name.chars().all(|c| c.is_ascii_hexdigit()));
@@ -69,13 +68,12 @@ fn cache_path_is_stable() {
 #[test]
 fn cache_path_deterministic() {
     use mntrs::cache_path;
-    use std::path::Path;
-    assert_eq!(
-        cache_path(Path::new("/a"), "x"),
-        cache_path(Path::new("/a"), "x")
+        assert_eq!(
+        cache_path(std::path::Path::new("/a"), "x"),
+        cache_path(std::path::Path::new("/a"), "x")
     );
     assert_ne!(
-        cache_path(Path::new("/a"), "x"),
-        cache_path(Path::new("/b"), "x")
+        cache_path(std::path::Path::new("/a"), "x"),
+        cache_path(std::path::Path::new("/b"), "x")
     );
 }
