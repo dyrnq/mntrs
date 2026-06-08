@@ -49,6 +49,45 @@ pub enum FileType {
     CharDevice,
     Socket,
 }
+
+#[cfg(not(unix))]
+/// Stub — mirrors fuser::INodeNo. Needed because `make_attr` is used in CoreFilesystem impl.
+#[cfg(not(unix))]
+#[derive(Debug, Clone, Copy)]
+pub struct INodeNo(pub u64);
+#[cfg(not(unix))]
+impl From<u64> for INodeNo {
+    fn from(v: u64) -> Self {
+        INodeNo(v)
+    }
+}
+#[cfg(not(unix))]
+impl From<INodeNo> for u64 {
+    fn from(v: INodeNo) -> u64 {
+        v.0
+    }
+}
+
+#[cfg(not(unix))]
+/// Stub — mirrors fuser::FileAttr. Needed because `make_attr` is used in CoreFilesystem impl.
+#[derive(Debug, Clone)]
+pub struct FileAttr {
+    pub ino: INodeNo,
+    pub size: u64,
+    pub blocks: u64,
+    pub atime: SystemTime,
+    pub mtime: SystemTime,
+    pub ctime: SystemTime,
+    pub crtime: SystemTime,
+    pub kind: FileType,
+    pub perm: u16,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub rdev: u32,
+    pub blksize: u32,
+    pub flags: u32,
+}
 use futures::StreamExt;
 use opendal::{EntryMode, Operator};
 

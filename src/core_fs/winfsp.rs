@@ -26,15 +26,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use widestring::U16CStr;
 use windows::Win32::Foundation::STATUS_INVALID_DEVICE_REQUEST;
-use winfsp::error::Result;
+use winfsp::Result;
 use winfsp::filesystem::{
     DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext,
     ModificationDescriptor, OpenFileInfo, VolumeInfo,
 };
-use winfsp_sys::{
-    FILE_ACCESS_RIGHTS, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
-    FILE_ATTRIBUTE_READONLY, FILE_FLAGS_AND_ATTRIBUTES,
-};
+use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
+
+// Win32 file attribute constants (same as win32 API)
+const FILE_ATTRIBUTE_READONLY: u32 = 0x00000001;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;
+const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x00000020;
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x00000080;
 
 use super::{CoreFileAttr, CoreFileType, CoreFilesystem, CoreVolumeStat};
 
@@ -236,14 +239,14 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
 
     fn set_basic_info(
         &self,
-        context: &Self::FileContext,
-        file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
-        _modification_time: Option<SystemTime>,
-        _change_time: Option<SystemTime>,
-        _modification_descriptor: Option<&ModificationDescriptor>,
+        _context: &Self::FileContext,
+        _file_attributes: u32,
+        _creation_time: u64,
+        _last_access_time: u64,
+        _last_write_time: u64,
+        _change_time: u64,
+        _file_info: &mut FileInfo,
     ) -> Result<()> {
-        // mtime change: set_basic_info can update mtime
-        let _ = file_attributes;
         // For now: no-op (S3 doesn't support Windows file attributes)
         // mtime/atime would need CoreFilesystem::setattr with mtime
         Ok(())
@@ -295,10 +298,14 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         Ok(())
     }
 
-    fn get_dir_info_by_name(&self, _file_name: &U16CStr, _file_info: &mut FileInfo) -> Result<()> {
-        // Windows uses get_security_by_name for lookup before open.
-        // get_dir_info_by_name is called during read_directory pattern matching.
-        // Use getattr since we have the path.
+    fn get_dir_info_by_name(
+        &self,
+        _context: &Self::FileContext,
+        _file_name: &U16CStr,
+        _out_dir_info: &mut DirInfo,
+    ) -> Result<()> {
+        // Called during read_directory pattern matching (only when
+        // VolumeParams::pass_query_directory_filename is enabled).
         Err(STATUS_INVALID_DEVICE_REQUEST.into())
     }
 

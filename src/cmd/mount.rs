@@ -548,11 +548,6 @@ pub fn mount(
     if allow_other || allow_root {
         cfg.acl = fuser::SessionACL::All;
     }
-    #[cfg(windows)]
-    if allow_idmap {
-        cfg.mount_options
-            .push(fuser::MountOption::CUSTOM("allow_idmap".to_string()));
-    }
     #[cfg(not(windows))]
     {
         cfg.mount_options = vec![
@@ -624,12 +619,12 @@ pub fn mount(
     #[cfg(windows)]
     {
         use crate::core_fs::winfsp::WinFspAdapter;
-        use crate::path::parse_windows_target;
         use std::sync::Arc;
-        let target = parse_windows_target(mountpoint)
-            .map_err(|e| anyhow::anyhow!("invalid Windows mount target '{mountpoint}': {e}"))?;
-        let host = winfsp::host::FileSystemHost::new(WinFspAdapter::new(Arc::new(fs)))?;
-        let _mp = host.mount(target)?;
+        let adapter = WinFspAdapter::new(Arc::new(fs));
+        let mut vol_params = winfsp::host::VolumeParams::default();
+        vol_params.filesystem_name(volname);
+        let mut host = winfsp::host::FileSystemHost::new(vol_params, adapter)?;
+        let _mp = host.mount(mountpoint)?;
         // Blocking: WinFSP runs on the calling thread
         host.start()?;
     }

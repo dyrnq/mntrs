@@ -169,13 +169,14 @@ pub mod test_helpers {
         use winfsp::host::{FileSystemHost, MountPoint};
 
         let adapter = WinFspAdapter::new(fs);
-        let host = FileSystemHost::new(adapter).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("FileSystemHost::new: {e}"),
-            )
-        })?;
-        let _mp = host.mount(MountPoint::DriveLetterAuto).map_err(|e| {
+        let host =
+            FileSystemHost::new(winfsp::host::VolumeParams::default(), adapter).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("FileSystemHost::new: {e}"),
+                )
+            })?;
+        let _mp = host.mount(MountPoint::NextFreeDrive).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::Other, format!("host.mount: {e}"))
         })?;
         Ok(MountGuard { host: Some(host) })
