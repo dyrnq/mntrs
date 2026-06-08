@@ -226,8 +226,8 @@ pub fn mount_internal(
         false,  // no_checksum
         false,  // no_seek
         false,  // links
-        noapple_double,
-        noapple_xattr,
+        false,  // noapple_double
+        false,  // noapple_xattr,
         false,  // mount_case_insensitive
         131072, // max_read_ahead
         0,      // vfs_read_chunk_size_limit
@@ -355,8 +355,8 @@ pub fn mount(
     _no_checksum: bool,
     _no_seek: bool,
     _links: bool,
-    noapple_double: bool,
-    noapple_xattr: bool,
+    _no_apple_double: bool,
+    _no_apple_xattr: bool,
     _mount_case_insensitive: bool,
     _max_read_ahead: u64,
     vfs_read_chunk_size_limit: u64,
@@ -421,6 +421,8 @@ pub fn mount(
         case_insensitive: vfs_case_insensitive,
         no_implicit_dir,
         use_server_modtime,
+        no_apple_double: false,
+        no_apple_xattr: false,
         block_norm_dupes: vfs_block_norm_dupes,
         write_wait: std::time::Duration::from_secs(vfs_write_wait),
         read_wait: std::time::Duration::from_secs(vfs_read_wait),
@@ -492,11 +494,11 @@ pub fn mount(
     }
     #[cfg(target_os = "macos")]
     {
-        if noapple_double {
+        if _no_apple_double {
             cfg.mount_options
                 .push(MountOption::CUSTOM("noappledouble".to_string()));
         }
-        if noapple_xattr {
+        if _no_apple_xattr {
             cfg.mount_options
                 .push(MountOption::CUSTOM("noapplexattr".to_string()));
         }

@@ -1914,17 +1914,17 @@ pub fn install_panic_logger() {
     std::panic::set_hook(Box::new(move |info| {
         let msg = format!("panic: {info}");
         let location = info.location().map(|l| l.to_string()).unwrap_or_default();
-        let backtrace = std::backtrace::Backtrace::capture();
+        let backtrace = std::backtrace::Backtrace::force_capture();
         let report = format!(
             "{msg}\n  at {location}\n  backtrace:\n{backtrace}\n"
         );
         // Always write to stderr
         eprintln!("{report}");
         // Also write to file
-        if let Ok(path) = std::env::var("MNNTRS_PANIC_LOG") {
+        if let Ok(path) = std::env::var("MNTRS_PANIC_LOG") {
             let _ = std::fs::write(&path, &report);
         } else {
-            let default_path = "/tmp/mntrs-panic.log";
+            let default_path = format!("/tmp/mntrs-panic.{}.log", std::process::id());
             let _ = std::fs::write(default_path, &report);
         }
         prev(info);
