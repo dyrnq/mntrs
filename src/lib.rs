@@ -1262,36 +1262,62 @@ impl Filesystem for MntrsFs {
         }
     }
 
-    fn rmdir(&self, _req: &Request, _parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let name = name.to_string_lossy();
-        let dir_path = format!("{}/", name.trim_end_matches('/'));
+        let parent_path = self.resolve(parent.into())
+            .map(|(p, _, _, _)| p).unwrap_or_default();
+        let full_path = if parent_path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}/{}", parent_path, name)
+        };
+        let dir_path = format!("{}/", full_path.trim_end_matches('/'));
         let op = self.op.clone();
         let p = dir_path.clone();
         let p2 = p.clone();
         if rt().block_on(async move { op.delete(&p2).await }).is_err() {
             tracing::debug!(path=%p, "rmdir delete failed");
         }
+        self.inodes.remove(&path_hash(&full_path));
+        self.attr_cache.remove(&full_path);
         reply.ok();
     }
 
     fn rename(
         &self,
         _req: &Request,
-        _parent: INodeNo,
+        parent: INodeNo,
         name: &OsStr,
-        _newparent: INodeNo,
+        newparent: INodeNo,
         newname: &OsStr,
         _flags: fuser::RenameFlags,
         reply: ReplyEmpty,
     ) {
-        let src = name.to_string_lossy().to_string();
-        let dst = newname.to_string_lossy().to_string();
+        let name = name.to_string_lossy();
+        let newname = newname.to_string_lossy();
+        let parent_path = self.resolve(parent.into())
+            .map(|(p, _, _, _)| p).unwrap_or_default();
+        let newparent_path = self.resolve(newparent.into())
+            .map(|(p, _, _, _)| p).unwrap_or_default();
+        let src = if parent_path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}/{}", parent_path, name)
+        };
+        let dst = if newparent_path.is_empty() {
+            newname.to_string()
+        } else {
+            format!("{}/{}", newparent_path, newname)
+        };
         let op = self.op.clone();
+        let src_clone = src.clone();
         rt().block_on(async move {
-            if op.copy(&src, &dst).await.is_ok() && op.delete(&src).await.is_err() {
-                tracing::debug!(path=%src, "rename delete failed");
+            if op.copy(&src_clone, &dst).await.is_ok() && op.delete(&src_clone).await.is_err() {
+                tracing::debug!(path=%src_clone, "rename delete failed");
             }
         });
+        self.inodes.remove(&path_hash(&src));
+        self.attr_cache.remove(&src);
         reply.ok();
     }
 
@@ -1407,20 +1433,28 @@ impl Filesystem for MntrsFs {
         }
     }
 
-    fn unlink(&self, _req: &Request, _parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let name = name.to_string_lossy();
+        let parent_path = self.resolve(parent.into())
+            .map(|(p, _, _, _)| p).unwrap_or_default();
+        let full_path = if parent_path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}/{}", parent_path, name)
+        };
         let op = self.op.clone();
-        let p = name.to_string();
-        let p2 = p.clone();
+        let p = full_path.clone();
+        let p2 = full_path.clone();
         if rt().block_on(async move { op.delete(&p2).await }).is_err() {
             tracing::debug!(path=%p, "unlink remote failed");
         }
-        // Also remove from local cache
-        let cpath = cache_path(&self.cache_dir, &name);
+        let cpath = cache_path(&self.cache_dir, &full_path);
         if let Err(e) = fs::remove_file(&cpath) {
             tracing::debug!(error=%e, path=?cpath, "unlink cache remove failed");
         }
-        self.disk_cache_index.remove(&name as &str);
+        self.disk_cache_index.remove(&full_path as &str);
+        self.inodes.remove(&path_hash(&full_path));
+        self.attr_cache.remove(&full_path);
         reply.ok();
     }
 
