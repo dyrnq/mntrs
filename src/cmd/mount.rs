@@ -255,7 +255,7 @@ pub fn mount_internal(
         None,                     // hash_filter
         false,                    // mount_case_insensitive
         131072,                   // max_read_ahead
-        0,                         // vfs_read_chunk_size_limit
+        0,                        // vfs_read_chunk_size_limit
         0,                        // vfs_read_chunk_streams (serial)
         false,                    // vfs_fast_fingerprint
         false,                    // async_read
