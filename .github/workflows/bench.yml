@@ -46,7 +46,7 @@ jobs:
           pip3 install awscli 2>/dev/null || true
 
       - name: Run FUSE integration tests
-        run: cargo test --test fuse_integration_test -- --test-threads=1 --nocapture --ignored 2>&1 || echo "FUSE integration tests skipped (run manually with MinIO)"
+        run: cargo test --test fuse_integration_test -- --test-threads=1 --nocapture 2>&1 || echo "FUSE integration tests skipped (needs MinIO + FUSE)"
 
   bench:
     runs-on: ubuntu-latest
