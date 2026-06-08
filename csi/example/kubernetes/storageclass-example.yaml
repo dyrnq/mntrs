@@ -1,0 +1,45 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: mntrs
+provisioner: csi-mntrs
+# parameters:
+#   pathPattern: "${.PVC.namespace}/${.PVC.name}"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data-mntrs-auto
+  annotations:
+    # csi-rclone compat annotations
+    csi-mntrs/storage: "s3://my-bucket"
+    csi-mntrs/prefix: "k8s-pv/${.PVC.namespace}"
+spec:
+  accessModes:
+  - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: mntrs
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx-mntrs-auto
+  labels:
+    run: nginx-mntrs-auto
+spec:
+  containers:
+  - image: nginx
+    imagePullPolicy: Always
+    name: nginx-mntrs
+    ports:
+    - containerPort: 80
+      protocol: TCP
+    volumeMounts:
+      - mountPath: /usr/share/nginx/html
+        name: data-mntrs-auto
+  volumes:
+  - name: data-mntrs-auto
+    persistentVolumeClaim:
+      claimName: data-mntrs-auto

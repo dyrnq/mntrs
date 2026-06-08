@@ -1,0 +1,59 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: data-mntrs-example
+  labels:
+    name: data-mntrs-example
+spec:
+  accessModes:
+  - ReadWriteMany
+  capacity:
+    storage: 10Gi
+  storageClassName: mntrs
+  csi:
+    driver: csi-mntrs
+    volumeHandle: data-id
+    volumeAttributes:
+      storage: "s3://my-bucket"
+      prefix: "k8s-pv/data-id"
+      s3-provider: "Minio"
+      s3-endpoint: "http://minio.minio:9000"
+      s3-access-key-id: "ACCESS_KEY_ID"
+      s3-secret-access-key: "SECRET_ACCESS_KEY"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data-mntrs-example
+spec:
+  accessModes:
+  - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: mntrs
+  selector:
+    matchLabels:
+      name: data-mntrs-example
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx-mntrs
+  labels:
+    run: nginx-mntrs
+spec:
+  containers:
+  - image: nginx
+    imagePullPolicy: Always
+    name: nginx-mntrs
+    ports:
+    - containerPort: 80
+      protocol: TCP
+    volumeMounts:
+      - mountPath: /usr/share/nginx/html
+        name: data-mntrs-example
+  volumes:
+  - name: data-mntrs-example
+    persistentVolumeClaim:
+      claimName: data-mntrs-example

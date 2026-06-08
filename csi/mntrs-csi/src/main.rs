@@ -182,6 +182,7 @@ impl controller_server::Controller for ControllerService {
 // Node Service
 // ============================================================
 
+#[allow(dead_code)]
 struct MountState {
     storage_url: String,
     mountpoint: String,

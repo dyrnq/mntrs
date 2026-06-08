@@ -1,0 +1,67 @@
+kind: StatefulSet
+apiVersion: apps/v1
+metadata:
+  name: csi-controller-mntrs
+  namespace: csi-mntrs
+spec:
+  serviceName: csi-controller-mntrs
+  replicas: 1
+  selector:
+    matchLabels:
+      app: csi-controller-mntrs
+  template:
+    metadata:
+      labels:
+        app: csi-controller-mntrs
+    spec:
+      serviceAccountName: csi-controller-mntrs
+      containers:
+        - name: csi-provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v5.0.2
+          args:
+            - "--csi-address=$(ADDRESS)"
+            - "--extra-create-metadata"
+            - "--v=1"
+          env:
+            - name: ADDRESS
+              value: /plugin/csi.sock
+          imagePullPolicy: Always
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /plugin
+        - name: csi-attacher
+          image: k8s.gcr.io/sig-storage/csi-attacher:v3.4.0
+          args:
+            - "--csi-address=$(ADDRESS)"
+            - "--v=1"
+          env:
+            - name: ADDRESS
+              value: /plugin/csi.sock
+          imagePullPolicy: Always
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /plugin
+        - name: mntrs
+          image: csi-mntrs:latest
+          args:
+            - "--nodeid=$(NODE_ID)"
+            - "--endpoint=$(CSI_ENDPOINT)"
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: CSI_ENDPOINT
+              value: unix://plugin/csi.sock
+          imagePullPolicy: Always
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["SYS_ADMIN"]
+            allowPrivilegeEscalation: true
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /plugin
+      volumes:
+        - name: socket-dir
+          emptyDir: {}
