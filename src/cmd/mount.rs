@@ -128,7 +128,7 @@ extern "C" fn cleanup() {
 /// Simplified mount entry point for CSI plugin.
 /// Uses defaults for all the FUSE tuning parameters.
 /// Check if a path is already a mount point by checking /proc/mounts.
-
+///
 /// Check if a path is already a mount point on macOS.
 #[cfg(target_os = "macos")]
 pub fn is_mount_point(path: &str) -> bool {
@@ -204,7 +204,7 @@ pub fn mount_internal(
         opts,
         read_only,
         false,                    // network_mode
-        10,                       // dir_cache_time
+        300,                      // dir_cache_time (5min)
         1,                        // attr_timeout
         10,                       // type_cache_ttl
         1,                        // stat_cache_ttl
@@ -220,12 +220,12 @@ pub fn mount_internal(
         10,                       // daemon_timeout
         false,                    // allow_root
         false,                    // allow_idmap
-        1024,                     // vfs_cache_max_size
+        0,                        // vfs_cache_max_size (off)
         256,                      // mem_limit
         5,                        // vfs_write_back
-        "writes",                 // vfs_cache_mode
-        131072,                   // vfs_read_ahead
-        0,                        // vfs_read_chunk_size
+        "off",                    // vfs_cache_mode
+        0,                        // vfs_read_ahead (off)
+        128 * 1024 * 1024,        // vfs_read_chunk_size (128MiB)
         false,                    // default_permissions
         None,                     // uid
         None,                     // gid
@@ -238,7 +238,7 @@ pub fn mount_internal(
         false,                    // direct_io
         60,                       // poll_interval
         3600,                     // vfs_cache_max_age
-        100,                      // vfs_cache_min_free_space
+        0,                        // vfs_cache_min_free_space (off)
         vec![],                   // exclude
         vec![],                   // include
         None,                     // max_size
@@ -255,8 +255,8 @@ pub fn mount_internal(
         None,                     // hash_filter
         false,                    // mount_case_insensitive
         131072,                   // max_read_ahead
-        0,                        // vfs_read_chunk_size_limit
-        1,                        // vfs_read_chunk_streams
+        0,                         // vfs_read_chunk_size_limit
+        0,                        // vfs_read_chunk_streams (serial)
         false,                    // vfs_fast_fingerprint
         false,                    // async_read
         false,                    // vfs_refresh
@@ -267,11 +267,11 @@ pub fn mount_internal(
         false,                    // vfs_used_is_size
         None,                     // vfs_metadata_extension
         None,                     // storage_class
-        5,                        // vfs_write_wait
-        5,                        // vfs_read_wait
+        1,                        // vfs_write_wait (1s)
+        1,                        // vfs_read_wait (1s)
         60,                       // vfs_cache_poll_interval
         0,                        // vfs_handle_caching
-        1024,                     // vfs_disk_space_total_size
+        0,                        // vfs_disk_space_total_size (off)
     )
 }
 
