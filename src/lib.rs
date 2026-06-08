@@ -77,22 +77,28 @@ enum FileHandleState {
 impl Clone for FileHandleState {
     fn clone(&self) -> Self {
         match self {
-            FileHandleState::Read { path, last_offset, chunk_size, prefetcher } => {
-                FileHandleState::Read {
-                    path: path.clone(),
-                    last_offset: *last_offset,
-                    chunk_size: *chunk_size,
-                    prefetcher: prefetcher.clone(),
-                }
-            }
-            FileHandleState::Write { path, cache_fd, dirty, dirty_since } => {
-                FileHandleState::Write {
-                    path: path.clone(),
-                    cache_fd: cache_fd.clone(),
-                    dirty: *dirty,
-                    dirty_since: *dirty_since,
-                }
-            }
+            FileHandleState::Read {
+                path,
+                last_offset,
+                chunk_size,
+                prefetcher,
+            } => FileHandleState::Read {
+                path: path.clone(),
+                last_offset: *last_offset,
+                chunk_size: *chunk_size,
+                prefetcher: prefetcher.clone(),
+            },
+            FileHandleState::Write {
+                path,
+                cache_fd,
+                dirty,
+                dirty_since,
+            } => FileHandleState::Write {
+                path: path.clone(),
+                cache_fd: cache_fd.clone(),
+                dirty: *dirty,
+                dirty_since: *dirty_since,
+            },
         }
     }
 }
@@ -1291,7 +1297,10 @@ impl Filesystem for MntrsFs {
         let end = offset + data.len() as u64;
 
         let cache_fd = self.handles.get(&fh_val).and_then(|e| {
-            if let FileHandleState::Write { cache_fd: Some(fd), .. } = e.value() {
+            if let FileHandleState::Write {
+                cache_fd: Some(fd), ..
+            } = e.value()
+            {
                 Some(fd.clone())
             } else {
                 None
@@ -1942,7 +1951,10 @@ impl CoreFilesystem for MntrsFs {
             let cache_fd = self.handles.get(&_fh).and_then(|e| {
                 if let crate::FileHandleState::Read { .. } = e.value() {
                     None
-                } else if let crate::FileHandleState::Write { cache_fd: Some(fd), .. } = e.value() {
+                } else if let crate::FileHandleState::Write {
+                    cache_fd: Some(fd), ..
+                } = e.value()
+                {
                     Some(fd.clone())
                 } else {
                     None
@@ -2024,7 +2036,10 @@ impl CoreFilesystem for MntrsFs {
 
         // Write via single cache fd (like rclone RWFileHandle)
         let cache_fd = self.handles.get(&fh_val).and_then(|e| {
-            if let crate::FileHandleState::Write { cache_fd: Some(fd), .. } = e.value() {
+            if let crate::FileHandleState::Write {
+                cache_fd: Some(fd), ..
+            } = e.value()
+            {
                 Some(fd.clone())
             } else {
                 None
@@ -2122,14 +2137,16 @@ impl CoreFilesystem for MntrsFs {
                 tracing::debug!(path=%path, "flush queued writeback");
             }
             // Mark handle clean; writeback happens asynchronously
-            let cache_fd = self.handles.get(&_fh)
-                .and_then(|e| {
-                    if let crate::FileHandleState::Write { cache_fd: Some(fd), .. } = e.value() {
-                        Some(fd.clone())
-                    } else {
-                        None
-                    }
-                });
+            let cache_fd = self.handles.get(&_fh).and_then(|e| {
+                if let crate::FileHandleState::Write {
+                    cache_fd: Some(fd), ..
+                } = e.value()
+                {
+                    Some(fd.clone())
+                } else {
+                    None
+                }
+            });
             self.handles.insert(
                 _fh,
                 crate::FileHandleState::Write {
@@ -2162,7 +2179,9 @@ impl CoreFilesystem for MntrsFs {
         }
         // Close the cache fd before removing handle
         if let Some(entry) = self.handles.get(&fh)
-            && let crate::FileHandleState::Write { cache_fd: Some(fd), .. } = entry.value()
+            && let crate::FileHandleState::Write {
+                cache_fd: Some(fd), ..
+            } = entry.value()
         {
             let _ = fd;
         }

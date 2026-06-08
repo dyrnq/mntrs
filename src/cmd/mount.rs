@@ -511,48 +511,51 @@ pub fn mount(
     if allow_other || allow_root {
         cfg.acl = fuser::SessionACL::All;
     }
-    cfg.mount_options = vec![
-        if read_only {
-            MountOption::RO
-        } else {
-            MountOption::RW
-        },
-        MountOption::Exec,
-        MountOption::FSName(devname.unwrap_or(volname).to_string()),
-    ];
-    if write_back_cache {
-        cfg.mount_options
-            .push(MountOption::CUSTOM("writeback_cache".to_string()));
-    }
-    if allow_root {
-        cfg.mount_options
-            .push(MountOption::CUSTOM("allow_root".to_string()));
-    }
-    #[cfg(target_os = "macos")]
+    #[cfg(not(windows))]
     {
-        if _no_apple_double {
+        cfg.mount_options = vec![
+            if read_only {
+                MountOption::RO
+            } else {
+                MountOption::RW
+            },
+            MountOption::Exec,
+            MountOption::FSName(devname.unwrap_or(volname).to_string()),
+        ];
+        if write_back_cache {
             cfg.mount_options
-                .push(MountOption::CUSTOM("noappledouble".to_string()));
+                .push(MountOption::CUSTOM("writeback_cache".to_string()));
         }
-        if _no_apple_xattr {
+        if allow_root {
             cfg.mount_options
-                .push(MountOption::CUSTOM("noapplexattr".to_string()));
+                .push(MountOption::CUSTOM("allow_root".to_string()));
         }
-        if _mount_case_insensitive {
+        #[cfg(target_os = "macos")]
+        {
+            if _no_apple_double {
+                cfg.mount_options
+                    .push(MountOption::CUSTOM("noappledouble".to_string()));
+            }
+            if _no_apple_xattr {
+                cfg.mount_options
+                    .push(MountOption::CUSTOM("noapplexattr".to_string()));
+            }
+            if _mount_case_insensitive {
+                cfg.mount_options
+                    .push(MountOption::CUSTOM("mount_case_insensitive".to_string()));
+            }
+        }
+        if default_permissions {
             cfg.mount_options
-                .push(MountOption::CUSTOM("mount_case_insensitive".to_string()));
+                .push(MountOption::CUSTOM("default_permissions".to_string()));
         }
-    }
-    if default_permissions {
-        cfg.mount_options
-            .push(MountOption::CUSTOM("default_permissions".to_string()));
-    }
-    if allow_non_empty {
-        cfg.mount_options
-            .push(MountOption::CUSTOM("nonempty".to_string()));
-    }
-    for opt in fuse_options {
-        cfg.mount_options.push(MountOption::CUSTOM(opt.clone()));
+        if allow_non_empty {
+            cfg.mount_options
+                .push(MountOption::CUSTOM("nonempty".to_string()));
+        }
+        for opt in fuse_options {
+            cfg.mount_options.push(MountOption::CUSTOM(opt.clone()));
+        }
     }
 
     #[cfg(not(windows))]
@@ -586,6 +589,7 @@ pub fn mount(
     }
 
     // Foreground mode with --daemon-wait: parent waits for pipe close
+    #[cfg(not(windows))]
     if !daemon && let Some((r, w)) = wait_pipe {
         unsafe {
             rustix::io::close(w);
