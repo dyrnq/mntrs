@@ -35,4 +35,4 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: (cargo clippy --package mntrs --lib --bins -- -D warnings 2>&1 || echo "clippy done (expect some Windows cfg gaps)") && true
+        run: cargo clippy --package mntrs --lib --bins -- -D warnings 2>&1 || echo "clippy done (expect some Windows cfg gaps)"
