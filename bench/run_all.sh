@@ -75,7 +75,7 @@ mkdir -p "$MNTRS_MNT" "$RCLONE_MNT"
     --opt "endpoint=$ENDPOINT" --opt "access-key=$ACCESS_KEY" \
     --opt "secret-key=$SECRET_KEY" --opt "region=$REGION" \
     --vfs-cache-mode=writes --vfs-write-back=5 \
-    --daemon --daemon-wait --daemon-timeout=15 2>/dev/null
+    --daemon --daemon-wait --daemon-timeout=15
 
 # rclone mount (writes cache mode for fair comparison)
 rclone mount --daemon --vfs-cache-mode=writes --vfs-write-back=5s \
@@ -83,6 +83,16 @@ rclone mount --daemon --vfs-cache-mode=writes --vfs-write-back=5s \
     "$RCLONE_MNT" 2>/dev/null
 
 sleep 3
+if mountpoint -q "$MNTRS_MNT" 2>/dev/null; then
+  echo "  mntrs mount: OK"
+else
+  echo "  mntrs mount: FAILED (check errors above)"
+fi
+if mountpoint -q "$RCLONE_MNT" 2>/dev/null; then
+  echo "  rclone mount: OK"
+else
+  echo "  rclone mount: FAILED"
+fi
 echo "  mounts ready"
 echo ""
 
