@@ -126,3 +126,117 @@ fn cache_path_format() {
     assert_eq!(name.len(), 20, "cache path filename should be 20-char hex");
     assert!(name.chars().all(|c| c.is_ascii_hexdigit()), "should be hex");
 }
+
+
+// ============================================================
+// mount_internal — verify parameter handling
+// ============================================================
+
+/// mount_internal with invalid scheme should return error (not panic)
+#[test]
+fn mount_internal_invalid_scheme_returns_error() {
+    let tmp = std::env::temp_dir().join(format!("mntrs-test-invalid-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+
+    let result = mntrs::cmd::mount::mount_internal(
+        "invalid-scheme://bucket",
+        tmp.to_str().unwrap(),
+        &std::collections::HashMap::new(),
+        false,
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+    assert!(result.is_err(), "invalid scheme should fail");
+}
+
+/// mount_internal with empty mountpoint should fail
+#[test]
+fn mount_internal_empty_mountpoint_fails() {
+    let result = mntrs::cmd::mount::mount_internal(
+        "s3://bucket",
+        "",
+        &std::collections::HashMap::new(),
+        false,
+    );
+    assert!(result.is_err(), "empty mountpoint should fail");
+}
+
+/// unmount_internal with non-existent path should not panic
+#[test]
+fn unmount_internal_nonexistent_does_not_panic() {
+    let result = mntrs::cmd::mount::unmount_internal("/tmp/mntrs-nonexistent-mount");
+    // Should return Ok (graceful handling)
+    assert!(result.is_ok(), "unmount of nonexistent path should be graceful");
+}
+
+/// path_hash returns same hash for same path
+#[test]
+fn path_hash_consistent() {
+    let h1 = path_hash("/some/long/path/with/many/parts");
+    let h2 = path_hash("/some/long/path/with/many/parts");
+    assert_eq!(h1, h2);
+}
+
+/// path_hash uniqueness check
+#[test]
+fn path_hash_uniqueness() {
+    let h1 = path_hash("/path/a");
+    let h2 = path_hash("/path/b");
+    assert_ne!(h1, h2);
+}
+
+/// cache_path produces expected format
+#[test]
+fn cache_path_format_verified() {
+    let tmp = std::env::temp_dir();
+    let p = cache_path(&tmp, "hello/world");
+    let name = p.file_name().unwrap().to_str().unwrap();
+    assert_eq!(name.len(), 20, "cache path filename should be 20-char hex");
+    assert!(name.chars().all(|c| c.is_ascii_hexdigit()), "should be hex");
+}
+
+/// cache_block_path includes block index in filename
+#[test]
+fn cache_block_path_includes_block_idx() {
+    let tmp = std::env::temp_dir();
+    let p = mntrs::cache_block_path(&tmp, "hello/world", 42);
+    let name = p.file_name().unwrap().to_str().unwrap();
+    assert!(name.ends_with(".block"), "should end with .block");
+    assert!(name.contains("_000000002a"), "should contain block index 42 in hex");
+}
+
+/// load_cache_index returns empty for non-existent cache dir
+#[test]
+fn load_cache_index_empty_for_nonexistent_dir() {
+    let entries = mntrs::load_cache_index(&std::env::temp_dir().join("__nonexistent_cache_dir__"));
+    assert!(entries.is_empty(), "should return empty list for nonexistent dir");
+}
+
+/// fnmatch with various patterns
+#[test]
+fn fnmatch_various_patterns() {
+    assert!(fnmatch("*.txt", "file.txt", false));
+    assert!(fnmatch("file.*", "file.txt", false));
+    assert!(fnmatch("file.*", "file.", false));
+    assert!(!fnmatch("*.txt", "file.rs", false));
+    assert!(fnmatch("a?c", "abc", false));
+    assert!(!fnmatch("a?c", "abdc", false));
+    assert!(fnmatch("a*c", "abbbc", false));
+    assert!(fnmatch("a*c", "ac", false));
+}
+
+/// fnmatch case insensitive
+#[test]
+fn fnmatch_case_insensitive_matching() {
+    assert!(fnmatch("*.TXT", "file.txt", true));
+    assert!(fnmatch("*.txt", "FILE.TXT", true));
+    assert!(!fnmatch("*.TXT", "file.txt", false));
+}
+
+/// fnmatch with path separators
+#[test]
+fn fnmatch_path_separator() {
+    assert!(fnmatch("a/b/c", "a/b/c", false));
+    assert!(!fnmatch("a/b/c", "a/b/d", false));
+}
+
