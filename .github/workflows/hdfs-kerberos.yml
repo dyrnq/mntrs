@@ -97,7 +97,7 @@ jobs:
             <property><name>dfs.web.authentication.kerberos.principal</name><value>HTTP/localhost@TEST.LOCAL</value></property>
           </configuration>
           XML
-          cp /tmp/hdfs.keytab /opt/hadoop/etc/hadoop/hdfs.keytab
+          sudo cp /tmp/hdfs.keytab /opt/hadoop/etc/hadoop/hdfs.keytab
           sudo chmod 600 /opt/hadoop/etc/hadoop/hdfs.keytab
           # Ensure JAVA_HOME is set for Hadoop
           echo "export JAVA_HOME=$(readlink -f /usr/bin/java | sed s:/bin/java::)" | sudo tee -a /opt/hadoop/etc/hadoop/hadoop-env.sh > /dev/null
