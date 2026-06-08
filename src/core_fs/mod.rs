@@ -149,3 +149,6 @@ pub trait CoreFilesystem: Send + Sync {
 }
 
 pub mod fuser;
+
+#[cfg(windows)]
+pub mod winfsp;

@@ -75,7 +75,7 @@ fn fnmatch_exclude_pattern() {
 #[test]
 fn fnmatch_include_overrides() {
     // If include is set, only matching files pass
-    let files = vec!["a.txt", "b.rs", "c.txt"];
+    let files = ["a.txt", "b.rs", "c.txt"];
     let included: Vec<_> = files.iter()
         .filter(|f| fnmatch("*.txt", f, false))
         .collect();
