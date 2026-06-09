@@ -47,13 +47,14 @@ jobs:
 
       - name: Smoke test — memory mount + read/write
         run: |
-          mkdir C:\mntrs-test 2>$null || $true
-          ./target/release/mntrs.exe mount memory:// C:\mntrs-test 2>&1 || echo "::warning::mount failed (WinFSP driver required)"
-          if (Test-Path C:\mntrs-test) {
+          rmdir C:\mntrs-test 2>$null || $true
+          mkdir C:\mntrs-test
+          ./target/release/mntrs.exe mount memory:// C:\mntrs-test 2>&1
+          if ($LASTEXITCODE -eq 0) {
             echo "hello from windows" > C:\mntrs-test\test.txt
             type C:\mntrs-test\test.txt
             dir C:\mntrs-test
             echo "::notice::memory mount read/write ok"
           } else {
-            echo "::warning::mount point not found — WinFSP driver required in CI runner"
+            echo "::warning::memory mount failed (WinFSP driver required in CI runner)"
           }
