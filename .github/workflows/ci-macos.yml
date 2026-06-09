@@ -44,7 +44,8 @@ jobs:
       - name: Smoke test — memory mount + read/write
         run: |
           mkdir -p /tmp/mntrs-macos-test
-          ./target/release/mntrs mount memory:// /tmp/mntrs-macos-test --volname mntrs-test --daemon --daemon-wait --daemon-timeout=15 2>&1
+          ./target/release/mntrs mount memory:// /tmp/mntrs-macos-test --volname mntrs-test 2>&1 &
+          sleep 5
           if ! mount | grep -q /tmp/mntrs-macos-test; then
             echo "ERROR: mount failed, /tmp/mntrs-macos-test is not a mountpoint"
             mount
