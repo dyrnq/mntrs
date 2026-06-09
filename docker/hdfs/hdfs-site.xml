@@ -1,0 +1,13 @@
+<configuration>
+    <property><name>dfs.replication</name><value>1</value></property>
+    <property><name>dfs.namenode.name.dir</name><value>/var/lib/hadoop/namenode</value></property>
+    <property><name>dfs.datanode.data.dir</name><value>/var/lib/hadoop/datanode</value></property>
+    <property><name>dfs.namenode.kerberos.principal</name><value>hdfs/localhost@TEST.LOCAL</value></property>
+    <property><name>dfs.namenode.keytab.file</name><value>/tmp/hdfs.keytab</value></property>
+    <property><name>dfs.datanode.kerberos.principal</name><value>hdfs/localhost@TEST.LOCAL</value></property>
+    <property><name>dfs.datanode.keytab.file</name><value>/tmp/hdfs.keytab</value></property>
+    <property><name>dfs.web.authentication.kerberos.principal</name><value>HTTP/localhost@TEST.LOCAL</value></property>
+    <property><name>dfs.web.authentication.kerberos.keytab</name><value>/tmp/hdfs.keytab</value></property>
+    <property><name>dfs.block.access.token.enable</name><value>true</value></property>
+    <property><name>dfs.namenode.secondary.http-address</name><value>0.0.0.0:0</value></property>
+</configuration>
