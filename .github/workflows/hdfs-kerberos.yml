@@ -81,7 +81,11 @@ jobs:
           kinit -kt /tmp/testuser.keytab testuser@TEST.LOCAL
           klist
 
-          # Create test data in HDFS before mounting
+          # Create test data in HDFS before mounting.
+          # The kinit on the runner only provides a ticket for the runner —
+          # the HDFS container needs its own kinit with the testuser keytab.
+          docker cp /tmp/testuser.keytab hdfs:/tmp/testuser.keytab
+          docker exec hdfs /usr/bin/kinit -kt /tmp/testuser.keytab testuser@TEST.LOCAL
           docker exec hdfs /opt/hadoop/bin/hdfs dfs -mkdir -p /test
           echo "hello kerberos hdfs" | docker exec -i hdfs /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt
           docker exec hdfs /opt/hadoop/bin/hdfs dfs -cat /test/hello.txt
