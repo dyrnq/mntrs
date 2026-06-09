@@ -92,6 +92,7 @@ jobs:
           sudo tee /opt/hadoop/etc/hadoop/hdfs-site.xml > /dev/null << XML
           <configuration>
             <property><name>dfs.replication</name><value>1</value></property>
+            <property><name>dfs.namenode.secondary.http-address</name><value>0.0.0.0:0</value></property>
             <property><name>dfs.namenode.kerberos.principal</name><value>hdfs/localhost@TEST.LOCAL</value></property>
             <property><name>dfs.namenode.keytab.file</name><value>/opt/hadoop/etc/hadoop/hdfs.keytab</value></property>
             <property><name>dfs.datanode.kerberos.principal</name><value>hdfs/localhost@TEST.LOCAL</value></property>
@@ -118,7 +119,6 @@ jobs:
           kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL
           export HDFS_NAMENODE_USER=$(whoami)
           export HDFS_DATANODE_USER=$(whoami)
-          export HDFS_SECONDARYNAMENODE_USER=$(whoami)
           /opt/hadoop/sbin/start-dfs.sh 2>&1
           # Dump NameNode log for debugging
           echo "=== NameNode log ==="
