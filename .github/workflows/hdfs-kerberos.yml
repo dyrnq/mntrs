@@ -110,7 +110,7 @@ jobs:
           sleep 3
           if mount | grep -q /mnt/hdfs; then
             ls -la /mnt/hdfs
-            hdfs dfs -cat /test/hello.txt 2>/dev/null
+            docker exec hdfs /opt/hadoop/bin/hdfs dfs -cat /test/hello.txt 2>/dev/null
             echo "::notice::HDFS Kerberos mount OK"
           else
             echo "::error::HDFS mount failed"
