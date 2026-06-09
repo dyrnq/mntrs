@@ -305,6 +305,15 @@ impl node_server::Node for NodeService {
         let volume_id = req.volume_id;
         let vol_ctx = req.volume_context;
 
+        if volume_id.is_empty() {
+            return Err(Status::invalid_argument("volume_id must not be empty"));
+        }
+        if staging_path.is_empty() {
+            return Err(Status::invalid_argument(
+                "staging_target_path must not be empty",
+            ));
+        }
+
         // Already mounted? Skip
         if is_mountpoint(&staging_path) {
             tracing::info!(volume_id, staging=%staging_path, "stage already mounted");
@@ -336,6 +345,12 @@ impl node_server::Node for NodeService {
         let req = request.into_inner();
         let staging_path = req.staging_target_path;
 
+        if staging_path.is_empty() {
+            return Err(Status::invalid_argument(
+                "staging_target_path must not be empty",
+            ));
+        }
+
         if is_mountpoint(&staging_path) {
             tracing::info!(staging=%staging_path, "unstaging FUSE mount");
             unmount_internal(&staging_path)
@@ -355,6 +370,13 @@ impl node_server::Node for NodeService {
         let volume_id = req.volume_id.clone();
         let vol_ctx = req.volume_context;
         let read_only = req.readonly;
+
+        if volume_id.is_empty() {
+            return Err(Status::invalid_argument("volume_id must not be empty"));
+        }
+        if target_path.is_empty() {
+            return Err(Status::invalid_argument("target_path must not be empty"));
+        }
 
         let storage = vol_ctx
             .get("storage")
