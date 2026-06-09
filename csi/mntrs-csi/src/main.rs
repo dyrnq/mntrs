@@ -331,11 +331,20 @@ impl node_server::Node for NodeService {
             let vol_cache = format!("{}/{}", cache_base, encode_volume_id(&storage_url));
             opts.insert("cache-dir".to_string(), vol_cache);
         }
-        mount_internal(&storage_url, &staging_path, &opts, read_only)
-            .map_err(|e| Status::internal(format!("stage mount failed: {e}")))?;
+        // FUSE mount blocks in session.run() — spawn on a dedicated OS thread
+        {
+            let su = storage_url.clone();
+            let sp = staging_path.clone();
+            let ro = read_only;
+            std::thread::spawn(move || {
+                if let Err(e) = mount_internal(&su, &sp, &opts, ro) {
+                    tracing::error!(error=%e, "stage FUSE mount thread failed");
+                }
+            });
+        }
 
         // Wait for mount to be ready
-        wait_for_mount(&staging_path, std::time::Duration::from_secs(10))?;
+        wait_for_mount(&staging_path, std::time::Duration::from_secs(30))?;
 
         Ok(Response::new(NodeStageVolumeResponse::default()))
     }
@@ -424,20 +433,31 @@ impl node_server::Node for NodeService {
         }
 
         #[cfg(not(windows))]
-        match mntrs::cmd::mount::mount_internal(&storage_url, &target_path, &opts, read_only) {
-            Ok(()) => {
-                let mut mounts = self.mounts.lock().unwrap();
-                mounts.insert(
-                    volume_id.clone(),
-                    MountState {
-                        storage_url: storage_url.clone(),
-                        mountpoint: target_path.clone(),
-                    },
-                );
-                tracing::info!(volume_id, storage=%storage_url, target=%target_path, "volume mounted");
-                Ok(Response::new(NodePublishVolumeResponse::default()))
-            }
-            Err(e) => Err(Status::internal(format!("mntrs mount failed: {e}"))),
+        {
+            let su = storage_url.clone();
+            let tp = target_path.clone();
+            let ro = read_only;
+            // FUSE mount blocks in session.run() — spawn on a dedicated OS thread
+            std::thread::spawn(move || {
+                if let Err(e) = mntrs::cmd::mount::mount_internal(&su, &tp, &opts, ro) {
+                    tracing::error!(error=%e, "publish FUSE mount thread failed");
+                }
+            });
+
+            // Wait for mount to appear
+            wait_for_mount(&target_path, std::time::Duration::from_secs(30))
+                .map_err(|e| Status::internal(format!("mount not ready: {e}")))?;
+
+            let mut mounts = self.mounts.lock().unwrap();
+            mounts.insert(
+                volume_id.clone(),
+                MountState {
+                    storage_url: storage_url.clone(),
+                    mountpoint: target_path.clone(),
+                },
+            );
+            tracing::info!(volume_id, storage=%storage_url, target=%target_path, "volume mounted");
+            Ok(Response::new(NodePublishVolumeResponse::default()))
         }
     }
 
