@@ -1,11 +1,11 @@
 # macOS CI — build + clippy + unit tests only.
 #
-# Limitations:
-#   - FUSE mount test skipped: macFUSE kext cannot be loaded in GH Actions
-#     (requires GUI approval in System Settings → Privacy & Security).
-#     Same limitation as WinFSP on Windows.
-#   - CSI build skipped: mntrs-csi is linux-only (depends on libfuse).
-#   - Build + clippy + unit tests still provide good platform coverage.
+# macFUSE is installed for its libfuse headers (needed by fuser crate at
+# compile time), but the kernel extension cannot be loaded in GH Actions
+# (requires GUI approval in System Settings → Privacy & Security).
+# Same limitation as WinFSP on Windows.
+#
+# CSI build skipped: mntrs-csi is linux-only.
 #
 name: CI - macOS
 
@@ -32,8 +32,9 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install protobuf
-        run: brew install protobuf
+      - name: Install FUSE + protobuf
+        run: |
+          brew install --cask macfuse && brew install protobuf
 
       - name: Format check
         run: cargo fmt --all -- --check
