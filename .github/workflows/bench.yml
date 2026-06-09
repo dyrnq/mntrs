@@ -42,9 +42,11 @@ jobs:
         run: |
           CONTAINER=$(docker ps -q -f ancestor=minio/minio | head -1)
           if [ -n "$CONTAINER" ]; then
-            docker exec "$CONTAINER" mc alias set bench http://localhost:9000 minioadmin minioadmin
-            docker exec "$CONTAINER" mc mb --ignore-existing bench/test-bucket
-            docker exec "$CONTAINER" mc cp /tmp/hello.txt bench/test-bucket/ 2>/dev/null
+            for i in $(seq 1 5); do
+              docker exec "$CONTAINER" mc alias set bench http://localhost:9000 minioadmin minioadmin 2>/dev/null && break
+              sleep 2
+            done
+            docker exec "$CONTAINER" mc mb --ignore-existing bench/test-bucket 2>/dev/null
           fi
           echo "test" > /tmp/hello.txt
 
