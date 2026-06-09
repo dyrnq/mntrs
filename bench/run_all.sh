@@ -84,15 +84,15 @@ mkdir -p "$MNTRS_MNT" "$RCLONE_MNT"
 # rclone mount (writes cache mode for fair comparison)
 rclone mount --daemon --vfs-cache-mode=writes --vfs-write-back=5s \
     :s3,provider=Minio,access_key_id=$ACCESS_KEY,secret_access_key=$SECRET_KEY,endpoint=$ENDPOINT,region=$REGION:$BUCKET \
-    "$RCLONE_MNT" 2>/dev/null
+    "$RCLONE_MNT"
 
 sleep 3
-if mountpoint -q "$MNTRS_MNT" 2>/dev/null; then
+if mountpoint -q "$MNTRS_MNT"; then
   echo "  mntrs mount: OK"
 else
   echo "  mntrs mount: FAILED (check errors above)"
 fi
-if mountpoint -q "$RCLONE_MNT" 2>/dev/null; then
+if mountpoint -q "$RCLONE_MNT"; then
   echo "  rclone mount: OK"
 else
   echo "  rclone mount: FAILED"
