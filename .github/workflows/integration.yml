@@ -60,7 +60,7 @@ jobs:
           # Run csi-sanity (non-zero exit is expected — known unimplemented CSI methods)
           "$CSI_SANITY" --csi.endpoint=unix:///tmp/csi.sock \
             --csi.testvolumeparameters=/tmp/csi-test-params.yaml \
-            --ginkgo.focus='NodePublishVolume|NodeUnpublishVolume|GetPluginInfo|Probe' --ginkgo.skip='remove target path' \
+            --ginkgo.focus='NodePublishVolume|NodeUnpublishVolume|GetPluginInfo|Probe' \
             2>&1
           CSI_EXIT=$?
           if [ $CSI_EXIT -ne 0 ]; then
