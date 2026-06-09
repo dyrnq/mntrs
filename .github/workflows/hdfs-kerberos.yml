@@ -77,7 +77,7 @@ jobs:
           }
           sudo tar xzf /tmp/hadoop.tgz -C /opt/
           sudo chown -R $(whoami) /opt/hadoop-${HADOOP_VER}
-          sudo ln -sf /opt/hadoop-${HADOOP_VER} /opt/hadoop 2>/dev/null || true
+          sudo ln -sf /opt/hadoop-${HADOOP_VER} /opt/hadoop 2>/dev/null
           echo "HADOOP_HOME=/opt/hadoop" >> $GITHUB_ENV
           echo "/opt/hadoop/bin" >> $GITHUB_PATH
           # Configure pseudo-distributed mode
@@ -123,9 +123,9 @@ jobs:
         run: |
           export HADOOP_CONF_DIR=/opt/hadoop/etc/hadoop
           echo "HDFS NameNode: $HDFS_NAMENODE_ADDR"
-          /opt/hadoop/bin/hdfs dfs -mkdir -p /test || true
-          echo "hello hdfs" | /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt || true
-          /opt/hadoop/bin/hdfs dfs -ls /test || true
+          /opt/hadoop/bin/hdfs dfs -mkdir -p /test
+          echo "hello hdfs" | /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt
+          /opt/hadoop/bin/hdfs dfs -ls /test
 
       - name: Test mntrs HDFS mount (Kerberos)
         run: |
