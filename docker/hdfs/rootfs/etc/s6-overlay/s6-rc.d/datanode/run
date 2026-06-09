@@ -1,0 +1,5 @@
+#!/usr/bin/with-contenv bash
+export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+export HADOOP_HOME=/opt/hadoop
+export HADOOP_OPTS="-Djava.security.krb5.conf=/etc/krb5.conf"
+exec /opt/hadoop/bin/hdfs --daemon start datanode && sleep infinity
