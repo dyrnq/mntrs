@@ -47,8 +47,8 @@ jobs:
 
       - name: Smoke test — memory mount + read/write
         run: |
-          rmdir C:\mntrs-test 2>$null || $true
-          mkdir C:\mntrs-test
+          if (Test-Path C:\mntrs-test) { rmdir C:\mntrs-test }
+          New-Item -ItemType Directory -Force -Path C:\mntrs-test | Out-Null
           ./target/release/mntrs.exe mount memory:// C:\mntrs-test 2>&1
           if ($LASTEXITCODE -eq 0) {
             echo "hello from windows" > C:\mntrs-test\test.txt
