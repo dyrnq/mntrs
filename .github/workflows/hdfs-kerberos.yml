@@ -131,4 +131,8 @@ jobs:
       packages: write
     steps:
       - name: Delete test image from GHCR
-        run: echo "Deleting ghcr.io/${{ github.repository_owner }}/mntrs-hdfs:ci-test-${{ github.sha }}"
+        run: |
+          # Use gh CLI to delete package version
+          echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token 2>/dev/null || true
+          gh api --method DELETE \
+            "/orgs/${{ github.repository_owner }}/packages/container/mntrs-hdfs:ci-test-${{ github.sha }}" 2>/dev/null || echo "Image cleanup skipped"

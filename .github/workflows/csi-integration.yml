@@ -154,4 +154,7 @@ jobs:
     steps:
       - name: Delete test image from GHCR
         run: |
-          echo "Deleting image: ghcr.io/${{ github.repository_owner }}/mntrs-csi:ci-test-${{ github.sha }}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token 2>/dev/null || true
+          gh api --method DELETE \
+            "/orgs/${{ github.repository_owner }}/packages/container/mntrs-csi/versions" \
+            2>/dev/null || echo "Image cleanup skipped"
