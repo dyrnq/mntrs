@@ -637,6 +637,7 @@ pub fn mount(
     }
 
     // Foreground / daemon-wait: called from CSI or interactive use, return control.
+    #[cfg(not(windows))]
     if let Some((r, w)) = wait_pipe {
         unsafe {
             rustix::io::close(w);
