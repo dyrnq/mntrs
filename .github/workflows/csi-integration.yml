@@ -112,11 +112,19 @@ jobs:
           sleep 5
           MNTRS_PID=$!
           sleep 5
-          if kill -0 $MNTRS_PID 2>/dev/null && mount | grep -q /mnt/mntrs-test; then
+          if kill -0 $MNTRS_PID 2>/dev/null; then
+            if mount | grep -q /mnt/mntrs-test; then
             ls /mnt/mntrs-test/ 2>&1 && echo "✅ ${{ matrix.test.name }} mount works"
           else
             echo "::error::${{ matrix.test.name }} mount failed"
-            mount | grep mntrs || true
+            fi
+            else
+              echo "::error::mount not found in mount table"
+              mount | grep mntrs || true
+              exit 1
+            fi
+          else
+            echo "::error::mntrs process died"
             exit 1
           fi
           sudo fusermount3 -u /mnt/mntrs-test 2>/dev/null

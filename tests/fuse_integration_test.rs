@@ -49,15 +49,14 @@ fn mntrs_mount(read_only: bool) {
     let mut child = cmd.spawn().expect("mntrs mount failed to start");
     thread::sleep(Duration::from_secs(5));
 
-    // Verify mount — use mountpoint command (more reliable on CI)
-    let mounted = std::process::Command::new("mountpoint")
-        .arg("-q")
-        .arg(MNTRS_MNT)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !mounted {
+    // Verify mount — use mount | grep (works even if /etc/mtab is stale)
+    let output = std::process::Command::new("mount")
+        .output()
+        .expect("mount command failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.contains(MNTRS_MNT) {
         let _ = child.kill();
+        eprintln!("mount output: {}", stdout);
         panic!("mntrs mount did not appear in mount table");
     }
 
