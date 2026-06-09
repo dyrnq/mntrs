@@ -24,7 +24,8 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 opendal = { version = "0.57", features = ["services-s3", "services-gcs", "services-azblob", "services-hdfs-native", "services-webhdfs", "services-oss", "services-cos", "services-obs", "services-b2", "services-vercel-blob", "services-aliyun-drive", "services-fs", "services-memory", "services-webdav"] }
 
 
-[target.'cfg(target_os = "linux")'.dependencies]
+
+[target.'cfg(unix)'.dependencies]
 fuser = "0.17"
 
 [target.'cfg(windows)'.dependencies]
