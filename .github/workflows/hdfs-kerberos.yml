@@ -104,7 +104,7 @@ jobs:
         run: |
           kinit -kt /tmp/testuser.keytab testuser@TEST.LOCAL
           klist
-          sudo mkdir -p /mnt/hdfs mkdir -p /mnt/hdfsmkdir -p /mnt/hdfs sudo chmod 777 /mnt/hdfs
+          sudo mkdir -p /mnt/hdfs && sudo chmod 777 /mnt/hdfs
           ./target/release/mntrs mount hdfs://localhost:8020/ /mnt/hdfs \
             --read-only --daemon --daemon-wait --daemon-timeout=15 2>&1
           sleep 3
