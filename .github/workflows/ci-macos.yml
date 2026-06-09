@@ -43,6 +43,7 @@ jobs:
 
       - name: Smoke test — memory mount + read/write
         run: |
+          trap 'fusermount -u /tmp/mntrs-macos-test 2>/dev/null; umount /tmp/mntrs-macos-test 2>/dev/null' EXIT
           mkdir -p /tmp/mntrs-macos-test
           ./target/release/mntrs mount memory:// /tmp/mntrs-macos-test --volname mntrs-test 2>&1 &
           sleep 5
@@ -50,4 +51,3 @@ jobs:
           cat /tmp/mntrs-macos-test/test.txt
           ls -la /tmp/mntrs-macos-test/
           echo "macOS memory mount read/write OK"
-          fusermount -u /tmp/mntrs-macos-test 2>/dev/null || umount /tmp/mntrs-macos-test 2>/dev/null
