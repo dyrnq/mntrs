@@ -46,7 +46,7 @@ jobs:
 
       - name: Smoke test — memory mount + read/write
         run: |
-          rm -rf /c/mntrs-test 2>/dev/null || true
+          rm -rf /c/mntrs-test 2>/dev/null; true
           mkdir -p /c/mntrs-test
           ./target/release/mntrs.exe mount memory:// C:/mntrs-test
           echo "hello from windows" > /c/mntrs-test/test.txt
