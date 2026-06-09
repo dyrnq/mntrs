@@ -888,10 +888,6 @@ impl Filesystem for MntrsFs {
         mut reply: ReplyDirectory,
     ) {
         let ino: u64 = ino.into();
-        if ino != FUSE_ROOT_INO {
-            reply.error(Errno::ENOENT);
-            return;
-        }
         let path = self.resolve(ino).map(|(p, _, _, _)| p).unwrap_or_default();
         let mut entries: Vec<(String, FileType, u64, Option<SystemTime>)> = vec![
             (".".to_string(), FileType::Directory, 4096, None),
@@ -941,10 +937,6 @@ impl Filesystem for MntrsFs {
         mut reply: ReplyDirectoryPlus,
     ) {
         let ino: u64 = ino.into();
-        if ino != FUSE_ROOT_INO {
-            reply.error(Errno::ENOENT);
-            return;
-        }
         let path = self.resolve(ino).map(|(p, _, _, _)| p).unwrap_or_default();
         let mut entries: Vec<(String, FileType, u64, Option<SystemTime>)> = vec![
             (".".to_string(), FileType::Directory, 4096, None),
