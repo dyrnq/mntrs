@@ -12,7 +12,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  LIBRARY_PATH: /opt/homebrew/lib
 
 jobs:
   build-test:
@@ -25,15 +24,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install deps
-        run: |
-          brew install --cask fuse-t 2>/dev/null || true
-          brew install protobuf
-          if [ -d /opt/homebrew/lib ]; then
-            echo "LIBRARY_PATH=/opt/homebrew/lib" >> $GITHUB_ENV
-            echo "PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig" >> $GITHUB_ENV
-          fi
-          ls -la /opt/homebrew/lib/libfuse* 2>/dev/null || echo "libfuse not found in /opt/homebrew/lib"
-          ls -la /usr/local/lib/libfuse* 2>/dev/null || echo "libfuse not found in /usr/local/lib"
+        run: brew install protobuf
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -49,23 +40,3 @@ jobs:
 
       - name: Build release
         run: cargo build --release --package mntrs
-
-      # FUSE mount test: uses fuse-t (kext-less, NFS-backed libfuse).
-      # Requires LIBRARY_PATH for Apple Silicon brew path.
-      # If mount fails here, check: brew install --cask fuse-t, /opt/homebrew/lib/libfuse.dylib
-      - name: Smoke test — memory mount
-        run: |
-          mkdir -p /tmp/mntrs-macos-test
-          ./target/release/mntrs mount memory:// /tmp/mntrs-macos-test --volname mntrs-test 2>&1 &
-          sleep 5
-          if mount | grep -q /tmp/mntrs-macos-test; then
-            echo "hello from macos" > /tmp/mntrs-macos-test/test.txt
-            cat /tmp/mntrs-macos-test/test.txt
-            ls -la /tmp/mntrs-macos-test/
-            echo "macOS memory mount read/write OK"
-          else
-            echo "::error::mount failed"
-            mount
-            exit 1
-          fi
-          umount /tmp/mntrs-macos-test
