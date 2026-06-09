@@ -28,7 +28,7 @@ pub fn to_native(p: &str) -> String {
 /// 将 Windows 盘符（如 `X:`）解析为 mount 目标。
 /// 返回 `DriveLetter('X')` 或 `NtfsDirectory(path)`。
 #[cfg(windows)]
-pub fn parse_windows_target(target: &str) -> std::io::Result<winfsp::host::MountPoint> {
+pub fn parse_windows_target(target: &str) -> std::io::Result<winfsp::host::MountPoint<'_>> {
     use winfsp::host::MountPoint;
     let t = target.trim();
     if t.len() == 2 && t.as_bytes()[1] == b':' {
