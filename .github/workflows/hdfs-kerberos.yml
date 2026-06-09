@@ -36,75 +36,42 @@ jobs:
   hdfs-kerberos:
     needs: build-hdfs-image
     runs-on: ubuntu-latest
-    services:
-      kdc:
-        image: gcavalcante8808/krb5-server:latest
-        env:
-          KRB5_REALM: TEST.LOCAL
-          KRB5_KDC: kdc
-          KRB5_PASS: adminpass
-        ports:
-          - 88:88
-          - 749:749
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y krb5-user libfuse3-dev fuse3 default-jdk
+        run: sudo apt-get update && sudo apt-get install -y krb5-user libfuse3-dev fuse3
 
-      - name: Configure Kerberos
-        run: |
-          cat | sudo tee /etc/krb5.conf << 'KRB5'
-          [libdefaults]
-            default_realm = TEST.LOCAL
-            udp_preference_limit = 1
-          [realms]
-            TEST.LOCAL = {
-              kdc = kdc
-              admin_server = kdc
-            }
-          KRB5
-          echo "127.0.0.1 kdc" | sudo tee -a /etc/hosts
-
-      - name: Create principals via Docker exec
-        run: |
-          CONTAINER=$(docker ps -q -f ancestor=gcavalcante8808/krb5-server)
-          docker exec "$CONTAINER" kadmin.local -q "addprinc -randkey hdfs/localhost@TEST.LOCAL"
-          docker exec "$CONTAINER" kadmin.local -q "addprinc -randkey testuser@TEST.LOCAL"
-          docker exec "$CONTAINER" kadmin.local -q "ktadd -k /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL"
-          docker exec "$CONTAINER" kadmin.local -q "ktadd -k /tmp/testuser.keytab testuser@TEST.LOCAL"
-          docker cp "$CONTAINER":/tmp/hdfs.keytab /tmp/
-          docker cp "$CONTAINER":/tmp/testuser.keytab /tmp/
-
-      # Start the pre-built HDFS Kerberos Docker image (s6-overlay: KDC + NameNode + DataNode).
-      # Image is built and pushed to GHCR in the build-hdfs-image job above.
-      # Keytab and krb5.conf are mounted from the runner (created by external KDC container).
-      # Resolve KDC container IP for the HDFS container to reach it.
-      # kdc service container and hdfs container are on different Docker
-      # networks, so 127.0.0.1 inside hdfs points to itself, not the host.
+      # HDFS image has its own KDC (krb5-kdc), pre-created principals,
+      # and keytabs. Just start it, extract keytabs, and configure runner.
       - name: Start HDFS container
         run: |
-          KDC_CONTAINER=$(docker ps -q -f ancestor=gcavalcante8808/krb5-server)
-          KDC_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$KDC_CONTAINER")
-          echo "KDC container IP: $KDC_IP"
-          docker run -d --name hdfs \
-            --add-host "kdc:${KDC_IP}" \
-            -v /tmp/hdfs.keytab:/tmp/hdfs.keytab:ro \
-            -v /tmp/testuser.keytab:/tmp/testuser.keytab:ro \
-            -v /etc/krb5.conf:/etc/krb5.conf:ro \
-            -p 8020:8020 \
-            ${{ needs.build-hdfs-image.outputs.image }}
+          docker run -d --name hdfs             -p 8020:8020 -p 88:88 -p 749:749             ${{ needs.build-hdfs-image.outputs.image }}
+
           # Wait for NameNode + DataNode
-          for i in $(seq 1 15); do
+          for i in $(seq 1 20); do
             if docker exec hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>/dev/null | grep -q "Live datanodes"; then
               echo "HDFS ready"
               break
             fi
+            echo "Waiting for HDFS... ($i/20)"
             sleep 5
           done
-          docker logs hdfs 2>&1 | tail -10
+          docker logs hdfs 2>&1 | tail -15
+
+          # Extract keytabs from HDFS image (pre-created during build)
+          docker cp hdfs:/tmp/testuser.keytab /tmp/testuser.keytab
+          docker cp hdfs:/tmp/hdfs.keytab /tmp/hdfs.keytab
+          docker cp hdfs:/etc/krb5.conf /tmp/krb5.conf
+          echo "172.17.0.1 kdc" | sudo tee -a /etc/hosts
+
+      - name: Configure Kerberos on runner
+        run: |
+          sudo cp /tmp/krb5.conf /etc/krb5.conf
+          kinit -kt /tmp/testuser.keytab testuser@TEST.LOCAL
+          klist
 
       - name: Build mntrs
         run: cargo build --release -p mntrs
@@ -148,7 +115,6 @@ jobs:
     steps:
       - name: Delete test image from GHCR
         run: |
-          # Use gh CLI to delete package version
           echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token 2>/dev/null || true
           gh api --method DELETE \
             "/orgs/${{ github.repository_owner }}/packages/container/mntrs-hdfs:ci-test-${{ github.sha }}" 2>/dev/null || echo "Image cleanup skipped"
