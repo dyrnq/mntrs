@@ -56,7 +56,7 @@ jobs:
           echo "hello minio" > /tmp/test.txt
           # Verify mount works
           ls /mnt/s3-test/ 2>&1 && echo "✅ S3 mount works" || echo "::warning::S3 mount empty (MinIO container may not be ready)"
-          sudo fusermount3 -u /mnt/s3-test 2>/dev/null
+          sudo fusermount3 -u /mnt/s3-test 2>/dev/null || true
 
   csi-k3s-hdfs:
     runs-on: ubuntu-latest
@@ -113,7 +113,7 @@ jobs:
           timeout 10 ./target/release/mntrs mount hdfs://localhost:8020/ /mnt/hdfs-test --read-only 2>&1 &
           sleep 5
           ls /mnt/hdfs-test/ 2>/dev/null && echo "✅ HDFS mount works" || echo "::warning::HDFS mount may be empty (fresh cluster)"
-          sudo fusermount3 -u /mnt/hdfs-test 2>/dev/null
+          sudo fusermount3 -u /mnt/hdfs-test 2>/dev/null || true
 
       - name: CSI k3s smoke test
         run: |
@@ -144,5 +144,5 @@ jobs:
         if: always()
         run: |
           kubectl delete pod mntrs-csi-test --ignore-not-found
-          sudo fusermount3 -u /mnt/hdfs-test 2>/dev/null
-          pkill -f 'hdfs\|simple' 2>/dev/null || true
+          sudo fusermount3 -u /mnt/hdfs-test 2>/dev/null || true
+          pkill -f 'hdfs\|simple' 2>/dev/null; true
