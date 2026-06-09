@@ -110,10 +110,14 @@ jobs:
           echo "export JAVA_HOME=$(readlink -f /usr/bin/java | sed s:/bin/java::)" | sudo tee -a /opt/hadoop/etc/hadoop/hadoop-env.sh > /dev/null
           echo "export HADOOP_OPTS=-Djava.security.krb5.conf=/etc/krb5.conf" | sudo tee -a /opt/hadoop/etc/hadoop/hadoop-env.sh > /dev/null
           # Setup passwordless SSH for localhost
+          chmod g-w $HOME
+          chmod o-w $HOME
           ssh-keygen -t rsa -P "" -f ~/.ssh/id_rsa
           cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
           chmod 600 ~/.ssh/authorized_keys
           ssh-keyscan -H localhost >> ~/.ssh/known_hosts
+          eval $(ssh-agent)
+          ssh-add ~/.ssh/id_rsa
           # Format Namenode
           /opt/hadoop/bin/hdfs namenode -format -force 2>&1 | tail -1
           # Start HDFS with Kerberos
