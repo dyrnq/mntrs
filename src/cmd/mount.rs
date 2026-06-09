@@ -632,7 +632,7 @@ pub fn mount(
         let mut host: winfsp::host::FileSystemHost<_, winfsp::host::FineGuard> =
             winfsp::host::FileSystemHost::new(vol_params, adapter)
                 .map_err(|e| anyhow::anyhow!("FileSystemHost::new: {e}"))?;
-        let _mp = host
+        let _ = host
             .mount(mountpoint)
             .map_err(|e| anyhow::anyhow!("host.mount: {e}"))?;
     }

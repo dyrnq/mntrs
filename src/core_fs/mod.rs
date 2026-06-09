@@ -169,12 +169,7 @@ pub mod test_helpers {
     pub fn mount_winfsp<F: CoreFilesystem + 'static>(fs: Arc<F>) -> std::io::Result<MountGuard<F>> {
         let adapter = WinFspAdapter::new(fs);
         let mut host = FileSystemHost::new(winfsp::host::VolumeParams::default(), adapter)
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("FileSystemHost::new: {e}"),
-                )
-            })?;
+            .map_err(|e| std::io::Error::other(format!("FileSystemHost::new: {e}")))?;
         let _ = host
             .mount(MountPoint::NextFreeDrive)
             .map_err(|e| std::io::Error::other(format!("host.mount: {e}")))?;
