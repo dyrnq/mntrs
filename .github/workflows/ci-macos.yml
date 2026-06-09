@@ -24,7 +24,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install FUSE
-        run: brew install --cask macfuse brew install --cask macfuse protobufbrew install --cask macfuse protobuf brew install protobuf
+        run: |
+          brew install --cask macfuse && brew install protobuf
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -47,13 +48,19 @@ jobs:
       - name: Smoke test — memory mount + read/write
         run: |
           mkdir -p /tmp/mntrs-macos-test
-          cargo run --release -- mount memory:// /tmp/mntrs-macos-test --volname mntrs-test 2>&1 &
+          ./target/release/mntrs mount memory:// /tmp/mntrs-macos-test --volname mntrs-test 2>&1 &
           MNTRS_PID=$!
           sleep 5
+          # Verify mount actually succeeded
+          if ! mount | grep -q /tmp/mntrs-macos-test; then
+            echo "::error::mount did not succeed — mount table:"
+            mount
+            exit 1
+          fi
           echo "hello from macos" > /tmp/mntrs-macos-test/test.txt
           cat /tmp/mntrs-macos-test/test.txt
           ls -la /tmp/mntrs-macos-test/
           echo "macOS memory mount read/write OK"
-          kill $MNTRS_PID 2>/dev/null
+          kill $MNTRS_PID
           sleep 2
-          fusermount -u /tmp/mntrs-macos-test 2>/dev/null || umount /tmp/mntrs-macos-test 2>/dev/null || true
+          umount /tmp/mntrs-macos-test 2>/dev/null || diskutil unmount /tmp/mntrs-macos-test 2>/dev/null || true

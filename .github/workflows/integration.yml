@@ -31,25 +31,31 @@ jobs:
 
       - name: Start CSI driver + run csi-sanity
         run: |
-          # Locate csi-sanity binary
-          go install github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@latest 2>/dev/null &&             CSI_SANITY="$(go env GOPATH)/bin/csi-sanity" || {
-              curl -sSL https://github.com/kubernetes-csi/csi-test/releases/download/v5.3.1/csi-sanity-v5.3.1-linux-amd64.tar.gz | tar xz
-              CSI_SANITY=""$CSI_SANITY""
-            }
-          [ -x "$CSI_SANITY" ] || { echo "::warning::csi-sanity not available"; exit 0; }
-          # Build csi-sanity from source
-          go install github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@latest 2>/dev/null || \
-            curl -sSL https://github.com/kubernetes-csi/csi-test/releases/download/v5.3.1/csi-sanity-v5.3.1-linux-amd64.tar.gz | tar xz
-          
+          # Download csi-sanity (try go install, fallback to prebuilt binary)
+          CSI_SANITY=""
+          if go install github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@latest; then
+            CSI_SANITY="$(go env GOPATH)/bin/csi-sanity"
+          elif curl -sSL https://github.com/kubernetes-csi/csi-test/releases/download/v5.3.1/csi-sanity-v5.3.1-linux-amd64.tar.gz | tar xz; then
+            CSI_SANITY="./csi-sanity"
+          fi
+          if [ ! -x "$CSI_SANITY" ]; then
+            echo "::error::csi-sanity not available (go install and curl both failed)"
+            exit 1
+          fi
+
           # Start mntrs-csi
           ./target/release/mntrs-csi --endpoint unix:///tmp/csi.sock &
           CSI_PID=$!
           sleep 3
 
-          # Run csi-sanity
+          # Run csi-sanity (non-zero exit is expected — known unimplemented CSI methods)
           "$CSI_SANITY" --csi.endpoint=unix:///tmp/csi.sock \
             --csi.testvolumeparameters="storage=memory://,readOnly=true" \
             --ginkgo.focus='NodePublishVolume|NodeUnpublishVolume|GetPluginInfo|Probe' \
-            2>&1 || echo "::warning::csi-sanity has known failures (CSI driver unimplemented methods)"
+            2>&1
+          CSI_EXIT=$?
+          if [ $CSI_EXIT -ne 0 ]; then
+            echo "::warning::csi-sanity exited $CSI_EXIT (known: CSI driver unimplemented methods)"
+          fi
 
           kill $CSI_PID
