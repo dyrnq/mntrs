@@ -44,7 +44,7 @@ jobs:
 
       - name: Test S3 mount via mntrs
         run: |
-          sudo mkdir -p /mnt/s3-test
+          sudo mkdir -p /mnt/s3-test && sudo chmod 777 /mnt/s3-test
           timeout 10 ./target/release/mntrs mount s3://test-bucket /mnt/s3-test \
             --opt endpoint=http://localhost:9000 \
             --opt access-key=minioadmin \
@@ -109,7 +109,7 @@ jobs:
 
       - name: Test mntrs HDFS mount (simple auth)
         run: |
-          sudo mkdir -p /mnt/hdfs-test
+          sudo mkdir -p /mnt/hdfs-test && sudo chmod 777 /mnt/hdfs-test
           timeout 10 ./target/release/mntrs mount hdfs://localhost:8020/ /mnt/hdfs-test --read-only 2>&1 &
           sleep 5
           ls /mnt/hdfs-test/ 2>/dev/null && echo "✅ HDFS mount works" || echo "::warning::HDFS mount may be empty (fresh cluster)"
