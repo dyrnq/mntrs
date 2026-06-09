@@ -81,10 +81,16 @@ jobs:
       # Start the pre-built HDFS Kerberos Docker image (s6-overlay: KDC + NameNode + DataNode).
       # Image is built and pushed to GHCR in the build-hdfs-image job above.
       # Keytab and krb5.conf are mounted from the runner (created by external KDC container).
+      # Resolve KDC container IP for the HDFS container to reach it.
+      # kdc service container and hdfs container are on different Docker
+      # networks, so 127.0.0.1 inside hdfs points to itself, not the host.
       - name: Start HDFS container
         run: |
+          KDC_CONTAINER=$(docker ps -q -f ancestor=gcavalcante8808/krb5-server)
+          KDC_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$KDC_CONTAINER")
+          echo "KDC container IP: $KDC_IP"
           docker run -d --name hdfs \
-            --add-host kdc:127.0.0.1 \
+            --add-host "kdc:${KDC_IP}" \
             -v /tmp/hdfs.keytab:/tmp/hdfs.keytab:ro \
             -v /tmp/testuser.keytab:/tmp/testuser.keytab:ro \
             -v /etc/krb5.conf:/etc/krb5.conf:ro \
