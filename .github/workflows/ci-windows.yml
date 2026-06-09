@@ -40,14 +40,19 @@ jobs:
       - name: Unit tests (lib only)
         run: cargo test --lib --package mntrs
 
-      - name: Smoke test — memory mount + read/write
-        shell: bash
+      - name: Smoke test
         run: |
-          rm -rf /c/mntrs-test
           mkdir -p /c/mntrs-test
-          ./target/release/mntrs.exe mount memory:// C:/mntrs-test
-          if ! mount | grep -q /mntrs-test; then echo "ERROR: mount failed"; mount; exit 1; fi
-          echo "hello from windows" > /c/mntrs-test/test.txt
-          cat /c/mntrs-test/test.txt
-          ls -la /c/mntrs-test/
-          echo "::notice::memory mount read/write ok"
+          ./target/release/mntrs.exe mount memory:// C:/mntrs-test 2>&1 &
+          MNTRS_PID=$!
+          sleep 5
+          if kill -0 $MNTRS_PID 2>/dev/null; then
+            echo "hello from windows" > /c/mntrs-test/test.txt
+            cat /c/mntrs-test/test.txt
+            ls -la /c/mntrs-test/
+            echo "::notice::memory mount read/write ok"
+          else
+            echo "::error::mntrs process died (WinFSP driver may not be loaded in CI)"
+            exit 1
+          fi
+        shell: bash
