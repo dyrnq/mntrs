@@ -116,8 +116,15 @@ jobs:
           export HDFS_DATANODE_USER=$(whoami)
           export HDFS_SECONDARYNAMENODE_USER=$(whoami)
           /opt/hadoop/sbin/start-dfs.sh 2>&1
+          # Dump NameNode log for debugging
+          echo "=== NameNode log ==="
+          cat /opt/hadoop/logs/hadoop-*-namenode-*.log 2>&1 | tail -30 || echo "No NameNode log"
+          echo "=== DataNode log ==="
+          cat /opt/hadoop/logs/hadoop-*-datanode-*.log 2>&1 | tail -10 || echo "No DataNode log"
           # Wait for NameNode to be ready (up to 60s)
           for i in $(seq 1 12); do
+            echo "Check $i: dfsadmin -report..."
+            /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | head -10
             if /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | grep -q "Live datanodes"; then
               echo "HDFS ready after ${i}x5s"
               break
