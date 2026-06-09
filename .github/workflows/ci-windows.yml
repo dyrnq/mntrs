@@ -41,6 +41,7 @@ jobs:
         run: cargo test --lib --package mntrs
 
       - name: Smoke test — memory mount + read/write
+        shell: bash
         run: |
           rm -rf /c/mntrs-test
           mkdir -p /c/mntrs-test
