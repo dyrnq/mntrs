@@ -78,7 +78,7 @@ jobs:
       - name: Build mntrs + CSI
         run: cargo build --release -p mntrs -p mntrs-csi
 
-      - name: Start MiniDFS (simple auth)
+      - name: Start hdfs-native (simple auth)
         run: |
           # Start a single-node HDFS in background
           cat > /tmp/hdfs-site.xml << 'XML'
@@ -100,13 +100,13 @@ jobs:
             echo "HDFS started on localhost:8020"
           else
             echo "hdfs CLI not available, building from hdfs-native test"
-            # Build minidfs from hdfs-native crate
+            # Build hdfs-native simple example
             git clone --depth 1 https://github.com/Kimahriman/hdfs-native.git /tmp/hdfs-native
             cd /tmp/hdfs-native
             cargo build --release --example simple
             target/release/examples/simple &
             sleep 5
-            echo "MiniDFS started"
+            echo "hdfs-native started"
           fi
 
       - name: Test mntrs HDFS mount (simple auth)
@@ -147,4 +147,4 @@ jobs:
         run: |
           kubectl delete pod mntrs-csi-test --ignore-not-found
           sudo fusermount3 -u /mnt/hdfs-test 2>/dev/null || true
-          pkill -f 'hdfs\|minidfs' 2>/dev/null || true
+          pkill -f 'hdfs\|simple' 2>/dev/null || true
