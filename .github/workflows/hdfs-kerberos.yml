@@ -1,6 +1,5 @@
 name: HDFS Kerberos Integration
 
-
 permissions:
   contents: read
 
@@ -12,7 +11,30 @@ on:
   workflow_dispatch:
 
 jobs:
+
+  build-hdfs-image:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    outputs:
+      image: ghcr.io/${{ github.repository_owner }}/mntrs-hdfs:ci-test-${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push HDFS image
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/hdfs
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/mntrs-hdfs:ci-test-${{ github.sha }}
+
   hdfs-kerberos:
+    needs: build-hdfs-image
     runs-on: ubuntu-latest
     services:
       kdc:
@@ -30,7 +52,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y krb5-user libgssapi-krb5-2 libfuse3-dev fuse3 default-jdk openssh-server openssh-client
+        run: sudo apt-get update && sudo apt-get install -y krb5-user libfuse3-dev fuse3 default-jdk
 
       - name: Configure Kerberos
         run: |
@@ -40,139 +62,73 @@ jobs:
             udp_preference_limit = 1
           [realms]
             TEST.LOCAL = {
-              kdc = 127.0.0.1
-              admin_server = 127.0.0.1
+              kdc = kdc
+              admin_server = kdc
             }
           KRB5
-          # Add KDC to hosts
           echo "127.0.0.1 kdc" | sudo tee -a /etc/hosts
 
       - name: Create principals via Docker exec
         run: |
-          KDC_CID=$(docker ps -q -f ancestor=gcavalcante8808/krb5-server)
-          docker exec $KDC_CID kadmin.local -q "addprinc -randkey hdfs/localhost@TEST.LOCAL"
-          docker exec $KDC_CID kadmin.local -q "addprinc -randkey testuser@TEST.LOCAL"
-          docker exec $KDC_CID kadmin.local -q "addprinc -randkey HTTP/localhost@TEST.LOCAL"
-          docker exec $KDC_CID kadmin.local -q "ktadd -k /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL"
-          docker exec $KDC_CID kadmin.local -q "ktadd -k /tmp/hdfs.keytab HTTP/localhost@TEST.LOCAL"
-          docker exec $KDC_CID kadmin.local -q "ktadd -k /tmp/testuser.keytab testuser@TEST.LOCAL"
-          docker cp $KDC_CID:/tmp/hdfs.keytab /tmp/
-          docker cp $KDC_CID:/tmp/testuser.keytab /tmp/
+          CONTAINER=$(docker ps -q -f ancestor=gcavalcante8808/krb5-server)
+          docker exec "$CONTAINER" kadmin.local -q "addprinc -randkey hdfs/localhost@TEST.LOCAL"
+          docker exec "$CONTAINER" kadmin.local -q "addprinc -randkey testuser@TEST.LOCAL"
+          docker exec "$CONTAINER" kadmin.local -q "ktadd -k /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL"
+          docker exec "$CONTAINER" kadmin.local -q "ktadd -k /tmp/testuser.keytab testuser@TEST.LOCAL"
+          docker cp "$CONTAINER":/tmp/hdfs.keytab /tmp/
+          docker cp "$CONTAINER":/tmp/testuser.keytab /tmp/
 
-      - name: kinit + verify
+      - name: Start HDFS container
         run: |
-          kinit -kt /tmp/testuser.keytab testuser@TEST.LOCAL
-          klist
-
-      - name: Build mntrs (with HDFS)
-        run: cargo build --release -p mntrs --features hdfs-jni
-
-      - name: Setup Hadoop single-node
-        run: |
-          HADOOP_VER="3.3.6"
-          HADOOP_URL="https://dlcdn.apache.org/hadoop/common/hadoop-${HADOOP_VER}/hadoop-${HADOOP_VER}.tar.gz"
-          echo "Downloading Hadoop ${HADOOP_VER}..."
-          curl -sL --retry 3 "$HADOOP_URL" -o /tmp/hadoop.tgz || {
-            echo "::warning::Apache CDN failed, trying mirror..."
-            curl -sL --retry 3 "https://archive.apache.org/dist/hadoop/common/hadoop-${HADOOP_VER}/hadoop-${HADOOP_VER}.tar.gz" -o /tmp/hadoop.tgz
-          }
-          sudo tar xzf /tmp/hadoop.tgz -C /opt/
-          sudo chown -R $(whoami) /opt/hadoop-${HADOOP_VER}
-          sudo ln -sf /opt/hadoop-${HADOOP_VER} /opt/hadoop
-          echo "HADOOP_HOME=/opt/hadoop" >> $GITHUB_ENV
-          echo "/opt/hadoop/bin" >> $GITHUB_PATH
-          # Configure pseudo-distributed mode
-          sudo tee /opt/hadoop/etc/hadoop/core-site.xml > /dev/null << XML
-          <configuration>
-            <property><name>fs.defaultFS</name><value>hdfs://localhost:9000</value></property>
-            <property><name>hadoop.security.authentication</name><value>kerberos</value></property>
-            <property><name>hadoop.security.authorization</name><value>true</value></property>
-            <property><name>hadoop.security.auth_to_local</name><value>DEFAULT</value></property>
-          </configuration>
-          XML
-          sudo tee /opt/hadoop/etc/hadoop/hdfs-site.xml > /dev/null << XML
-          <configuration>
-            <property><name>dfs.replication</name><value>1</value></property>
-            <property><name>dfs.namenode.secondary.http-address</name><value>0.0.0.0:0</value></property>
-            <property><name>dfs.namenode.secondary.https-address</name><value>0.0.0.0:0</value></property>
-            <property><name>dfs.namenode.kerberos.principal</name><value>hdfs/localhost@TEST.LOCAL</value></property>
-            <property><name>dfs.namenode.keytab.file</name><value>/opt/hadoop/etc/hadoop/hdfs.keytab</value></property>
-            <property><name>dfs.datanode.kerberos.principal</name><value>hdfs/localhost@TEST.LOCAL</value></property>
-            <property><name>dfs.datanode.keytab.file</name><value>/opt/hadoop/etc/hadoop/hdfs.keytab</value></property>
-            <property><name>dfs.web.authentication.kerberos.principal</name><value>HTTP/localhost@TEST.LOCAL</value></property>
-            <property><name>dfs.web.authentication.kerberos.keytab</name><value>/opt/hadoop/etc/hadoop/hdfs.keytab</value></property>
-          </configuration>
-          XML
-          sudo cp /tmp/hdfs.keytab /opt/hadoop/etc/hadoop/hdfs.keytab
-          sudo chmod 644 /opt/hadoop/etc/hadoop/hdfs.keytab
-          sudo chown $(whoami) /opt/hadoop/etc/hadoop/hdfs.keytab
-          # Ensure JAVA_HOME is set for Hadoop
-          echo "export JAVA_HOME=$(readlink -f /usr/bin/java | sed s:/bin/java::)" | sudo tee -a /opt/hadoop/etc/hadoop/hadoop-env.sh > /dev/null
-          echo "export HADOOP_OPTS=-Djava.security.krb5.conf=/etc/krb5.conf" | sudo tee -a /opt/hadoop/etc/hadoop/hadoop-env.sh > /dev/null
-          # Setup passwordless SSH for localhost
-          chmod g-w $HOME
-          chmod o-w $HOME
-          ssh-keygen -t rsa -P "" -f ~/.ssh/id_rsa
-          cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
-          chmod 600 ~/.ssh/authorized_keys
-          ssh-keyscan -H localhost >> ~/.ssh/known_hosts
-          eval $(ssh-agent)
-          ssh-add ~/.ssh/id_rsa
-          # Format Namenode
-          /opt/hadoop/bin/hdfs namenode -format -force 2>&1 | tail -1
-          # Start HDFS with Kerberos
-          # Verify KDC is reachable before starting NameNode
-          echo "Checking KDC reachability..."
-          for i in $(seq 1 10); do
-            if echo | nc -u -w 2 kdc 88 2>/dev/null; then echo "KDC reachable"; break; fi
-            echo "Waiting for KDC... ($i)"
-            sleep 3
-          done
-          export HADOOP_OPTS="-Djava.security.krb5.conf=/etc/krb5.conf"
-          kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL
-          export HDFS_NAMENODE_USER=$(whoami)
-          export HDFS_DATANODE_USER=$(whoami)
-          /opt/hadoop/sbin/hadoop-daemon.sh start namenode 2>&1
-          /opt/hadoop/sbin/hadoop-daemon.sh start datanode 2>&1
-          # Dump NameNode log for debugging
-          echo "=== NameNode log ==="
-          cat /opt/hadoop/logs/hadoop-*-namenode-*.log 2>&1 | tail -30 || echo "No NameNode log"
-          echo "=== DataNode log ==="
-          cat /opt/hadoop/logs/hadoop-*-datanode-*.log 2>&1 | tail -10 || echo "No DataNode log"
-          # Wait for NameNode to be ready (up to 60s)
-          for i in $(seq 1 12); do
-            echo "Check $i: dfsadmin -report..."
-            /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | head -10
-            if /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | grep -q "Live datanodes"; then
-              echo "HDFS ready after ${i}x5s"
+          docker run -d --name hdfs \
+            --add-host kdc:127.0.0.1 \
+            -v /tmp/hdfs.keytab:/tmp/hdfs.keytab:ro \
+            -v /tmp/testuser.keytab:/tmp/testuser.keytab:ro \
+            -v /etc/krb5.conf:/etc/krb5.conf:ro \
+            -p 8020:8020 \
+            ${{ needs.build-hdfs-image.outputs.image }}
+          # Wait for NameNode + DataNode
+          for i in $(seq 1 15); do
+            if docker exec hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>/dev/null | grep -q "Live datanodes"; then
+              echo "HDFS ready"
               break
             fi
             sleep 5
           done
-          HDFS_NAMENODE_ADDR="localhost:9000"
-          echo "HDFS_NAMENODE_ADDR=localhost:9000" >> $GITHUB_ENV
+          docker logs hdfs 2>&1 | tail -10
 
-      - name: Verify HDFS is running
-        run: |
-          export HADOOP_CONF_DIR=/opt/hadoop/etc/hadoop
-          echo "HDFS NameNode: $HDFS_NAMENODE_ADDR"
-          /opt/hadoop/bin/hdfs dfs -mkdir -p /test
-          echo "hello hdfs" | /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt
-          /opt/hadoop/bin/hdfs dfs -ls /test
+      - name: Build mntrs
+        run: cargo build --release -p mntrs
 
-      - name: Test mntrs HDFS mount (Kerberos)
+      - name: Test HDFS mount
         run: |
-          # kinit as testuser — needed for Kerberos-secured HDFS
-          kinit -kt /tmp/testuser.keytab testuser@TEST.LOCAL && klist
-          sudo mkdir -p /mnt/hdfs && sudo chown $(whoami) /mnt/hdfs
-          export HADOOP_CONF_DIR=/opt/hadoop/etc/hadoop
-          ./target/release/mntrs mount "hdfs://$HDFS_NAMENODE_ADDR" /mnt/hdfs \
-            --read-only --daemon --daemon-wait --daemon-timeout=15 2>&1 || echo "::warning::HDFS mount failed"
-          sleep 2
-          ls -la /mnt/hdfs 2>&1 || echo "::warning::mount not ready"
-          if [ -d /mnt/hdfs/test ]; then
-            cat /mnt/hdfs/test/hello.txt
-            echo "::notice::HDFS mount + read OK"
+          kinit -kt /tmp/testuser.keytab testuser@TEST.LOCAL
+          klist
+          mkdir -p /mnt/hdfs
+          ./target/release/mntrs mount hdfs://localhost:8020/ /mnt/hdfs \
+            --read-only --daemon --daemon-wait --daemon-timeout=15 2>&1
+          sleep 3
+          if mount | grep -q /mnt/hdfs; then
+            ls -la /mnt/hdfs
+            hdfs dfs -cat /test/hello.txt 2>/dev/null
+            echo "::notice::HDFS Kerberos mount OK"
           else
-            echo "::warning::HDFS mount verification skipped"
+            echo "::error::HDFS mount failed"
+            exit 1
           fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          fusermount3 -uz /mnt/hdfs 2>/dev/null
+          docker rm -f hdfs 2>/dev/null
+
+  cleanup-image:
+    needs: hdfs-kerberos
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Delete test image from GHCR
+        run: echo "Deleting ghcr.io/${{ github.repository_owner }}/mntrs-hdfs:ci-test-${{ github.sha }}"
