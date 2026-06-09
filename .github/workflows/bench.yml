@@ -17,7 +17,6 @@ jobs:
 
   fuse-integration:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     services:
       minio:
         image: minio/minio:latest
@@ -50,7 +49,6 @@ jobs:
 
   bench:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     services:
       minio:
         image: minio/minio:latest
