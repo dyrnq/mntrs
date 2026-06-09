@@ -100,28 +100,20 @@ fi
 echo "  mounts ready"
 echo ""
 
-# ---- Upload test data (skip if data already in bucket) ----
-echo "--- Checking test data ---"
-# Quick check: if 1K.bin already exists, skip upload (CI may have pre-uploaded)
-if curl -sfI "$ENDPOINT/$BUCKET/1K.bin" >/dev/null 2>&1; then
-    echo "  data already in bucket, skipping upload"
+# ---- Upload test data via mc in MinIO container ----
+echo "--- Uploading test data ---"
+CONTAINER=$(docker ps -q -f ancestor=minio/minio | head -1)
+if [ -n "$CONTAINER" ]; then
+  docker exec "$CONTAINER" mc alias set bench http://localhost:9000 $ACCESS_KEY $SECRET_KEY 2>/dev/null
+  docker exec "$CONTAINER" mc mb --ignore-existing bench/$BUCKET 2>/dev/null
+  mkdir -p /tmp/bench-upload
+  cp "$DATA_DIR"/1K.bin "$DATA_DIR"/4K.bin "$DATA_DIR"/64K.bin "$DATA_DIR"/1M.bin "$DATA_DIR"/10M.bin "$DATA_DIR"/100M.bin /tmp/bench-upload/
+  cp -r "$DATA_DIR"/many /tmp/bench-upload/ 2>/dev/null || true
+  docker cp /tmp/bench-upload/. "$CONTAINER":/tmp/bench-upload/
+  docker exec "$CONTAINER" mc cp --recursive /tmp/bench-upload/ bench/$BUCKET/ 2>&1 || echo "  mc upload failed"
+  echo "  upload done"
 else
-    echo "  uploading test data..."
-    pip3 install awscli 2>/dev/null || true
-    mkdir -p /tmp/bench-upload
-    cp "$DATA_DIR"/1K.bin "$DATA_DIR"/4K.bin "$DATA_DIR"/64K.bin "$DATA_DIR"/1M.bin "$DATA_DIR"/10M.bin "$DATA_DIR"/100M.bin /tmp/bench-upload/
-    cp -r "$DATA_DIR"/many /tmp/bench-upload/ 2>/dev/null || true
-    AWS_ACCESS_KEY_ID="$ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$SECRET_KEY"         aws --endpoint-url "$ENDPOINT" --no-verify-ssl s3 sync /tmp/bench-upload/ "s3://$BUCKET/" --quiet 2>/dev/null || {
-        echo "  awscli failed, trying curl fallback..."
-        for f in 1K.bin 4K.bin 64K.bin 1M.bin 10M.bin 100M.bin; do
-            curl -sf -X PUT "$ENDPOINT/$BUCKET/$f" --data-binary @"$DATA_DIR/$f" 2>/dev/null || true
-        done
-        for f in "$DATA_DIR/many/"*; do
-            name=$(basename "$f")
-            curl -sf -X PUT "$ENDPOINT/$BUCKET/many/$name" --data-binary @"$f" 2>/dev/null || true
-        done
-    }
-    echo "  upload done"
+  echo "  MinIO container not found, skipping upload"
 fi
 echo ""
 

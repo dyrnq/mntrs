@@ -38,11 +38,15 @@ jobs:
       - name: Build mntrs
         run: cargo build
 
-      - name: Create MinIO test bucket
+      - name: Create MinIO test bucket (via mc)
         run: |
-          curl -sf -X PUT http://localhost:9000/test-bucket 2>/dev/null || echo "bucket may exist"
+          CONTAINER=$(docker ps -q -f ancestor=minio/minio | head -1)
+          if [ -n "$CONTAINER" ]; then
+            docker exec "$CONTAINER" mc alias set bench http://localhost:9000 minioadmin minioadmin
+            docker exec "$CONTAINER" mc mb --ignore-existing bench/test-bucket
+            docker exec "$CONTAINER" mc cp /tmp/hello.txt bench/test-bucket/ 2>/dev/null || true
+          fi
           echo "test" > /tmp/hello.txt
-          pip3 install awscli 2>/dev/null || true
 
       - name: Run FUSE integration tests
         run: cargo test --test fuse_integration_test -- --test-threads=1 --nocapture 2>&1 || echo "FUSE integration tests skipped (needs MinIO + FUSE)"
