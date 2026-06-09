@@ -100,6 +100,8 @@ jobs:
       - name: Build mntrs
         run: cargo build --release -p mntrs
 
+      # Verify FUSE mount via process liveness + mount table.
+      # Uses kill -0 (check process alive) and mount | grep (check mount table).
       - name: Test mntrs mount
         run: |
           sudo mkdir -p /mnt/mntrs-test && sudo chmod 777 /mnt/mntrs-test

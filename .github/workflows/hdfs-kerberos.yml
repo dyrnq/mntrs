@@ -78,6 +78,9 @@ jobs:
           docker cp "$CONTAINER":/tmp/hdfs.keytab /tmp/
           docker cp "$CONTAINER":/tmp/testuser.keytab /tmp/
 
+      # Start the pre-built HDFS Kerberos Docker image (s6-overlay: KDC + NameNode + DataNode).
+      # Image is built and pushed to GHCR in the build-hdfs-image job above.
+      # Keytab and krb5.conf are mounted from the runner (created by external KDC container).
       - name: Start HDFS container
         run: |
           docker run -d --name hdfs \

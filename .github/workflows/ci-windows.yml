@@ -40,6 +40,9 @@ jobs:
       - name: Unit tests (lib only)
         run: cargo test --lib --package mntrs
 
+      # FUSE mount test skipped: GitHub Actions Windows runner cannot
+      # load kernel drivers. WinFSP requires a system reboot after install.
+      # Build + clippy + unit tests still provide good coverage.
       - name: Check WinFSP availability
         run: |
           echo "WinFSP installed but kext not loadable in CI"
