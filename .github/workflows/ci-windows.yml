@@ -1,8 +1,5 @@
 name: CI - Windows
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-
 permissions:
   contents: read
 
