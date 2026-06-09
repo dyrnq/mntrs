@@ -107,13 +107,20 @@ jobs:
         run: |
           kinit -kt /tmp/testuser.keytab testuser@TEST.LOCAL
           klist
+
+          # Create test data in HDFS before mounting
+          docker exec hdfs /opt/hadoop/bin/hdfs dfs -mkdir -p /test
+          echo "hello kerberos hdfs" | docker exec -i hdfs /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt
+          docker exec hdfs /opt/hadoop/bin/hdfs dfs -cat /test/hello.txt
+
+          # Mount HDFS via mntrs (read-only)
           sudo mkdir -p /mnt/hdfs && sudo chmod 777 /mnt/hdfs
           ./target/release/mntrs mount hdfs://localhost:8020/ /mnt/hdfs \
             --read-only --daemon --daemon-wait --daemon-timeout=15 2>&1
           sleep 3
           if mount | grep -q /mnt/hdfs; then
             ls -la /mnt/hdfs
-            docker exec hdfs /opt/hadoop/bin/hdfs dfs -cat /test/hello.txt 2>/dev/null
+            cat /mnt/hdfs/test/hello.txt
             echo "::notice::HDFS Kerberos mount OK"
           else
             echo "::error::HDFS mount failed"
