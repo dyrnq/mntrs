@@ -85,9 +85,12 @@ jobs:
           # The kinit on the runner only provides a ticket for the runner —
           # the HDFS container needs its own kinit with the testuser keytab.
           docker cp /tmp/testuser.keytab hdfs:/tmp/testuser.keytab
-          docker exec hdfs /usr/bin/kinit -kt /tmp/testuser.keytab testuser@TEST.LOCAL
+          # Use hdfs superuser to create test data (root of HDFS is owned by hdfs)
+          docker exec hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL
           docker exec hdfs /opt/hadoop/bin/hdfs dfs -mkdir -p /test
+          docker exec hdfs /opt/hadoop/bin/hdfs dfs -chmod 777 /test
           echo "hello kerberos hdfs" | docker exec -i hdfs /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt
+          docker exec hdfs /opt/hadoop/bin/hdfs dfs -chmod 644 /test/hello.txt
           docker exec hdfs /opt/hadoop/bin/hdfs dfs -cat /test/hello.txt
 
           # Mount HDFS via mntrs (read-only)
