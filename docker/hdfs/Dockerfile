@@ -9,17 +9,17 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HADOOP_HOME=/opt/hadoop \
     S6_OVERLAY_VERSION=${S6_OVERLAY_VERSION}
 
+# Local: use USTC mirror + HTTP proxy (DO NOT COMMIT)
+
 RUN set -ex; \
     apt-get update && apt-get install -y --no-install-recommends \
     openjdk-21-jdk-headless \
     krb5-kdc krb5-admin-server krb5-user \
-    openssh-server openssh-client \
-    curl wget ca-certificates procps netcat-openbsd \
+    curl wget ca-certificates procps netcat-openbsd gosu \
     locales xz-utils; \
     localedef -i en_US -c -f UTF-8 -A /usr/share/locale/locale.alias en_US.UTF-8; \
     rm -rf /var/lib/apt/lists/*
 
-# Install s6-overlay (same pattern as docker-doris)
 RUN set -ex; \
     ARCH="$(uname -m)"; \
     case "${ARCH}" in \
@@ -31,21 +31,25 @@ RUN set -ex; \
     curl --retry 3 -f#SL "https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz" | tar -Jxp -C /; \
     curl --retry 3 -f#SL "https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-symlinks-noarch.tar.xz" | tar -Jxp -C /
 
-# Download Hadoop
 RUN curl --retry 3 -f#SL "https://dlcdn.apache.org/hadoop/common/hadoop-${HADOOP_VERSION}/hadoop-${HADOOP_VERSION}.tar.gz" \
     | tar xz -C /opt && ln -s /opt/hadoop-${HADOOP_VERSION} /opt/hadoop
 
-# SSH + Kerberos config
+# Create app user (uid 1000 matches host)
+# Use ubuntu user (uid 1000) — already exists in base image
+RUN if id ubuntu 2>/dev/null; then \
+        groupmod -n mntrs ubuntu && \
+        usermod -l mntrs -d /home/mntrs -m ubuntu; \
+    else \
+        groupadd -g 1000 -o mntrs && \
+        useradd -u 1000 -g 1000 -m -s /bin/bash mntrs; \
+    fi
+
+
+
+
 COPY krb5.conf /etc/krb5.conf
 
-RUN ssh-keygen -t rsa -P "" -f /root/.ssh/id_rsa && \
-    cat /root/.ssh/id_rsa.pub >> /root/.ssh/authorized_keys && \
-    chmod 600 /root/.ssh/authorized_keys && \
-    ssh-keyscan -H localhost >> /root/.ssh/known_hosts && \
-    chmod g-w /root && chmod o-w /root
-
-# Create KDC database and principals (must be at build time)
-RUN /usr/sbin/krb5_newrealm <<< "adminpass"$'\n'"adminpass" && \
+RUN printf "adminpass\nadminpass\n" | /usr/sbin/krb5_newrealm && \
     kadmin.local -q "addprinc -randkey hdfs/localhost@TEST.LOCAL" && \
     kadmin.local -q "addprinc -randkey HTTP/localhost@TEST.LOCAL" && \
     kadmin.local -q "addprinc -randkey testuser@TEST.LOCAL" && \
@@ -54,19 +58,27 @@ RUN /usr/sbin/krb5_newrealm <<< "adminpass"$'\n'"adminpass" && \
     kadmin.local -q "ktadd -k /tmp/testuser.keytab testuser@TEST.LOCAL" && \
     chmod 644 /tmp/hdfs.keytab /tmp/testuser.keytab
 
-# Hadoop config
 COPY hdfs-site.xml core-site.xml /opt/hadoop/etc/hadoop/
 
-RUN set -ex; \
-    echo "export JAVA_HOME=${JAVA_HOME}" >> /opt/hadoop/etc/hadoop/hadoop-env.sh; \
-    echo "export HDFS_NAMENODE_USER=root" >> /opt/hadoop/etc/hadoop/hadoop-env.sh; \
-    echo "export HDFS_DATANODE_USER=root" >> /opt/hadoop/etc/hadoop/hadoop-env.sh; \
-    echo "export HDFS_SECONDARYNAMENODE_USER=root" >> /opt/hadoop/etc/hadoop/hadoop-env.sh; \
-    echo 'export HADOOP_OPTS="-Djava.security.krb5.conf=/etc/krb5.conf"' >> /opt/hadoop/etc/hadoop/hadoop-env.sh; \
-    /opt/hadoop/bin/hdfs namenode -format -force
+RUN echo "export JAVA_HOME=${JAVA_HOME}" >> /opt/hadoop/etc/hadoop/hadoop-env.sh && \
+    echo "export HDFS_NAMENODE_USER=mntrs" >> /opt/hadoop/etc/hadoop/hadoop-env.sh && \
+    echo "export HDFS_DATANODE_USER=mntrs" >> /opt/hadoop/etc/hadoop/hadoop-env.sh && \
+    echo "export HDFS_SECONDARYNAMENODE_USER=mntrs" >> /opt/hadoop/etc/hadoop/hadoop-env.sh && \
+    echo 'export HADOOP_OPTS="-Djava.security.krb5.conf=/etc/krb5.conf"' >> /opt/hadoop/etc/hadoop/hadoop-env.sh
 
-# s6 overlay services
+ARG CACHE_BUSTER=1
+
+# Generate self-signed keystore for HTTPS (DataNode Kerberos requirement)
+RUN keytool -genkey -alias hdfs -keyalg RSA -keysize 2048 -keystore /tmp/keystore.jks \
+    -dname "CN=localhost" -storepass changeit -keypass changeit -noprompt -validity 3650 \
+    && chmod 644 /tmp/keystore.jks
+
 COPY rootfs /
+
+RUN \
+mkdir -p /var/lib/hadoop && \
+chown -R mntrs:mntrs /var/lib/hadoop && \
+chown -R mntrs:mntrs /opt/hadoop
 
 EXPOSE 8020 9870 88 749 22
 

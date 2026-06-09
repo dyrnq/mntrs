@@ -1,5 +1,9 @@
 #!/usr/bin/with-contenv bash
 export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
 export HADOOP_HOME=/opt/hadoop
-export HADOOP_OPTS="-Djava.security.krb5.conf=/etc/krb5.conf"
-exec /opt/hadoop/bin/hdfs --daemon start namenode && sleep infinity
+if [ ! -d /var/lib/hadoop/namenode/current ]; then
+    echo "[namenode] Formatting..."
+    gosu mntrs /opt/hadoop/bin/hdfs namenode -format -force
+fi
+echo "[namenode] Starting..."
+exec gosu mntrs /opt/hadoop/bin/hdfs namenode

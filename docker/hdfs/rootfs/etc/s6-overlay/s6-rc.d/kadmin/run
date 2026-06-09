@@ -1,2 +1,2 @@
 #!/usr/bin/with-contenv bash
-exec /usr/sbin/kadmind -n
+exec /usr/sbin/kadmind -nofork
