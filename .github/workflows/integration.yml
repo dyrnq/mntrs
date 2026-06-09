@@ -57,10 +57,11 @@ jobs:
           readOnly: "true"
           EOF
 
-          # Run csi-sanity (non-zero exit is expected — known unimplemented CSI methods)
+          # Run csi-sanity (non-zero exit is expected — known unimplemented CSI methods).
+          # skip=remove-target-path: mount --bind needs root; full test in csi-integration.yml (k3s).
           "$CSI_SANITY" --csi.endpoint=unix:///tmp/csi.sock \
             --csi.testvolumeparameters=/tmp/csi-test-params.yaml \
-            --ginkgo.focus='NodePublishVolume|NodeUnpublishVolume|GetPluginInfo|Probe' \
+            --ginkgo.focus='NodePublishVolume|NodeUnpublishVolume|GetPluginInfo|Probe' --ginkgo.skip='remove target path' \
             2>&1
           CSI_EXIT=$?
           if [ $CSI_EXIT -ne 0 ]; then
