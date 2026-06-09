@@ -50,4 +50,4 @@ jobs:
           cat /tmp/mntrs-macos-test/test.txt
           ls -la /tmp/mntrs-macos-test/
           echo "macOS memory mount read/write OK"
-          fusermount -u /tmp/mntrs-macos-test || umount /tmp/mntrs-macos-test
+          umount /tmp/mntrs-macos-test
