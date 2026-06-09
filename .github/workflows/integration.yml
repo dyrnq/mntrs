@@ -70,7 +70,7 @@ jobs:
           cd /tmp
           git clone --depth 1 https://github.com/Kimahriman/hdfs-native.git
           cd hdfs-native
-          cargo build --example simple 2>&1 || true
+          cargo build --example simple
           # If simple example binary exists, run it
           if [ -f target/debug/examples/simple ]; then
             target/debug/examples/simple --kerberos &
@@ -131,6 +131,6 @@ jobs:
           "$CSI_SANITY" --csi.endpoint=unix:///tmp/csi.sock \
             --csi.testvolumeparameters="storage=memory://,readOnly=true" \
             --ginkgo.focus='NodePublishVolume|NodeUnpublishVolume|GetPluginInfo|Probe' \
-            2>&1 || true
+            2>&1
 
           kill $CSI_PID 2>/dev/null

@@ -44,12 +44,12 @@ jobs:
           if [ -n "$CONTAINER" ]; then
             docker exec "$CONTAINER" mc alias set bench http://localhost:9000 minioadmin minioadmin
             docker exec "$CONTAINER" mc mb --ignore-existing bench/test-bucket
-            docker exec "$CONTAINER" mc cp /tmp/hello.txt bench/test-bucket/ 2>/dev/null || true
+            docker exec "$CONTAINER" mc cp /tmp/hello.txt bench/test-bucket/ 2>/dev/null
           fi
           echo "test" > /tmp/hello.txt
 
       - name: Run FUSE integration tests
-        run: cargo test --test fuse_integration_test -- --test-threads=1 --nocapture 2>&1 || echo "FUSE integration tests skipped (needs MinIO + FUSE)"
+        run: cargo test --test fuse_integration_test -- --test-threads=1 --nocapture
 
   bench:
     runs-on: ubuntu-latest
