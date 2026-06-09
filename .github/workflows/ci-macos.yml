@@ -1,3 +1,12 @@
+# macOS CI — build + clippy + unit tests only.
+#
+# Limitations:
+#   - FUSE mount test skipped: macFUSE kext cannot be loaded in GH Actions
+#     (requires GUI approval in System Settings → Privacy & Security).
+#     Same limitation as WinFSP on Windows.
+#   - CSI build skipped: mntrs-csi is linux-only (depends on libfuse).
+#   - Build + clippy + unit tests still provide good platform coverage.
+#
 name: CI - macOS
 
 permissions:
@@ -23,18 +32,14 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install FUSE
-        run: |
-          brew install --cask macfuse && brew install protobuf
+      - name: Install protobuf
+        run: brew install protobuf
 
       - name: Format check
         run: cargo fmt --all -- --check
 
       - name: Build workspace
         run: cargo build --workspace
-
-      - name: Build CSI plugin
-        run: cargo build --package mntrs-csi
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -45,22 +50,13 @@ jobs:
       - name: Build release
         run: cargo build --release --package mntrs
 
-      - name: Smoke test — memory mount + read/write
+      # FUSE mount 集成测试跳过：
+      #   macFUSE 需要加载内核扩展(kext)，但 GitHub Actions macOS runner
+      #   是 headless 环境，无法弹出 System Settings → Privacy & Security
+      #   的 GUI 审批对话框，kext 安装成功却不会生效。
+      #   和 Windows 上 WinFSP 内核驱动一样的限制。
+      #   → 编译 + clippy + 单元测试仍能保证代码质量。
+      - name: Mount test skipped — kext not loadable in CI
         run: |
-          mkdir -p /tmp/mntrs-macos-test
-          ./target/release/mntrs mount memory:// /tmp/mntrs-macos-test --volname mntrs-test 2>&1 &
-          MNTRS_PID=$!
-          sleep 5
-          # Verify mount actually succeeded
-          if ! mount | grep -q /tmp/mntrs-macos-test; then
-            echo "::error::mount did not succeed — mount table:"
-            mount
-            exit 1
-          fi
-          echo "hello from macos" > /tmp/mntrs-macos-test/test.txt
-          cat /tmp/mntrs-macos-test/test.txt
-          ls -la /tmp/mntrs-macos-test/
-          echo "macOS memory mount read/write OK"
-          kill $MNTRS_PID
-          sleep 2
-          umount /tmp/mntrs-macos-test 2>/dev/null || diskutil unmount /tmp/mntrs-macos-test 2>/dev/null || true
+          echo "FUSE mount test skipped on macOS CI"
+          echo "Reason: macFUSE kernel extension requires GUI approval"
