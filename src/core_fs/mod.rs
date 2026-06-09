@@ -166,7 +166,7 @@ pub mod test_helpers {
 
     /// Mount a CoreFilesystem on a Windows drive letter (auto-assigned).
     /// Returns the mount handle. Dropping it unmounts.
-    pub fn mount_winfsp<F: CoreFilesystem + 'static>(fs: Arc<F>) -> std::io::Result<MountGuard> {
+    pub fn mount_winfsp<F: CoreFilesystem + 'static>(fs: Arc<F>) -> std::io::Result<MountGuard<F>> {
         let adapter = WinFspAdapter::new(fs);
         let mut host = FileSystemHost::new(winfsp::host::VolumeParams::default(), adapter)
             .map_err(|e| {
@@ -188,7 +188,7 @@ pub mod test_helpers {
 
     impl<F: CoreFilesystem + 'static> Drop for MountGuard<F> {
         fn drop(&mut self) {
-            if let Some(host) = self.host.take() {
+            if let Some(mut host) = self.host.take() {
                 host.stop();
             }
         }

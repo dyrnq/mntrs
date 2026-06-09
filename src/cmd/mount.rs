@@ -629,8 +629,9 @@ pub fn mount(
         let adapter = WinFspAdapter::new(Arc::new(fs));
         let mut vol_params = winfsp::host::VolumeParams::default();
         vol_params.filesystem_name(volname);
-        let mut host = winfsp::host::FileSystemHost::new(vol_params, adapter)
-            .map_err(|e| anyhow::anyhow!("FileSystemHost::new: {e}"))?;
+        let mut host: winfsp::host::FileSystemHost<_, winfsp::host::FineGuard> =
+            winfsp::host::FileSystemHost::new(vol_params, adapter)
+                .map_err(|e| anyhow::anyhow!("FileSystemHost::new: {e}"))?;
         let _mp = host
             .mount(mountpoint)
             .map_err(|e| anyhow::anyhow!("host.mount: {e}"))?;
