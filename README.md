@@ -421,7 +421,7 @@ cargo bench                         # micro-benchmarks
 | `ci-windows` | Windows | WinFSP + release build + 15 mount integration tests |
 | `ci-macos` | macOS | macFUSE + FUSE build + test |
 | `bench` | Linux (weekly) | vs rclone benchmark (MinIO) |
-| `integration` | Linux | KDC + miniDFS + csi-sanity |
+| `integration` | Linux | KDC + hdfs-native + csi-sanity |
 
 ---
 
