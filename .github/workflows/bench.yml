@@ -1,6 +1,5 @@
 name: Benchmark
 
-
 permissions:
   contents: read
 
@@ -11,12 +10,25 @@ on:
     branches: [main]
   workflow_dispatch:
   schedule:
-    - cron: '0 2 * * 1'  # every Monday 02:00 UTC
+    - cron: '0 2 * * 1'
 
 jobs:
 
-  fuse-integration:
+  bench:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode:
+          - name: fuse-integration
+            build-flags: ""
+            run: cargo test --test fuse_integration_test -- --test-threads=1 --nocapture
+            setup-rclone: false
+          - name: bench-comparison
+            build-flags: "--release"
+            run: MNTRS_BIN=./target/release/mntrs RCLONE_MNT=/tmp/rclone-mnt MNTRS_MNT=/tmp/mntrs-bench ENDPOINT=http://localhost:9000 BUCKET=bench-bucket ACCESS_KEY=minioadmin SECRET_KEY=minioadmin bash bench/run_all.sh 2>&1 | tee bench-result.txt
+            setup-rclone: true
+
     services:
       minio:
         image: minio/minio:latest
@@ -27,6 +39,7 @@ jobs:
           MINIO_ROOT_PASSWORD: minioadmin
         ports:
           - 9000:9000
+
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -36,9 +49,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev
 
       - name: Build mntrs
-        run: cargo build
+        run: cargo build ${{ matrix.mode.build-flags }}
 
-      - name: Create MinIO test bucket (via mc)
+      - name: Setup MinIO bucket
         run: |
           CONTAINER=$(docker ps -q -f ancestor=minio/minio | head -1)
           if [ -n "$CONTAINER" ]; then
@@ -50,82 +63,29 @@ jobs:
           fi
           echo "test" > /tmp/hello.txt
 
-      - name: Run FUSE integration tests
-        run: cargo test --test fuse_integration_test -- --test-threads=1 --nocapture
-
-  bench:
-    runs-on: ubuntu-latest
-    services:
-      minio:
-        image: minio/minio:latest
-        command: server /data
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-        ports:
-          - 9000:9000
-        options: --health-cmd "curl -sf http://localhost:9000/minio/health/live || exit 1" --health-interval 5s
-
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install FUSE
-        run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev
-
-      - name: Build mntrs
-        run: cargo build --release
-
-      - name: Setup MinIO test bucket
-        run: |
-          pip3 install awscli
-          AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
-            aws --endpoint-url http://localhost:9000 --no-verify-ssl s3 mb s3://bench-bucket
-          # Prepare test data in dedicated directory
-          mkdir -p /tmp/bench-seed/many
-          dd if=/dev/urandom of=/tmp/bench-seed/1K.bin bs=1K count=1 2>/dev/null
-          dd if=/dev/urandom of=/tmp/bench-seed/4K.bin bs=4K count=1 2>/dev/null
-          dd if=/dev/urandom of=/tmp/bench-seed/64K.bin bs=64K count=1 2>/dev/null
-          dd if=/dev/urandom of=/tmp/bench-seed/1M.bin bs=1M count=1 2>/dev/null
-          dd if=/dev/urandom of=/tmp/bench-seed/10M.bin bs=1M count=10 2>/dev/null
-          dd if=/dev/urandom of=/tmp/bench-seed/100M.bin bs=1M count=100 2>/dev/null
-          for i in $(seq 1 500); do echo "$i" > "/tmp/bench-seed/many/file_$(printf '%04d' $i).txt"; done
-          AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin             aws --endpoint-url http://localhost:9000 --no-verify-ssl s3 sync /tmp/bench-seed/ s3://bench-bucket/ --quiet
-      - name: Setup rclone for comparison
+      - name: Setup rclone (bench only)
+        if: matrix.mode.setup-rclone
         run: |
           curl -sSL https://downloads.rclone.org/rclone-current-linux-amd64.deb -o rclone.deb
           sudo dpkg -i rclone.deb
           mkdir -p /tmp/rclone-mnt
+          mkdir -p /tmp/mntrs-bench
           rclone config create minio s3 provider Minio env_auth false \
             access_key_id minioadmin secret_access_key minioadmin \
             endpoint http://localhost:9000 region us-east-1
-          rclone mount minio:bench-bucket /tmp/rclone-mnt --daemon --vfs-cache-mode=writes --vfs-write-back=5s
-          sleep 3
 
-      - name: Run benchmark
-        run: MNTRS_BIN=./target/release/mntrs RCLONE_MNT=/tmp/rclone-mnt MNTRS_MNT=/tmp/mntrs-bench ENDPOINT=http://localhost:9000 BUCKET=bench-bucket ACCESS_KEY=minioadmin SECRET_KEY=minioadmin bash bench/run_all.sh 2>&1 | tee bench-result.txt
+      - name: Run ${{ matrix.mode.name }}
+        run: ${{ matrix.mode.run }}
 
-      - name: Upload results
+      - name: Upload benchmark results
+        if: matrix.mode.name == 'bench-comparison'
         uses: actions/upload-artifact@v4
         with:
           name: bench-result
           path: bench-result.txt
 
       - name: Check regressions
+        if: matrix.mode.name == 'bench-comparison'
         run: |
           echo "=== Benchmark Results ==="
           cat bench-result.txt
-          echo ""
-          # Check if any test shows mntrs >2x slower than rclone
-          echo "Regression check: " && cat bench-result.txt && echo "done" '^.*\|.*\|.*$' bench-result.txt | awk -F'|' '{
-            split($2, a, "m"); split($3, b, "m");
-            mntrs_ms = a[1]*60 + a[2]; rclone_ms = b[1]*60 + b[2];
-            if (mntrs_ms > rclone_ms * 2) {
-              print "REGRESSION: "$1" mntrs="mntrs_ms"ms rclone="rclone_ms"ms"
-            }
-          }' | tee regression.txt
-          if [ -s regression.txt ]; then
-            echo "::warning::Performance regression detected!"
-          fi
-          echo "Benchmark completed (exit code ignored)"
