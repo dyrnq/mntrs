@@ -115,6 +115,13 @@ jobs:
           # Format Namenode
           /opt/hadoop/bin/hdfs namenode -format -force 2>&1 | tail -1
           # Start HDFS with Kerberos
+          # Verify KDC is reachable before starting NameNode
+          echo "Checking KDC reachability..."
+          for i in $(seq 1 10); do
+            if echo | nc -u -w 2 kdc 88 2>/dev/null; then echo "KDC reachable"; break; fi
+            echo "Waiting for KDC... ($i)"
+            sleep 3
+          done
           export HADOOP_OPTS="-Djava.security.krb5.conf=/etc/krb5.conf"
           kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL
           export HDFS_NAMENODE_USER=$(whoami)
