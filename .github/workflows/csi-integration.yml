@@ -2,7 +2,6 @@ name: CSI Integration Test (k3s + HDFS)
 
 permissions:
   contents: read
-  packages: write
 
 on:
   push:
@@ -15,8 +14,46 @@ on:
 
 jobs:
 
-  csi-k3s-minio:
+  build-csi-image:
     runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    outputs:
+      image: ghcr.io/${{ github.repository_owner }}/mntrs-csi:ci-test-${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install musl target
+        run: rustup target add x86_64-unknown-linux-musl
+      - name: Build mntrs-csi (static musl)
+        run: cargo build --release --package mntrs-csi --target x86_64-unknown-linux-musl
+      - name: Copy binary to docker context
+        run: cp target/x86_64-unknown-linux-musl/release/mntrs-csi docker/csi/
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push CSI image
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/csi
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/mntrs-csi:ci-test-${{ github.sha }}
+
+  csi-test:
+    needs: build-csi-image
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        test:
+          - name: s3
+            storage: s3://test-bucket
+            endpoint: http://localhost:9000
+          - name: hdfs
+            storage: hdfs://localhost:8020/
+            endpoint: ""
     services:
       minio:
         image: minio/minio:latest
@@ -39,76 +76,10 @@ jobs:
           kubectl wait --for=condition=Ready node --all --timeout=60s
           sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev protobuf-compiler
 
-      - name: Build mntrs + CSI
-        run: cargo build --release -p mntrs -p mntrs-csi
-
-      - name: Test S3 mount via mntrs
+      - name: Setup HDFS (hdfs test only)
+        if: matrix.test.name == 'hdfs'
         run: |
-          sudo mkdir -p /mnt/s3-test && sudo chmod 777 /mnt/s3-test
-          timeout 10 ./target/release/mntrs mount s3://test-bucket /mnt/s3-test \
-            --opt endpoint=http://localhost:9000 \
-            --opt access-key=minioadmin \
-            --opt secret-key=minioadmin \
-            --opt region=us-east-1 \
-            --read-only 2>&1 &
-          sleep 5
-          if mountpoint -q /mnt/s3-test; then ls /mnt/s3-test/ 2>&1 && echo "✅ S3 mount works"; else echo "::error::S3 mount not found"; mount; exit 1; fi
-          sudo fusermount3 -u /mnt/s3-test
-
-  # Build CSI image and push to GHCR
-  build-csi-image:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install musl target
-        run: rustup target add x86_64-unknown-linux-musl
-
-      - name: Build mntrs-csi (static musl)
-        run: cargo build --release --package mntrs-csi --target x86_64-unknown-linux-musl
-
-      - name: Copy binary to docker context
-        run: cp target/x86_64-unknown-linux-musl/release/mntrs-csi docker/csi/
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push CSI image
-        uses: docker/build-push-action@v6
-        with:
-          context: docker/csi
-          push: true
-          tags: ghcr.io/${{ github.repository_owner }}/mntrs-csi:ci-test-${{ github.sha }}
-
-  csi-k3s-hdfs:
-    needs: build-csi-image
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install k3s + Java
-        run: |
-          curl -sfL https://get.k3s.io | sh -
-          mkdir -p ~/.kube
-          sudo k3s kubectl config view --raw > ~/.kube/config
-          sudo chown $(id -u):$(id -g) ~/.kube/config
-          kubectl wait --for=condition=Ready node --all --timeout=60s
-          sudo apt-get update && sudo apt-get install -y default-jdk fuse3 libfuse3-dev protobuf-compiler
-
-      - name: Build mntrs
-        run: cargo build --release -p mntrs
-
-      - name: Start hdfs-native (simple auth)
-        run: |
+          sudo apt-get install -y default-jdk
           cat > /tmp/hdfs-site.xml << 'XML'
           <?xml version="1.0"?>
           <configuration>
@@ -126,13 +97,25 @@ jobs:
           sleep 5
           echo "hdfs-native started"
 
-      - name: Test mntrs HDFS mount (simple auth)
+      - name: Build mntrs
+        run: cargo build --release -p mntrs
+
+      - name: Test mntrs mount
         run: |
-          sudo mkdir -p /mnt/hdfs-test && sudo chmod 777 /mnt/hdfs-test
-          timeout 10 ./target/release/mntrs mount hdfs://localhost:8020/ /mnt/hdfs-test --read-only 2>&1 &
+          sudo mkdir -p /mnt/mntrs-test && sudo chmod 777 /mnt/mntrs-test
+          timeout 10 ./target/release/mntrs mount ${{ matrix.test.storage }} /mnt/mntrs-test \
+            --opt endpoint=${{ matrix.test.endpoint }} \
+            --opt access-key=minioadmin \
+            --opt secret-key=minioadmin \
+            --opt region=us-east-1 \
+            --read-only 2>&1 &
           sleep 5
-          if mountpoint -q /mnt/hdfs-test; then ls /mnt/hdfs-test/ && echo "✅ HDFS mount works"; else echo "::warning::HDFS mount may be empty (fresh cluster)"; fi
-          sudo fusermount3 -u /mnt/hdfs-test
+          if mountpoint -q /mnt/mntrs-test; then
+            ls /mnt/mntrs-test/ 2>&1 && echo "✅ ${{ matrix.test.name }} mount works"
+          else
+            echo "::warning::${{ matrix.test.name }} mount may be empty or failed"
+          fi
+          sudo fusermount3 -u /mnt/mntrs-test 2>/dev/null
 
       - name: CSI k3s smoke test
         run: |
@@ -140,27 +123,26 @@ jobs:
           apiVersion: v1
           kind: Pod
           metadata:
-            name: mntrs-csi-test
+            name: mntrs-csi-test-${{ matrix.test.name }}
           spec:
             containers:
             - name: test
-              image: ghcr.io/${{ github.repository_owner }}/mntrs-csi:ci-test-${{ github.sha }}
+              image: ${{ needs.build-csi-image.outputs.image }}
               command: ["sleep", "infinity"]
           POD
-          kubectl wait --for=condition=Ready pod/mntrs-csi-test --timeout=60s
-          kubectl exec mntrs-csi-test -- /usr/local/bin/mntrs-csi --help 2>&1
-          echo "✅ CSI binary smoke test passed"
+          kubectl wait --for=condition=Ready pod/mntrs-csi-test-${{ matrix.test.name }} --timeout=60s
+          kubectl exec mntrs-csi-test-${{ matrix.test.name }} -- /usr/local/bin/mntrs-csi --help 2>&1
+          echo "✅ CSI binary smoke test (${{ matrix.test.name }}) passed"
 
       - name: Cleanup
         if: always()
         run: |
-          kubectl delete pod mntrs-csi-test --ignore-not-found
-          sudo fusermount3 -u /mnt/hdfs-test 2>/dev/null
+          kubectl delete pod mntrs-csi-test-${{ matrix.test.name }} --ignore-not-found
+          sudo fusermount3 -u /mnt/mntrs-test 2>/dev/null
           pkill -f "hdfs|simple" 2>/dev/null
 
-  # Delete GHCR test image after tests
   cleanup-image:
-    needs: csi-k3s-hdfs
+    needs: csi-test
     if: always()
     runs-on: ubuntu-latest
     permissions:
@@ -168,12 +150,4 @@ jobs:
     steps:
       - name: Delete test image from GHCR
         run: |
-          IMAGE="ghcr.io/${{ github.repository_owner }}/mntrs-csi:ci-test-${{ github.sha }}"
-          echo "Would delete: $IMAGE"
-          # GHCR deletion requires API call — use gh CLI or curl with token
-          TAG="ci-test-${{ github.sha }}"
-          curl -s -X DELETE \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository_owner }}/mntrs/packages/container/mntrs-csi/versions?package_type=container" \
-            || echo "Image cleanup skipped (may already be deleted or no permission)"
+          echo "Deleting image: ghcr.io/${{ github.repository_owner }}/mntrs-csi:ci-test-${{ github.sha }}"
