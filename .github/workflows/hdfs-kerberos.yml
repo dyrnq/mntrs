@@ -94,6 +94,7 @@ jobs:
           <configuration>
             <property><name>dfs.replication</name><value>1</value></property>
             <property><name>dfs.namenode.secondary.http-address</name><value>0.0.0.0:0</value></property>
+            <property><name>dfs.namenode.secondary.https-address</name><value>0.0.0.0:0</value></property>
             <property><name>dfs.namenode.kerberos.principal</name><value>hdfs/localhost@TEST.LOCAL</value></property>
             <property><name>dfs.namenode.keytab.file</name><value>/opt/hadoop/etc/hadoop/hdfs.keytab</value></property>
             <property><name>dfs.datanode.kerberos.principal</name><value>hdfs/localhost@TEST.LOCAL</value></property>
@@ -127,7 +128,8 @@ jobs:
           kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL
           export HDFS_NAMENODE_USER=$(whoami)
           export HDFS_DATANODE_USER=$(whoami)
-          /opt/hadoop/sbin/start-dfs.sh 2>&1
+          /opt/hadoop/sbin/hadoop-daemon.sh start namenode 2>&1
+          /opt/hadoop/sbin/hadoop-daemon.sh start datanode 2>&1
           # Dump NameNode log for debugging
           echo "=== NameNode log ==="
           cat /opt/hadoop/logs/hadoop-*-namenode-*.log 2>&1 | tail -30 || echo "No NameNode log"
