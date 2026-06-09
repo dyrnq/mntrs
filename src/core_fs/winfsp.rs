@@ -29,8 +29,8 @@ use widestring::U16CStr;
 use windows::Win32::Foundation::STATUS_INVALID_DEVICE_REQUEST;
 use winfsp::Result;
 use winfsp::filesystem::{
-    DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext,
-    ModificationDescriptor, OpenFileInfo, VolumeInfo,
+    DirInfo, FileInfo, FileSecurity, FileSystemContext, ModificationDescriptor, OpenFileInfo,
+    VolumeInfo,
 };
 use winfsp_sys::FILE_ACCESS_RIGHTS;
 

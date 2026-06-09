@@ -12,10 +12,7 @@ pub type Inodes = Arc<dashmap::DashMap<u64, (String, FileType, u64, Option<Syste
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fs;
-#[cfg(unix)]
 use std::io::{Seek, SeekFrom, Write};
-#[cfg(not(unix))]
-use std::io::{SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;

@@ -28,7 +28,7 @@ opendal = { version = "0.57", features = ["services-s3", "services-gcs", "servic
 fuser = "0.17"
 
 [target.'cfg(windows)'.dependencies]
-winfsp = "0.13"
+winfsp = { version = "0.13", features = ["async-io"] }
 winfsp-sys = "0.12"
 windows = { version = "0.61", features = ["Win32_Foundation"] }
 widestring = "1"

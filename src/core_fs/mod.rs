@@ -178,15 +178,15 @@ pub mod test_helpers {
         let _mp = host.mount(MountPoint::NextFreeDrive).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::Other, format!("host.mount: {e}"))
         })?;
-        Ok(MountGuard { host: Some(host) })
+        Ok(MountGuard::<F> { host: Some(host) })
     }
 
     /// RAII guard that unmounts on drop.
-    pub struct MountGuard {
-        host: Option<FileSystemHost<WinFspAdapter<crate::MntrsFs>>>,
+    pub struct MountGuard<F: CoreFilesystem + 'static> {
+        host: Option<FileSystemHost<WinFspAdapter<F>>>,
     }
 
-    impl Drop for MountGuard {
+    impl<F: CoreFilesystem + 'static> Drop for MountGuard<F> {
         fn drop(&mut self) {
             if let Some(host) = self.host.take() {
                 host.stop();
