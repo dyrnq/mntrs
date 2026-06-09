@@ -81,7 +81,7 @@ jobs:
         run: |
           pip3 install awscli
           AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
-            aws --endpoint-url http://localhost:9000 --no-verify-ssl s3 mb s3://bench-bucket 2>/dev/null || echo "bucket may exist"
+            aws --endpoint-url http://localhost:9000 --no-verify-ssl s3 mb s3://bench-bucket
           # Prepare test data in dedicated directory
           mkdir -p /tmp/bench-seed/many
           dd if=/dev/urandom of=/tmp/bench-seed/1K.bin bs=1K count=1 2>/dev/null

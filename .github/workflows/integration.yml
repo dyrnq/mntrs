@@ -90,7 +90,7 @@ jobs:
             echo "HDFS Kerberos mount SUCCESS"
             
             fusermount3 -u /tmp/hdfs-mnt
-            kill $MNTRS_PID $MINIDFS_PID 2>/dev/null
+            kill $MNTRS_PID $MINIDFS_PID
           else
             echo "hdfs-native simple example not found — skipping mount test"
           fi
@@ -133,4 +133,4 @@ jobs:
             --ginkgo.focus='NodePublishVolume|NodeUnpublishVolume|GetPluginInfo|Probe' \
             2>&1 || echo "::warning::csi-sanity has known failures (CSI driver unimplemented methods)"
 
-          kill $CSI_PID 2>/dev/null
+          kill $CSI_PID
