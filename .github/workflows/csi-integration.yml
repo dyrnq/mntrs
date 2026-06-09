@@ -1,8 +1,8 @@
 name: CSI Integration Test (k3s + HDFS)
 
-
 permissions:
   contents: read
+  packages: write
 
 on:
   push:
@@ -52,13 +52,44 @@ jobs:
             --opt region=us-east-1 \
             --read-only 2>&1 &
           sleep 5
-          # Create a test file
-          echo "hello minio" > /tmp/test.txt
-          # Verify mount works
           if mountpoint -q /mnt/s3-test; then ls /mnt/s3-test/ 2>&1 && echo "✅ S3 mount works"; else echo "::error::S3 mount not found"; mount; exit 1; fi
           sudo fusermount3 -u /mnt/s3-test
 
+  # Build CSI image and push to GHCR
+  build-csi-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install musl target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: Build mntrs-csi (static musl)
+        run: cargo build --release --package mntrs-csi --target x86_64-unknown-linux-musl
+
+      - name: Copy binary to docker context
+        run: cp target/x86_64-unknown-linux-musl/release/mntrs-csi docker/csi/
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push CSI image
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/csi
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/mntrs-csi:ci-test-${{ github.sha }}
+
   csi-k3s-hdfs:
+    needs: build-csi-image
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -73,12 +104,11 @@ jobs:
           kubectl wait --for=condition=Ready node --all --timeout=60s
           sudo apt-get update && sudo apt-get install -y default-jdk fuse3 libfuse3-dev protobuf-compiler
 
-      - name: Build mntrs + CSI
-        run: cargo build --release -p mntrs -p mntrs-csi
+      - name: Build mntrs
+        run: cargo build --release -p mntrs
 
       - name: Start hdfs-native (simple auth)
         run: |
-          # Start a single-node HDFS in background
           cat > /tmp/hdfs-site.xml << 'XML'
           <?xml version="1.0"?>
           <configuration>
@@ -89,23 +119,12 @@ jobs:
           </configuration>
           XML
           export HADOOP_CONF_DIR=/tmp
-          # Use hdfs binary if available, otherwise skip
-          if command -v hdfs &>/dev/null; then
-            hdfs namenode -format -force
-            hdfs namenode &
-            hdfs datanode &
-            sleep 5
-            echo "HDFS started on localhost:8020"
-          else
-            echo "hdfs CLI not available, building from hdfs-native test"
-            # Build hdfs-native simple example
-            git clone --depth 1 https://github.com/Kimahriman/hdfs-native.git /tmp/hdfs-native
-            cd /tmp/hdfs-native
-            cargo build --release --example simple
-            target/release/examples/simple &
-            sleep 5
-            echo "hdfs-native started"
-          fi
+          git clone --depth 1 https://github.com/Kimahriman/hdfs-native.git /tmp/hdfs-native
+          cd /tmp/hdfs-native
+          cargo build --release --example simple
+          target/release/examples/simple &
+          sleep 5
+          echo "hdfs-native started"
 
       - name: Test mntrs HDFS mount (simple auth)
         run: |
@@ -117,7 +136,7 @@ jobs:
 
       - name: CSI k3s smoke test
         run: |
-          kubectl apply -f - << 'POD'
+          kubectl apply -f - << POD
           apiVersion: v1
           kind: Pod
           metadata:
@@ -125,16 +144,8 @@ jobs:
           spec:
             containers:
             - name: test
-              image: ubuntu:24.04
+              image: ghcr.io/${{ github.repository_owner }}/mntrs-csi:ci-test-${{ github.sha }}
               command: ["sleep", "infinity"]
-              volumeMounts:
-              - name: binary
-                mountPath: /usr/local/bin/mntrs-csi
-            volumes:
-            - name: binary
-              hostPath:
-                path: ${{ github.workspace }}/target/release/mntrs-csi
-                type: File
           POD
           kubectl wait --for=condition=Ready pod/mntrs-csi-test --timeout=60s
           kubectl exec mntrs-csi-test -- /usr/local/bin/mntrs-csi --help 2>&1
@@ -144,5 +155,25 @@ jobs:
         if: always()
         run: |
           kubectl delete pod mntrs-csi-test --ignore-not-found
-          sudo fusermount3 -u /mnt/hdfs-test
-          pkill -f "hdfs|simple"
+          sudo fusermount3 -u /mnt/hdfs-test 2>/dev/null
+          pkill -f "hdfs|simple" 2>/dev/null
+
+  # Delete GHCR test image after tests
+  cleanup-image:
+    needs: csi-k3s-hdfs
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Delete test image from GHCR
+        run: |
+          IMAGE="ghcr.io/${{ github.repository_owner }}/mntrs-csi:ci-test-${{ github.sha }}"
+          echo "Would delete: $IMAGE"
+          # GHCR deletion requires API call — use gh CLI or curl with token
+          TAG="ci-test-${{ github.sha }}"
+          curl -s -X DELETE \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository_owner }}/mntrs/packages/container/mntrs-csi/versions?package_type=container" \
+            || echo "Image cleanup skipped (may already be deleted or no permission)"
