@@ -102,7 +102,7 @@ jobs:
 
       - name: Test mntrs mount
         run: |
-          mkdir -p /mnt/mntrs-test && chmod 777 /mnt/mntrs-test
+          sudo mkdir -p /mnt/mntrs-test && sudo chmod 777 /mnt/mntrs-test
           timeout 10 ./target/release/mntrs mount ${{ matrix.test.storage }} /mnt/mntrs-test \
             --opt endpoint=${{ matrix.test.endpoint }} \
             --opt access-key=minioadmin \
