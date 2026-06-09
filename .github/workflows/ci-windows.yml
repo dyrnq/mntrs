@@ -49,6 +49,7 @@ jobs:
           rm -rf /c/mntrs-test
           mkdir -p /c/mntrs-test
           ./target/release/mntrs.exe mount memory:// C:/mntrs-test
+          if ! mount | grep -q /mntrs-test; then echo "ERROR: mount failed"; mount; exit 1; fi
           echo "hello from windows" > /c/mntrs-test/test.txt
           cat /c/mntrs-test/test.txt
           ls -la /c/mntrs-test/

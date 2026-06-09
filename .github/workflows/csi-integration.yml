@@ -55,7 +55,7 @@ jobs:
           # Create a test file
           echo "hello minio" > /tmp/test.txt
           # Verify mount works
-          ls /mnt/s3-test/ 2>&1 && echo "✅ S3 mount works" || echo "::warning::S3 mount empty (MinIO container may not be ready)"
+          if mountpoint -q /mnt/s3-test; then ls /mnt/s3-test/ 2>&1 && echo "✅ S3 mount works"; else echo "::error::S3 mount not found"; mount; exit 1; fi
           sudo fusermount3 -u /mnt/s3-test
 
   csi-k3s-hdfs:
@@ -112,7 +112,7 @@ jobs:
           sudo mkdir -p /mnt/hdfs-test && sudo chmod 777 /mnt/hdfs-test
           timeout 10 ./target/release/mntrs mount hdfs://localhost:8020/ /mnt/hdfs-test --read-only 2>&1 &
           sleep 5
-          ls /mnt/hdfs-test/ && echo "✅ HDFS mount works" || echo "::warning::HDFS mount may be empty (fresh cluster)"
+          if mountpoint -q /mnt/hdfs-test; then ls /mnt/hdfs-test/ && echo "✅ HDFS mount works"; else echo "::warning::HDFS mount may be empty (fresh cluster)"; fi
           sudo fusermount3 -u /mnt/hdfs-test
 
       - name: CSI k3s smoke test

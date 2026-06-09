@@ -85,9 +85,8 @@ jobs:
             MNTRS_PID=$!
             sleep 5
             
-            # Verify
-            ls /tmp/hdfs-mnt/
-            echo "HDFS Kerberos mount SUCCESS"
+            # Verify mount
+            if mountpoint -q /tmp/hdfs-mnt; then ls /tmp/hdfs-mnt/ && echo "HDFS Kerberos mount SUCCESS"; else echo "ERROR: HDFS mount failed"; mount; exit 1; fi
             
             fusermount3 -u /tmp/hdfs-mnt
             kill $MNTRS_PID $MINIDFS_PID
