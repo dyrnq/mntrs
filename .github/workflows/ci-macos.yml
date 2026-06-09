@@ -43,6 +43,11 @@ jobs:
 
       - name: Smoke test — memory mount + read/write
         run: |
+          # Verify macFUSE is available
+          if ! kextstat | grep -q macfuse && ! [ -c /dev/fuse ]; then
+            echo "WARNING: macFUSE kernel extension not loaded, /dev/fuse not found"
+            echo "Mount test will fail but this is expected on CI runners"
+          fi
           mkdir -p /tmp/mntrs-macos-test
           ./target/release/mntrs mount memory:// /tmp/mntrs-macos-test --volname mntrs-test 2>&1 &
           sleep 5
