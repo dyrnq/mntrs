@@ -101,7 +101,8 @@ jobs:
           </configuration>
           XML
           sudo cp /tmp/hdfs.keytab /opt/hadoop/etc/hadoop/hdfs.keytab
-          sudo chmod 600 /opt/hadoop/etc/hadoop/hdfs.keytab
+          sudo chmod 644 /opt/hadoop/etc/hadoop/hdfs.keytab
+          sudo chown $(whoami) /opt/hadoop/etc/hadoop/hdfs.keytab
           # Ensure JAVA_HOME is set for Hadoop
           echo "export JAVA_HOME=$(readlink -f /usr/bin/java | sed s:/bin/java::)" | sudo tee -a /opt/hadoop/etc/hadoop/hadoop-env.sh > /dev/null
           echo "export HADOOP_OPTS=-Djava.security.krb5.conf=/etc/krb5.conf" | sudo tee -a /opt/hadoop/etc/hadoop/hadoop-env.sh > /dev/null
