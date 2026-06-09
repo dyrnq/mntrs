@@ -13,6 +13,7 @@ MNTRS_BIN="${MNTRS_BIN:-./target/release/mntrs}"
 MNTRS_MNT="${MNTRS_MNT:-/tmp/mntrs-bench}"
 RCLONE_MNT="${RCLONE_MNT:-/tmp/rclone-bench}"
 MEM_MNT="/tmp/mntrs-mem-bench"
+RESULT_TMP="$(mktemp /tmp/bench-results-XXXXXX)"
 
 PASS=0
 FAIL=0
