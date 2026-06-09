@@ -417,7 +417,15 @@ impl node_server::Node for NodeService {
         request: Request<NodeUnpublishVolumeRequest>,
     ) -> Result<Response<NodeUnpublishVolumeResponse>, Status> {
         let req = request.into_inner();
+        let volume_id = req.volume_id;
         let target_path = req.target_path;
+
+        if volume_id.is_empty() {
+            return Err(Status::invalid_argument("volume_id must not be empty"));
+        }
+        if target_path.is_empty() {
+            return Err(Status::invalid_argument("target_path must not be empty"));
+        }
 
         #[cfg(not(windows))]
         if let Err(e) = mntrs::cmd::mount::unmount_internal(&target_path) {
@@ -426,9 +434,9 @@ impl node_server::Node for NodeService {
         let _ = std::fs::remove_dir(&target_path);
 
         let mut mounts = self.mounts.lock().unwrap();
-        mounts.remove(&req.volume_id);
+        mounts.remove(&volume_id);
 
-        tracing::info!(target=%target_path, "volume unmounted");
+        tracing::info!(target=%target_path, vol=%volume_id, "volume unmounted");
         Ok(Response::new(NodeUnpublishVolumeResponse::default()))
     }
 
