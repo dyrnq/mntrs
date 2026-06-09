@@ -48,9 +48,16 @@ jobs:
           CSI_PID=$!
           sleep 3
 
+          # csi-sanity v5 expects --csi.testvolumeparameters to be a file path (YAML/JSON),
+          # not inline key=value. Generate a temp YAML file.
+          cat > /tmp/csi-test-params.yaml << 'EOF'
+          storage: "memory://"
+          readOnly: "true"
+          EOF
+
           # Run csi-sanity (non-zero exit is expected — known unimplemented CSI methods)
           "$CSI_SANITY" --csi.endpoint=unix:///tmp/csi.sock \
-            --csi.testvolumeparameters="storage=memory://,readOnly=true" \
+            --csi.testvolumeparameters=/tmp/csi-test-params.yaml \
             --ginkgo.focus='NodePublishVolume|NodeUnpublishVolume|GetPluginInfo|Probe' \
             2>&1
           CSI_EXIT=$?
