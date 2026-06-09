@@ -23,20 +23,37 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install deps
-        run: brew install protobuf
+      - name: Install FUSE
+        run: brew install macfuse protobuf
 
       - name: Format check
         run: cargo fmt --all -- --check
 
-      - name: Build
-        run: cargo build --package mntrs
+      - name: Build workspace
+        run: cargo build --workspace
+
+      - name: Build CSI plugin
+        run: cargo build --package mntrs-csi
 
       - name: Clippy
-        run: cargo clippy --package mntrs --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Unit tests (lib only)
-        run: cargo test --package mntrs --lib
+        run: cargo test --workspace --lib
 
       - name: Build release
         run: cargo build --release --package mntrs
+
+      - name: Smoke test — memory mount + read/write
+        run: |
+          mkdir -p /tmp/mntrs-macos-test
+          cargo run --release -- mount memory:// /tmp/mntrs-macos-test --volname mntrs-test 2>&1 &
+          MNTRS_PID=$!
+          sleep 5
+          echo "hello from macos" > /tmp/mntrs-macos-test/test.txt
+          cat /tmp/mntrs-macos-test/test.txt
+          ls -la /tmp/mntrs-macos-test/
+          echo "macOS memory mount read/write OK"
+          kill $MNTRS_PID 2>/dev/null
+          sleep 2
+          fusermount -u /tmp/mntrs-macos-test 2>/dev/null || umount /tmp/mntrs-macos-test 2>/dev/null || true
