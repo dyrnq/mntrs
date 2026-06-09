@@ -30,7 +30,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Build workspace
-        run: cargo build --workspace
+        run: cargo build --package mntrs
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
