@@ -128,8 +128,8 @@ timeout 10 cat "$RCLONE_MNT/1K.bin" >/dev/null 2>&1 || echo "  warmup: rclone ca
 # ============================================================
 
 # Dir listing
-echo "=== 1. Directory listing ===
-CATEGORY="DirList""
+echo "=== 1. Directory listing ==="
+CATEGORY="DirList"
 for d in "" "many"; do
     bench "ls $d" "mntrs" ls "$MNTRS_MNT/$d"
     bench "ls $d" "rclone" ls "$RCLONE_MNT/$d"
@@ -143,8 +143,8 @@ done
 
 # Stat
 echo ""
-echo "=== 2. Stat ===
-CATEGORY="Stat""
+echo "=== 2. Stat ==="
+CATEGORY="Stat"
 for f in 1K.bin 4K.bin 64K.bin 1M.bin 10M.bin 100M.bin; do
     bench "stat $f" "mntrs" stat "$MNTRS_MNT/$f"
     bench "stat $f" "rclone" stat "$RCLONE_MNT/$f"
@@ -158,8 +158,8 @@ done
 
 # Read
 echo ""
-echo "=== 3. Sequential read ===
-CATEGORY="SeqRead""
+echo "=== 3. Sequential read ==="
+CATEGORY="SeqRead"
 for f in 1K.bin 4K.bin 64K.bin 1M.bin 10M.bin 100M.bin; do
     bench "cat $f" "mntrs" cat "$MNTRS_MNT/$f"
     bench "cat $f" "rclone" cat "$RCLONE_MNT/$f"
@@ -173,8 +173,8 @@ done
 
 # Read with different block sizes (dd)
 echo ""
-echo "=== 4. Read via dd (block size variation) ===
-CATEGORY="ddRead""
+echo "=== 4. Read via dd (block size variation) ==="
+CATEGORY="ddRead"
 for bs in 512 4096 65536 1048576; do
     for f in 1M.bin 10M.bin; do
         bench "dd bs=${bs} $f" "mntrs" dd if="$MNTRS_MNT/$f" bs=$bs of=/dev/null 2>/dev/null
@@ -184,8 +184,8 @@ done
 
 # Random read
 echo ""
-echo "=== 5. Random read ===
-CATEGORY="RandRead""
+echo "=== 5. Random read ==="
+CATEGORY="RandRead"
 for f in 1M.bin 10M.bin; do
     for seeks in 10 50; do
         bench "random ${seeks}x $f" "mntrs" bash -c "
@@ -207,8 +207,8 @@ done
 
 # Write
 echo ""
-echo "=== 6. Write ===
-CATEGORY="Write""
+echo "=== 6. Write ==="
+CATEGORY="Write"
 for sz in 1K 4K 64K 1M; do
     src="$DATA_DIR/${sz}.bin"
     bench "write $sz new" "mntrs" cp "$src" "$MNTRS_MNT/bench-write-${sz}.bin"
@@ -222,8 +222,8 @@ done
 
 # Mkdir / Rmdir / Unlink
 echo ""
-echo "=== 7. Dir/File ops ===
-CATEGORY="DirOps""
+echo "=== 7. Dir/File ops ==="
+CATEGORY="DirOps"
 bench "mkdir" "mntrs" mkdir -p "$MNTRS_MNT/bench-dir"
 bench "mkdir" "rclone" mkdir -p "$RCLONE_MNT/bench-dir"
 bench "rmdir" "mntrs" rmdir "$MNTRS_MNT/bench-dir"
@@ -236,8 +236,8 @@ bench "unlink exist" "rclone" rm -f "$RCLONE_MNT/bench-unlink-test"
 
 # Rename
 echo ""
-echo "=== 8. Rename ===
-CATEGORY="Rename""
+echo "=== 8. Rename ==="
+CATEGORY="Rename"
 cp "$DATA_DIR/1K.bin" "$MNTRS_MNT/bench-rename-src" 2>/dev/null
 cp "$DATA_DIR/1K.bin" "$RCLONE_MNT/bench-rename-src" 2>/dev/null
 bench "rename" "mntrs" mv "$MNTRS_MNT/bench-rename-src" "$MNTRS_MNT/bench-rename-dst"
@@ -245,8 +245,8 @@ bench "rename" "rclone" mv "$RCLONE_MNT/bench-rename-src" "$RCLONE_MNT/bench-ren
 
 # Truncate
 echo ""
-echo "=== 9. Truncate ===
-CATEGORY="Truncate""
+echo "=== 9. Truncate ==="
+CATEGORY="Truncate"
 cp "$DATA_DIR/10M.bin" "$MNTRS_MNT/bench-trunc" 2>/dev/null
 cp "$DATA_DIR/10M.bin" "$RCLONE_MNT/bench-trunc" 2>/dev/null
 bench "truncate 0" "mntrs" truncate -s 0 "$MNTRS_MNT/bench-trunc"
@@ -256,15 +256,15 @@ bench "truncate 1M" "rclone" truncate -s 1M "$RCLONE_MNT/bench-trunc"
 
 # Xattr
 echo ""
-echo "=== 10. Xattr ===
-CATEGORY="Xattr""
+echo "=== 10. Xattr ==="
+CATEGORY="Xattr"
 bench "getfattr" "mntrs" getfattr -d "$MNTRS_MNT/1K.bin" 2>/dev/null || true
 bench "getfattr" "rclone" getfattr -d "$RCLONE_MNT/1K.bin" 2>/dev/null || true
 
 # memory backend baseline (zero network, single mount)
 echo ""
-echo "=== 11. Memory backend (zero network) ===
-CATEGORY="Memory""
+echo "=== 11. Memory backend (zero network) ==="
+CATEGORY="Memory"
 mkdir -p "$MEM_MNT"
 "$MNTRS_BIN" mount "memory://" "$MEM_MNT" \
     --daemon --daemon-wait --daemon-timeout=10 2>/dev/null
@@ -285,8 +285,8 @@ echo "============================================"
 
 # Additional read tests
 echo ""
-echo "=== 12. Head/tail reads ===
-CATEGORY="HeadTail""
+echo "=== 12. Head/tail reads ==="
+CATEGORY="HeadTail"
 for f in 10M.bin 100M.bin; do
     for n in 1 10 100; do
         bench "head -c${n}K $f" "mntrs" head -c "${n}K" "$MNTRS_MNT/$f"
@@ -296,8 +296,8 @@ done
 
 # Md5sum / sha
 echo ""
-echo "=== 13. Checksum ===
-CATEGORY="Checksum""
+echo "=== 13. Checksum ==="
+CATEGORY="Checksum"
 for f in 1K.bin 4K.bin 64K.bin 1M.bin; do
     bench "md5sum $f" "mntrs" md5sum "$MNTRS_MNT/$f"
     bench "md5sum $f" "rclone" md5sum "$RCLONE_MNT/$f"
@@ -307,8 +307,8 @@ done
 
 # Touch (create empty, update mtime)
 echo ""
-echo "=== 14. Touch ===
-CATEGORY="Touch""
+echo "=== 14. Touch ==="
+CATEGORY="Touch"
 bench "touch new" "mntrs" touch "$MNTRS_MNT/bench-touch-new"
 bench "touch new" "rclone" touch "$RCLONE_MNT/bench-touch-new"
 bench "touch exist" "mntrs" touch "$MNTRS_MNT/1K.bin"
@@ -316,15 +316,15 @@ bench "touch exist" "rclone" touch "$RCLONE_MNT/1K.bin"
 
 # Chmod (where supported)
 echo ""
-echo "=== 15. Chmod ===
-CATEGORY="Chmod""
+echo "=== 15. Chmod ==="
+CATEGORY="Chmod"
 bench "chmod" "mntrs" chmod 0644 "$MNTRS_MNT/1K.bin" 2>/dev/null || true
 bench "chmod" "rclone" chmod 0644 "$RCLONE_MNT/1K.bin" 2>/dev/null || true
 
 # Hardlink / Symlink (if supported)
 echo ""
-echo "=== 16. Symlink ===
-CATEGORY="Symlink""
+echo "=== 16. Symlink ==="
+CATEGORY="Symlink"
 ln -sf "$MNTRS_MNT/1K.bin" "$MNTRS_MNT/bench-link" 2>/dev/null || true
 ln -sf "$RCLONE_MNT/1K.bin" "$RCLONE_MNT/bench-link" 2>/dev/null || true
 bench "readlink" "mntrs" readlink "$MNTRS_MNT/bench-link" 2>/dev/null || true
@@ -332,8 +332,8 @@ bench "readlink" "rclone" readlink "$RCLONE_MNT/bench-link" 2>/dev/null || true
 
 # Dir with 500 files
 echo ""
-echo "=== 17. Large dir ops ===
-CATEGORY="LargeDir""
+echo "=== 17. Large dir ops ==="
+CATEGORY="LargeDir"
 bench "ls -f many" "mntrs" ls "$MNTRS_MNT/many" 2>/dev/null
 bench "ls -f many" "rclone" ls "$RCLONE_MNT/many" 2>/dev/null
 bench "find many" "mntrs" find "$MNTRS_MNT/many" 2>/dev/null
@@ -343,8 +343,8 @@ bench "rm many 10" "rclone" bash -c "cd '$RCLONE_MNT/many' && ls | head -10 | xa
 
 # Concurrent reads
 echo ""
-echo "=== 18. Concurrent reads ===
-CATEGORY="Concurrent""
+echo "=== 18. Concurrent reads ==="
+CATEGORY="Concurrent"
 for threads in 2 4 8; do
     for f in 1M.bin 10M.bin; do
         bench "concurrent ${threads}x $f" "mntrs" bash -c "
@@ -364,14 +364,14 @@ done
 
 # Fstat (stat by fd)
 echo ""
-echo "=== 19. Fstat ===
-CATEGORY="Fstat""
+echo "=== 19. Fstat ==="
+CATEGORY="Fstat"
 bench "fstat 1K" "mntrs" bash -c "exec 3<'$MNTRS_MNT/1K.bin'; fstat \$3 2>/dev/null; exec 3>&-"
 bench "fstat 1K" "rclone" bash -c "exec 3<'$RCLONE_MNT/1K.bin'; fstat \$3 2>/dev/null; exec 3>&-"
 
 # Lseek
 echo ""
-echo "=== 20. Lseek ===
-CATEGORY="Lseek""
+echo "=== 20. Lseek ==="
+CATEGORY="Lseek"
 bench "lseek 100M" "mntrs" bash -c "exec 3<'$MNTRS_MNT/100M.bin'; dd bs=1 seek=1000 count=0 of=/dev/null 2>/dev/null <&3; exec 3>&-"
 bench "lseek 100M" "rclone" bash -c "exec 3<'$RCLONE_MNT/100M.bin'; dd bs=1 seek=1000 count=0 of=/dev/null 2>/dev/null <&3; exec 3>&-"
