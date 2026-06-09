@@ -284,12 +284,14 @@ struct MountState {
 
 pub struct NodeService {
     mounts: Mutex<HashMap<String, MountState>>,
+    node_id: String,
 }
 
 impl NodeService {
-    pub fn new() -> Self {
+    pub fn new(node_id: String) -> Self {
         Self {
             mounts: Mutex::new(HashMap::new()),
+            node_id,
         }
     }
 }
@@ -376,6 +378,11 @@ impl node_server::Node for NodeService {
         }
         if target_path.is_empty() {
             return Err(Status::invalid_argument("target_path must not be empty"));
+        }
+        if req.volume_capability.is_none() {
+            return Err(Status::invalid_argument(
+                "volume_capability must be provided",
+            ));
         }
 
         let storage = vol_ctx
@@ -515,7 +522,10 @@ impl node_server::Node for NodeService {
         &self,
         _request: Request<NodeGetInfoRequest>,
     ) -> Result<Response<NodeGetInfoResponse>, Status> {
-        Ok(Response::new(NodeGetInfoResponse::default()))
+        Ok(Response::new(NodeGetInfoResponse {
+            node_id: self.node_id.clone(),
+            ..Default::default()
+        }))
     }
 }
 
@@ -631,7 +641,7 @@ async fn main() -> anyhow::Result<()> {
     Server::builder()
         .add_service(identity_server::IdentityServer::new(IdentityService))
         .add_service(controller_server::ControllerServer::new(ControllerService))
-        .add_service(node_server::NodeServer::new(NodeService::new()))
+        .add_service(node_server::NodeServer::new(NodeService::new(node_id)))
         .serve_with_incoming(incoming)
         .await?;
 
