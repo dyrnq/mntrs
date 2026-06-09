@@ -43,7 +43,7 @@ jobs:
 
       - name: Smoke test — memory mount + read/write
         run: |
-          trap 'fusermount -u /tmp/mntrs-macos-test 2>/dev/null; umount /tmp/mntrs-macos-test 2>/dev/null' EXIT
+          trap 'fusermount -u /tmp/mntrs-macos-test; umount /tmp/mntrs-macos-test' EXIT
           mkdir -p /tmp/mntrs-macos-test
           ./target/release/mntrs mount memory:// /tmp/mntrs-macos-test --volname mntrs-test 2>&1 &
           sleep 5
