@@ -51,6 +51,6 @@ jobs:
           cat /tmp/mntrs-macos-test/test.txt
           ls -la /tmp/mntrs-macos-test/
           echo "macOS memory mount read/write OK"
-          kill $MNTRS_PID 2>/dev/null
+          kill $MNTRS_PID 2>/dev/null || true
           sleep 2
           fusermount -u /tmp/mntrs-macos-test 2>/dev/null || umount /tmp/mntrs-macos-test 2>/dev/null
