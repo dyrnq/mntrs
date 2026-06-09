@@ -36,9 +36,13 @@ jobs:
         run: cargo clippy --package mntrs --lib --bins -- -D warnings 2>&1 || echo "::warning::Windows clippy known issues (winfsp 0.13 API mismatch, needs winfsp crate update)"
 
       - name: Build release (best-effort)
+        env:
+          RUSTFLAGS: ""
         run: cargo build --release --package mntrs 2>&1 || echo "::warning::Windows build known issues (winfsp 0.13 API mismatch)"
 
       - name: Unit tests (best-effort, no FUSE)
+        env:
+          RUSTFLAGS: ""
         run: cargo test --lib --package mntrs 2>&1 || echo "::warning::Windows unit tests known issues"
 
       - name: Smoke test — memory mount + read/write
