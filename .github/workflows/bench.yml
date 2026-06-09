@@ -83,6 +83,14 @@ jobs:
           name: bench-result
           path: bench-result.txt
 
-      - name: Check regressions
+      - name: 
+      - name: Upload rclone log
+        if: matrix.mode.name == 'bench-comparison'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rclone-bench-log
+          path: /tmp/rclone-bench.log
+
+Check regressions
         if: matrix.mode.name == 'bench-comparison'
         run: cat bench-result.txt

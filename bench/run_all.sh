@@ -82,9 +82,10 @@ mkdir -p "$MNTRS_MNT" "$RCLONE_MNT"
     --daemon --daemon-wait --daemon-timeout=15
 
 # rclone mount (writes cache mode for fair comparison)
-rclone mount --daemon --vfs-cache-mode=writes --vfs-write-back=5s \
-    :s3,provider=Minio,access_key_id=$ACCESS_KEY,secret_access_key=$SECRET_KEY,endpoint=$ENDPOINT,region=$REGION:$BUCKET \
-    "$RCLONE_MNT"
+rclone config create bench s3 provider Minio \
+    access_key_id $ACCESS_KEY secret_access_key $SECRET_KEY \
+    endpoint $ENDPOINT region $REGION 2>/dev/null
+rclone mount bench:$BUCKET "$RCLONE_MNT" --daemon --vfs-cache-mode=writes --vfs-write-back=5s --log-file /tmp/rclone-bench.log --log-level INFO
 
 sleep 3
 if mountpoint -q "$MNTRS_MNT"; then
@@ -92,7 +93,7 @@ if mountpoint -q "$MNTRS_MNT"; then
 else
   echo "  mntrs mount: FAILED (check errors above)"
 fi
-if mountpoint -q "$RCLONE_MNT"; then
+if mountpoint -q "$RCLONE_MNT" || mount | grep -q "$RCLONE_MNT"; then
   echo "  rclone mount: OK"
 else
   echo "  rclone mount: FAILED"
@@ -268,6 +269,7 @@ echo "  (memory backend — for reference only)"
 
 # ---- Table ----
 python3 "$SCRIPT_DIR/render_table.py" "$RESULT_TMP"
+if [ -f /tmp/rclone-bench.log ]; then echo "=== rclone log ===" >> "$RESULT_TMP"; cat /tmp/rclone-bench.log >> "$RESULT_TMP"; fi
 rm -f "$RESULT_TMP"
 
 # ---- Summary ----
