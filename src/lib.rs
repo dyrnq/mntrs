@@ -105,6 +105,7 @@ fn rt() -> &'static tokio::runtime::Runtime {
 
 // TTL now comes from MntrsFs.attr_ttl field
 const FUSE_ROOT_INO: u64 = 1;
+static NEXT_INO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(2);
 // DIR_CACHE_TTL now comes from MntrsFs.dir_cache_ttl field
 
 /// Per-open-file-handle state
@@ -406,7 +407,7 @@ impl MntrsFs {
     }
 
     fn alloc_ino(&self, path: &str, kind: FileType, size: u64) -> u64 {
-        let ino = path_hash(path);
+        let ino = NEXT_INO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inodes
             .entry(ino)
             .and_modify(|v| v.2 = size)
@@ -1531,8 +1532,11 @@ impl Filesystem for MntrsFs {
         let op = self.op.clone();
         let src_clone = src.clone();
         rt().block_on(async move {
-            if op.copy(&src_clone, &dst).await.is_ok() && op.delete(&src_clone).await.is_err() {
-                tracing::debug!(path=%src_clone, "rename delete failed");
+            if let Err(e) = op.rename(&src_clone, &dst).await {
+                tracing::warn!(path=%src_clone, error=%e, "rename failed, falling back to copy+delete");
+                if op.copy(&src_clone, &dst).await.is_ok() {
+                    let _ = op.delete(&src_clone).await;
+                }
             }
         });
         let cpath = cache_path(&self.cache_dir, &src);
