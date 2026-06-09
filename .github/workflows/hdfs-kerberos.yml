@@ -113,9 +113,14 @@ jobs:
           export HADOOP_OPTS="-Djava.security.krb5.conf=/etc/krb5.conf"
           kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL
           sudo -E /opt/hadoop/sbin/start-dfs.sh 2>&1 || /opt/hadoop/sbin/start-dfs.sh 2>&1
-          sleep 5
-          # Verify
-          /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | head -5
+          # Wait for NameNode to be ready (up to 60s)
+          for i in $(seq 1 12); do
+            if /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | grep -q "Live datanodes"; then
+              echo "HDFS ready after ${i}x5s"
+              break
+            fi
+            sleep 5
+          done
           HDFS_NAMENODE_ADDR="localhost:9000"
           echo "HDFS_NAMENODE_ADDR=localhost:9000" >> $GITHUB_ENV
 
@@ -123,9 +128,9 @@ jobs:
         run: |
           export HADOOP_CONF_DIR=/opt/hadoop/etc/hadoop
           echo "HDFS NameNode: $HDFS_NAMENODE_ADDR"
-          /opt/hadoop/bin/hdfs dfs -mkdir -p /test 2>/dev/null || true
-          echo "hello hdfs" | /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt 2>/dev/null || true
-          /opt/hadoop/bin/hdfs dfs -ls /test 2>/dev/null || true
+          /opt/hadoop/bin/hdfs dfs -mkdir -p /test
+          echo "hello hdfs" | /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt
+          /opt/hadoop/bin/hdfs dfs -ls /test
 
       - name: Test mntrs HDFS mount (Kerberos)
         run: |

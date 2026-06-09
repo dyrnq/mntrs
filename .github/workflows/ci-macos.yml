@@ -44,13 +44,13 @@ jobs:
       - name: Smoke test — memory mount + read/write
         run: |
           mkdir -p /tmp/mntrs-macos-test
-          cargo run --release -- mount memory:// /tmp/mntrs-macos-test --volname mntrs-test 2>&1 &
+          ./target/release/mntrs mount memory:// /tmp/mntrs-macos-test --volname mntrs-test 2>&1 &
           MNTRS_PID=$!
           sleep 5
           echo "hello from macos" > /tmp/mntrs-macos-test/test.txt
           cat /tmp/mntrs-macos-test/test.txt
           ls -la /tmp/mntrs-macos-test/
           echo "macOS memory mount read/write OK"
-          kill $MNTRS_PID 2>/dev/null || true
+          kill $MNTRS_PID 2>/dev/null
           sleep 2
           fusermount -u /tmp/mntrs-macos-test 2>/dev/null || umount /tmp/mntrs-macos-test 2>/dev/null
