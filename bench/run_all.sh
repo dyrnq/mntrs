@@ -34,11 +34,13 @@ bench() {
     local out
     out=$({ time "$@" >/dev/null 2>&1; } 2>&1) || {
         printf "  %-35s | %15s | FAIL\n" "$name" "$mnt"
+        echo "FAIL|$name|$mnt|$CATEGORY" >> "$RESULT_TMP"
         FAIL=$((FAIL + 1))
         return
     }
     local t=$(echo "$out" | grep real | awk '{print $2}')
     printf "  %-35s | %15s | %s\n" "$name" "$t" "OK"
+    echo "$t|$name|$mnt|$CATEGORY" >> "$RESULT_TMP"
     PASS=$((PASS + 1))
 }
 
