@@ -44,8 +44,8 @@ jobs:
       - name: Smoke test — memory mount + read/write
         run: |
           mkdir -p /tmp/mntrs-macos-test
-          ./target/release/mntrs mount memory:// /tmp/mntrs-macos-test --volname mntrs-test 2>&1 &
-          sleep 5
+          ./target/release/mntrs mount memory:// /tmp/mntrs-macos-test --volname mntrs-test --daemon --daemon-wait --daemon-timeout=15 2>&1
+          sleep 3
           echo "hello from macos" > /tmp/mntrs-macos-test/test.txt
           cat /tmp/mntrs-macos-test/test.txt
           ls -la /tmp/mntrs-macos-test/
