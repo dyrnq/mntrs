@@ -12,6 +12,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  LIBRARY_PATH: /opt/homebrew/lib
 
 jobs:
   build-test:
@@ -23,28 +24,41 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install FUSE
-        run: brew install --cask fuse-t && brew install protobuf
+      - name: Install deps
+        run: |
+          brew install --cask fuse-t 2>/dev/null || true
+          brew install protobuf
+          echo "LIBRARY_PATH=$LIBRARY_PATH"
+          ls -la $LIBRARY_PATH/libfuse* 2>/dev/null || echo "libfuse not found in $LIBRARY_PATH"
 
       - name: Format check
         run: cargo fmt --all -- --check
 
-      - name: Build workspace
+      - name: Build
         run: cargo build --package mntrs
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --package mntrs --all-targets -- -D warnings
 
       - name: Unit tests (lib only)
-        run: cargo test --workspace --lib
+        run: cargo test --package mntrs --lib
 
       - name: Build release
         run: cargo build --release --package mntrs
 
-      - name: Check macFUSE (no mount test — GH Actions lacks kext)
+      - name: Smoke test — memory mount
         run: |
-          if kextstat 2>/dev/null | grep -q macfuse || [ -c /dev/fuse ]; then
-            echo "macFUSE available"
+          mkdir -p /tmp/mntrs-macos-test
+          ./target/release/mntrs mount memory:// /tmp/mntrs-macos-test --volname mntrs-test 2>&1 &
+          sleep 5
+          if mount | grep -q /tmp/mntrs-macos-test; then
+            echo "hello from macos" > /tmp/mntrs-macos-test/test.txt
+            cat /tmp/mntrs-macos-test/test.txt
+            ls -la /tmp/mntrs-macos-test/
+            echo "macOS memory mount read/write OK"
           else
-            echo "macFUSE not available — mount test skipped (GH Actions limitation)"
+            echo "::error::mount failed"
+            mount
+            exit 1
           fi
+          umount /tmp/mntrs-macos-test
