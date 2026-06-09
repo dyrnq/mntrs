@@ -125,7 +125,7 @@ jobs:
           spec:
             containers:
             - name: test
-              image: ubuntu:22.04
+              image: ubuntu:24.04
               command: ["sleep", "infinity"]
               volumeMounts:
               - name: binary
