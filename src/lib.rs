@@ -1,4 +1,5 @@
 #![allow(unused_imports)]
+#![allow(unexpected_cfgs)]
 #![allow(unused)]
 #![recursion_limit = "256"]
 pub mod cmd;

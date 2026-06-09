@@ -51,7 +51,7 @@ fn core_kind_to_file_attributes(kind: CoreFileType, perm: u16) -> u32 {
     if perm & 0o200 == 0 {
         attrs |= FILE_ATTRIBUTE_READONLY;
     }
-    attrs as u32 | FILE_ATTRIBUTE_ARCHIVE as u32
+    attrs | FILE_ATTRIBUTE_ARCHIVE
 }
 
 /// Convert CoreFileAttr to WinFSP FileInfo (in place).
@@ -135,7 +135,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         Ok(FileSecurity {
             reparse: false,
             sz_security_descriptor: 0,
-            attributes: FILE_ATTRIBUTE_NORMAL as u32,
+            attributes: FILE_ATTRIBUTE_NORMAL,
         })
     }
 

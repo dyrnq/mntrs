@@ -175,9 +175,9 @@ pub mod test_helpers {
                     format!("FileSystemHost::new: {e}"),
                 )
             })?;
-        let _mp = host.mount(MountPoint::NextFreeDrive).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("host.mount: {e}"))
-        })?;
+        let _ = host
+            .mount(MountPoint::NextFreeDrive)
+            .map_err(|e| std::io::Error::other(format!("host.mount: {e}")))?;
         Ok(MountGuard::<F> { host: Some(host) })
     }
 
