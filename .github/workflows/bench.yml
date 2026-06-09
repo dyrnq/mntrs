@@ -21,13 +21,7 @@ jobs:
       matrix:
         mode:
           - name: fuse-integration
-            build-flags: ""
-            run: cargo test --test fuse_integration_test -- --test-threads=1 --nocapture
-            setup-rclone: false
           - name: bench-comparison
-            build-flags: "--release"
-            run: MNTRS_BIN=./target/release/mntrs RCLONE_MNT=/tmp/rclone-mnt MNTRS_MNT=/tmp/mntrs-bench ENDPOINT=http://localhost:9000 BUCKET=bench-bucket ACCESS_KEY=minioadmin SECRET_KEY=minioadmin bash bench/run_all.sh 2>&1 | tee bench-result.txt
-            setup-rclone: true
 
     services:
       minio:
@@ -48,8 +42,11 @@ jobs:
       - name: Install FUSE
         run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev
 
-      - name: Build mntrs
-        run: cargo build ${{ matrix.mode.build-flags }}
+      - name: Build mntrs (debug, for fuse test)
+        run: cargo build
+
+      - name: Build mntrs (release, for bench)
+        run: cargo build --release
 
       - name: Setup MinIO bucket
         run: |
@@ -63,19 +60,27 @@ jobs:
           fi
           echo "test" > /tmp/hello.txt
 
-      - name: Setup rclone (bench only)
-        if: matrix.mode.setup-rclone
+      - name: Run FUSE integration tests
+        if: matrix.mode.name == 'fuse-integration'
+        run: cargo test --test fuse_integration_test -- --test-threads=1 --nocapture
+
+      - name: Setup rclone
+        if: matrix.mode.name == 'bench-comparison'
         run: |
           curl -sSL https://downloads.rclone.org/rclone-current-linux-amd64.deb -o rclone.deb
           sudo dpkg -i rclone.deb
-          mkdir -p /tmp/rclone-mnt
-          mkdir -p /tmp/mntrs-bench
+          mkdir -p /tmp/rclone-mnt /tmp/mntrs-bench
           rclone config create minio s3 provider Minio env_auth false \
             access_key_id minioadmin secret_access_key minioadmin \
             endpoint http://localhost:9000 region us-east-1
 
-      - name: Run ${{ matrix.mode.name }}
-        run: ${{ matrix.mode.run }}
+      - name: Run benchmark
+        if: matrix.mode.name == 'bench-comparison'
+        run: |
+          MNTRS_BIN=./target/release/mntrs RCLONE_MNT=/tmp/rclone-mnt MNTRS_MNT=/tmp/mntrs-bench \
+            ENDPOINT=http://localhost:9000 BUCKET=bench-bucket \
+            ACCESS_KEY=minioadmin SECRET_KEY=minioadmin \
+            bash bench/run_all.sh 2>&1 | tee bench-result.txt
 
       - name: Upload benchmark results
         if: matrix.mode.name == 'bench-comparison'
@@ -86,6 +91,4 @@ jobs:
 
       - name: Check regressions
         if: matrix.mode.name == 'bench-comparison'
-        run: |
-          echo "=== Benchmark Results ==="
-          cat bench-result.txt
+        run: cat bench-result.txt
