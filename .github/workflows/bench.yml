@@ -50,14 +50,8 @@ jobs:
 
       - name: Setup MinIO bucket
         run: |
-          CONTAINER=$(docker ps -q -f ancestor=minio/minio | head -1)
-          if [ -n "$CONTAINER" ]; then
-            for i in $(seq 1 5); do
-              docker exec "$CONTAINER" mc alias set bench http://localhost:9000 minioadmin minioadmin 2>/dev/null && break
-              sleep 2
-            done
-            docker exec "$CONTAINER" mc mb --ignore-existing bench/test-bucket 2>/dev/null
-          fi
+          pip3 install awscli
+          AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin             aws --endpoint-url http://localhost:9000 --no-verify-ssl s3 mb s3://test-bucket 2>/dev/null || true
           echo "test" > /tmp/hello.txt
 
       - name: Run FUSE integration tests
