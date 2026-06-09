@@ -1,4 +1,5 @@
 #![allow(unused_imports)]
+#![allow(unused)]
 #![recursion_limit = "256"]
 pub mod cmd;
 pub mod core_fs;
