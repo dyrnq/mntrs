@@ -123,11 +123,11 @@ else
 fi
 echo ""
 
-# ---- Warmup ----
-ls "$MNTRS_MNT"/ >/dev/null 2>&1
-ls "$RCLONE_MNT"/ >/dev/null 2>&1
-cat "$MNTRS_MNT/1K.bin" >/dev/null 2>&1 || true
-cat "$RCLONE_MNT/1K.bin" >/dev/null 2>&1 || true
+# ---- Warmup (with timeout, S3 mount may hang) ----
+timeout 10 ls "$MNTRS_MNT"/ >/dev/null 2>&1 || echo "  warmup: mntrs ls hung"
+timeout 10 ls "$RCLONE_MNT"/ >/dev/null 2>&1 || echo "  warmup: rclone ls hung"
+timeout 10 cat "$MNTRS_MNT/1K.bin" >/dev/null 2>&1 || echo "  warmup: mntrs cat hung"
+timeout 10 cat "$RCLONE_MNT/1K.bin" >/dev/null 2>&1 || echo "  warmup: rclone cat hung"
 
 # ============================================================
 # Test categories
