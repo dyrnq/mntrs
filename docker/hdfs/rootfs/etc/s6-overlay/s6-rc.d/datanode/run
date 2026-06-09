@@ -2,6 +2,16 @@
 export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
 export HADOOP_HOME=/opt/hadoop
 export HADOOP_OPTS="-Djava.security.krb5.conf=/etc/krb5.conf"
-sleep 10
+
+# Wait for NameNode to be ready
+echo "[datanode] Waiting for NameNode..."
+for i in $(seq 1 30); do
+    if gosu mntrs /opt/hadoop/bin/hdfs dfsadmin -fs hdfs://localhost:8020 -report 2>/dev/null | grep -q "Live datanodes\|Safe mode is ON"; then
+        echo "[datanode] NameNode is ready"
+        break
+    fi
+    sleep 2
+done
+
 echo "[datanode] Starting..."
-exec /opt/hadoop/bin/hdfs datanode
+exec gosu mntrs /opt/hadoop/bin/hdfs datanode

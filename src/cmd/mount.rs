@@ -512,16 +512,8 @@ pub fn mount(
         None
     };
 
-    #[cfg(not(windows))]
-    if daemon {
-        daemonize(mountpoint, wait_pipe.map(|(_, w)| w))?;
-        // After daemonize returns (in grandchild), close read end if we inherited it
-        if let Some((r, _)) = wait_pipe {
-            unsafe {
-                rustix::io::close(r);
-            }
-        }
-    }
+    // fuser::spawn_mount2 already spawns a background thread.
+    // Daemon mode: keep main thread alive to prevent session drop (which unmounts).
 
     let mount_path = Path::new(mountpoint);
     #[cfg(not(windows))]
@@ -636,31 +628,39 @@ pub fn mount(
             .map_err(|e| anyhow::anyhow!("host.mount: {e}"))?;
     }
 
-    // Foreground mode with --daemon-wait: parent waits for pipe close
-    #[cfg(not(windows))]
-    if !daemon && let Some((r, w)) = wait_pipe {
+    if daemon {
+        // Keep the process alive indefinitely (FUSE session runs in background thread).
+        // Ctrl-C or SIGTERM will trigger cleanup via atexit.
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    }
+
+    // Foreground / daemon-wait: called from CSI or interactive use, return control.
+    if let Some((r, w)) = wait_pipe {
         unsafe {
             rustix::io::close(w);
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(_daemon_timeout);
-        // Use libc::poll for timeout-based polling
-        while std::time::Instant::now() < deadline {
-            let mut pfd = libc::pollfd {
-                fd: r,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let ms = (deadline - std::time::Instant::now()).as_millis().min(100) as i32;
-            if unsafe { libc::poll(&mut pfd, 1, ms) } > 0
-                && pfd.revents & (libc::POLLIN | libc::POLLHUP) != 0
-            {
-                break;
+        if daemon_wait {
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(_daemon_timeout);
+            while std::time::Instant::now() < deadline {
+                let mut pfd = libc::pollfd {
+                    fd: r,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ms = (deadline - std::time::Instant::now()).as_millis().min(100) as i32;
+                if unsafe { libc::poll(&mut pfd, 1, ms) } > 0
+                    && pfd.revents & (libc::POLLIN | libc::POLLHUP) != 0
+                {
+                    break;
+                }
             }
         }
         unsafe {
             rustix::io::close(r);
         }
-        std::process::exit(0);
     }
 
     CLEANUP_MP.set(mountpoint.to_string()).ok();
