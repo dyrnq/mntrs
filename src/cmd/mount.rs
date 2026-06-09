@@ -221,7 +221,7 @@ pub fn mount_internal(
         false,                    // write_back_cache
         &[],                      // fuse_options
         &[],                      // fuse_flags
-        true,                     // daemon
+        false,                    // daemon (no fork — std::thread::spawn holds session)
         false,                    // daemon_wait
         10,                       // daemon_timeout
         false,                    // allow_root

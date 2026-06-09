@@ -344,7 +344,7 @@ impl node_server::Node for NodeService {
         }
 
         // Wait for mount to be ready
-        wait_for_mount(&staging_path, std::time::Duration::from_secs(30))?;
+        wait_for_mount(&staging_path, std::time::Duration::from_secs(60))?;
 
         Ok(Response::new(NodeStageVolumeResponse::default()))
     }
@@ -379,8 +379,7 @@ impl node_server::Node for NodeService {
         let req = request.into_inner();
         let target_path = req.target_path.clone();
         let volume_id = req.volume_id.clone();
-        let vol_ctx = req.volume_context;
-        let read_only = req.readonly;
+        let staging_target_path = req.staging_target_path.clone();
 
         if volume_id.is_empty() {
             return Err(Status::invalid_argument("volume_id must not be empty"));
@@ -388,77 +387,55 @@ impl node_server::Node for NodeService {
         if target_path.is_empty() {
             return Err(Status::invalid_argument("target_path must not be empty"));
         }
+        if staging_target_path.is_empty() {
+            return Err(Status::invalid_argument(
+                "staging_target_path must not be empty",
+            ));
+        }
         if req.volume_capability.is_none() {
             return Err(Status::invalid_argument(
                 "volume_capability must be provided",
             ));
         }
 
-        let storage = vol_ctx
-            .get("storage")
-            .or_else(|| vol_ctx.get("storageUrl"))
-            .or_else(|| vol_ctx.get("storage-url"))
-            .ok_or_else(|| Status::invalid_argument("missing volume context: storage"))?;
+        // Idempotency: already published?
+        if is_mountpoint(&target_path) {
+            tracing::info!(volume_id, target=%target_path, "already mounted (bind)");
+            return Ok(Response::new(NodePublishVolumeResponse::default()));
+        }
 
-        let prefix = vol_ctx
-            .get("prefix")
-            .or_else(|| vol_ctx.get("path"))
-            .map(|s| s.as_str())
-            .unwrap_or("");
-        let storage_url = if prefix.is_empty() {
-            storage.clone()
-        } else {
-            format!(
-                "{}/{}",
-                storage.trim_end_matches('/'),
-                prefix.trim_start_matches('/')
-            )
-        };
-
-        let target = std::path::Path::new(&target_path);
-        if let Err(e) = std::fs::create_dir_all(target) {
+        // Ensure staging is mounted (FUSE mount done in NodeStageVolume)
+        if !is_mountpoint(&staging_target_path) {
             return Err(Status::internal(format!(
-                "create_dir_all {target_path}: {e}"
+                "staging path not mounted: {staging_target_path}"
             )));
         }
 
-        let mut opts = HashMap::new();
-        for (k, v) in &vol_ctx {
-            match k.as_str() {
-                "storage" | "storageUrl" | "storage-url" | "prefix" | "path" => continue,
-                _ => {
-                    opts.insert(k.clone(), v.clone());
-                }
-            }
+        // Ensure target exists for bind mount
+        std::fs::create_dir_all(&target_path)
+            .map_err(|e| Status::internal(format!("create_dir_all {}: {}", target_path, e)))?;
+
+        // Bind mount: staging → target (like k8s-csi-s3).
+        // CSI nodeplugin runs in privileged mode — mount --bind works without sudo.
+        tracing::info!(volume_id, staging=%staging_target_path, target=%target_path, "bind mounting");
+        let output = std::process::Command::new("mount")
+            .args(["--bind", &staging_target_path, &target_path])
+            .output()
+            .map_err(|e| Status::internal(format!("mount --bind failed: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Status::internal(format!("mount --bind: {stderr}")));
         }
-
-        #[cfg(not(windows))]
-        {
-            let su = storage_url.clone();
-            let tp = target_path.clone();
-            let ro = read_only;
-            // FUSE mount blocks in session.run() — spawn on a dedicated OS thread
-            std::thread::spawn(move || {
-                if let Err(e) = mntrs::cmd::mount::mount_internal(&su, &tp, &opts, ro) {
-                    tracing::error!(error=%e, "publish FUSE mount thread failed");
-                }
-            });
-
-            // Wait for mount to appear
-            wait_for_mount(&target_path, std::time::Duration::from_secs(30))
-                .map_err(|e| Status::internal(format!("mount not ready: {e}")))?;
-
-            let mut mounts = self.mounts.lock().unwrap();
-            mounts.insert(
-                volume_id.clone(),
-                MountState {
-                    storage_url: storage_url.clone(),
-                    mountpoint: target_path.clone(),
-                },
-            );
-            tracing::info!(volume_id, storage=%storage_url, target=%target_path, "volume mounted");
-            Ok(Response::new(NodePublishVolumeResponse::default()))
-        }
+        let mut mounts = self.mounts.lock().unwrap();
+        mounts.insert(
+            volume_id.clone(),
+            MountState {
+                storage_url: staging_target_path.clone(),
+                mountpoint: target_path.clone(),
+            },
+        );
+        tracing::info!(volume_id, staging=%staging_target_path, target=%target_path, "volume published");
+        Ok(Response::new(NodePublishVolumeResponse::default()))
     }
 
     async fn node_unpublish_volume(
@@ -477,10 +454,22 @@ impl node_server::Node for NodeService {
         }
 
         #[cfg(not(windows))]
-        if let Err(e) = mntrs::cmd::mount::unmount_internal(&target_path) {
-            tracing::warn!(target=%target_path, error=%e, "unmount failed");
+        {
+            // Unmount bind mount first
+            let output = std::process::Command::new("umount")
+                .arg(&target_path)
+                .output();
+            if let Ok(o) = &output {
+                if !o.status.success() {
+                    tracing::warn!(target=%target_path, stderr=%String::from_utf8_lossy(&o.stderr), "umount failed, trying force");
+                    std::process::Command::new("umount")
+                        .args(["-l", &target_path])
+                        .output()
+                        .ok();
+                }
+            }
         }
-        let _ = std::fs::remove_dir(&target_path);
+        std::fs::remove_dir_all(&target_path).ok();
 
         let mut mounts = self.mounts.lock().unwrap();
         mounts.remove(&volume_id);
