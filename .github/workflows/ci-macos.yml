@@ -24,7 +24,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install FUSE
-        run: brew install macfuse protobuf
+        run: brew install --cask macfuse protobuf
 
       - name: Format check
         run: cargo fmt --all -- --check
