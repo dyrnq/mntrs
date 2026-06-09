@@ -102,7 +102,7 @@ jobs:
 
       - name: Test mntrs mount
         run: |
-          sudo mkdir -p /mnt/mntrs-test && sudo chmod 777 /mnt/mntrs-test
+          mkdir -p /mnt/mntrs-test && chmod 777 /mnt/mntrs-test
           timeout 10 ./target/release/mntrs mount ${{ matrix.test.storage }} /mnt/mntrs-test \
             --opt endpoint=${{ matrix.test.endpoint }} \
             --opt access-key=minioadmin \
@@ -110,10 +110,14 @@ jobs:
             --opt region=us-east-1 \
             --read-only 2>&1 &
           sleep 5
-          if mountpoint -q /mnt/mntrs-test; then
+          MNTRS_PID=$!
+          sleep 5
+          if kill -0 $MNTRS_PID 2>/dev/null && mount | grep -q /mnt/mntrs-test; then
             ls /mnt/mntrs-test/ 2>&1 && echo "✅ ${{ matrix.test.name }} mount works"
           else
-            echo "::warning::${{ matrix.test.name }} mount may be empty or failed"
+            echo "::error::${{ matrix.test.name }} mount failed"
+            mount | grep mntrs || true
+            exit 1
           fi
           sudo fusermount3 -u /mnt/mntrs-test 2>/dev/null
 
