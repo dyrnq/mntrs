@@ -102,10 +102,20 @@ jobs:
 
       # Verify FUSE mount via process liveness + mount table.
       # Uses kill -0 (check process alive) and mount | grep (check mount table).
+      - name: Setup MinIO bucket (s3 test only)
+        if: matrix.test.name == 's3'
+        run: |
+          pip3 install awscli
+          AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+            aws --endpoint-url http://localhost:9000 --no-verify-ssl s3 mb s3://test-bucket 2>/dev/null || true
+          echo "hello from minio" > /tmp/s3-test.txt
+          AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+            aws --endpoint-url http://localhost:9000 --no-verify-ssl s3 cp /tmp/s3-test.txt s3://test-bucket/
+
       - name: Test mntrs mount
         run: |
           sudo mkdir -p /mnt/mntrs-test && sudo chmod 777 /mnt/mntrs-test
-          timeout 10 ./target/release/mntrs mount ${{ matrix.test.storage }} /mnt/mntrs-test \
+          timeout 15 ./target/release/mntrs mount ${{ matrix.test.storage }} /mnt/mntrs-test \
             --opt endpoint=${{ matrix.test.endpoint }} \
             --opt access-key=minioadmin \
             --opt secret-key=minioadmin \
@@ -115,7 +125,8 @@ jobs:
           sleep 5
           if kill -0 $MNTRS_PID 2>/dev/null; then
             if mount | grep -q /mnt/mntrs-test; then
-              ls /mnt/mntrs-test/ 2>&1 && echo "✅ ${{ matrix.test.name }} mount works"
+              ls /mnt/mntrs-test/ 2>&1
+              cat /mnt/mntrs-test/s3-test.txt 2>&1 && echo "✅ ${{ matrix.test.name }} mount read OK"
             else
               echo "::error::${{ matrix.test.name }} mount failed: mount not in mount table"
               mount | grep mntrs || true
