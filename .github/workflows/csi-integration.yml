@@ -145,4 +145,4 @@ jobs:
         run: |
           kubectl delete pod mntrs-csi-test --ignore-not-found
           sudo fusermount3 -u /mnt/hdfs-test 2>/dev/null || true
-          pkill -f 'hdfs\|simple' 2>/dev/null; true
+          pkill -f "hdfs|simple" 2>/dev/null || true
