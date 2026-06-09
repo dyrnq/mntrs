@@ -37,10 +37,11 @@ jobs:
           cat | sudo tee /etc/krb5.conf << 'KRB5'
           [libdefaults]
             default_realm = TEST.LOCAL
+            udp_preference_limit = 1
           [realms]
             TEST.LOCAL = {
-              kdc = kdc
-              admin_server = kdc
+              kdc = 127.0.0.1
+              admin_server = 127.0.0.1
             }
           KRB5
           # Add KDC to hosts
