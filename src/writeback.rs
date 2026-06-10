@@ -57,9 +57,9 @@ pub fn spawn(
             }
 
             if queue.is_empty() {
-                PENDING_COUNT.fetch_add(1, Ordering::Relaxed);
                 match rx.recv().await {
                     Some(task) => {
+                        PENDING_COUNT.fetch_add(1, Ordering::Relaxed);
                         queue.insert_at(task, tokio::time::Instant::now() + delay);
                     }
                     None => break,
@@ -93,6 +93,7 @@ pub fn spawn(
                                         v.3 = Some(std::time::SystemTime::now());
                                     });
                                 }
+                                PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
                                 let _ = std::fs::remove_file(&cache_path);
                                 let _ = std::fs::remove_file(cache_path.with_extension("dirty"));
                                 return;
@@ -107,6 +108,7 @@ pub fn spawn(
                             }
                         }
                     }
+                    PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
                     tracing::warn!(
                         path = %p,
                         error = ?last_err,

@@ -408,6 +408,20 @@ impl MntrsFs {
         self.inodes.get(&ino).map(|r| r.clone())
     }
 
+    /// Background thread that periodically clears stale directory cache entries.
+    pub fn start_cache_poller(&self) {
+        let dir_cache = self.dir_cache.clone();
+        let dir_cache_ttl = self.dir_cache_ttl;
+        let interval = self.cache_poll_interval;
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(interval);
+                let now = std::time::Instant::now();
+                dir_cache.retain(|_k, (t, _v)| now.duration_since(*t) < dir_cache_ttl);
+            }
+        });
+    }
+
     /// Recover writeback queue + spawn worker. Shared by fuser + CoreFilesystem init.
     fn common_init_wb(&self) {
         self.alloc_ino("", FileType::Directory, 4096);
