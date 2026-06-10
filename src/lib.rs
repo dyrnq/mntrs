@@ -444,16 +444,13 @@ impl MntrsFs {
                 }
             }
         }
-        // Spawn writeback worker via std thread (daemonize+fork safe)
+        // Spawn writeback worker (tokio, requires runtime)
+        crate::rt();
         let op = self.op.clone();
-        let queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-        let queue2 = queue.clone();
         let delay = self.write_back_delay;
-        let max_age = self.cache_max_age;
         let inodes = Arc::new(self.inodes.clone());
-        std::thread::spawn(move || crate::writeback::worker(op, inodes, queue2, delay, max_age));
-        // Store queue for flush/release enqueue
-        self.writeback_queue.set(queue).ok();
+        let (tx, _handle) = crate::writeback::spawn(op, inodes, delay);
+        self.writeback_sender.set(tx).ok();
     }
 
     fn alloc_ino(&self, path: &str, kind: FileType, size: u64) -> u64 {
