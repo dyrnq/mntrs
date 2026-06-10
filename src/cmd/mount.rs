@@ -341,6 +341,7 @@ pub fn pending_writebacks() -> usize {
     crate::writeback::pending_count()
 }
 #[allow(clippy::too_many_arguments)]
+#[allow(unused_variables)]
 pub fn mount(
     storage_url: &str,
     mountpoint: &str,
