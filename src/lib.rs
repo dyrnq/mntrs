@@ -2071,6 +2071,14 @@ impl CoreFilesystem for MntrsFs {
             format!("{}/", path)
         };
         for (name, mode, size, _mtime) in self.list_op(&list_path) {
+            // hdfs-native returns the queried path itself as the first entry
+            // (e.g. listing "/" yields a root entry with name=""). Such entries
+            // must be filtered: an empty dirent name is invalid in FUSE and
+            // makes the kernel EIO the readdir. Mirrors the filter in
+            // impl Filesystem for MntrsFs (see SESSION_PITFALLS §2.4).
+            if name.is_empty() || name == "/" {
+                continue;
+            }
             let kind = match mode {
                 EntryMode::DIR => CoreFileType::Directory,
                 _ => CoreFileType::RegularFile,

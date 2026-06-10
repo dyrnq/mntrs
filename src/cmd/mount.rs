@@ -533,8 +533,12 @@ pub fn mount(
             .args(&args)
             .env("MNTRS_INTERNAL_DAEMON", "1")
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            // Inherit stdout/stderr so the FUSE worker's tracing output
+            // reaches the parent's stdio redirection (e.g. shell's
+            // `> "$MOUNT_LOG" 2>&1 &`). Without this, daemon-wait mode
+            // makes the worker a black box — see SESSION_PITFALLS §2.2.
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
             .spawn()
             .map_err(|e| anyhow!("failed to spawn daemon: {}", e))?;
         std::process::exit(0);
