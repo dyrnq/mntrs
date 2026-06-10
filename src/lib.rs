@@ -220,6 +220,7 @@ pub struct MntrsFs {
     pub cache_poll_interval: Duration,
     pub disk_total_size: u64,
     writeback_sender: std::sync::OnceLock<writeback::Sender>,
+
     mem_cache: dashmap::DashMap<(u64, u64), bytes::Bytes>,
     attr_cache: dashmap::DashMap<
         String,
