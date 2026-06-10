@@ -1619,6 +1619,10 @@ impl Filesystem for MntrsFs {
         let op = self.op.clone();
         let src_clone = src.clone();
         let dst_clone = dst.clone();
+        let dst_clone2 = dst.clone();
+        // Pre-delete destination to match POSIX rename semantics
+        let op_del = op.clone();
+        let _ = rt().block_on(async move { op_del.delete(&dst_clone2).await });
         rt().block_on(async move {
             if let Err(e) = op.rename(&src_clone, &dst_clone).await {
                 tracing::warn!(path=%src_clone, error=%e, "rename failed, falling back to copy+delete");
@@ -1627,8 +1631,17 @@ impl Filesystem for MntrsFs {
                 }
             }
         });
-        let cpath = cache_path(&self.cache_dir, &src);
-        let _ = fs::remove_file(&cpath);
+        // Migrate cache file from src to dst (like rclone)
+        let cpath_src = cache_path(&self.cache_dir, &src);
+        let cpath_dst = cache_path(&self.cache_dir, &dst);
+        if cpath_src.exists() && !cpath_dst.exists() {
+            if let Some(parent) = cpath_dst.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::rename(&cpath_src, &cpath_dst);
+        } else {
+            let _ = fs::remove_file(&cpath_src);
+        }
         // Clean block-level cache for src
         let prefix = format!("{:020x}_", crate::path_hash(&src));
         if let Ok(entries) = fs::read_dir(&self.cache_dir) {
@@ -2565,11 +2578,29 @@ impl CoreFilesystem for MntrsFs {
         let op = self.op.clone();
         let src_clone = src.clone();
         let dst_clone = dst.clone();
+        let dst_clone2 = dst.clone();
+        // Pre-delete destination (POSIX semantics)
+        let op_del = op.clone();
+        let _ = rt().block_on(async move { op_del.delete(&dst_clone2).await });
         rt().block_on(async move {
-            if op.copy(&src_clone, &dst_clone).await.is_ok() {
-                let _ = op.delete(&src_clone).await;
+            if let Err(e) = op.rename(&src_clone, &dst_clone).await {
+                tracing::warn!(path=%src_clone, error=%e, "rename failed, falling back to copy+delete");
+                if op.copy(&src_clone, &dst_clone).await.is_ok() {
+                    let _ = op.delete(&src_clone).await;
+                }
             }
         });
+        // Migrate cache file
+        let cpath_src = crate::cache_path(&self.cache_dir, &src);
+        let cpath_dst = crate::cache_path(&self.cache_dir, &dst);
+        if cpath_src.exists() && !cpath_dst.exists() {
+            if let Some(parent) = cpath_dst.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::rename(&cpath_src, &cpath_dst);
+        } else {
+            let _ = std::fs::remove_file(&cpath_src);
+        }
         self.inodes.remove(&crate::path_hash(&src));
         self.attr_cache.remove(&src);
         self.invalidate_dir_cache(&src);
