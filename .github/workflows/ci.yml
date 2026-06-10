@@ -70,10 +70,10 @@ jobs:
         if: matrix.task == 'hdfs-jni'
         run: |
           sudo apt-get update && sudo apt-get install -y default-jdk
-          echo "JAVA_HOME=/usr/lib/jvm/default-java" >> $GITHUB_ENV
+          export JAVA_HOME=/usr/lib/jvm/default-java
           JVM_LIB=$(find /usr/lib/jvm -name "libjvm.so" | head -1)
           if [ -n "$JVM_LIB" ]; then
-            echo "LD_LIBRARY_PATH=$(dirname "$JVM_LIB"):${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
+            export LD_LIBRARY_PATH=$(dirname "$JVM_LIB"):${LD_LIBRARY_PATH:-}
           fi
           cargo build --release --features hdfs-jni
           cargo test --test hdfs_integration_test --features hdfs-jni
