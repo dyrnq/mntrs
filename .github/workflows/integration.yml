@@ -143,7 +143,7 @@ jobs:
           # hdfs backend uses --daemon --daemon-wait (parent exits after spawn); other backends run in foreground
           # Per SESSION_PITFALLS §2.2: --daemon re-execs, $! is unreliable — use mount table only
           # Per SESSION_PITFALLS §2.4: hdfs-native can return root entry / trailing slashes; ls may EIO briefly
-          MOUNT_LOG="/tmp/mntrs-mount-${BACKEND}.log"
+          MOUNT_LOG="/tmp/mntrs-mount-${{ matrix.backend.name }}.log"
           if [ "${{ matrix.backend.name }}" = "hdfs" ]; then
             ./target/release/mntrs mount ${{ matrix.backend.storage }} /mnt/mntrs-test $MOUNT_OPTS --allow-other --daemon --daemon-wait --daemon-timeout=20 > "$MOUNT_LOG" 2>&1 &
           else
@@ -172,6 +172,12 @@ jobs:
             cat "$MOUNT_LOG" 2>/dev/null || true
             echo "--- mount table ---"
             mount | grep mntrs-test || echo "(no mount)"
+            echo "--- mntrs processes ---"
+            pgrep -alf mntrs || echo "(no mntrs process)"
+            if [ "${{ matrix.backend.name }}" = "hdfs" ]; then
+              echo "--- HDFS dfsadmin -report (server side) ---"
+              docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | tee /tmp/hdfs-dfsadmin-report.txt | head -30 || true
+            fi
             echo "--- fusermount might be needed ---"
             exit 1
           fi
@@ -250,6 +256,25 @@ jobs:
             sudo fusermount3 -u /mnt/mntrs-test
           fi
           docker rm -f hdfs 2>/dev/null || true
+
+      # Per SESSION_PITFALLS §2.6: CI green ≠ tests pass; on failure, preserve
+      # the mount log and HDFS dfsadmin report for post-mortem. Pattern adapted
+      # from bench.yml ("Upload rclone log" + "actions/upload-artifact@v4").
+      - name: Upload mount log (failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mount-log-${{ matrix.backend.name }}
+          path: /tmp/mntrs-mount-${{ matrix.backend.name }}.log
+          if-no-files-found: warn
+
+      - name: Upload HDFS dfsadmin report (failure, hdfs only)
+        if: failure() && matrix.backend.name == 'hdfs'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hdfs-dfsadmin-report
+          path: /tmp/hdfs-dfsadmin-report.txt
+          if-no-files-found: warn
 
 
   hdfs-kerberos:
@@ -430,3 +455,13 @@ jobs:
         run: |
           fusermount3 -uz /mnt/hdfs 2>/dev/null
           docker rm -f hdfs 2>/dev/null
+
+      # Per SESSION_PITFALLS §2.6: preserve post-mortem on failure.
+      # Pattern adapted from bench.yml ("Upload rclone log" + actions/upload-artifact@v4).
+      - name: Upload mount log (failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mount-log-hdfs-kerberos
+          path: /tmp/mntrs-mount.log
+          if-no-files-found: warn
