@@ -875,6 +875,7 @@ async fn build_webhdfs(url: &url::Url, opts: &HashMap<String, String>) -> Result
 static DAEMON_PIPE_WR: OnceLock<i32> = OnceLock::new();
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 fn daemonize(mountpoint: &str, wait_pipe: Option<i32>) -> Result<()> {
     // fork/setsid require unsafe — rustix intentionally doesn't wrap them
     match unsafe { libc::fork() } {

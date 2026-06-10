@@ -1,6 +1,4 @@
-#![allow(unused_imports)]
 #![allow(unexpected_cfgs)]
-#![allow(unused)]
 #![recursion_limit = "256"]
 pub mod cmd;
 pub mod core_fs;
@@ -12,13 +10,11 @@ pub mod writeback;
 pub const CACHE_BLOCK_SIZE: u64 = 8 * 1024 * 1024;
 pub type Inodes = Arc<dashmap::DashMap<u64, (String, FileType, u64, Option<SystemTime>)>>;
 
-use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 #[cfg(unix)]
