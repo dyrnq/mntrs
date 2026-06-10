@@ -188,14 +188,15 @@ jobs:
           docker exec hdfs /opt/hadoop/bin/hdfs dfs -chmod 644 /test/hello.txt
 
           sudo mkdir -p /mnt/hdfs && sudo chmod 777 /mnt/hdfs
-          ./target/release/mntrs mount hdfs://localhost:8020/ /mnt/hdfs             --read-only --daemon --daemon-wait --daemon-timeout=15 2>&1
-          sleep 3
+          timeout 15 ./target/release/mntrs mount hdfs://localhost:8020/ /mnt/hdfs             --read-only --daemon --daemon-wait --daemon-timeout=15 2>&1 &
+          sleep 5
           if mount | grep -q /mnt/hdfs; then
-            ls -la /mnt/hdfs
+            ls /mnt/hdfs/
             cat /mnt/hdfs/test/hello.txt
-            echo "::notice::HDFS Kerberos mount OK"
+            echo "✅ HDFS Kerberos mount OK"
           else
             echo "::error::HDFS Kerberos mount failed"
+            mount | grep hdfs || true
             exit 1
           fi
 
