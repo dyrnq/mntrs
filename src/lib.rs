@@ -1534,6 +1534,13 @@ impl Filesystem for MntrsFs {
                     &self.make_attr(ino, 4096, FileType::Directory, SystemTime::UNIX_EPOCH),
                     Generation(0),
                 );
+                self.cache_add_entry(
+                    &parent_path,
+                    &name,
+                    EntryMode::DIR,
+                    4096,
+                    SystemTime::UNIX_EPOCH,
+                );
             }
             Err(_) => reply.error(Errno::EIO),
         }
