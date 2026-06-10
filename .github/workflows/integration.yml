@@ -94,8 +94,17 @@ jobs:
             <property><name>hadoop.security.authorization</name><value>false</value></property>
           </configuration>
           XML
+          cat > /tmp/hdfs-site-simple.xml << 'XML'
+          <configuration>
+            <property><name>dfs.replication</name><value>1</value></property>
+            <property><name>dfs.permissions.enabled</name><value>false</value></property>
+            <property><name>dfs.datanode.address</name><value>0.0.0.0:9866</value></property>
+            <property><name>dfs.datanode.http.address</name><value>0.0.0.0:9864</value></property>
+          </configuration>
+          XML
           docker run -d --name hdfs \
             -p 8020:8020 \
+            -v /tmp/hdfs-site-simple.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro \
             -v /tmp/core-site-simple.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro \
             ghcr.io/dyrnq/mntrs-hdfs:ci-test-${{ github.sha }}
           # Wait for NameNode
