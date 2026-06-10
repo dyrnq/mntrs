@@ -407,6 +407,40 @@ impl MntrsFs {
         self.inodes.get(&ino).map(|r| r.clone())
     }
 
+    /// Recover writeback queue + spawn worker. Shared by fuser + CoreFilesystem init.
+    fn common_init_wb(&self) {
+        self.alloc_ino("", FileType::Directory, 4096);
+        // Recover writeback queue from dirty sidecars
+        if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().is_some_and(|ext| ext == "dirty") {
+                    let cache_path = p.with_extension("");
+                    if let Ok(remote) = std::fs::read_to_string(&p) {
+                        let remote = remote.trim().to_string();
+                        if !remote.is_empty() && cache_path.exists() {
+                            self.writeback_queue.lock().unwrap().push_back((
+                                0,
+                                remote,
+                                cache_path.clone(),
+                            ));
+                        }
+                    }
+                    if let Err(e) = std::fs::remove_file(&p) {
+                        tracing::warn!(error=%e, path=?p, "dirty recovery remove failed");
+                    }
+                }
+            }
+        }
+        // Spawn writeback worker thread
+        let op = self.op.clone();
+        let queue = self.writeback_queue.clone();
+        let delay = self.write_back_delay;
+        let max_age = self.cache_max_age;
+        let inodes = Arc::new(self.inodes.clone());
+        std::thread::spawn(move || crate::writeback::worker(op, inodes, queue, delay, max_age));
+    }
+
     fn alloc_ino(&self, path: &str, kind: FileType, size: u64) -> u64 {
         let ino = NEXT_INO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inodes
@@ -710,7 +744,7 @@ impl MntrsFs {
 #[cfg(unix)]
 impl Filesystem for MntrsFs {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
-        self.alloc_ino("", FileType::Directory, 4096);
+        self.common_init_wb();
         if let Err(e) = fs::create_dir_all(&self.cache_dir) {
             tracing::warn!(error=%e, "create_dir_all failed for cache");
         }
@@ -761,38 +795,7 @@ impl Filesystem for MntrsFs {
                     "attr_cache recovered from .meta sidecars"
                 );
             }
-        }
-
-        // Recover writeback queue from dirty sidecars
-        if let Ok(entries) = fs::read_dir(&self.cache_dir) {
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.extension().is_some_and(|ext| ext == "dirty") {
-                    let cache_path = p.with_extension("");
-                    if let Ok(remote) = fs::read_to_string(&p) {
-                        let remote = remote.trim().to_string();
-                        if !remote.is_empty() && cache_path.exists() {
-                            self.writeback_queue.lock().unwrap().push_back((
-                                0,
-                                remote,
-                                cache_path.clone(),
-                            ));
-                        }
-                    }
-                    if let Err(e) = fs::remove_file(&p) {
-                        tracing::warn!(error=%e, path=?p, "dirty recovery remove failed");
-                    }
-                }
-            }
-        }
-        // Spawn writeback worker thread
-        let op = self.op.clone();
-        let queue = self.writeback_queue.clone();
-        let delay = self.write_back_delay;
-        let max_age = self.cache_max_age;
-        let inodes = Arc::new(self.inodes.clone());
-        thread::spawn(move || writeback::worker(op, inodes, queue, delay, max_age));
-        // Pre-populate root directory cache on mount if --vfs-refresh
+        } // Pre-populate root directory cache on mount if --vfs-refresh
         if self.vfs_refresh {
             let _ = self.list_op("");
         }
@@ -1913,36 +1916,7 @@ use crate::core_fs::{CoreDirEntry, CoreFileAttr, CoreFileType, CoreFilesystem, C
 
 impl CoreFilesystem for MntrsFs {
     fn init(&self) -> std::io::Result<()> {
-        self.alloc_ino("", FileType::Directory, 4096);
-        // Recover writeback queue from dirty sidecars
-        if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.extension().is_some_and(|ext| ext == "dirty") {
-                    let cache_path = p.with_extension("");
-                    if let Ok(remote) = std::fs::read_to_string(&p) {
-                        let remote = remote.trim().to_string();
-                        if !remote.is_empty() && cache_path.exists() {
-                            self.writeback_queue.lock().unwrap().push_back((
-                                0,
-                                remote,
-                                cache_path.clone(),
-                            ));
-                        }
-                    }
-                    if let Err(e) = std::fs::remove_file(&p) {
-                        tracing::warn!(error=%e, path=?p, "dirty recovery remove failed");
-                    }
-                }
-            }
-        }
-        // Spawn writeback worker thread
-        let op = self.op.clone();
-        let queue = self.writeback_queue.clone();
-        let delay = self.write_back_delay;
-        let max_age = self.cache_max_age;
-        let inodes = Arc::new(self.inodes.clone());
-        std::thread::spawn(move || crate::writeback::worker(op, inodes, queue, delay, max_age));
+        self.common_init_wb();
         Ok(())
     }
 
