@@ -533,12 +533,11 @@ pub fn mount(
             .args(&args)
             .env("MNTRS_INTERNAL_DAEMON", "1")
             .stdin(std::process::Stdio::null())
-            // Inherit stdout/stderr so the FUSE worker's tracing output
-            // reaches the parent's stdio redirection (e.g. shell's
-            // `> "$MOUNT_LOG" 2>&1 &`). Without this, daemon-wait mode
-            // makes the worker a black box — see SESSION_PITFALLS §2.2.
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
+            // Daemon stdio is detached in the re-exec'd child (see block
+            // below). Spawning with null here is safe — the child re-opens
+            // its own fds 1/2 to /dev/null (or MNTRS_DAEMON_LOG).
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .map_err(|e| anyhow!("failed to spawn daemon: {}", e))?;
         std::process::exit(0);
@@ -547,6 +546,50 @@ pub fn mount(
     // Re-exec child: treat as daemon (stay alive after mount)
     #[cfg(not(windows))]
     let daemon = daemon || std::env::var_os("MNTRS_INTERNAL_DAEMON").is_some();
+
+    // Detach stdio in the daemon child. Without this, the daemon inherits
+    // the calling shell's pipe (e.g. `bash run_all.sh | tee` or shell's
+    // `> MOUNT_LOG 2>&1 &`). The daemon keeps the write end of that pipe
+    // open for its entire lifetime (the FUSE session), so the parent
+    // shell/tee never sees EOF and the runner hangs waiting for the step
+    // to finish. Symptom in CI: bench-comparison job sits at 9-27 min
+    // post-bench with orphan `tee` + `mntrs` processes.
+    //
+    // Fix per daemon(3): dup2 the desired target onto fds 1,2. We default
+    // to /dev/null to drop output; CI sets MNTRS_DAEMON_LOG to a file
+    // path (typically MOUNT_LOG) so the artifact upload still captures
+    // tracing for post-mortem.
+    #[cfg(not(windows))]
+    if std::env::var_os("MNTRS_INTERNAL_DAEMON").is_some() && daemon {
+        unsafe {
+            let target: i32 = match std::env::var_os("MNTRS_DAEMON_LOG") {
+                Some(p) => std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p.to_string_lossy().as_ref())
+                    .map(|f| {
+                        use std::os::unix::io::IntoRawFd;
+                        f.into_raw_fd()
+                    })
+                    .unwrap_or(-1),
+                None => libc::open(
+                    b"/dev/null\0".as_ptr() as *const i8,
+                    libc::O_RDWR,
+                ),
+            };
+            if target >= 0 {
+                libc::dup2(target, libc::STDOUT_FILENO);
+                libc::dup2(target, libc::STDERR_FILENO);
+                if target > 2 {
+                    libc::close(target);
+                }
+            }
+            // If target < 0 (e.g. /dev/null missing, disk full, log path
+            // unwritable), silently fall through: the daemon keeps the
+            // inherited stdio, which is the pre-b3f85dc behavior. Worse
+            // case is a hung pipe — never worse than the regression.
+        }
+    }
 
     let mount_path = Path::new(mountpoint);
     #[cfg(not(windows))]
