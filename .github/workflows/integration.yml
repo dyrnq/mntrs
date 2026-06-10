@@ -186,21 +186,39 @@ jobs:
 
       - name: Start HDFS container
         run: |
+          set -x
           docker run -d --name hdfs -p 8020:8020 -p 88:88 -p 749:749             ${{ needs.build-hdfs-image.outputs.image }}
+          HDFS_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' hdfs)
+          echo "HDFS container IP: $HDFS_IP"
+
+          echo "=== Wait for NameNode + DataNode ==="
           docker exec hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL
           for i in $(seq 1 20); do
-            if docker exec hdfs /opt/hadoop/bin/hdfs dfsadmin -report | grep -q "Live datanodes"; then
+            echo "  attempt $i..."
+            if docker exec hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | grep -q "Live datanodes"; then
               echo "HDFS ready"
               break
             fi
+            if [ $i -eq 20 ]; then
+              echo "::error::HDFS did not become ready after 20 attempts"
+              docker exec hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1
+              docker logs hdfs 2>&1 | tail -30
+              exit 1
+            fi
             sleep 5
           done
+
+          echo "=== Container status ==="
           docker logs hdfs 2>&1 | tail -10
+          docker exec hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | head -10
+
+          echo "=== Extracting Kerberos config ==="
           docker cp hdfs:/tmp/testuser.keytab /tmp/testuser.keytab
           docker cp hdfs:/tmp/hdfs.keytab /tmp/hdfs.keytab
           docker cp hdfs:/etc/krb5.conf /tmp/krb5.conf
-          HDFS_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' hdfs)
           echo "${HDFS_IP} kdc" | sudo tee -a /etc/hosts
+          docker cp hdfs:/opt/hadoop/etc/hadoop/core-site.xml /tmp/core-site.xml
+          docker cp hdfs:/opt/hadoop/etc/hadoop/hdfs-site.xml /tmp/hdfs-site.xml
 
       - name: Configure Kerberos
         run: |
@@ -213,24 +231,57 @@ jobs:
 
       - name: Test HDFS Kerberos mount
         run: |
+          set -x
+          echo "=== 1. Renew Kerberos ticket ==="
           kinit -kt /tmp/testuser.keytab testuser@TEST.LOCAL
-          docker cp /tmp/testuser.keytab hdfs:/tmp/testuser.keytab
+          klist
+
+          echo "=== 2. Create test data in HDFS ==="
           docker exec hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL
           docker exec hdfs /opt/hadoop/bin/hdfs dfs -mkdir -p /test
           docker exec hdfs /opt/hadoop/bin/hdfs dfs -chmod 777 /test
           echo "hello kerberos hdfs" | docker exec -i hdfs /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt
           docker exec hdfs /opt/hadoop/bin/hdfs dfs -chmod 644 /test/hello.txt
+          docker exec hdfs /opt/hadoop/bin/hdfs dfs -ls /test/
 
+          echo "=== 3. Export Hadoop config for OpenDAL native HDFS backend ==="
+          mkdir -p /tmp/hadoop-conf
+          cp /tmp/core-site.xml /tmp/hadoop-conf/
+          cp /tmp/hdfs-site.xml /tmp/hadoop-conf/
+          export HADOOP_CONF_DIR=/tmp/hadoop-conf
+          ls -la /tmp/hadoop-conf/
+
+          echo "=== 4. Check HDFS connectivity from host ==="
+          HDFS_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' hdfs)
+          echo "HDFS container IP: $HDFS_IP"
+          echo "krb5.conf:"
+          cat /etc/krb5.conf
+          echo "---"
+          echo "/etc/hosts:"
+          grep kdc /etc/hosts || echo "(no kdc entry)"
+
+          echo "=== 5. Mount ==="
           sudo mkdir -p /mnt/hdfs && sudo chmod 777 /mnt/hdfs
-          timeout 15 ./target/release/mntrs mount hdfs://localhost:8020/ /mnt/hdfs             --read-only --daemon --daemon-wait --daemon-timeout=15 2>&1 &
+          MOUNT_LOG="/tmp/mntrs-mount.log"
+          sudo -E timeout 20 ./target/release/mntrs mount hdfs://localhost:8020/ /mnt/hdfs \
+            --read-only --daemon --daemon-wait --daemon-timeout=20 \
+            > "$MOUNT_LOG" 2>&1 &
+          MOUNT_PID=$!
           sleep 5
+          echo "--- mount stdout/stderr ---"
+          cat "$MOUNT_LOG"
+          echo "--- mount table ---"
+          mount | grep hdfs || echo "(no hdfs mount)"
+          echo "--- ps mntrs ---"
+          ps aux | grep mntrs | grep -v grep || echo "(no mntrs process)"
+
           if mount | grep -q /mnt/hdfs; then
-            ls /mnt/hdfs/
+            echo "=== 6. Verify ==="
+            ls -la /mnt/hdfs/
             cat /mnt/hdfs/test/hello.txt
             echo "✅ HDFS Kerberos mount OK"
           else
             echo "::error::HDFS Kerberos mount failed"
-            mount | grep hdfs || true
             exit 1
           fi
 
