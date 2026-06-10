@@ -647,27 +647,28 @@ impl MntrsFs {
 
     fn mem_cache_insert(&self, ino: u64, block_idx: u64, data: bytes::Bytes) {
         let size = data.len() as u64;
-        let new_total = self
-            .mem_used
-            .fetch_add(size, std::sync::atomic::Ordering::Relaxed)
-            + size;
         let key = (ino, block_idx);
 
-        // FIFO eviction via VecDeque (O(1) pop_front, no full scan)
-        if new_total > self.mem_limit {
-            let mut to_free = new_total.saturating_sub(self.mem_limit);
-            let mut order = self.mem_access_order.lock().unwrap();
-            while to_free > 0 {
-                let victim = match order.pop_front() {
-                    Some(v) => v,
-                    None => break,
-                };
-                if let Some((_, removed)) = self.mem_cache.remove(&victim) {
-                    self.mem_used
-                        .fetch_sub(removed.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                    to_free = to_free.saturating_sub(removed.len() as u64);
-                }
+        // Back-pressure: evict before inserting (like mountpoint-s3 MemoryLimiter)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if self.mem_used.load(std::sync::atomic::Ordering::Relaxed) + size <= self.mem_limit {
+                break;
             }
+            let mut order = self.mem_access_order.lock().unwrap();
+            let victim = match order.pop_front() {
+                Some(v) => v,
+                None => break,
+            };
+            drop(order);
+            if let Some((_, removed)) = self.mem_cache.remove(&victim) {
+                self.mem_used
+                    .fetch_sub(removed.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            if std::time::Instant::now() >= deadline {
+                break; // force-proceed, may temporarily exceed limit
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
         // Deduplicate: if same block already cached, don't double-count used bytes
@@ -675,6 +676,8 @@ impl MntrsFs {
             self.mem_used
                 .fetch_sub(old.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
+        self.mem_used
+            .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
         self.mem_cache.insert(key, data);
         self.mem_access_order.lock().unwrap().push_back(key);
     }
