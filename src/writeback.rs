@@ -47,7 +47,7 @@ pub fn spawn(
 ) -> (Sender, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-    let handle = crate::rt().spawn(async move {
+    let handle = tokio::spawn(async move {
         let mut queue: DelayQueue<Task> = DelayQueue::new();
 
         loop {
