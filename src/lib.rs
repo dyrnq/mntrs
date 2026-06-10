@@ -1578,6 +1578,8 @@ impl Filesystem for MntrsFs {
         self.disk_cache_index.remove(&full_path as &str);
         self.inodes.remove(&path_hash(&full_path));
         self.attr_cache.remove(&full_path);
+        self.cache_remove_entry(&parent_path, &name);
+        self.invalidate_dir_cache(&full_path);
         reply.ok();
     }
 
@@ -1812,6 +1814,7 @@ impl Filesystem for MntrsFs {
         self.disk_cache_index.remove(&full_path as &str);
         self.inodes.remove(&path_hash(&full_path));
         self.attr_cache.remove(&full_path);
+        self.cache_remove_entry(&parent_path, &name);
         reply.ok();
     }
 
@@ -2516,6 +2519,7 @@ impl CoreFilesystem for MntrsFs {
         self.disk_cache_index.remove(&full_path);
         self.inodes.remove(&crate::path_hash(&full_path));
         self.attr_cache.remove(&full_path);
+        self.cache_remove_entry(&parent_path, name);
         Ok(())
     }
 
@@ -2536,6 +2540,8 @@ impl CoreFilesystem for MntrsFs {
             .map_err(|_| std::io::Error::other("rmdir failed"))?;
         self.inodes.remove(&crate::path_hash(&full_path));
         self.attr_cache.remove(&full_path);
+        self.cache_remove_entry(&parent_path, name);
+        self.invalidate_dir_cache(&full_path);
         Ok(())
     }
 
