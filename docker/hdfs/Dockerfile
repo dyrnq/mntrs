@@ -49,6 +49,7 @@ RUN if id ubuntu 2>/dev/null; then \
 
 COPY krb5.conf /etc/krb5.conf
 
+RUN touch /etc/krb5kdc/kadm5.acl
 RUN printf "adminpass\nadminpass\n" | /usr/sbin/krb5_newrealm && \
     kadmin.local -q "addprinc -randkey hdfs/localhost@TEST.LOCAL" && \
     kadmin.local -q "addprinc -randkey HTTP/localhost@TEST.LOCAL" && \
