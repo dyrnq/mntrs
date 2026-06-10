@@ -158,7 +158,9 @@ jobs:
         if: always()
         run: |
           kubectl delete pod mntrs-csi-test-${{ matrix.test.name }} --ignore-not-found
-          sudo fusermount3 -u -z /mnt/mntrs-test
+          if mount | grep -q /mnt/mntrs-test; then
+            sudo fusermount3 -u /mnt/mntrs-test
+          fi
           pkill -f "hdfs|simple" 2>/dev/null || true
 
   cleanup-image:
