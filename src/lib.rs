@@ -563,6 +563,18 @@ impl MntrsFs {
         result
     }
 
+    /// Invalidate directory cache entries for the given path and its ancestors.
+    /// Called after create/unlink/rename/rmdir to maintain write-after-read consistency.
+    fn invalidate_dir_cache(&self, path: &str) {
+        self.dir_cache.remove(path);
+        if let Some(slash) = path.rfind('/') {
+            let parent = &path[..slash];
+            if !parent.is_empty() {
+                self.dir_cache.remove(parent);
+            }
+        }
+    }
+
     fn mem_cache_insert(&self, ino: u64, block_idx: u64, data: bytes::Bytes) {
         let size = data.len() as u64;
         let new_total = self
@@ -1049,6 +1061,7 @@ impl Filesystem for MntrsFs {
             FileHandle(fh),
             FopenFlags::empty(),
         );
+        self.invalidate_dir_cache(&full_path);
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
@@ -1593,6 +1606,8 @@ impl Filesystem for MntrsFs {
             self.attr_cache.insert(dst.to_string(), entry);
         }
         self.attr_cache.remove(&src);
+        self.invalidate_dir_cache(&src);
+        self.invalidate_dir_cache(&dst);
         reply.ok();
     }
 
