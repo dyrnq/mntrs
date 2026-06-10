@@ -671,14 +671,16 @@ impl MntrsFs {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
-        // Deduplicate: if same block already cached, don't double-count used bytes
-        if let Some(old) = self.mem_cache.get(&key) {
-            self.mem_used
-                .fetch_sub(old.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        }
+        // Atomic deduplicate via entry API: get-or-insert with size accounting
+        self.mem_cache
+            .entry(key)
+            .and_modify(|old| {
+                self.mem_used
+                    .fetch_sub(old.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            })
+            .or_insert(data);
         self.mem_used
             .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
-        self.mem_cache.insert(key, data);
         self.mem_access_order.lock().unwrap().push_back(key);
     }
 
