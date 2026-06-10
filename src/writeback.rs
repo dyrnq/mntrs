@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use opendal::Operator;
+use tokio::sync::Semaphore;
 use tokio_util::time::delay_queue::DelayQueue;
 
 use crate::Inodes;
@@ -70,7 +71,7 @@ pub fn spawn(
             // Wait for next expired entry
             if let Some(expired) = queue.next().await {
                 let task = expired.into_inner();
-                let p = task.1.clone();
+                let _p = task.1.clone();
                 let data = match std::fs::read(&task.2) {
                     Ok(d) => d,
                     Err(_) => continue,
@@ -80,10 +81,14 @@ pub fn spawn(
                 let ino = task.0;
                 let cache_path = task.2;
                 // Upload in a separate task so DelayQueue keeps ticking
+                static UPLOAD_SEM: std::sync::LazyLock<Semaphore> =
+                    std::sync::LazyLock::new(|| Semaphore::new(4));
+                let permit = UPLOAD_SEM.acquire().await.unwrap();
                 let inodes2 = inodes.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let mut last_err = None;
-                    for attempt in 0..3 {
+                    for attempt in 0..5 {
                         match op.write(&remote, data.clone()).await {
                             Ok(_) => {
                                 if let Ok(meta) = std::fs::metadata(&cache_path) {
@@ -98,22 +103,22 @@ pub fn spawn(
                                 let _ = std::fs::remove_file(cache_path.with_extension("dirty"));
                                 return;
                             }
-                            Err(e) if attempt < 2 => {
+                            Err(e) if attempt < 4 => {
                                 last_err = Some(e);
                                 tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
                             }
                             Err(e) => {
                                 last_err = Some(e);
-                                break;
                             }
                         }
                     }
                     PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
                     tracing::warn!(
-                        path = %p,
+                        path = %remote,
                         error = ?last_err,
-                        "writeback upload failed after 3 retries"
+                        "writeback upload failed after 5 retries, re-enqueueing"
                     );
+                    // File stays on disk with .dirty sidecar — recovered on next mount
                 });
             }
         }
