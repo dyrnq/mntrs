@@ -113,6 +113,8 @@ fn remove_mount(mountpoint: &str) {
 }
 
 static CLEANUP_MP: OnceLock<String> = OnceLock::new();
+static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 extern "C" fn cleanup() {
     if let Some(mp) = CLEANUP_MP.get() {
@@ -674,7 +676,12 @@ pub fn mount(
     }
 
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(3600));
+        if SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!("shutdown requested, cleaning up...");
+            cleanup();
+            std::process::exit(0);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
 }
 
@@ -1060,8 +1067,10 @@ async fn build_memory(_url: &url::Url, _opts: &HashMap<String, String>) -> Resul
     apply_operator_with_tls(builder, _opts)
 }
 
+/// Async-signal-safe: only sets an atomic flag.
+/// The main loop checks SHUTDOWN_REQUESTED and performs proper cleanup.
 extern "C" fn handler(_: i32) {
-    std::process::exit(0);
+    SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 async fn build_webdav(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
