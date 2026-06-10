@@ -94,22 +94,25 @@ jobs:
             <property><name>hadoop.security.authorization</name><value>false</value></property>
           </configuration>
           XML
-          cat > /tmp/hdfs-site-simple.xml << 'XML'
+          docker run -d --name hdfs \
+            -p 8020:8020 -p 9866:9866 -p 9864:9864 \
+            ghcr.io/dyrnq/mntrs-hdfs:ci-test-${{ github.sha }}
+          HDFS_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' hdfs)
+          echo "HDFS container IP: $HDFS_IP"
+          cat > /tmp/hdfs-site-simple.xml << ENDXML
           <configuration>
             <property><name>dfs.replication</name><value>1</value></property>
             <property><name>dfs.permissions.enabled</name><value>false</value></property>
             <property><name>dfs.datanode.address</name><value>0.0.0.0:9866</value></property>
             <property><name>dfs.datanode.http.address</name><value>0.0.0.0:9864</value></property>
-            <property><name>dfs.datanode.hostname</name><value>${HOSTNAME}</value></property>
+            <property><name>dfs.datanode.hostname</name><value>${HDFS_IP}</value></property>
             <property><name>dfs.client.use.datanode.hostname</name><value>true</value></property>
           </configuration>
-          XML
-          docker run -d --name hdfs \
-            -p 8020:8020 -p 9866:9866 -p 9864:9864 \
-            --add-host $(hostname):127.0.0.1 \
-            -v /tmp/hdfs-site-simple.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro \
-            -v /tmp/core-site-simple.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro \
-            ghcr.io/dyrnq/mntrs-hdfs:ci-test-${{ github.sha }}
+          ENDXML
+          docker cp /tmp/core-site-simple.xml hdfs:/opt/hadoop/etc/hadoop/core-site.xml
+          docker cp /tmp/hdfs-site-simple.xml hdfs:/opt/hadoop/etc/hadoop/hdfs-site.xml
+          docker restart hdfs
+          sleep 10
           # Wait for NameNode
           for i in $(seq 1 20); do
             if docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfsadmin -report >/dev/null 2>&1; then
