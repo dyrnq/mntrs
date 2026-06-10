@@ -601,7 +601,6 @@ pub fn mount(
     {
         use crate::core_fs::fuser::FuserAdapter;
         fs.start_cache_poller();
-        fs.start_cache_poller();
         let adapter = FuserAdapter::new(
             fs,
             std::time::Duration::from_secs(dir_cache_time),
