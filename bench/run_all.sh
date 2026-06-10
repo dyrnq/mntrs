@@ -103,7 +103,7 @@ echo ""
 
 # ---- Upload test data via S3 API (same protocol as mntrs/rclone) ----
 echo "--- Uploading test data ---"
-pip3 install awscli 2>/dev/null || true
+uv tool install awscli 2>/dev/null || pip3 install awscli 2>/dev/null || true
 AWS_ACCESS_KEY_ID="$ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$SECRET_KEY"   aws --endpoint-url "$ENDPOINT" --no-verify-ssl s3 mb "s3://$BUCKET" 2>/dev/null || true
 mkdir -p /tmp/bench-upload
 cp "$DATA_DIR"/1K.bin "$DATA_DIR"/4K.bin "$DATA_DIR"/64K.bin "$DATA_DIR"/1M.bin "$DATA_DIR"/10M.bin "$DATA_DIR"/100M.bin /tmp/bench-upload/
