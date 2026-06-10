@@ -166,8 +166,40 @@ jobs:
           else
             ./target/release/mntrs mount ${{ matrix.backend.storage }} /mnt/mntrs-test $MOUNT_OPTS 2>&1 &
           fi
-          sleep 6
+
+          # Readiness probe: wait up to 60s for mount + ls to both succeed
+          # Per SESSION_PITFALLS §2.2/§2.4/§2.6
+          MOUNT_LOG="/tmp/mntrs-mount-csi-${{ matrix.test.name }}.log"
+          # Re-direct mount output to MOUNT_LOG (was /dev/null, lost debug info)
+          if [ "${{ matrix.test.name }}" = "hdfs" ]; then
+            ./target/release/mntrs mount ${{ matrix.test.storage }} /mnt/mntrs-test $MOUNT_OPTS --allow-other --daemon --daemon-wait --daemon-timeout=20 > "$MOUNT_LOG" 2>&1 &
+          else
+            ./target/release/mntrs mount ${{ matrix.test.storage }} /mnt/mntrs-test $MOUNT_OPTS > "$MOUNT_LOG" 2>&1 &
+          fi
+
           FAIL=0
+          READY=0
+          for i in $(seq 1 60); do
+            if mount | grep -q /mnt/mntrs-test; then
+              if ls /mnt/mntrs-test/ >/dev/null 2>&1; then
+                echo "mount ready after ${i}s"
+                READY=1
+                break
+              fi
+            fi
+            sleep 1
+          done
+
+          if [ $READY -eq 0 ]; then
+            echo "::error::${{ matrix.test.name }} mount not ready after 60s"
+            echo "--- mount log ---"
+            cat "$MOUNT_LOG" 2>/dev/null || true
+            echo "--- mount table ---"
+            mount | grep mntrs-test || echo "(no mount)"
+            echo "--- fusermount might be needed ---"
+            exit 1
+          fi
+
           if mount | grep -q /mnt/mntrs-test; then
             echo "--- 1. ls ---"
             ls -laR /mnt/mntrs-test/ 2>&1

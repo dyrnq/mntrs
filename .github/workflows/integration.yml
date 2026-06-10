@@ -141,13 +141,42 @@ jobs:
           sudo mkdir -p /mnt/mntrs-test && sudo chmod 777 /mnt/mntrs-test
           MOUNT_OPTS="--opt endpoint=http://localhost:9000 --opt access-key=minioadmin --opt secret-key=minioadmin --opt region=us-east-1"
           # hdfs backend uses --daemon --daemon-wait (parent exits after spawn); other backends run in foreground
+          # Per SESSION_PITFALLS §2.2: --daemon re-execs, $! is unreliable — use mount table only
+          # Per SESSION_PITFALLS §2.4: hdfs-native can return root entry / trailing slashes; ls may EIO briefly
+          MOUNT_LOG="/tmp/mntrs-mount-${BACKEND}.log"
           if [ "${{ matrix.backend.name }}" = "hdfs" ]; then
-            ./target/release/mntrs mount ${{ matrix.backend.storage }} /mnt/mntrs-test $MOUNT_OPTS --allow-other --daemon --daemon-wait --daemon-timeout=20 >/dev/null 2>&1 &
+            ./target/release/mntrs mount ${{ matrix.backend.storage }} /mnt/mntrs-test $MOUNT_OPTS --allow-other --daemon --daemon-wait --daemon-timeout=20 > "$MOUNT_LOG" 2>&1 &
           else
-            ./target/release/mntrs mount ${{ matrix.backend.storage }} /mnt/mntrs-test $MOUNT_OPTS 2>&1 &
+            ./target/release/mntrs mount ${{ matrix.backend.storage }} /mnt/mntrs-test $MOUNT_OPTS > "$MOUNT_LOG" 2>&1 &
           fi
-          sleep 6
+
+          # Readiness probe: wait up to 60s for mount + ls to both succeed
+          # HDFS containers take 30-60s to fully boot; mem/s3 are sub-second
           FAIL=0
+          READY=0
+          for i in $(seq 1 60); do
+            if mount | grep -q /mnt/mntrs-test; then
+              # ls may transiently EIO on hdfs while NameNode finishes startup
+              if ls /mnt/mntrs-test/ >/dev/null 2>&1; then
+                echo "mount ready after ${i}s"
+                READY=1
+                break
+              fi
+            fi
+            sleep 1
+          done
+
+          if [ $READY -eq 0 ]; then
+            echo "::error::${{ matrix.backend.name }} mount not ready after 60s"
+            echo "--- mount log ---"
+            cat "$MOUNT_LOG" 2>/dev/null || true
+            echo "--- mount table ---"
+            mount | grep mntrs-test || echo "(no mount)"
+            echo "--- fusermount might be needed ---"
+            exit 1
+          fi
+
+          # Per SESSION_PITFALLS §2.6: CI green ≠ tests pass — track failures explicitly
           if mount | grep -q /mnt/mntrs-test; then
             echo "--- 1. ls ---"
             ls -laR /mnt/mntrs-test/ 2>&1
@@ -320,15 +349,35 @@ jobs:
             --allow-other --daemon --daemon-wait --daemon-timeout=20 \
             --opt dfs.namenode.kerberos.principal=hdfs/localhost@TEST.LOCAL \
             > "$MOUNT_LOG" 2>&1 &
-          sleep 6
-          echo "--- mount stdout/stderr ---"
-          cat "$MOUNT_LOG"
-          echo "--- mount table ---"
-          mount | grep hdfs || echo "(no hdfs mount)"
-          echo "--- ps mntrs ---"
-          ps aux | grep mntrs | grep -v grep || echo "(no mntrs process)"
 
+          # Readiness probe: wait up to 60s for mount + ls to both succeed
+          # Per SESSION_PITFALLS §2.2: --daemon re-execs, $! is unreliable
+          # Per SESSION_PITFALLS §2.4: hdfs-native can return root entry / trailing slashes
           FAIL=0
+          READY=0
+          for i in $(seq 1 60); do
+            if mount | grep -q /mnt/hdfs; then
+              if ls /mnt/hdfs/ >/dev/null 2>&1; then
+                echo "mount ready after ${i}s"
+                READY=1
+                break
+              fi
+            fi
+            sleep 1
+          done
+
+          if [ $READY -eq 0 ]; then
+            echo "::error::HDFS Kerberos mount not ready after 60s"
+            echo "--- mount stdout/stderr ---"
+            cat "$MOUNT_LOG"
+            echo "--- mount table ---"
+            mount | grep hdfs || echo "(no hdfs mount)"
+            echo "--- ps mntrs ---"
+            ps aux | grep mntrs | grep -v grep || echo "(no mntrs process)"
+            exit 1
+          fi
+
+          # Per SESSION_PITFALLS §2.6: CI green ≠ tests pass — track failures explicitly
           if mount | grep -q /mnt/hdfs; then
             echo "=== 6. Verify ==="
 
