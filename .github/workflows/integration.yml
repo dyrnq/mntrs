@@ -100,10 +100,13 @@ jobs:
             <property><name>dfs.permissions.enabled</name><value>false</value></property>
             <property><name>dfs.datanode.address</name><value>0.0.0.0:9866</value></property>
             <property><name>dfs.datanode.http.address</name><value>0.0.0.0:9864</value></property>
+            <property><name>dfs.datanode.hostname</name><value>${HOSTNAME}</value></property>
+            <property><name>dfs.client.use.datanode.hostname</name><value>true</value></property>
           </configuration>
           XML
           docker run -d --name hdfs \
-            -p 8020:8020 \
+            -p 8020:8020 -p 9866:9866 -p 9864:9864 \
+            --add-host $(hostname):127.0.0.1 \
             -v /tmp/hdfs-site-simple.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro \
             -v /tmp/core-site-simple.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro \
             ghcr.io/dyrnq/mntrs-hdfs:ci-test-${{ github.sha }}
@@ -129,32 +132,67 @@ jobs:
           fi
           timeout 15 ./target/release/mntrs mount ${{ matrix.backend.storage }} /mnt/mntrs-test $MOUNT_OPTS 2>&1 &
           sleep 5
+          FAIL=0
           if mount | grep -q /mnt/mntrs-test; then
             echo "--- 1. ls ---"
-            ls -la /mnt/mntrs-test/ 2>&1
+            ls -laR /mnt/mntrs-test/ 2>&1
 
-            echo "--- 2. write small file ---"
+            echo "--- 2. cat pre-existing files ---"
+            case "${{ matrix.backend.name }}" in
+              s3)
+                EXPECTED="hello s3"
+                GOT=$(cat /mnt/mntrs-test/s3-test.txt 2>/dev/null)
+                if [ "$GOT" = "$EXPECTED" ]; then
+                  echo "read pre-existing OK: s3-test.txt"
+                else
+                  echo "::error::read pre-existing FAIL: s3-test.txt (got '$GOT')"
+                  FAIL=1
+                fi
+                ;;
+              hdfs)
+                EXPECTED="hello hdfs"
+                GOT=$(cat /mnt/mntrs-test/test/hello.txt 2>/dev/null)
+                if [ "$GOT" = "$EXPECTED" ]; then
+                  echo "read pre-existing OK: test/hello.txt"
+                else
+                  echo "::error::read pre-existing FAIL: test/hello.txt (got '$GOT')"
+                  FAIL=1
+                fi
+                ;;
+            esac
+
+            echo "--- 3. write small file ---"
             echo "hello from ${{ matrix.backend.name }}" > /mnt/mntrs-test/_ci_small.txt 2>/dev/null && echo "write OK" || echo "(write skipped: readonly)"
 
-            echo "--- 3. read back ---"
-            cat /mnt/mntrs-test/_ci_small.txt 2>/dev/null || echo "(no file)"
+            echo "--- 4. read back written file ---"
+            GOT=$(cat /mnt/mntrs-test/_ci_small.txt 2>/dev/null)
+            if [ "$GOT" = "hello from ${{ matrix.backend.name }}" ]; then
+              echo "read back OK"
+            else
+              echo "(write skipped: readonly - file not expected)"
+            fi
 
-            echo "--- 4. append write ---"
-            echo "more data" >> /mnt/mntrs-test/_ci_small.txt 2>/dev/null && echo "append OK" || echo "(append skipped)"
+            echo "--- 5. append write ---"
+            echo "more data" >> /mnt/mntrs-test/_ci_small.txt 2>/dev/null && echo "append OK" || echo "(append skipped: readonly)"
 
-            echo "--- 5. sequential write+read 10M ---"
-            dd if=/dev/urandom of=/mnt/mntrs-test/_ci_10m.bin bs=1M count=10 2>/dev/null && echo "write 10M OK" || echo "(10M write skipped)"
-            dd if=/mnt/mntrs-test/_ci_10m.bin of=/dev/null bs=64K 2>/dev/null && echo "read 10M OK" || echo "(10M read skipped)"
+            echo "--- 6. write+read 10M sequential ---"
+            dd if=/dev/urandom of=/mnt/mntrs-test/_ci_10m.bin bs=1M count=10 2>/dev/null && echo "write 10M OK" || echo "(10M write skipped: readonly)"
+            dd if=/mnt/mntrs-test/_ci_10m.bin of=/dev/null bs=64K 2>/dev/null && echo "read 10M OK" || echo "(10M read skipped: readonly)"
 
-            echo "--- 6. random read 10M ---"
+            echo "--- 7. random read 10M ---"
             for off in 0 500 10000 50000 500000 5000000 9000000 9999999; do
-              dd if=/mnt/mntrs-test/_ci_10m.bin bs=1 count=1 skip=$off of=/dev/null 2>/dev/null && echo "  seek $off OK" || echo "  seek $off FAIL"
+              dd if=/mnt/mntrs-test/_ci_10m.bin bs=1 count=1 skip=$off of=/dev/null 2>/dev/null && echo "  seek $off OK" || { echo "  seek $off FAIL"; FAIL=1; }
             done
 
-            echo "--- 7. cleanup ---"
+            echo "--- 8. cleanup ---"
             rm -f /mnt/mntrs-test/_ci_small.txt /mnt/mntrs-test/_ci_10m.bin 2>/dev/null || true
 
-            echo "✅ ${{ matrix.backend.name }} mount OK"
+            if [ $FAIL -eq 0 ]; then
+              echo "✅ ${{ matrix.backend.name }} mount OK"
+            else
+              echo "::error::${{ matrix.backend.name }} mount tests FAILED"
+              exit 1
+            fi
           else
             echo "::error::${{ matrix.backend.name }} mount failed: not in mount table"
             mount | grep mntrs || true

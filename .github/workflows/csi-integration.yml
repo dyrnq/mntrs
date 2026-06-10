@@ -133,7 +133,7 @@ jobs:
           </configuration>
           XML
           docker run -d --name hdfs \
-            -p 8020:8020 \
+            -p 8020:8020 -p 9866:9866 -p 9864:9864 --add-host $(hostname):127.0.0.1 \
             -v /tmp/hdfs-site-simple.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro \
             -v /tmp/core-site-simple.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro \
             ${{ needs.build-hdfs-image.outputs.image }}
