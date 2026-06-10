@@ -145,7 +145,13 @@ jobs:
           # Per SESSION_PITFALLS §2.4: hdfs-native can return root entry / trailing slashes; ls may EIO briefly
           MOUNT_LOG="/tmp/mntrs-mount-${{ matrix.backend.name }}.log"
           if [ "${{ matrix.backend.name }}" = "hdfs" ]; then
-            ./target/release/mntrs mount ${{ matrix.backend.storage }} /mnt/mntrs-test $MOUNT_OPTS --allow-other --daemon --daemon-wait --daemon-timeout=20 > "$MOUNT_LOG" 2>&1 &
+            # MNTRS_DAEMON_LOG redirects daemon child's stdout/stderr to the
+            # MOUNT_LOG file (the > $MOUNT_LOG 2>&1 above only captures the
+            # parent, which exits immediately after spawning the daemon —
+            # see SESSION_PITFALLS §2.2). Without this, daemon's tracing
+            # output goes to /dev/null and the artifact is empty.
+            MNTRS_DAEMON_LOG="$MOUNT_LOG" \
+              ./target/release/mntrs mount ${{ matrix.backend.storage }} /mnt/mntrs-test $MOUNT_OPTS --allow-other --daemon --daemon-wait --daemon-timeout=20 > "$MOUNT_LOG" 2>&1 &
           else
             ./target/release/mntrs mount ${{ matrix.backend.storage }} /mnt/mntrs-test $MOUNT_OPTS > "$MOUNT_LOG" 2>&1 &
           fi
@@ -370,10 +376,11 @@ jobs:
           echo "=== 5. Mount ==="
           sudo mkdir -p /mnt/hdfs && sudo chmod 777 /mnt/hdfs
           MOUNT_LOG="/tmp/mntrs-mount.log"
-          ./target/release/mntrs mount hdfs://localhost:8020/ /mnt/hdfs \
-            --allow-other --daemon --daemon-wait --daemon-timeout=20 \
-            --opt dfs.namenode.kerberos.principal=hdfs/localhost@TEST.LOCAL \
-            > "$MOUNT_LOG" 2>&1 &
+          MNTRS_DAEMON_LOG="$MOUNT_LOG" \
+            ./target/release/mntrs mount hdfs://localhost:8020/ /mnt/hdfs \
+              --allow-other --daemon --daemon-wait --daemon-timeout=20 \
+              --opt dfs.namenode.kerberos.principal=hdfs/localhost@TEST.LOCAL \
+              > "$MOUNT_LOG" 2>&1 &
 
           # Readiness probe: wait up to 60s for mount + ls to both succeed
           # Per SESSION_PITFALLS §2.2: --daemon re-execs, $! is unreliable
