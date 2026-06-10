@@ -670,6 +670,11 @@ impl MntrsFs {
             }
         }
 
+        // Deduplicate: if same block already cached, don't double-count used bytes
+        if let Some(old) = self.mem_cache.get(&key) {
+            self.mem_used
+                .fetch_sub(old.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         self.mem_cache.insert(key, data);
         self.mem_access_order.lock().unwrap().push_back(key);
     }
@@ -2671,6 +2676,8 @@ impl CoreFilesystem for MntrsFs {
         if let Some((path, _, _, _)) = self.resolve(ino) {
             self.inodes.remove(&ino);
             self.attr_cache.remove(&path);
+            // Clean up any open file handles for this inode
+            self.handles.retain(|k, v| k != &ino && v.path() != path);
         }
     }
 }
