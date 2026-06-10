@@ -263,8 +263,8 @@ jobs:
           echo "=== 5. Mount ==="
           sudo mkdir -p /mnt/hdfs && sudo chmod 777 /mnt/hdfs
           MOUNT_LOG="/tmp/mntrs-mount.log"
-          sudo -E timeout 20 ./target/release/mntrs mount hdfs://localhost:8020/ /mnt/hdfs \
-            --read-only --daemon --daemon-wait --daemon-timeout=20 \
+          timeout 20 ./target/release/mntrs mount hdfs://localhost:8020/ /mnt/hdfs \
+            --read-only --allow-other --daemon --daemon-wait --daemon-timeout=20 \
             > "$MOUNT_LOG" 2>&1 &
           MOUNT_PID=$!
           sleep 5
