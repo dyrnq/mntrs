@@ -1813,6 +1813,7 @@ dependencies = [
  "reqwest",
  "rustix",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "unicode-normalization",
@@ -3674,6 +3675,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "pin-project-lite",
+ "slab",
  "tokio",
 ]
 

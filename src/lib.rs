@@ -219,7 +219,7 @@ pub struct MntrsFs {
     pub handle_caching: Duration,
     pub cache_poll_interval: Duration,
     pub disk_total_size: u64,
-    writeback_queue: Arc<Mutex<VecDeque<(u64, String, PathBuf)>>>,
+    writeback_sender: std::sync::OnceLock<writeback::Sender>,
     mem_cache: dashmap::DashMap<(u64, u64), bytes::Bytes>,
     attr_cache: dashmap::DashMap<
         String,
@@ -418,13 +418,13 @@ impl MntrsFs {
                     let cache_path = p.with_extension("");
                     if let Ok(remote) = std::fs::read_to_string(&p) {
                         let remote = remote.trim().to_string();
-                        if !remote.is_empty() && cache_path.exists() {
-                            self.writeback_queue.lock().unwrap().push_back((
-                                0,
-                                remote,
-                                cache_path.clone(),
-                            ));
-                        }
+                            if let Some(tx) = self.writeback_sender.get() {
+                                tx.send((
+                                    0,
+                                    remote,
+                                    cache_path.clone(),
+                                )).ok();
+                            }
                     }
                     if let Err(e) = std::fs::remove_file(&p) {
                         tracing::warn!(error=%e, path=?p, "dirty recovery remove failed");
@@ -432,13 +432,12 @@ impl MntrsFs {
                 }
             }
         }
-        // Spawn writeback worker thread
+        // Spawn writeback worker via tokio runtime
         let op = self.op.clone();
-        let queue = self.writeback_queue.clone();
         let delay = self.write_back_delay;
-        let max_age = self.cache_max_age;
         let inodes = Arc::new(self.inodes.clone());
-        std::thread::spawn(move || crate::writeback::worker(op, inodes, queue, delay, max_age));
+        let (tx, _handle) = crate::writeback::spawn(op, inodes, delay);
+        self.writeback_sender.set(tx).ok();
     }
 
     fn alloc_ino(&self, path: &str, kind: FileType, size: u64) -> u64 {
@@ -1886,10 +1885,9 @@ impl Filesystem for MntrsFs {
                 if let Err(e) = fs::write(&sidecar, path.as_bytes()) {
                     tracing::warn!(error=%e, path=?sidecar, "sidecar write failed");
                 }
-                self.writeback_queue
-                    .lock()
-                    .unwrap()
-                    .push_back((_ino.into(), path, cpath));
+                if let Some(tx) = self.writeback_sender.get() {
+                    tx.send((_ino.into(), path, cpath)).ok();
+                }
             }
         }
         // Queue the writeback; don't block FUSE thread waiting for upload.
@@ -2309,10 +2307,9 @@ impl CoreFilesystem for MntrsFs {
                 if let Err(e) = std::fs::write(&sidecar, path.as_bytes()) {
                     tracing::warn!(error=%e, path=?sidecar, "sidecar write failed");
                 }
-                self.writeback_queue
-                    .lock()
-                    .unwrap()
-                    .push_back((_ino, path.clone(), cpath));
+                if let Some(tx) = self.writeback_sender.get() {
+                    tx.send((_ino, path.clone(), cpath)).ok();
+                }
                 tracing::debug!(path=%path, "flush queued writeback");
             }
             // Mark handle clean; writeback happens asynchronously
@@ -2349,10 +2346,9 @@ impl CoreFilesystem for MntrsFs {
             if cpath.exists() {
                 let sidecar = cpath.with_extension("dirty");
                 let _ = std::fs::write(&sidecar, path.as_bytes());
-                self.writeback_queue
-                    .lock()
-                    .unwrap()
-                    .push_back((_ino, path.clone(), cpath));
+                if let Some(tx) = self.writeback_sender.get() {
+                    tx.send((_ino, path.clone(), cpath)).ok();
+                }
                 tracing::debug!(path=%path, "release queued writeback");
             }
             true
@@ -2871,7 +2867,7 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         cache_poll_interval: std::time::Duration::from_secs(60),
         handle_caching: std::time::Duration::from_secs(0),
         disk_total_size: 0,
-        writeback_queue: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+        writeback_sender: std::sync::OnceLock::new(),
         mem_cache: Default::default(),
         attr_cache: Default::default(),
         disk_cache_index: Default::default(),
