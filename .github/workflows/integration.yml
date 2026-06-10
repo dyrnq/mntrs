@@ -199,7 +199,8 @@ jobs:
           docker cp hdfs:/tmp/testuser.keytab /tmp/testuser.keytab
           docker cp hdfs:/tmp/hdfs.keytab /tmp/hdfs.keytab
           docker cp hdfs:/etc/krb5.conf /tmp/krb5.conf
-          echo "172.17.0.1 kdc" | sudo tee -a /etc/hosts
+          HDFS_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' hdfs)
+          echo "${HDFS_IP} kdc" | sudo tee -a /etc/hosts
 
       - name: Configure Kerberos
         run: |
