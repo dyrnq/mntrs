@@ -13,6 +13,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -26,6 +27,14 @@ pub type Task = (u64, String, PathBuf);
 
 /// The shared sender used by FUSE threads to enqueue writeback work.
 pub type Sender = tokio::sync::mpsc::UnboundedSender<Task>;
+
+/// Global counter of pending writeback tasks.
+static PENDING_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Return number of in-flight writeback tasks (queued or uploading).
+pub fn pending_count() -> usize {
+    PENDING_COUNT.load(Ordering::Relaxed) as usize
+}
 
 /// Spawn the writeback worker inside the global tokio runtime.
 ///
@@ -43,10 +52,12 @@ pub fn spawn(
         loop {
             // Drain channel into queue
             while let Ok(task) = rx.try_recv() {
+                PENDING_COUNT.fetch_add(1, Ordering::Relaxed);
                 queue.insert_at(task, tokio::time::Instant::now() + delay);
             }
 
             if queue.is_empty() {
+                PENDING_COUNT.fetch_add(1, Ordering::Relaxed);
                 match rx.recv().await {
                     Some(task) => {
                         queue.insert_at(task, tokio::time::Instant::now() + delay);

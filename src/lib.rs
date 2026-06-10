@@ -418,13 +418,9 @@ impl MntrsFs {
                     let cache_path = p.with_extension("");
                     if let Ok(remote) = std::fs::read_to_string(&p) {
                         let remote = remote.trim().to_string();
-                            if let Some(tx) = self.writeback_sender.get() {
-                                tx.send((
-                                    0,
-                                    remote,
-                                    cache_path.clone(),
-                                )).ok();
-                            }
+                        if let Some(tx) = self.writeback_sender.get() {
+                            tx.send((0, remote, cache_path.clone())).ok();
+                        }
                     }
                     if let Err(e) = std::fs::remove_file(&p) {
                         tracing::warn!(error=%e, path=?p, "dirty recovery remove failed");

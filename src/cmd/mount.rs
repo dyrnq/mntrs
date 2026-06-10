@@ -301,7 +301,17 @@ pub fn unmount_internal(mountpoint: &str) -> anyhow::Result<()> {
     // Phase 0: note cache dir for cleanup after unmount
     let _cache_dir = cache_dir_for_mount(mountpoint);
 
-// Phase 2: unmount
+    // Phase 1: wait for writeback queue to drain
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    while std::time::Instant::now() < deadline {
+        let pending = crate::cmd::mount::pending_writebacks();
+        if pending == 0 {
+            break;
+        }
+        tracing::info!(mountpoint, pending, "waiting for writeback to complete");
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+    // Phase 2: unmount
     if let Err(e) = crate::cmd::unmount::unmount(mountpoint) {
         tracing::warn!(mountpoint, error=%e, "regular unmount failed, trying lazy");
         // Phase 3: lazy unmount fallback
@@ -326,11 +336,9 @@ pub fn unmount_internal(mountpoint: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Returns number of pending writebacks.
-/// Writeback is now async via tokio DelayQueue — this always returns 0.
-/// The FUSE process exit will naturally drain all pending work.
+/// Returns number of in-flight writeback tasks.
 pub fn pending_writebacks() -> usize {
-    0
+    crate::writeback::pending_count()
 }
 #[allow(clippy::too_many_arguments)]
 pub fn mount(
