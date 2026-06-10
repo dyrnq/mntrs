@@ -967,7 +967,11 @@ impl Filesystem for MntrsFs {
         ];
         for (name, mode, size, mtime) in self.list_op(&path) {
             let clean_name = name.trim_start_matches('/').trim_end_matches('/');
-            let name = if clean_name.is_empty() { name.clone() } else { clean_name.to_string() };
+            let name = if clean_name.is_empty() {
+                name.clone()
+            } else {
+                clean_name.to_string()
+            };
             // Skip root entry and empty names from list_op
             if name.is_empty() || name == "/" {
                 continue;
@@ -1022,7 +1026,11 @@ impl Filesystem for MntrsFs {
         ];
         for (name, mode, size, mtime) in self.list_op(&path) {
             let clean_name = name.trim_start_matches('/').trim_end_matches('/');
-            let name = if clean_name.is_empty() { name.clone() } else { clean_name.to_string() };
+            let name = if clean_name.is_empty() {
+                name.clone()
+            } else {
+                clean_name.to_string()
+            };
             // Skip root entry and empty names from list_op
             if name.is_empty() || name == "/" {
                 continue;
