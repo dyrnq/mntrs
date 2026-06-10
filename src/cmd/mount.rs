@@ -342,6 +342,7 @@ pub fn pending_writebacks() -> usize {
 }
 #[allow(clippy::too_many_arguments)]
 #[allow(unused_variables)]
+#[allow(unused_imports)]
 pub fn mount(
     storage_url: &str,
     mountpoint: &str,

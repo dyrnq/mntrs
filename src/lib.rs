@@ -10,8 +10,10 @@ pub mod writeback;
 pub const CACHE_BLOCK_SIZE: u64 = 8 * 1024 * 1024;
 pub type Inodes = Arc<dashmap::DashMap<u64, (String, FileType, u64, Option<SystemTime>)>>;
 
+#[cfg(unix)]
 use std::ffi::OsStr;
 use std::fs;
+#[cfg(unix)]
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
