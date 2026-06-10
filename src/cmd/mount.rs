@@ -489,6 +489,7 @@ pub fn mount(
             u64::MAX
         },
         mem_used: std::sync::atomic::AtomicU64::new(0),
+        mem_access_order: std::sync::Mutex::new(std::collections::VecDeque::new()),
     };
 
     // Create pipe for daemon_wait parent-child synchronization

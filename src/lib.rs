@@ -237,6 +237,7 @@ pub struct MntrsFs {
     pub storage_class: Option<String>,
     pub mem_limit: u64,
     mem_used: std::sync::atomic::AtomicU64,
+    mem_access_order: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>>, // FIFO for eviction
 }
 
 /// Convert OpenDAL Timestamp to std::time::SystemTime, clamped to UNIX_EPOCH.
@@ -653,25 +654,27 @@ impl MntrsFs {
             .mem_used
             .fetch_add(size, std::sync::atomic::Ordering::Relaxed)
             + size;
+        let key = (ino, block_idx);
+
+        // FIFO eviction via VecDeque (O(1) pop_front, no full scan)
         if new_total > self.mem_limit {
-            // Evict oldest entries from mem_cache until under limit
             let mut to_free = new_total.saturating_sub(self.mem_limit);
-            let mut victims: Vec<(u64, u64)> = Vec::new();
-            for entry in self.mem_cache.iter() {
-                if to_free == 0 {
-                    break;
-                }
-                victims.push(*entry.key());
-                to_free = to_free.saturating_sub(entry.value().len() as u64);
-            }
-            for v in &victims {
-                if let Some((_, removed)) = self.mem_cache.remove(v) {
+            let mut order = self.mem_access_order.lock().unwrap();
+            while to_free > 0 {
+                let victim = match order.pop_front() {
+                    Some(v) => v,
+                    None => break,
+                };
+                if let Some((_, removed)) = self.mem_cache.remove(&victim) {
                     self.mem_used
                         .fetch_sub(removed.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    to_free = to_free.saturating_sub(removed.len() as u64);
                 }
             }
         }
-        self.mem_cache.insert((ino, block_idx), data);
+
+        self.mem_cache.insert(key, data);
+        self.mem_access_order.lock().unwrap().push_back(key);
     }
 
     fn evict_lru(&self) {
@@ -2886,5 +2889,6 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         storage_class: None,
         mem_limit: u64::MAX,
         mem_used: std::sync::atomic::AtomicU64::new(0),
+        mem_access_order: std::sync::Mutex::new(std::collections::VecDeque::new()),
     }
 }
