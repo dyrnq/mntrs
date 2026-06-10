@@ -1,4 +1,4 @@
-name: Integration Tests (CLI mount)
+name: Integration Tests
 
 permissions:
   contents: read
@@ -13,7 +13,29 @@ on:
     - cron: '0 4 * * 0'
 
 jobs:
+  build-hdfs-image:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    outputs:
+      image: ghcr.io/${{ github.repository_owner }}/mntrs-hdfs:ci-test-${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push HDFS image
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/hdfs
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/mntrs-hdfs:ci-test-${{ github.sha }}
+
   mount-tests:
+    needs: build-hdfs-image
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -113,3 +135,72 @@ jobs:
             sudo fusermount3 -u /mnt/mntrs-test
           fi
           docker rm -f hdfs 2>/dev/null || true
+
+
+  hdfs-kerberos:
+    needs: build-hdfs-image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y krb5-user libfuse3-dev fuse3
+          sudo grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+
+      - name: Start HDFS container
+        run: |
+          docker run -d --name hdfs -p 8020:8020 -p 88:88 -p 749:749             ${{ needs.build-hdfs-image.outputs.image }}
+          docker exec hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL
+          for i in $(seq 1 20); do
+            if docker exec hdfs /opt/hadoop/bin/hdfs dfsadmin -report | grep -q "Live datanodes"; then
+              echo "HDFS ready"
+              break
+            fi
+            sleep 5
+          done
+          docker logs hdfs 2>&1 | tail -10
+          docker cp hdfs:/tmp/testuser.keytab /tmp/testuser.keytab
+          docker cp hdfs:/tmp/hdfs.keytab /tmp/hdfs.keytab
+          docker cp hdfs:/etc/krb5.conf /tmp/krb5.conf
+          echo "172.17.0.1 kdc" | sudo tee -a /etc/hosts
+
+      - name: Configure Kerberos
+        run: |
+          sudo cp /tmp/krb5.conf /etc/krb5.conf
+          kinit -kt /tmp/testuser.keytab testuser@TEST.LOCAL
+          klist
+
+      - name: Build mntrs
+        run: cargo build --release -p mntrs
+
+      - name: Test HDFS Kerberos mount
+        run: |
+          kinit -kt /tmp/testuser.keytab testuser@TEST.LOCAL
+          docker cp /tmp/testuser.keytab hdfs:/tmp/testuser.keytab
+          docker exec hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL
+          docker exec hdfs /opt/hadoop/bin/hdfs dfs -mkdir -p /test
+          docker exec hdfs /opt/hadoop/bin/hdfs dfs -chmod 777 /test
+          echo "hello kerberos hdfs" | docker exec -i hdfs /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt
+          docker exec hdfs /opt/hadoop/bin/hdfs dfs -chmod 644 /test/hello.txt
+
+          sudo mkdir -p /mnt/hdfs && sudo chmod 777 /mnt/hdfs
+          ./target/release/mntrs mount hdfs://localhost:8020/ /mnt/hdfs             --read-only --daemon --daemon-wait --daemon-timeout=15 2>&1
+          sleep 3
+          if mount | grep -q /mnt/hdfs; then
+            ls -la /mnt/hdfs
+            cat /mnt/hdfs/test/hello.txt
+            echo "::notice::HDFS Kerberos mount OK"
+          else
+            echo "::error::HDFS Kerberos mount failed"
+            exit 1
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          fusermount3 -uz /mnt/hdfs 2>/dev/null
+          docker rm -f hdfs 2>/dev/null
