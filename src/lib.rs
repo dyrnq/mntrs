@@ -2481,6 +2481,7 @@ impl CoreFilesystem for MntrsFs {
         rt().block_on(async move { op.create_dir(&p).await })
             .map_err(|_| std::io::Error::other("mkdir failed"))?;
         let ino = self.alloc_ino(&full_path, FileType::Directory, 4096);
+        self.cache_add_entry(&parent_path, name, EntryMode::DIR, 4096, SystemTime::now());
         Ok(to_core_attr(&self.make_attr(
             ino,
             4096,
