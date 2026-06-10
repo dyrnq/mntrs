@@ -72,30 +72,41 @@ echo "  data prepared: $(du -sh $DATA_DIR | awk '{print $1}')"
 # ---- Mount mntrs + rclone ----
 echo ""
 echo "--- Mounting ---"
+echo "  $(date -Iseconds): preparing mount dirs..."
 mkdir -p "$MNTRS_MNT" "$RCLONE_MNT"
 
 # Write mount for mntrs (default: writes cache mode)
+echo "  $(date -Iseconds): starting mntrs mount..."
 "$MNTRS_BIN" mount "s3://$BUCKET" "$MNTRS_MNT" \
     --opt "endpoint=$ENDPOINT" --opt "access-key=$ACCESS_KEY" \
     --opt "secret-key=$SECRET_KEY" --opt "region=$REGION" \
     --vfs-cache-mode=writes --vfs-write-back=5 \
-    --daemon --daemon-wait --daemon-timeout=15
+    --daemon --daemon-wait --daemon-timeout=15 2>&1
+echo "  $(date -Iseconds): mntrs mount returned (exit=$?)"
 
 # rclone mount (writes cache mode for fair comparison)
+echo "  $(date -Iseconds): setting up rclone config..."
 rclone config create bench s3 provider Minio \
     access_key_id $ACCESS_KEY secret_access_key $SECRET_KEY \
     endpoint $ENDPOINT region $REGION 2>/dev/null
-rclone mount bench:$BUCKET "$RCLONE_MNT" --daemon --vfs-cache-mode=writes --vfs-write-back=5s --log-file /tmp/rclone-bench.log --log-level INFO
+echo "  $(date -Iseconds): starting rclone mount..."
+rclone mount bench:$BUCKET "$RCLONE_MNT" --daemon --vfs-cache-mode=writes --vfs-write-back=5s --log-file /tmp/rclone-bench.log --log-level INFO 2>&1
+echo "  $(date -Iseconds): rclone mount returned (exit=$?)"
 
 sleep 3
+echo "  $(date -Iseconds): checking mounts..."
 if mountpoint -q "$MNTRS_MNT"; then
   echo "  mntrs mount: OK"
 else
+  echo "  mntrs mount: FAILED — mount table:"
+  mount | grep mntrs || true
   echo "  mntrs mount: FAILED (check errors above)"
 fi
 if mountpoint -q "$RCLONE_MNT" || mount | grep -q "$RCLONE_MNT"; then
   echo "  rclone mount: OK"
 else
+  echo "  rclone mount: FAILED — mount table:"
+  mount | grep rclone || true
   echo "  rclone mount: FAILED"
 fi
 echo "  mounts ready"
