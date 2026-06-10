@@ -120,7 +120,7 @@ AWS_ACCESS_KEY_ID="$ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$SECRET_KEY"   aws --endp
 rm -rf /tmp/bench-upload
 mkdir -p /tmp/bench-upload
 cp "$DATA_DIR"/1K.bin "$DATA_DIR"/4K.bin "$DATA_DIR"/64K.bin "$DATA_DIR"/1M.bin "$DATA_DIR"/10M.bin "$DATA_DIR"/100M.bin /tmp/bench-upload/
-cp -r "$DATA_DIR"/many /tmp/bench-upload/
+mkdir -p /tmp/bench-upload/many && cp -r "$DATA_DIR"/many/* /tmp/bench-upload/many/
 AWS_ACCESS_KEY_ID="$ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$SECRET_KEY"   aws --endpoint-url "$ENDPOINT" --no-verify-ssl s3 sync /tmp/bench-upload/ "s3://$BUCKET/" 2>&1
 echo "  upload done"
 echo ""
