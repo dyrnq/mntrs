@@ -86,42 +86,52 @@ jobs:
       - name: Setup HDFS (HDFS only)
         if: matrix.backend.name == 'hdfs'
         run: |
-          # Override Kerberos core-site.xml with simple auth variant
+          # Configure HDFS as single-node HA nameservice cluster.
+          # OpenDAL hdfs-native backend uses hdfs://nameservice internally,
+          # so the NameNode must register under the nameservice name.
           cat > /tmp/core-site-simple.xml << 'XML'
           <configuration>
-            <property><name>fs.defaultFS</name><value>hdfs://localhost:8020</value></property>
+            <property><name>fs.defaultFS</name><value>hdfs://nameservice</value></property>
             <property><name>hadoop.security.authentication</name><value>simple</value></property>
             <property><name>hadoop.security.authorization</name><value>false</value></property>
           </configuration>
           XML
-          docker run -d --name hdfs \
-            -p 8020:8020 -p 9866:9866 -p 9864:9864 \
-            ghcr.io/dyrnq/mntrs-hdfs:ci-test-${{ github.sha }}
-          HDFS_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' hdfs)
-          echo "HDFS container IP: $HDFS_IP"
-          cat > /tmp/hdfs-site-simple.xml << ENDXML
+          cat > /tmp/hdfs-site-simple.xml << 'XML'
           <configuration>
             <property><name>dfs.replication</name><value>1</value></property>
             <property><name>dfs.permissions.enabled</name><value>false</value></property>
+            <property><name>dfs.nameservices</name><value>nameservice</value></property>
+            <property><name>dfs.ha.namenodes.nameservice</name><value>nn0</value></property>
+            <property><name>dfs.namenode.rpc-address.nameservice.nn0</name><value>0.0.0.0:8020</value></property>
+            <property><name>dfs.namenode.http-address.nameservice.nn0</name><value>0.0.0.0:9870</value></property>
+            <property><name>dfs.client.failover.proxy.provider.nameservice</name><value>org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider</value></property>
             <property><name>dfs.datanode.address</name><value>0.0.0.0:9866</value></property>
             <property><name>dfs.datanode.http.address</name><value>0.0.0.0:9864</value></property>
-            <property><name>dfs.datanode.hostname</name><value>${HDFS_IP}</value></property>
-            <property><name>dfs.client.use.datanode.hostname</name><value>true</value></property>
           </configuration>
-          ENDXML
-          docker cp /tmp/core-site-simple.xml hdfs:/opt/hadoop/etc/hadoop/core-site.xml
-          docker cp /tmp/hdfs-site-simple.xml hdfs:/opt/hadoop/etc/hadoop/hdfs-site.xml
-          docker restart hdfs
-          sleep 10
-          # Wait for NameNode
+          XML
+          docker run -d --name hdfs \
+            -p 8020:8020 -p 9866:9866 -p 9864:9864 \
+            -v /tmp/core-site-simple.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro \
+            -v /tmp/hdfs-site-simple.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro \
+            ghcr.io/dyrnq/mntrs-hdfs:ci-test-${{ github.sha }}
+
+          # Wait for NameNode + DataNode
           for i in $(seq 1 20); do
+            echo "  attempt $i..."
             if docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfsadmin -report >/dev/null 2>&1; then
               echo "HDFS ready"
               break
             fi
+            if [ $i -eq 20 ]; then
+              echo "::error::HDFS not ready after 20 attempts"
+              docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 || true
+              docker logs hdfs 2>&1 | tail -20
+              exit 1
+            fi
             sleep 5
           done
           docker logs hdfs 2>&1 | tail -5
+          docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | head -10
           docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -mkdir -p /test
           echo "hello hdfs" | docker exec -i -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt
 
@@ -302,8 +312,9 @@ jobs:
           echo "=== 5. Mount ==="
           sudo mkdir -p /mnt/hdfs && sudo chmod 777 /mnt/hdfs
           MOUNT_LOG="/tmp/mntrs-mount.log"
-          timeout 20 ./target/release/mntrs mount hdfs://localhost:8020/ /mnt/hdfs \
-            --read-only --allow-other --daemon --daemon-wait --daemon-timeout=20 \
+          ./target/release/mntrs mount hdfs://localhost:8020/ /mnt/hdfs \
+            --allow-other --daemon --daemon-wait --daemon-timeout=20 \
+            --opt dfs.namenode.kerberos.principal=hdfs/localhost@TEST.LOCAL \
             > "$MOUNT_LOG" 2>&1 &
           MOUNT_PID=$!
           sleep 5
@@ -314,11 +325,49 @@ jobs:
           echo "--- ps mntrs ---"
           ps aux | grep mntrs | grep -v grep || echo "(no mntrs process)"
 
-          if mount | grep -q /mnt/hdfs; then
+          FAIL=0
+          if mount | grep -q /mnt/hdfs && kill -0 $MOUNT_PID 2>/dev/null; then
             echo "=== 6. Verify ==="
-            ls -la /mnt/hdfs/
-            cat /mnt/hdfs/test/hello.txt
-            echo "✅ HDFS Kerberos mount OK"
+
+            echo "--- ls ---"
+            ls -laR /mnt/hdfs/ 2>&1
+
+            echo "--- read pre-existing file ---"
+            GOT=$(cat /mnt/hdfs/test/hello.txt 2>/dev/null)
+            if [ "$GOT" = "hello kerberos hdfs" ]; then
+              echo "read pre-existing OK: test/hello.txt"
+            else
+              echo "::error::read pre-existing FAIL: test/hello.txt (got '$GOT')"
+              FAIL=1
+            fi
+
+            echo "--- write small file ---"
+            echo "hello kerberos" > /mnt/hdfs/_ci_small.txt 2>/dev/null && echo "write OK" || { echo "write FAIL"; FAIL=1; }
+
+            echo "--- read back ---"
+            GOT=$(cat /mnt/hdfs/_ci_small.txt 2>/dev/null)
+            if [ "$GOT" = "hello kerberos" ]; then echo "read back OK"
+            else echo "read back FAIL: got '$GOT'"; FAIL=1; fi
+
+            echo "--- append ---"
+            echo "more" >> /mnt/hdfs/_ci_small.txt 2>/dev/null && echo "append OK" || { echo "append FAIL"; FAIL=1; }
+            GOT=$(cat /mnt/hdfs/_ci_small.txt 2>/dev/null)
+            if [ "$GOT" = "hello kerberos${NEWLINE}more" ]; then echo "append verify OK"
+            else echo "(append verify: got '$GOT')"; fi
+
+            echo "--- write+read 1M ---"
+            dd if=/dev/urandom of=/mnt/hdfs/_ci_1m.bin bs=1M count=1 2>/dev/null && echo "write 1M OK" || { echo "write 1M FAIL"; FAIL=1; }
+            dd if=/mnt/hdfs/_ci_1m.bin of=/dev/null bs=64K 2>/dev/null && echo "read 1M OK" || { echo "read 1M FAIL"; FAIL=1; }
+
+            echo "--- cleanup ---"
+            rm -f /mnt/hdfs/_ci_small.txt /mnt/hdfs/_ci_1m.bin 2>/dev/null || true
+
+            if [ $FAIL -eq 0 ]; then
+              echo "✅ HDFS Kerberos mount OK"
+            else
+              echo "::error::HDFS Kerberos mount tests FAILED"
+              exit 1
+            fi
           else
             echo "::error::HDFS Kerberos mount failed"
             exit 1
