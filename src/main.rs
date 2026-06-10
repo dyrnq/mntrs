@@ -72,6 +72,9 @@ enum Commands {
         /// Timeout in seconds for --daemon-wait (default: 10)
         #[arg(long, default_value = "10")]
         daemon_timeout: u64,
+        /// Internal: set by parent when re-exec'ing daemon child
+        #[arg(long, hide = true)]
+        internal_daemon: bool,
         /// Allow root user to access the mount
         #[arg(long)]
         allow_root: bool,

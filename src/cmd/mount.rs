@@ -513,8 +513,36 @@ pub fn mount(
         None
     };
 
-    // fuser::spawn_mount2 already spawns a background thread.
-    // Daemon mode: keep main thread alive to prevent session drop (which unmounts).
+    // Re-exec daemon (rclone-style): parent spawns a child process that does
+    // the actual mount. Parent exits immediately; child stays alive holding
+    // the FUSE session. This avoids fork+tokio incompatibility.
+    #[cfg(not(windows))]
+    if daemon && std::env::var_os("MNTRS_INTERNAL_DAEMON").is_none() {
+        let bin = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("mntrs"));
+        let args: Vec<String> = std::env::args()
+            .skip(1)
+            .map(|a| {
+                if a == "--daemon" {
+                    "--internal-daemon".to_string()
+                } else {
+                    a.clone()
+                }
+            })
+            .collect();
+        std::process::Command::new(&bin)
+            .args(&args)
+            .env("MNTRS_INTERNAL_DAEMON", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| anyhow!("failed to spawn daemon: {}", e))?;
+        std::process::exit(0);
+    }
+
+    // Re-exec child: treat as daemon (stay alive after mount)
+    #[cfg(not(windows))]
+    let daemon = daemon || std::env::var_os("MNTRS_INTERNAL_DAEMON").is_some();
 
     let mount_path = Path::new(mountpoint);
     #[cfg(not(windows))]
