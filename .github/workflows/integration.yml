@@ -140,11 +140,15 @@ jobs:
         run: |
           sudo mkdir -p /mnt/mntrs-test && sudo chmod 777 /mnt/mntrs-test
           MOUNT_OPTS="--opt endpoint=http://localhost:9000 --opt access-key=minioadmin --opt secret-key=minioadmin --opt region=us-east-1"
-          ./target/release/mntrs mount ${{ matrix.backend.storage }} /mnt/mntrs-test $MOUNT_OPTS 2>&1 &
-          MOUNT_PID=$!
-          sleep 5
+          # hdfs backend uses --daemon --daemon-wait (parent exits after spawn); other backends run in foreground
+          if [ "${{ matrix.backend.name }}" = "hdfs" ]; then
+            ./target/release/mntrs mount ${{ matrix.backend.storage }} /mnt/mntrs-test $MOUNT_OPTS --allow-other --daemon --daemon-wait --daemon-timeout=20 >/dev/null 2>&1 &
+          else
+            ./target/release/mntrs mount ${{ matrix.backend.storage }} /mnt/mntrs-test $MOUNT_OPTS 2>&1 &
+          fi
+          sleep 6
           FAIL=0
-          if mount | grep -q /mnt/mntrs-test && kill -0 $MOUNT_PID 2>/dev/null; then
+          if mount | grep -q /mnt/mntrs-test; then
             echo "--- 1. ls ---"
             ls -laR /mnt/mntrs-test/ 2>&1
 
@@ -316,8 +320,7 @@ jobs:
             --allow-other --daemon --daemon-wait --daemon-timeout=20 \
             --opt dfs.namenode.kerberos.principal=hdfs/localhost@TEST.LOCAL \
             > "$MOUNT_LOG" 2>&1 &
-          MOUNT_PID=$!
-          sleep 5
+          sleep 6
           echo "--- mount stdout/stderr ---"
           cat "$MOUNT_LOG"
           echo "--- mount table ---"
@@ -326,7 +329,7 @@ jobs:
           ps aux | grep mntrs | grep -v grep || echo "(no mntrs process)"
 
           FAIL=0
-          if mount | grep -q /mnt/hdfs && kill -0 $MOUNT_PID 2>/dev/null; then
+          if mount | grep -q /mnt/hdfs; then
             echo "=== 6. Verify ==="
 
             echo "--- ls ---"
