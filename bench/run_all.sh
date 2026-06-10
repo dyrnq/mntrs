@@ -81,6 +81,7 @@ echo "  $(date -Iseconds): starting mntrs mount..."
     --opt "endpoint=$ENDPOINT" --opt "access-key=$ACCESS_KEY" \
     --opt "secret-key=$SECRET_KEY" --opt "region=$REGION" \
     --vfs-cache-mode=writes --vfs-write-back=5 \
+    --vfs-read-ahead=134217728 --async-read \
     --daemon --daemon-wait --daemon-timeout=15 2>&1
 echo "  $(date -Iseconds): mntrs mount returned (exit=$?)"
 
