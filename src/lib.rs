@@ -2095,9 +2095,7 @@ impl CoreFilesystem for MntrsFs {
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .unwrap_or_default();
         for (name, mode, size, _mtime) in self.list_op(&list_path) {
-            if name.is_empty()
-                || name == "/"
-                || (name == queried_last && !queried_last.is_empty())
+            if name.is_empty() || name == "/" || (name == queried_last && !queried_last.is_empty())
             {
                 continue;
             }
