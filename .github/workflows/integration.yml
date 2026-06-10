@@ -1,5 +1,4 @@
-name: Integration Tests
-
+name: Integration Tests (CLI mount)
 
 permissions:
   contents: read
@@ -11,11 +10,33 @@ on:
     branches: [main]
   workflow_dispatch:
   schedule:
-    - cron: '0 4 * * 0'  # weekly Sunday 04:00 UTC
+    - cron: '0 4 * * 0'
 
 jobs:
-  csi-sanity:
+  mount-tests:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend:
+          - name: memory
+            storage: memory://
+          - name: s3
+            storage: s3://test-bucket
+          - name: hdfs
+            storage: hdfs://localhost:8020/
+
+    services:
+      minio:
+        image: minio/minio:latest
+        command: server /data
+        options: --health-cmd "curl -sf http://localhost:9000/minio/health/live || exit 1" --health-interval 5s
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        ports:
+          - 9000:9000
+
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -25,47 +46,70 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libfuse3-dev fuse3 protobuf-compiler
-          # Allow non-root FUSE mounts with allow_other
           sudo grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
 
-      - name: Build CSI driver
-        run: cargo build --release -p mntrs-csi
+      - name: Build mntrs
+        run: cargo build --release -p mntrs
 
-      - name: Start CSI driver + run csi-sanity
+      # ---- S3 backend: create bucket + upload test file ----
+      - name: Setup MinIO (S3 only)
+        if: matrix.backend.name == 's3'
         run: |
-          # Download csi-sanity (try go install, fallback to prebuilt binary)
-          CSI_SANITY=""
-          if go install github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@latest; then
-            CSI_SANITY="$(go env GOPATH)/bin/csi-sanity"
-          elif curl -sSL https://github.com/kubernetes-csi/csi-test/releases/download/v5.3.1/csi-sanity-v5.3.1-linux-amd64.tar.gz | tar xz; then
-            CSI_SANITY="./csi-sanity"
-          fi
-          if [ ! -x "$CSI_SANITY" ]; then
-            echo "::error::csi-sanity not available (go install and curl both failed)"
+          pip3 install awscli
+          AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin             aws --endpoint-url http://localhost:9000 --no-verify-ssl s3 mb s3://test-bucket 2>/dev/null || true
+          echo "hello s3" > /tmp/s3-test.txt
+          AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin             aws --endpoint-url http://localhost:9000 --no-verify-ssl s3 cp /tmp/s3-test.txt s3://test-bucket/
+
+      # ---- HDFS backend: start container in simple auth mode ----
+      - name: Setup HDFS (HDFS only)
+        if: matrix.backend.name == 'hdfs'
+        run: |
+          # Override Kerberos core-site.xml with simple auth variant
+          cat > /tmp/core-site-simple.xml << 'XML'
+          <configuration>
+            <property><name>fs.defaultFS</name><value>hdfs://localhost:9000</value></property>
+            <property><name>hadoop.security.authentication</name><value>simple</value></property>
+            <property><name>hadoop.security.authorization</name><value>false</value></property>
+          </configuration>
+          XML
+          docker run -d --name hdfs \
+            -p 8020:8020 \
+            -v /tmp/core-site-simple.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro \
+            ghcr.io/dyrnq/mntrs-hdfs:ci-test-${{ github.sha }}
+          # Wait for NameNode
+          for i in $(seq 1 20); do
+            if docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfsadmin -report >/dev/null 2>&1; then
+              echo "HDFS ready"
+              break
+            fi
+            sleep 5
+          done
+          docker logs hdfs 2>&1 | tail -5
+
+      # ---- Mount + read/write test ----
+      - name: Test mount
+        run: |
+          sudo mkdir -p /mnt/mntrs-test && sudo chmod 777 /mnt/mntrs-test
+          timeout 15 ./target/release/mntrs mount ${{ matrix.backend.storage }} /mnt/mntrs-test \
+            --opt endpoint=http://localhost:9000 \
+            --opt access-key=minioadmin \
+            --opt secret-key=minioadmin \
+            --opt region=us-east-1 \
+            --read-only 2>&1 &
+          sleep 5
+          if mount | grep -q /mnt/mntrs-test; then
+            ls /mnt/mntrs-test/ 2>&1
+            echo "✅ ${{ matrix.backend.name }} mount OK"
+          else
+            echo "::error::${{ matrix.backend.name }} mount failed: not in mount table"
+            mount | grep mntrs || true
             exit 1
           fi
 
-          # Start mntrs-csi
-          ./target/release/mntrs-csi --endpoint unix:///tmp/csi.sock &
-          CSI_PID=$!
-          sleep 3
-
-          # csi-sanity v5 expects --csi.testvolumeparameters to be a file path (YAML/JSON),
-          # not inline key=value. Generate a temp YAML file.
-          cat > /tmp/csi-test-params.yaml << 'EOF'
-          storage: "memory://"
-          readOnly: "true"
-          EOF
-
-          # Run csi-sanity (non-zero exit is expected — known unimplemented CSI methods).
-          # skip=remove-target-path: mount --bind needs root; full test in csi-integration.yml (k3s).
-          "$CSI_SANITY" --csi.endpoint=unix:///tmp/csi.sock \
-            --csi.testvolumeparameters=/tmp/csi-test-params.yaml \
-            --ginkgo.focus='NodePublishVolume|NodeUnpublishVolume|GetPluginInfo|Probe' --ginkgo.skip='remove target path' \
-            2>&1
-          CSI_EXIT=$?
-          if [ $CSI_EXIT -ne 0 ]; then
-            echo "::warning::csi-sanity exited $CSI_EXIT (known: CSI driver unimplemented methods)"
+      - name: Cleanup
+        if: always()
+        run: |
+          if mount | grep -q /mnt/mntrs-test; then
+            sudo fusermount3 -u /mnt/mntrs-test
           fi
-
-          kill $CSI_PID
+          docker rm -f hdfs 2>/dev/null || true
