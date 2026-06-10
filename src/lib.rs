@@ -2070,13 +2070,35 @@ impl CoreFilesystem for MntrsFs {
         } else {
             format!("{}/", path)
         };
+        // hdfs-native quirk: the first entry of op.lister(p) is the queried
+        // path itself. After trim_end_matches('/') inside list_op:
+        //   lister("/")      → entries[0].name = ""       ← was caught
+        //   lister("/test/") → entries[0].name = "/test"
+        //   lister("/test")  → entries[0].name = "test"
+        // Without filtering all three, the FUSE reply contains a phantom
+        // entry that matches the parent dir name. ls -R then descends into
+        // it and gets EIO on stat, plus the root listing can show an empty
+        // name (kernel EIO on readdir).
+        // hdfs-native quirk: the first entry of op.lister(p) is a phantom
+        // whose name is the LAST path component of p (with any trailing
+        // slash already trimmed by list_op). Confirmed by direct probe:
+        //   lister("/")         → [0].name = ""        (root, no component)
+        //   lister("/test/")    → [0].name = "test"
+        //   lister("/test/sub/")→ [0].name = "sub"
+        // Without filtering, the FUSE reply contains a phantom that
+        // matches the parent dir's basename. ls -R then descends into it
+        // and gets EIO on stat, plus the root listing can show an empty
+        // name (kernel EIO on readdir). Per SESSION_PITFALLS §2.4.
+        let queried_last = std::path::Path::new(&list_path)
+            .components()
+            .next_back()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .unwrap_or_default();
         for (name, mode, size, _mtime) in self.list_op(&list_path) {
-            // hdfs-native returns the queried path itself as the first entry
-            // (e.g. listing "/" yields a root entry with name=""). Such entries
-            // must be filtered: an empty dirent name is invalid in FUSE and
-            // makes the kernel EIO the readdir. Mirrors the filter in
-            // impl Filesystem for MntrsFs (see SESSION_PITFALLS §2.4).
-            if name.is_empty() || name == "/" {
+            if name.is_empty()
+                || name == "/"
+                || (name == queried_last && !queried_last.is_empty())
+            {
                 continue;
             }
             let kind = match mode {
