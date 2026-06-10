@@ -3,10 +3,13 @@ export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
 export HADOOP_HOME=/opt/hadoop
 export HADOOP_OPTS="-Djava.security.krb5.conf=/etc/krb5.conf"
 
+# Obtain Kerberos ticket (no-op if keytab missing or simple auth)
+gosu mntrs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL 2>/dev/null || true
+
 # Wait for NameNode to be ready
 echo "[datanode] Waiting for NameNode..."
 for i in $(seq 1 30); do
-    if gosu mntrs /opt/hadoop/bin/hdfs dfsadmin -fs hdfs://localhost:8020 -report 2>/dev/null | grep -q "Live datanodes\|Safe mode is ON"; then
+    if gosu mntrs /opt/hadoop/bin/hdfs dfsadmin -fs hdfs://localhost:8020 -report >/dev/null 2>&1; then
         echo "[datanode] NameNode is ready"
         break
     fi
