@@ -2032,16 +2032,10 @@ impl CoreFilesystem for MntrsFs {
     }
 
     fn readdir(&self, ino: u64) -> std::io::Result<Vec<CoreDirEntry>> {
-        if ino != 1 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "not root",
-            ));
-        }
         let path = self.resolve(ino).map(|(p, _, _, _)| p).unwrap_or_default();
         let mut entries = vec![
             CoreDirEntry {
-                ino: 1,
+                ino,
                 kind: CoreFileType::Directory,
                 name: ".".to_string(),
             },
@@ -2051,25 +2045,35 @@ impl CoreFilesystem for MntrsFs {
                 name: "..".to_string(),
             },
         ];
-        for (name, mode, size, _mtime) in self.list_op(&path) {
+        let list_path = if path.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", path)
+        };
+        for (name, mode, size, _mtime) in self.list_op(&list_path) {
             let kind = match mode {
                 EntryMode::DIR => CoreFileType::Directory,
                 _ => CoreFileType::RegularFile,
             };
-            let cp = if path.is_empty() {
-                name.clone()
-            } else {
-                format!("{}/{}", path, name)
-            };
+            // name from list_op already includes path prefix (e.g., "many/file_0001.txt")
+            // Extract just the filename for display, use full path for inode allocation
+            let display_name = name
+                .rsplit_once('/')
+                .map(|(_, n)| n.to_string())
+                .unwrap_or_else(|| name.clone());
             let ino = self.alloc_ino(
-                &cp,
+                &name,
                 match kind {
                     CoreFileType::Directory => FileType::Directory,
                     _ => FileType::RegularFile,
                 },
                 size,
             );
-            entries.push(CoreDirEntry { ino, kind, name });
+            entries.push(CoreDirEntry {
+                ino,
+                kind,
+                name: display_name,
+            });
         }
         Ok(entries)
     }
