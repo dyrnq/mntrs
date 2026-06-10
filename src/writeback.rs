@@ -136,6 +136,7 @@ pub fn worker(
 /// Unlike the legacy `worker()` which uses Arc<Mutex<VecDeque>>,
 /// this version uses `tokio::sync::mpsc::unbounded_channel`.
 /// FUSE threads call `tx.send()` without blocking on a Mutex.
+#[allow(dead_code)]
 pub fn start_channel(
     op: Arc<Operator>,
     inodes: Inodes,

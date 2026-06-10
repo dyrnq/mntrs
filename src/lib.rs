@@ -106,6 +106,7 @@ fn rt() -> &'static tokio::runtime::Runtime {
 // TTL now comes from MntrsFs.attr_ttl field
 const FUSE_ROOT_INO: u64 = 1;
 static NEXT_INO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(2);
+static NEXT_HANDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 // DIR_CACHE_TTL now comes from MntrsFs.dir_cache_ttl field
 
 /// Per-open-file-handle state
@@ -910,15 +911,15 @@ impl Filesystem for MntrsFs {
             reply.ok();
             return;
         }
-        for (i, (name, kind, _size, _mtime)) in entries.iter().enumerate().skip(start) {
+        // entries already carry size/mtime from list_op — no per-entry stat needed
+        for (i, (name, kind, size, _mtime)) in entries.iter().enumerate().skip(start) {
             let cp = if path.is_empty() {
                 name.clone()
             } else {
                 format!("{}/{}", path, name)
             };
-            let (_, size, _mtime) = self.stat_op(&cp).unwrap_or((*kind, 0, None));
             if reply.add(
-                INodeNo(self.alloc_ino(&cp, *kind, size)),
+                INodeNo(self.alloc_ino(&cp, *kind, *size)),
                 (i + 1) as u64,
                 *kind,
                 name,
@@ -1019,6 +1020,7 @@ impl Filesystem for MntrsFs {
             format!("{}/{}", parent_path, name)
         };
         let ino = self.alloc_ino(&full_path, FileType::RegularFile, 0);
+        let fh = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let cpath = cache_path(&self.cache_dir, &full_path);
         if let Some(parent) = cpath.parent() {
             let _ = fs::create_dir_all(parent);
@@ -1032,7 +1034,7 @@ impl Filesystem for MntrsFs {
             .ok()
             .map(|f| Arc::new(std::sync::Mutex::new(f)));
         self.handles.insert(
-            ino,
+            fh,
             FileHandleState::Write {
                 path: full_path.clone(),
                 cache_fd,
@@ -1044,25 +1046,51 @@ impl Filesystem for MntrsFs {
             &self.attr_ttl,
             &self.make_attr(ino, 0, FileType::RegularFile, SystemTime::UNIX_EPOCH),
             Generation(0),
-            FileHandle(ino),
+            FileHandle(fh),
             FopenFlags::empty(),
         );
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let ino: u64 = ino.into();
+        let fh = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some((path, FileType::RegularFile, _, _)) = self.resolve(ino) {
-            self.handles.insert(
-                ino,
-                FileHandleState::Read {
-                    path: path.clone(),
-                    last_offset: 0,
-                    chunk_size: 131072,
-                    prefetcher: self.maybe_create_prefetcher(ino, &path),
-                },
-            );
+            let is_write = !matches!(flags.acc_mode(), fuser::OpenAccMode::O_RDONLY);
+            if is_write {
+                let cpath = cache_path(&self.cache_dir, &path);
+                if let Some(parent) = cpath.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let cache_fd = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .read(true)
+                    .open(&cpath)
+                    .ok()
+                    .map(|f| Arc::new(std::sync::Mutex::new(f)));
+                self.handles.insert(
+                    fh,
+                    FileHandleState::Write {
+                        path: path.clone(),
+                        cache_fd,
+                        dirty: false,
+                        dirty_since: None,
+                    },
+                );
+            } else {
+                self.handles.insert(
+                    fh,
+                    FileHandleState::Read {
+                        path: path.clone(),
+                        last_offset: 0,
+                        chunk_size: 131072,
+                        prefetcher: self.maybe_create_prefetcher(ino, &path),
+                    },
+                );
+            }
         }
-        reply.opened(FileHandle(ino), FopenFlags::empty());
+        reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
     fn read(
@@ -1531,10 +1559,11 @@ impl Filesystem for MntrsFs {
         };
         let op = self.op.clone();
         let src_clone = src.clone();
+        let dst_clone = dst.clone();
         rt().block_on(async move {
-            if let Err(e) = op.rename(&src_clone, &dst).await {
+            if let Err(e) = op.rename(&src_clone, &dst_clone).await {
                 tracing::warn!(path=%src_clone, error=%e, "rename failed, falling back to copy+delete");
-                if op.copy(&src_clone, &dst).await.is_ok() {
+                if op.copy(&src_clone, &dst_clone).await.is_ok() {
                     let _ = op.delete(&src_clone).await;
                 }
             }
@@ -1553,7 +1582,16 @@ impl Filesystem for MntrsFs {
             }
         }
         self.disk_cache_index.remove(&src as &str);
-        self.inodes.remove(&path_hash(&src));
+        // Migrate inode and attr_cache from src to dst
+        let src_hash = path_hash(&src);
+        let dst_hash = path_hash(&dst);
+        if let Some(entry) = self.inodes.get(&src_hash).map(|e| e.value().clone()) {
+            self.inodes.insert(dst_hash, entry);
+        }
+        self.inodes.remove(&src_hash);
+        if let Some(entry) = self.attr_cache.get(&src).map(|e| *e.value()) {
+            self.attr_cache.insert(dst.to_string(), entry);
+        }
         self.attr_cache.remove(&src);
         reply.ok();
     }
@@ -1978,20 +2016,7 @@ impl CoreFilesystem for MntrsFs {
 
     fn open(&self, ino: u64, _flags: u32) -> std::io::Result<u64> {
         let path = self.resolve(ino).map(|(p, _, _, _)| p).unwrap_or_default();
-
-        // If handle caching is active, check for existing write handle for this inode
-        if self.handle_caching > std::time::Duration::ZERO
-            && let Some(entry) = self.handles.get(&ino)
-            && let crate::FileHandleState::Write {
-                path: existing_path,
-                cache_fd: Some(_fd),
-                ..
-            } = entry.value()
-            && *existing_path == path
-        {
-            // Reuse existing cached handle
-            return Ok(ino);
-        }
+        let fh = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // Check if flags contain write access (O_WRONLY=1, O_RDWR=2)
         let is_write = if cfg!(unix) {
@@ -2012,7 +2037,7 @@ impl CoreFilesystem for MntrsFs {
                 .open(&cpath)
                 .ok();
             self.handles.insert(
-                ino,
+                fh,
                 FileHandleState::Write {
                     path,
                     cache_fd: cache_fd.map(|f| std::sync::Arc::new(std::sync::Mutex::new(f))),
@@ -2022,7 +2047,7 @@ impl CoreFilesystem for MntrsFs {
             );
         } else {
             self.handles.insert(
-                ino,
+                fh,
                 FileHandleState::Read {
                     path,
                     last_offset: 0,
@@ -2031,7 +2056,7 @@ impl CoreFilesystem for MntrsFs {
                 },
             );
         }
-        Ok(ino)
+        Ok(fh)
     }
 
     fn read(&self, ino: u64, _fh: u64, offset: u64, size: u32) -> std::io::Result<Vec<u8>> {
@@ -2474,8 +2499,9 @@ impl CoreFilesystem for MntrsFs {
         };
         let op = self.op.clone();
         let src_clone = src.clone();
+        let dst_clone = dst.clone();
         rt().block_on(async move {
-            if op.copy(&src_clone, &dst).await.is_ok() {
+            if op.copy(&src_clone, &dst_clone).await.is_ok() {
                 let _ = op.delete(&src_clone).await;
             }
         });
