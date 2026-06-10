@@ -52,7 +52,7 @@ jobs:
 
           # Wait for NameNode + DataNode
           for i in $(seq 1 20); do
-            if docker exec hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>/dev/null | grep -q "Live datanodes"; then
+            if docker exec hdfs /opt/hadoop/bin/hdfs dfsadmin -report | grep -q "Live datanodes"; then
               echo "HDFS ready"
               break
             fi
