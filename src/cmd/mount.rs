@@ -610,7 +610,12 @@ pub fn mount(
         let session = fuser::spawn_mount2(adapter, mount_path, &cfg)?;
         record_mount(storage_url, mountpoint, read_only);
         if daemon_wait {
-            unblock_parent();
+            // Close write end of pipe to signal parent (POLLHUP on read end)
+            if let Some((_r, w)) = wait_pipe.as_ref() {
+                unsafe {
+                    rustix::io::close(*w);
+                }
+            }
         }
         // Prevent session drop on thread exit (keeps FUSE mounted)
         std::mem::forget(session);
@@ -630,15 +635,10 @@ pub fn mount(
             .map_err(|e| anyhow::anyhow!("host.mount: {e}"))?;
     }
 
-    if daemon {
-        // Keep the process alive indefinitely (FUSE session runs in background thread).
-        // Ctrl-C or SIGTERM will trigger cleanup via atexit.
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(3600));
-        }
-    }
-
-    // Foreground / daemon-wait: called from CSI or interactive use, return control.
+    // Daemon-wait: signal mount readiness before entering daemon loop.
+    // rclone-style: --daemon --daemon-wait means "fork, mount, signal, stay alive".
+    // Without fork, we signal via pipe then enter the keep-alive loop.
+    // CSI (daemon=false, daemon_wait=true): signal then return control to caller.
     #[cfg(not(windows))]
     if let Some((r, w)) = wait_pipe {
         unsafe {
@@ -663,6 +663,14 @@ pub fn mount(
         }
         unsafe {
             rustix::io::close(r);
+        }
+    }
+
+    if daemon {
+        // Keep the process alive indefinitely (FUSE session runs in background thread).
+        // Ctrl-C or SIGTERM will trigger cleanup via atexit.
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
         }
     }
 
@@ -934,19 +942,6 @@ fn daemonize(mountpoint: &str, wait_pipe: Option<i32>) -> Result<()> {
     }
     Ok(())
 }
-
-#[cfg(not(windows))]
-fn unblock_parent() {
-    if let Some(&fd) = DAEMON_PIPE_WR.get() {
-        // Safety: fd was created by pipe() and is valid
-        unsafe {
-            rustix::io::close(fd);
-        }
-    }
-}
-
-#[cfg(windows)]
-fn unblock_parent() {}
 
 async fn build_oss(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
     let bucket = url.host_str().ok_or_else(|| anyhow!("missing bucket"))?;
