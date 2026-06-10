@@ -2436,6 +2436,17 @@ impl CoreFilesystem for MntrsFs {
                 dirty_since: None,
             },
         );
+        self.cache_add_entry(
+            &parent_path,
+            name,
+            if kind == FileType::Directory {
+                EntryMode::DIR
+            } else {
+                EntryMode::FILE
+            },
+            size,
+            mtime.unwrap_or(SystemTime::UNIX_EPOCH),
+        );
         Ok(to_core_attr(&self.make_attr(
             ino,
             size,
@@ -2556,6 +2567,8 @@ impl CoreFilesystem for MntrsFs {
         });
         self.inodes.remove(&crate::path_hash(&src));
         self.attr_cache.remove(&src);
+        self.invalidate_dir_cache(&src);
+        self.invalidate_dir_cache(&dst);
         Ok(())
     }
 
