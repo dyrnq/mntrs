@@ -172,7 +172,7 @@ pub struct MntrsFs {
         String,
         (
             std::time::Instant,
-            std::sync::Arc<Vec<(String, EntryMode, u64, std::time::SystemTime)>>,
+            dashmap::DashMap<String, (EntryMode, u64, std::time::SystemTime)>,
         ),
     >,
     cache_dir: PathBuf,
@@ -468,18 +468,19 @@ impl MntrsFs {
         {
             if let Some(entry) = self.dir_cache.get(path) {
                 let (t, entries) = entry.value();
-                let entries = entries.clone();
                 let age = t.elapsed();
                 if age < self.dir_cache_ttl {
-                    return entries.as_ref().clone();
+                    return entries
+                        .iter()
+                        .map(|r| {
+                            let (name, (mode, size, mtime)) = r.pair();
+                            (name.clone(), *mode, *size, *mtime)
+                        })
+                        .collect();
                 }
-                // Cache expired — re-read from remote
-                tracing::debug!(
-                    path,
-                    age_ms = age.as_millis(),
-                    "Re-reading directory ({}ms old)",
-                    age.as_millis()
-                );
+                // Cache expired — drop and re-read from remote
+                drop(entry);
+                self.dir_cache.remove(path);
             }
         }
         let depth = path.matches('/').count();
@@ -553,20 +554,47 @@ impl MntrsFs {
                 seen.insert(norm)
             });
         }
-        self.dir_cache.insert(
-            path.to_string(),
-            (
-                std::time::Instant::now(),
-                std::sync::Arc::new(result.clone()),
-            ),
-        );
+        // Store entries individually (like rclone DirEntry per name)
+        let dir_entries: dashmap::DashMap<String, (EntryMode, u64, SystemTime)> = result
+            .iter()
+            .map(|(name, mode, size, mtime)| (name.clone(), (*mode, *size, *mtime)))
+            .collect();
+        self.dir_cache
+            .insert(path.to_string(), (std::time::Instant::now(), dir_entries));
         result
     }
 
-    /// Invalidate directory cache entries for the given path and its ancestors.
-    /// Called after create/unlink/rename/rmdir to maintain write-after-read consistency.
+    /// Add a single entry to directory cache (like rclone addObject).
+    /// Called after create() to avoid full directory re-read.
+    fn cache_add_entry(
+        &self,
+        parent_path: &str,
+        name: &str,
+        mode: EntryMode,
+        size: u64,
+        mtime: SystemTime,
+    ) {
+        if let Some(entry) = self.dir_cache.get(parent_path) {
+            let (_, entries) = entry.value();
+            entries.insert(name.to_string(), (mode, size, mtime));
+        }
+    }
+
+    /// Remove a single entry from directory cache (like rclone delObject).
+    /// Called after unlink/rmdir to avoid full directory re-read.
+    fn cache_remove_entry(&self, parent_path: &str, name: &str) {
+        if let Some(entry) = self.dir_cache.get(parent_path) {
+            let (_, entries) = entry.value();
+            entries.remove(name);
+        }
+    }
+
+    /// Full invalidation: remove directory cache and all sub-paths.
+    /// Used for rename (both src and dst sides) where we can't cheaply update.
     fn invalidate_dir_cache(&self, path: &str) {
         self.dir_cache.remove(path);
+        let prefix = format!("{}/", path);
+        self.dir_cache.retain(|k, _| !k.starts_with(&prefix));
         if let Some(slash) = path.rfind('/') {
             let parent = &path[..slash];
             if !parent.is_empty() {
@@ -1061,7 +1089,13 @@ impl Filesystem for MntrsFs {
             FileHandle(fh),
             FopenFlags::empty(),
         );
-        self.invalidate_dir_cache(&full_path);
+        self.cache_add_entry(
+            &parent_path,
+            &name,
+            EntryMode::FILE,
+            0,
+            SystemTime::UNIX_EPOCH,
+        );
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
