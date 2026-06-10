@@ -966,6 +966,8 @@ impl Filesystem for MntrsFs {
             ("..".to_string(), FileType::Directory, 4096, None),
         ];
         for (name, mode, size, mtime) in self.list_op(&path) {
+            let clean_name = name.trim_start_matches('/').trim_end_matches('/');
+            let name = if clean_name.is_empty() { name.clone() } else { clean_name.to_string() };
             entries.push((
                 name,
                 match mode {
@@ -1015,6 +1017,8 @@ impl Filesystem for MntrsFs {
             ("..".to_string(), FileType::Directory, 4096, None),
         ];
         for (name, mode, size, mtime) in self.list_op(&path) {
+            let clean_name = name.trim_start_matches('/').trim_end_matches('/');
+            let name = if clean_name.is_empty() { name.clone() } else { clean_name.to_string() };
             entries.push((
                 name,
                 match mode {
