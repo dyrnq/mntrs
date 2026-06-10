@@ -159,10 +159,11 @@ jobs:
         run: |
           sudo mkdir -p /mnt/mntrs-test && sudo chmod 777 /mnt/mntrs-test
           MOUNT_OPTS="--opt endpoint=${{ matrix.test.endpoint }} --opt access-key=minioadmin --opt secret-key=minioadmin --opt region=us-east-1"
-          timeout 15 ./target/release/mntrs mount ${{ matrix.test.storage }} /mnt/mntrs-test $MOUNT_OPTS 2>&1 &
+          ./target/release/mntrs mount ${{ matrix.backend.storage }} /mnt/mntrs-test $MOUNT_OPTS 2>&1 &
+          MOUNT_PID=$!
           sleep 5
           FAIL=0
-          if mount | grep -q /mnt/mntrs-test; then
+          if mount | grep -q /mnt/mntrs-test && kill -0 $MOUNT_PID 2>/dev/null; then
             echo "--- 1. ls ---"
             ls -laR /mnt/mntrs-test/ 2>&1
 
