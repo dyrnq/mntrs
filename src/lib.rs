@@ -1,4 +1,5 @@
 #![allow(unexpected_cfgs)]
+#![cfg_attr(windows, allow(dead_code, unused_imports, unused_variables))]
 #![recursion_limit = "256"]
 pub mod cmd;
 pub mod core_fs;
