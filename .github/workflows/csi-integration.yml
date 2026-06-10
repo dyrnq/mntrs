@@ -136,7 +136,6 @@ jobs:
             echo "::error::${{ matrix.test.name }} mount failed: mntrs process died"
             exit 1
           fi
-          sudo fusermount3 -u /mnt/mntrs-test 2>/dev/null
 
       - name: CSI k3s smoke test
         run: |
