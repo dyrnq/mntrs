@@ -1,7 +1,7 @@
 FROM ubuntu:24.04
 
 ARG S6_OVERLAY_VERSION=3.2.0.2
-ARG HADOOP_VERSION=3.3.6
+ARG HADOOP_VERSION=3.5.0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=en_US.utf8 \
@@ -78,7 +78,7 @@ COPY rootfs /
 RUN \
 mkdir -p /var/lib/hadoop && \
 chown -R mntrs:mntrs /var/lib/hadoop && \
-chown -R mntrs:mntrs /opt/hadoop
+chown -R mntrs:mntrs /opt/hadoop; mkdir -p /opt/hadoop/logs; chown mntrs:mntrs /opt/hadoop/logs
 
 EXPOSE 8020 9870 88 749 22
 
