@@ -572,10 +572,7 @@ pub fn mount(
                         f.into_raw_fd()
                     })
                     .unwrap_or(-1),
-                None => libc::open(
-                    b"/dev/null\0".as_ptr() as *const i8,
-                    libc::O_RDWR,
-                ),
+                None => libc::open(c"/dev/null".as_ptr(), libc::O_RDWR),
             };
             if target >= 0 {
                 libc::dup2(target, libc::STDOUT_FILENO);
