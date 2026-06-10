@@ -107,6 +107,8 @@ jobs:
             sleep 5
           done
           docker logs hdfs 2>&1 | tail -5
+          docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -mkdir -p /test
+          echo "hello hdfs" | docker exec -i -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt
 
       # ---- Mount + read/write test ----
       - name: Test mount
@@ -121,6 +123,11 @@ jobs:
           sleep 5
           if mount | grep -q /mnt/mntrs-test; then
             ls /mnt/mntrs-test/ 2>&1
+            if [ "${{ matrix.backend.name }}" = "s3" ]; then
+              cat /mnt/mntrs-test/s3-test.txt 2>/dev/null || echo "(no s3 test file)"
+            elif [ "${{ matrix.backend.name }}" = "hdfs" ]; then
+              cat /mnt/mntrs-test/test/hello.txt 2>/dev/null || echo "(no hdfs test file)"
+            fi
             echo "✅ ${{ matrix.backend.name }} mount OK"
           else
             echo "::error::${{ matrix.backend.name }} mount failed: not in mount table"
