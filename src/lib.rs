@@ -634,15 +634,20 @@ impl MntrsFs {
         if self.cache_max_size == 0 && self.cache_min_free_space == 0 {
             return;
         }
-        // Collect from in-memory index instead of fs::read_dir
-        let mut files: Vec<(String, u64, std::time::SystemTime)> = Vec::new();
+        // Calculate total cache size and collect entries for LRU eviction.
+        // Uses a min-heap (BinaryHeap with Reverse) for O(k log n) vs O(n log n) sort.
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+
         let mut total: u64 = 0;
+        let mut heap: BinaryHeap<Reverse<(std::time::SystemTime, String, u64)>> = BinaryHeap::new();
         for entry in self.disk_cache_index.iter() {
-            let path: String = entry.key().clone();
+            let path = entry.key().clone();
             let (size, atime) = *entry.value();
             total += size;
-            files.push((path, size, atime));
+            heap.push(Reverse((atime, path, size)));
         }
+
         // Check free disk space if configured
         let need_free = if self.cache_min_free_space > 0 {
             #[cfg(unix)]
@@ -678,23 +683,21 @@ impl MntrsFs {
         }
         self.out_of_space
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        // LRU: sort by access time ascending, remove oldest until under limit
-        files.sort_by_key(|(_, _, atime)| *atime);
+
+        // Pop oldest entries from min-heap until enough space freed
         let mut remaining = to_free;
         let mut freed: u64 = 0;
-        for (path, size, _) in files {
+        while let Some(Reverse((_, path, size))) = heap.pop() {
             if remaining == 0 {
                 break;
             }
-            let block_idx = 0; // flush uses block 0 (main cache location)
-            let cpath = cache_block_path(&self.cache_dir, &path, block_idx);
+            let cpath = cache_block_path(&self.cache_dir, &path, 0);
             let _ = fs::remove_file(&cpath);
             let _ = fs::remove_file(cpath.with_extension("meta"));
             self.disk_cache_index.remove(&path as &str);
             freed += size;
             remaining = remaining.saturating_sub(size);
         }
-        // If we freed enough, clear out_of_space
         if freed >= to_free {
             self.out_of_space
                 .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1873,20 +1876,8 @@ impl Filesystem for MntrsFs {
                     .push_back((_ino.into(), path, cpath));
             }
         }
-        if dirty {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
-            loop {
-                let pending = self.writeback_queue.lock().unwrap().len();
-                if pending == 0 {
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    tracing::warn!("fsync timeout waiting for writeback");
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        }
+        // Queue the writeback; don't block FUSE thread waiting for upload.
+        // rclone does the same: close() returns immediately, upload happens async.
         reply.ok();
     }
 
