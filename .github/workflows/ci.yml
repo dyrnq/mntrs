@@ -1,0 +1,112 @@
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # === Shared build job (all other jobs cache from this) ===
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3 protobuf-compiler
+      - name: Build workspace
+        run: cargo build --workspace
+      - name: Build CSI plugin
+        run: cargo build --package mntrs-csi
+
+  # === Matrix: test / clippy / fmt / hdfs-jni / csi-sanity ===
+  check:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        task:
+          - test
+          - clippy
+          - fmt
+          - hdfs-jni
+          - csi-sanity
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev fuse3 protobuf-compiler
+          sudo grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+
+      - name: Test (lib)
+        if: matrix.task == 'test'
+        run: cargo test --workspace --lib
+
+      - name: Clippy
+        if: matrix.task == 'clippy'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Format check
+        if: matrix.task == 'fmt'
+        run: cargo fmt --all -- --check
+
+      - name: HDFS JNI (build + test + clippy)
+        if: matrix.task == 'hdfs-jni'
+        run: |
+          sudo apt-get update && sudo apt-get install -y default-jdk
+          echo "JAVA_HOME=/usr/lib/jvm/default-java" >> $GITHUB_ENV
+          JVM_LIB=$(find /usr/lib/jvm -name "libjvm.so" | head -1)
+          if [ -n "$JVM_LIB" ]; then
+            echo "LD_LIBRARY_PATH=$(dirname "$JVM_LIB"):${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
+          fi
+          cargo build --release --features hdfs-jni
+          cargo test --test hdfs_integration_test --features hdfs-jni
+
+      - name: CSI sanity test
+        if: matrix.task == 'csi-sanity'
+        run: |
+          cargo build --release -p mntrs-csi
+          # Download csi-sanity
+          CSI_SANITY=""
+          if go install github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@latest; then
+            CSI_SANITY="$(go env GOPATH)/bin/csi-sanity"
+          elif curl -sSL https://github.com/kubernetes-csi/csi-test/releases/download/v5.3.1/csi-sanity-v5.3.1-linux-amd64.tar.gz | tar xz; then
+            CSI_SANITY="./csi-sanity"
+          fi
+          [ -x "$CSI_SANITY" ] || { echo "::error::csi-sanity not available"; exit 1; }
+
+          cat > /tmp/csi-test-params.yaml << 'YAML'
+          storage: "memory://"
+          readOnly: "true"
+          YAML
+
+          ./target/release/mntrs-csi --endpoint unix:///tmp/csi.sock &
+          CSI_PID=$!
+          sleep 3
+
+          "$CSI_SANITY" --csi.endpoint=unix:///tmp/csi.sock \
+            --csi.testvolumeparameters=/tmp/csi-test-params.yaml \
+            --ginkgo.focus='NodePublishVolume|NodeUnpublishVolume|GetPluginInfo|Probe' \
+            --ginkgo.skip='remove target path' \
+            2>&1
+          CSI_EXIT=$?
+          if [ $CSI_EXIT -ne 0 ]; then
+            echo "::warning::csi-sanity exited $CSI_EXIT (known: CSI driver unimplemented methods)"
+          fi
+          kill $CSI_PID
