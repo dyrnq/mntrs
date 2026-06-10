@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity)]
 use crate::MntrsFs;
 use anyhow::{Result, anyhow};
 #[cfg(not(windows))]
@@ -113,6 +114,9 @@ fn remove_mount(mountpoint: &str) {
 }
 
 static CLEANUP_MP: OnceLock<String> = OnceLock::new();
+static GLOBAL_WRITEBACK_QUEUE: OnceLock<
+    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(u64, String, std::path::PathBuf)>>>,
+> = OnceLock::new();
 static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -338,12 +342,10 @@ pub fn unmount_internal(mountpoint: &str) -> anyhow::Result<()> {
 
 /// Returns number of pending writebacks in the global queue.
 pub fn pending_writebacks() -> usize {
-    // Access the static writeback queue via MntrsFs is tricky.
-    // For now, return 0: the writeback queue is per-MntrsFs instance,
-    // not accessible from a static context. The CSI node server tracks
-    // mount state separately.
-    // TODO: make writeback queue accessible from a global/cross-instance API
-    0
+    GLOBAL_WRITEBACK_QUEUE
+        .get()
+        .map(|q| q.lock().unwrap().len())
+        .unwrap_or(0)
 }
 #[allow(clippy::too_many_arguments)]
 pub fn mount(
@@ -482,6 +484,7 @@ pub fn mount(
         handle_caching: std::time::Duration::from_secs(vfs_handle_caching),
         disk_total_size: vfs_disk_space_total_size * 1024 * 1024 * 1024 * 1024, // TB to bytes
         writeback_queue: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+
         mem_cache: dashmap::DashMap::new(),
         attr_cache: dashmap::DashMap::new(),
         disk_cache_index: dashmap::DashMap::new(),
