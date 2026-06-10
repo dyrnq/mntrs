@@ -50,7 +50,9 @@ jobs:
         run: |
           docker run -d --name hdfs             -p 8020:8020 -p 88:88 -p 749:749             ${{ needs.build-hdfs-image.outputs.image }}
 
-          # Wait for NameNode + DataNode
+          # Wait for NameNode + DataNode.
+          # Container's kinit is needed: dfsadmin talks to Kerberised NameNode.
+          docker exec hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL
           for i in $(seq 1 20); do
             if docker exec hdfs /opt/hadoop/bin/hdfs dfsadmin -report | grep -q "Live datanodes"; then
               echo "HDFS ready"
