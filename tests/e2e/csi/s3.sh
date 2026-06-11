@@ -392,7 +392,7 @@ ${KUBECTL} -n "${E2E_NAMESPACE}" exec "${E2E_POD_NAME}" -- \
            dd if=/data/_ci_1m.bin of=/dev/null bs=64K 2>/dev/null && echo OK" >/dev/null
 DD_OUT=$(${KUBECTL} -n "${E2E_NAMESPACE}" exec "${E2E_POD_NAME}" -- \
     sh -c "dd if=/data/_ci_1m.bin of=/dev/null bs=64K 2>&1 | tail -1")
-assert_in "1M random write+read" "records" "${DD_OUT}"
+assert_in "1M random write+read" "bytes" "${DD_OUT}"
 
 ${KUBECTL} -n "${E2E_NAMESPACE}" exec "${E2E_POD_NAME}" -- \
     sh -c "rm -f /data/_ci_small.txt /data/_ci_1m.bin" >/dev/null
@@ -500,7 +500,7 @@ ${KUBECTL} -n "${E2E_NAMESPACE}" exec "${DYN_POD_NAME}" -- \
            dd if=/data/_ci_1m.bin of=/dev/null bs=64K 2>/dev/null && echo OK" >/dev/null
 DD_OUT=$(${KUBECTL} -n "${E2E_NAMESPACE}" exec "${DYN_POD_NAME}" -- \
     sh -c "dd if=/data/_ci_1m.bin of=/dev/null bs=64K 2>&1 | tail -1")
-assert_in "dynamic: 1M random write+read" "records" "${DD_OUT}"
+assert_in "dynamic: 1M random write+read" "bytes" "${DD_OUT}"
 ${KUBECTL} -n "${E2E_NAMESPACE}" exec "${DYN_POD_NAME}" -- \
     sh -c "rm -f /data/_ci_small.txt /data/_ci_1m.bin" >/dev/null
 
