@@ -60,7 +60,7 @@ spec:
         - name: mntrs
           image: csi-mntrs:latest
           args:
-            - "--nodeid=$(NODE_ID)"
+            - "--node-id=$(NODE_ID)"
             - "--endpoint=$(CSI_ENDPOINT)"
           env:
             - name: NODE_ID
