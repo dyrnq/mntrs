@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use crate::cache::MemCache;
+
 #[cfg(unix)]
 use fuser::{
     AccessFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
@@ -222,7 +224,7 @@ pub struct MntrsFs {
     pub(crate) disk_total_size: u64,
     writeback_sender: std::sync::OnceLock<writeback::Sender>,
 
-    mem_cache: dashmap::DashMap<(u64, u64), bytes::Bytes>,
+    mem_cache: std::sync::Arc<crate::cache::DashMapMemCache>,
     attr_cache: dashmap::DashMap<
         String,
         (
@@ -236,9 +238,6 @@ pub struct MntrsFs {
     disk_cache_index: dashmap::DashMap<String, (u64, std::time::SystemTime)>,
     out_of_space: std::sync::atomic::AtomicBool,
     pub(crate) storage_class: Option<String>,
-    pub(crate) mem_limit: u64,
-    mem_used: std::sync::atomic::AtomicU64,
-    mem_access_order: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>>, // FIFO for eviction
 }
 
 /// Convert OpenDAL Timestamp to std::time::SystemTime, clamped to UNIX_EPOCH.
@@ -660,45 +659,6 @@ impl MntrsFs {
                 self.dir_cache.remove(parent);
             }
         }
-    }
-
-    fn mem_cache_insert(&self, ino: u64, block_idx: u64, data: bytes::Bytes) {
-        let size = data.len() as u64;
-        let key = (ino, block_idx);
-
-        // Back-pressure: evict before inserting (like mountpoint-s3 MemoryLimiter)
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if self.mem_used.load(std::sync::atomic::Ordering::Relaxed) + size <= self.mem_limit {
-                break;
-            }
-            let mut order = self.mem_access_order.lock().unwrap();
-            let victim = match order.pop_front() {
-                Some(v) => v,
-                None => break,
-            };
-            drop(order);
-            if let Some((_, removed)) = self.mem_cache.remove(&victim) {
-                self.mem_used
-                    .fetch_sub(removed.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            }
-            if std::time::Instant::now() >= deadline {
-                break; // force-proceed, may temporarily exceed limit
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-
-        // Atomic deduplicate via entry API: get-or-insert with size accounting
-        self.mem_cache
-            .entry(key)
-            .and_modify(|old| {
-                self.mem_used
-                    .fetch_sub(old.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            })
-            .or_insert(data);
-        self.mem_used
-            .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
-        self.mem_access_order.lock().unwrap().push_back(key);
     }
 
     fn evict_lru(&self) {
@@ -1273,8 +1233,7 @@ impl Filesystem for MntrsFs {
         let cap = file_size - offset;
         // 1. Check memory cache first (fast path)
         let block_idx = offset / CACHE_BLOCK_SIZE;
-        if let Some(entry) = self.mem_cache.get(&(ino, block_idx)) {
-            let data = entry.value().clone();
+        if let Some(data) = self.mem_cache.get(ino, block_idx) {
             let start = offset as usize;
             let end = (start + size as usize).min(data.len());
             if start < data.len() {
@@ -1298,7 +1257,7 @@ impl Filesystem for MntrsFs {
                     vec![]
                 };
                 let b = bytes::Bytes::from(data);
-                self.mem_cache_insert(ino, block_idx, b);
+                self.mem_cache.put(ino, block_idx, b);
                 reply.data(&result);
                 return;
             }
@@ -1326,7 +1285,7 @@ impl Filesystem for MntrsFs {
                     } else {
                         reply.data(&[]);
                     }
-                    self.mem_cache_insert(ino, offset / CACHE_BLOCK_SIZE, b);
+                    self.mem_cache.put(ino, offset / CACHE_BLOCK_SIZE, b);
                     return;
                 } else {
                     tracing::warn!(path=?cpath, "cache checksum mismatch, re-fetching");
@@ -1432,7 +1391,7 @@ impl Filesystem for MntrsFs {
                 let b: bytes::Bytes = all_data.freeze();
                 let slice = &b[..(b.len() as u32).min(clamped_size) as usize];
                 reply.data(slice);
-                self.mem_cache_insert(ino, offset / CACHE_BLOCK_SIZE, b);
+                self.mem_cache.put(ino, offset / CACHE_BLOCK_SIZE, b);
             } else {
                 reply.error(Errno::EIO);
             }
@@ -1447,7 +1406,7 @@ impl Filesystem for MntrsFs {
                     let b: bytes::Bytes = buf.to_vec().into();
                     let slice = &b[..(b.len() as u32).min(clamped_size) as usize];
                     reply.data(slice);
-                    self.mem_cache_insert(ino, offset / CACHE_BLOCK_SIZE, b);
+                    self.mem_cache.put(ino, offset / CACHE_BLOCK_SIZE, b);
                 }
                 Err(_) => reply.error(Errno::EIO),
             }
@@ -2376,8 +2335,7 @@ impl CoreFilesystem for MntrsFs {
             }
         }
 
-        if let Some(entry) = self.mem_cache.get(&(ino, block_idx)) {
-            let data = entry.value();
+        if let Some(data) = self.mem_cache.get(ino, block_idx) {
             let start = offset as usize;
             let end = (start + size as usize).min(data.len());
             return if start < data.len() {
@@ -2400,7 +2358,7 @@ impl CoreFilesystem for MntrsFs {
                 } else {
                     vec![]
                 };
-                self.mem_cache_insert(ino, offset / CACHE_BLOCK_SIZE, b);
+                self.mem_cache.put(ino, offset / CACHE_BLOCK_SIZE, b);
                 return Ok(result);
             }
             // Fallback to block-level cache
@@ -2416,7 +2374,7 @@ impl CoreFilesystem for MntrsFs {
                 } else {
                     vec![]
                 };
-                self.mem_cache_insert(ino, offset / CACHE_BLOCK_SIZE, b);
+                self.mem_cache.put(ino, offset / CACHE_BLOCK_SIZE, b);
                 return Ok(result);
             }
         }
@@ -2429,7 +2387,7 @@ impl CoreFilesystem for MntrsFs {
                 let b: bytes::Bytes = buf.to_vec().into();
                 let len = (b.len() as u32).min(size) as usize;
                 let data = b[..len].to_vec();
-                self.mem_cache_insert(ino, offset / CACHE_BLOCK_SIZE, b);
+                self.mem_cache.put(ino, offset / CACHE_BLOCK_SIZE, b);
                 Ok(data)
             }
             Err(_) => Err(std::io::Error::other("read failed")),
@@ -2579,7 +2537,7 @@ impl CoreFilesystem for MntrsFs {
         // which ones. The cost is O(mem_cache size for this shard);
         // mem_cache uses DashMap so shards are independent and the
         // retain only locks the affected shard(s).
-        self.mem_cache.retain(|&(i, _), _| i != _ino);
+        self.mem_cache.invalidate_ino(_ino);
 
         self.handles.insert(
             fh_val,
@@ -3177,13 +3135,12 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         handle_caching: std::time::Duration::from_secs(0),
         disk_total_size: 0,
         writeback_sender: std::sync::OnceLock::new(),
-        mem_cache: Default::default(),
+        // Unbounded mem_cache for unit tests. Production mounts
+        // overwrite this in cmd/mount.rs after the size is known.
+        mem_cache: std::sync::Arc::new(crate::cache::DashMapMemCache::new(0)),
         attr_cache: Default::default(),
         disk_cache_index: Default::default(),
         out_of_space: std::sync::atomic::AtomicBool::new(false),
         storage_class: None,
-        mem_limit: u64::MAX,
-        mem_used: std::sync::atomic::AtomicU64::new(0),
-        mem_access_order: std::sync::Mutex::new(std::collections::VecDeque::new()),
     }
 }

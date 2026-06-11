@@ -480,18 +480,19 @@ pub fn mount(
         disk_total_size: vfs_disk_space_total_size * 1024 * 1024 * 1024 * 1024, // TB to bytes
         writeback_sender: std::sync::OnceLock::new(),
 
-        mem_cache: dashmap::DashMap::new(),
+        // mem_limit is interpreted as MiB by the CLI; 0 means
+        // "unbounded" (still tracked by DashMapMemCache, but
+        // no eviction triggered). Production default is 256 MiB
+        // (see `cli_defaults` above).
+        mem_cache: std::sync::Arc::new(crate::cache::DashMapMemCache::new(if mem_limit > 0 {
+            mem_limit * 1024 * 1024
+        } else {
+            0
+        })),
         attr_cache: dashmap::DashMap::new(),
         disk_cache_index: dashmap::DashMap::new(),
         out_of_space: std::sync::atomic::AtomicBool::new(false),
         storage_class: storage_class.map(|s| s.to_string()),
-        mem_limit: if mem_limit > 0 {
-            mem_limit * 1024 * 1024
-        } else {
-            u64::MAX
-        },
-        mem_used: std::sync::atomic::AtomicU64::new(0),
-        mem_access_order: std::sync::Mutex::new(std::collections::VecDeque::new()),
     };
 
     // Create pipe for daemon_wait parent-child synchronization

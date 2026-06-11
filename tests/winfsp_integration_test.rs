@@ -65,8 +65,6 @@ fn make_memory_fs() -> MntrsFs {
         disk_cache_index: Default::default(),
         out_of_space: Default::default(),
         storage_class: None,
-        mem_limit: 256 * 1024 * 1024,
-        mem_used: Default::default(),
     }
 }
 
