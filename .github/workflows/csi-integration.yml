@@ -146,14 +146,13 @@ jobs:
             -v /tmp/hdfs-site-simple.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro \
             ${{ needs.build-hdfs-image.outputs.image }}
           for i in $(seq 1 30); do
-            REPORT=$(docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1)
-            # Wait until at least 1 live datanode is registered
-            LIVE=$(echo "$REPORT" | grep -oP 'Live datanodes.*?:\s+\K\d+' || echo "0")
-            if [[ "$LIVE" -ge 1 ]]; then
-              echo "HDFS ready (live datanodes: $LIVE) after ${i} attempts"
+            # Probe readiness by attempting a real write
+            if echo "probe" | docker exec -i -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -put - /_readiness_probe 2>/dev/null \
+               && docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -rm /_readiness_probe >/dev/null 2>&1; then
+              echo "HDFS ready after ${i} attempts"
               break
             fi
-            echo "  attempt $i: waiting for datanode (live=$LIVE)..."
+            echo "  attempt $i: waiting for HDFS write readiness..."
             sleep 3
           done
           docker logs hdfs 2>&1 | tail -5
