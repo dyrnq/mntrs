@@ -111,6 +111,10 @@ jobs:
       - name: Run e2e
         env:
           KUBECONFIG: /tmp/kubeconfig
+          SKIP_BUILD: '1'
+          IMAGE: ghcr.io/${{ github.repository_owner }}/mntrs-csi:ci-test-e2e-${{ github.sha }}
+          MINIO_ENDPOINT: ${{ env.MINIO_ENDPOINT }}
+          KEEP_ON_FAIL: ${{ env.KEEP_ON_FAIL }}
         run: |
           bash tests/e2e/csi/s3.sh
 
