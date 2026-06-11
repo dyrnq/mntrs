@@ -237,22 +237,48 @@ jobs:
             if [ "$GOT" = "hello from ${{ matrix.backend.name }}" ]; then
               echo "read back OK"
             else
-              echo "(write skipped: readonly - file not expected)"
+              echo "::error::read back FAIL: got '$GOT'"
+              FAIL=1
             fi
 
-            echo "--- 5. append write ---"
-            echo "more data" >> /mnt/mntrs-test/_ci_small.txt 2>/dev/null && echo "append OK" || echo "(append skipped: readonly)"
+            echo "--- 5. append write + verify ---"
+            echo "more data" >> /mnt/mntrs-test/_ci_small.txt 2>/dev/null && echo "append OK" || { echo "append FAIL"; FAIL=1; }
+            GOT=$(cat /mnt/mntrs-test/_ci_small.txt 2>/dev/null)
+            if [ "$GOT" = "hello from ${{ matrix.backend.name }}
+more data" ]; then echo "append verify OK"
+            else echo "::error::append verify FAIL: got '$GOT'"; FAIL=1; fi
 
-            echo "--- 6. write+read 10M sequential ---"
+            echo "--- 6. append to pre-existing file ---"
+            echo "appended" >> /mnt/mntrs-test/test/hello.txt 2>/dev/null && echo "append pre-existing OK" || { echo "append pre-existing FAIL"; FAIL=1; }
+            GOT=$(cat /mnt/mntrs-test/test/hello.txt 2>/dev/null)
+            if echo "$GOT" | grep -q "appended"; then echo "append pre-existing verify OK"
+            else echo "::error::append pre-existing verify FAIL: got '$GOT'"; FAIL=1; fi
+
+            echo "--- 7. write+read 10M sequential ---"
             dd if=/dev/urandom of=/mnt/mntrs-test/_ci_10m.bin bs=1M count=10 2>/dev/null && echo "write 10M OK" || { echo "write 10M FAIL"; FAIL=1; }
-            dd if=/mnt/mntrs-test/_ci_10m.bin of=/dev/null bs=64K 2>/dev/null && echo "read 10M OK" || echo "(10M read skipped: readonly)"
+            dd if=/mnt/mntrs-test/_ci_10m.bin of=/dev/null bs=64K 2>/dev/null && echo "read 10M OK" || { echo "read 10M FAIL"; FAIL=1; }
 
-            echo "--- 7. random read 10M ---"
+            echo "--- 8. random seek read ---"
             for off in 0 500 10000 50000 500000 5000000 9000000 9999999; do
               dd if=/mnt/mntrs-test/_ci_10m.bin bs=1 count=1 skip=$off of=/dev/null 2>/dev/null && echo "  seek $off OK" || { echo "  seek $off FAIL"; FAIL=1; }
             done
 
-            echo "--- 8. cleanup ---"
+            echo "--- 9. delete + recreate ---"
+            rm -f /mnt/mntrs-test/_ci_small.txt 2>/dev/null
+            echo "recreated" > /mnt/mntrs-test/_ci_small.txt 2>/dev/null && echo "recreate OK" || { echo "recreate FAIL"; FAIL=1; }
+            GOT=$(cat /mnt/mntrs-test/_ci_small.txt 2>/dev/null)
+            if [ "$GOT" = "recreated" ]; then echo "recreate verify OK"
+            else echo "::error::recreate verify FAIL: got '$GOT'"; FAIL=1; fi
+
+            echo "--- 10. directory create + list + delete ---"
+            mkdir -p /mnt/mntrs-test/_ci_dir 2>/dev/null && echo "mkdir OK" || { echo "mkdir FAIL"; FAIL=1; }
+            echo "dirfile" > /mnt/mntrs-test/_ci_dir/file.txt 2>/dev/null
+            GOT=$(ls /mnt/mntrs-test/_ci_dir/ 2>/dev/null)
+            if [ "$GOT" = "file.txt" ]; then echo "dir list OK"
+            else echo "::error::dir list FAIL: got '$GOT'"; FAIL=1; fi
+            rm -rf /mnt/mntrs-test/_ci_dir 2>/dev/null && echo "rmdir OK" || { echo "rmdir FAIL"; FAIL=1; }
+
+            echo "--- 11. cleanup ---"
             rm -f /mnt/mntrs-test/_ci_small.txt /mnt/mntrs-test/_ci_10m.bin 2>/dev/null || true
 
             if [ $FAIL -eq 0 ]; then
@@ -572,12 +598,38 @@ jobs:
             if [ "$GOT" = "hello kerberos${NEWLINE}more" ]; then echo "append verify OK"
             else echo "(append verify: got '$GOT')"; fi
 
-            echo "--- write+read 1M ---"
-            dd if=/dev/urandom of=/mnt/hdfs/_ci_1m.bin bs=1M count=1 2>/dev/null && echo "write 1M OK" || { echo "write 1M FAIL"; FAIL=1; }
-            dd if=/mnt/hdfs/_ci_1m.bin of=/dev/null bs=64K 2>/dev/null && echo "read 1M OK" || { echo "read 1M FAIL"; FAIL=1; }
+            echo "--- append to pre-existing file ---"
+            echo "appended" >> /mnt/hdfs/test/hello.txt 2>/dev/null && echo "append pre-existing OK" || { echo "append pre-existing FAIL"; FAIL=1; }
+            GOT=$(cat /mnt/hdfs/test/hello.txt 2>/dev/null)
+            if echo "$GOT" | grep -q "appended"; then echo "append pre-existing verify OK"
+            else echo "::error::append pre-existing verify FAIL: got '$GOT'"; FAIL=1; fi
+
+            echo "--- write+read 10M sequential ---"
+            dd if=/dev/urandom of=/mnt/hdfs/_ci_10m.bin bs=1M count=10 2>/dev/null && echo "write 10M OK" || { echo "write 10M FAIL"; FAIL=1; }
+            dd if=/mnt/hdfs/_ci_10m.bin of=/dev/null bs=64K 2>/dev/null && echo "read 10M OK" || { echo "read 10M FAIL"; FAIL=1; }
+
+            echo "--- random seek read ---"
+            for off in 0 500 10000 50000 500000 5000000 9000000 9999999; do
+              dd if=/mnt/hdfs/_ci_10m.bin bs=1 count=1 skip=$off of=/dev/null 2>/dev/null && echo "  seek $off OK" || { echo "  seek $off FAIL"; FAIL=1; }
+            done
+
+            echo "--- delete + recreate ---"
+            rm -f /mnt/hdfs/_ci_small.txt 2>/dev/null
+            echo "recreated" > /mnt/hdfs/_ci_small.txt 2>/dev/null && echo "recreate OK" || { echo "recreate FAIL"; FAIL=1; }
+            GOT=$(cat /mnt/hdfs/_ci_small.txt 2>/dev/null)
+            if [ "$GOT" = "recreated" ]; then echo "recreate verify OK"
+            else echo "::error::recreate verify FAIL: got '$GOT'"; FAIL=1; fi
+
+            echo "--- directory create + list + delete ---"
+            mkdir -p /mnt/hdfs/_ci_dir 2>/dev/null && echo "mkdir OK" || { echo "mkdir FAIL"; FAIL=1; }
+            echo "dirfile" > /mnt/hdfs/_ci_dir/file.txt 2>/dev/null
+            GOT=$(ls /mnt/hdfs/_ci_dir/ 2>/dev/null)
+            if [ "$GOT" = "file.txt" ]; then echo "dir list OK"
+            else echo "::error::dir list FAIL: got '$GOT'"; FAIL=1; fi
+            rm -rf /mnt/hdfs/_ci_dir 2>/dev/null && echo "rmdir OK" || { echo "rmdir FAIL"; FAIL=1; }
 
             echo "--- cleanup ---"
-            rm -f /mnt/hdfs/_ci_small.txt /mnt/hdfs/_ci_1m.bin 2>/dev/null || true
+            rm -f /mnt/hdfs/_ci_small.txt /mnt/hdfs/_ci_10m.bin 2>/dev/null || true
 
             if [ $FAIL -eq 0 ]; then
               echo "✅ HDFS Kerberos mount OK"
