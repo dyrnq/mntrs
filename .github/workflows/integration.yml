@@ -118,6 +118,7 @@ jobs:
           </configuration>
           XML
           docker run -d --name hdfs \
+            --add-host nameservice:127.0.0.1 \
             -p 8020:8020 -p 9866:9866 -p 9864:9864 \
             -v /tmp/core-site-simple.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro \
             -v /tmp/hdfs-site-simple.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro \
@@ -351,6 +352,7 @@ jobs:
           XML
           set -x
           docker run -d --name hdfs --hostname "$HDFS_HOSTNAME" \
+            --add-host nameservice:127.0.0.1 \
             -p 8020:8020 -p 88:88 -p 749:749 \
             -v /tmp/core-site-ha-krb.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro \
             -v /tmp/hdfs-site-ha-krb.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro \
