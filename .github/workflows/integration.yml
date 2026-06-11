@@ -304,16 +304,41 @@ jobs:
           HDFS_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' hdfs)
           echo "HDFS container IP: $HDFS_IP"
 
-          echo "=== Wait for NameNode + DataNode ==="
-          docker exec hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL
+          echo "=== Wait for KDC port 88 ==="
+          for i in $(seq 1 30); do
+            echo "  kdc attempt $i..."
+            if docker exec hdfs bash -c 'echo > /dev/tcp/127.0.0.1/88' 2>/dev/null; then
+              echo "KDC port 88 up after ${i}s"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "::error::KDC port 88 never came up"
+              docker logs hdfs 2>&1 | tail -40
+              exit 1
+            fi
+            sleep 2
+          done
+
+          echo "=== Wait for NameNode + DataNode (kinit retry inside loop) ==="
+          # s6-overlay starts krb5kdc, kadmin, namenode, datanode concurrently.
+          # Even after KDC port 88 is open, the kadmin realm can take a few
+          # more seconds to bootstrap, and the first kinit may race the
+          # kadmind startup. Retry kinit until it succeeds, then poll
+          # dfsadmin for the live datanode.
+          KINITED=0
           for i in $(seq 1 20); do
             echo "  attempt $i..."
-            if docker exec hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | grep -q "Live datanodes"; then
-              echo "HDFS ready"
+            if docker exec hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL 2>/dev/null; then
+              KINITED=1
+            fi
+            if [ $KINITED -eq 1 ] \
+               && docker exec hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | grep -q "Live datanodes"; then
+              echo "HDFS ready (kinit took attempt $i)"
               break
             fi
             if [ $i -eq 20 ]; then
-              echo "::error::HDFS did not become ready after 20 attempts"
+              echo "::error::HDFS did not become ready after 20 attempts (kinit_ok=$KINITED)"
+              docker exec hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL 2>&1
               docker exec hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1
               docker logs hdfs 2>&1 | tail -30
               exit 1
