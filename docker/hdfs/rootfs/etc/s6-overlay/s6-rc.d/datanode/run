@@ -9,14 +9,14 @@ export HADOOP_OPTS="-Djava.security.krb5.conf=/etc/krb5.conf"
 : "${HDFS_HOSTNAME:=localhost}"
 gosu mntrs /usr/bin/kinit -kt /tmp/hdfs.keytab "hdfs/${HDFS_HOSTNAME}@TEST.LOCAL" 2>/dev/null || true
 
-# Wait for NameNode. Use the configured defaultFS (hdfs://nameservice
-# in HA mode, or whatever core-site.xml specifies) rather than
-# hardcoding localhost:8020 – the latter bypasses the HA proxy and
-# can fail intermittently when the NameNode is registered under the
-# nameservice rather than as a standalone host.
+# Wait for NameNode. Use -fs hdfs://localhost:8020 to bypass the HA
+# proxy — at container boot the proxy may race s6-overlay startup.
+# The Datanode binary itself uses the configured defaultFS (hdfs-site.xml)
+# for its actual operation, so this wait path doesn't affect how it
+# connects once running.
 echo "[datanode] Waiting for NameNode..."
 for i in $(seq 1 30); do
-    if gosu mntrs /opt/hadoop/bin/hdfs dfsadmin -report >/dev/null 2>&1; then
+    if gosu mntrs /opt/hadoop/bin/hdfs dfsadmin -fs hdfs://localhost:8020 -report >/dev/null 2>&1; then
         echo "[datanode] NameNode is ready"
         break
     fi
