@@ -2428,6 +2428,14 @@ impl CoreFilesystem for MntrsFs {
             }
         });
 
+        // Invalidate mem_cache for this ino — writes change the on-disk cache
+        // file but leave mem_cache entries stale (they hold the pre-write
+        // content). Subsequent reads would otherwise return truncated data
+        // capped at the old mem_cache entry length.
+        // Use retain to clear every block_idx for this ino, since a single
+        // write can span multiple CACHE_BLOCK_SIZE-aligned blocks.
+        self.mem_cache.retain(|&(i, _), _| i != _ino);
+
         self.handles.insert(
             fh_val,
             crate::FileHandleState::Write {
