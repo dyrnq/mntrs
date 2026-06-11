@@ -98,8 +98,10 @@ pub fn spawn(
                                         v.3 = Some(std::time::SystemTime::now());
                                     });
                                 }
+                                // Keep cache file on disk as a read cache.
+                                // Only remove the .dirty sidecar to mark upload complete.
+                                // The cache eviction logic handles disk space separately.
                                 PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
-                                let _ = std::fs::remove_file(&cache_path);
                                 let _ = std::fs::remove_file(cache_path.with_extension("dirty"));
                                 return;
                             }
