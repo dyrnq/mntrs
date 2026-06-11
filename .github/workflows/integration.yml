@@ -250,10 +250,22 @@ jobs:
             else echo "::error::append verify FAIL: got '$GOT'"; FAIL=1; fi
 
             echo "--- 6. append to pre-existing file ---"
-            echo "appended" >> /mnt/mntrs-test/test/hello.txt 2>/dev/null && echo "append pre-existing OK" || { echo "append pre-existing FAIL"; FAIL=1; }
-            GOT=$(cat /mnt/mntrs-test/test/hello.txt 2>/dev/null)
-            if echo "$GOT" | grep -q "appended"; then echo "append pre-existing verify OK"
-            else echo "::error::append pre-existing verify FAIL: got '$GOT'"; FAIL=1; fi
+            case "${{ matrix.backend.name }}" in
+              s3)
+                PRE_EXISTING="s3-test.txt" ;;
+              hdfs)
+                PRE_EXISTING="test/hello.txt" ;;
+              *)
+                PRE_EXISTING="" ;;
+            esac
+            if [ -n "$PRE_EXISTING" ]; then
+              echo "appended" >> "/mnt/mntrs-test/${PRE_EXISTING}" 2>/dev/null && echo "append pre-existing OK" || { echo "append pre-existing FAIL"; FAIL=1; }
+              GOT=$(cat "/mnt/mntrs-test/${PRE_EXISTING}" 2>/dev/null)
+              if echo "$GOT" | grep -q "appended"; then echo "append pre-existing verify OK"
+              else echo "::error::append pre-existing verify FAIL: got '$GOT'"; FAIL=1; fi
+            else
+              echo "(skipped: no pre-existing file for ${{ matrix.backend.name }})"
+            fi
 
             echo "--- 7. write+read 10M sequential ---"
             dd if=/dev/urandom of=/mnt/mntrs-test/_ci_10m.bin bs=1M count=10 2>/dev/null && echo "write 10M OK" || { echo "write 10M FAIL"; FAIL=1; }
