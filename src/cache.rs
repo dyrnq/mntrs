@@ -42,8 +42,8 @@
 //!   (capped at the old block's length on the next read).
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -187,8 +187,7 @@ impl MemCache for DashMapMemCache {
                 match victim {
                     Some(v) => {
                         if let Some((_, removed)) = self.inner.remove(&v) {
-                            self.used
-                                .fetch_sub(removed.len() as u64, Ordering::Relaxed);
+                            self.used.fetch_sub(removed.len() as u64, Ordering::Relaxed);
                         }
                     }
                     None => break, // empty cache but limit still exceeded — nothing to evict
