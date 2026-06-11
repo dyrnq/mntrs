@@ -940,8 +940,12 @@ impl Filesystem for MntrsFs {
             );
             return;
         }
-        if let Some((path, kind, _, _)) = self.resolve(ino) {
-            let (_, size, mtime) = self.stat_op(&path).unwrap_or((kind, 0, None));
+        if let Some((path, kind, inodes_size, _)) = self.resolve(ino) {
+            let (_, backend_size, mtime) = self.stat_op(&path).unwrap_or((kind, 0, None));
+            // Use the larger of inodes size and backend size.
+            // The inodes map is updated immediately by write(), while the
+            // backend may lag behind due to async writeback.
+            let size = inodes_size.max(backend_size);
             let mut attr = self.make_attr(ino, size, kind, mtime.unwrap_or(SystemTime::UNIX_EPOCH));
             if let Some(mt) = mtime {
                 attr.mtime = mt;
@@ -2200,21 +2204,6 @@ impl CoreFilesystem for MntrsFs {
             if let Some(parent) = cpath.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            // Pre-populate cache with remote content when cache file is empty.
-            // Without this, append writes to pre-existing files would create a
-            // sparse cache (zero-filled prefix) and corrupt the file on flush.
-            let cache_empty = !cpath.exists()
-                || std::fs::metadata(&cpath)
-                    .map(|m| m.len() == 0)
-                    .unwrap_or(true);
-            if cache_empty {
-                let op = self.op.clone();
-                let p = path.clone();
-                let cp = cpath.clone();
-                if let Ok(remote) = rt().block_on(async { op.read(&p).await }) {
-                    let _ = std::fs::write(&cp, remote.to_vec());
-                }
-            }
             let cache_fd = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
@@ -2379,6 +2368,20 @@ impl CoreFilesystem for MntrsFs {
                 use std::io::{Seek, Write};
                 let mut f = fd.lock().unwrap();
                 let end = _offset + _data.len() as u64;
+                let current_len = f.metadata()?.len();
+                // When writing at an offset beyond the cache file length,
+                // fetch the missing prefix from the remote backend to avoid
+                // creating a sparse (zero-filled) cache that corrupts reads.
+                if _offset > 0 && current_len == 0 && _offset > current_len {
+                    let op = self.op.clone();
+                    let p = path.clone();
+                    if let Ok(remote) = rt().block_on(async { op.read(&p).await }) {
+                        let prefix = remote.to_vec();
+                        if !prefix.is_empty() {
+                            let _ = f.write_all(&prefix);
+                        }
+                    }
+                }
                 let current_len = f.metadata()?.len();
                 if end > current_len {
                     f.set_len(end)?;

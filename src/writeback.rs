@@ -91,13 +91,14 @@ pub fn spawn(
                     for attempt in 0..5 {
                         match op.write(&remote, data.clone()).await {
                             Ok(_) => {
-                                if let Ok(meta) = std::fs::metadata(&cache_path) {
-                                    let new_size = meta.len();
-                                    inodes2.entry(ino).and_modify(|v| {
-                                        v.2 = new_size;
-                                        v.3 = Some(std::time::SystemTime::now());
-                                    });
-                                }
+                                // Only update mtime — do NOT update file size (v.2).
+                                // The write function tracks the correct logical size
+                                // via inodes. The cache file may be larger than the
+                                // logical size due to set_len sparse extension, so
+                                // using cache metadata length would corrupt reads.
+                                inodes2.entry(ino).and_modify(|v| {
+                                    v.3 = Some(std::time::SystemTime::now());
+                                });
                                 // Keep cache file on disk as a read cache.
                                 // Only remove the .dirty sidecar to mark upload complete.
                                 // The cache eviction logic handles disk space separately.
