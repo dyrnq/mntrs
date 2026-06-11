@@ -6,3 +6,5 @@ graphify-out/
 TODO.md
 COMPARE.md
 examples/
+# CSI docker build context: binary is copied in at build time
+docker/csi/mntrs-csi
