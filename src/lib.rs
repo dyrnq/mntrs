@@ -1196,6 +1196,19 @@ impl Filesystem for MntrsFs {
                 if let Some(parent) = cpath.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
+                // Pre-populate cache with remote content when empty (append fix)
+                let cache_empty = !cpath.exists()
+                    || std::fs::metadata(&cpath)
+                        .map(|m| m.len() == 0)
+                        .unwrap_or(true);
+                if cache_empty {
+                    let op = self.op.clone();
+                    let p = path.clone();
+                    let cp = cpath.clone();
+                    if let Ok(remote) = crate::rt().block_on(async { op.read(&p).await }) {
+                        let _ = std::fs::write(&cp, remote.to_vec());
+                    }
+                }
                 let cache_fd = std::fs::OpenOptions::new()
                     .create(true)
                     .truncate(false)
@@ -2186,6 +2199,21 @@ impl CoreFilesystem for MntrsFs {
             let cpath = crate::cache_path(&self.cache_dir, &path);
             if let Some(parent) = cpath.parent() {
                 let _ = std::fs::create_dir_all(parent);
+            }
+            // Pre-populate cache with remote content when cache file is empty.
+            // Without this, append writes to pre-existing files would create a
+            // sparse cache (zero-filled prefix) and corrupt the file on flush.
+            let cache_empty = !cpath.exists()
+                || std::fs::metadata(&cpath)
+                    .map(|m| m.len() == 0)
+                    .unwrap_or(true);
+            if cache_empty {
+                let op = self.op.clone();
+                let p = path.clone();
+                let cp = cpath.clone();
+                if let Ok(remote) = rt().block_on(async { op.read(&p).await }) {
+                    let _ = std::fs::write(&cp, remote.to_vec());
+                }
             }
             let cache_fd = std::fs::OpenOptions::new()
                 .create(true)
