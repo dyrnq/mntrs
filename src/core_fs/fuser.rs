@@ -105,7 +105,13 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         match self.inner.lookup(parent.into(), &name) {
             Ok(attr) => {
                 let fattr = from_core_attr(&attr);
-                reply.entry(&self.attr_ttl, &fattr, Generation(0));
+                // TTL=0: see the note on FuserAdapter::getattr. With
+                // the default 1s entry timeout, the kernel would
+                // cache a stale (parent, name) → ino mapping and
+                // reuse the OLD ino after a rename, causing the
+                // read to use the wrong path/inode entry. Cost is
+                // one extra lookup per access — cheap.
+                reply.entry(&Duration::ZERO, &fattr, Generation(0));
             }
             Err(e) => reply.error(io_err_to_fuse_errno(e)),
         }

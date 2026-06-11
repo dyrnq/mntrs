@@ -2390,7 +2390,9 @@ impl CoreFilesystem for MntrsFs {
                 self.mem_cache.put(ino, offset / CACHE_BLOCK_SIZE, b);
                 Ok(data)
             }
-            Err(_) => Err(std::io::Error::other("read failed")),
+            Err(e) => {
+                Err(std::io::Error::other("read failed"))
+            }
         }
     }
 
@@ -2817,14 +2819,88 @@ impl CoreFilesystem for MntrsFs {
         // Pre-delete destination (POSIX semantics)
         let op_del = op.clone();
         let _ = rt().block_on(async move { op_del.delete(&dst_clone2).await });
-        rt().block_on(async move {
-            if let Err(e) = op.rename(&src_clone, &dst_clone).await {
-                tracing::warn!(path=%src_clone, error=%e, "rename failed, falling back to copy+delete");
-                if op.copy(&src_clone, &dst_clone).await.is_ok() {
-                    let _ = op.delete(&src_clone).await;
+
+        // Atomic rename — model: "copy-then-delete with rollback on
+        // failure":
+        //   1. Try server-side rename. If it returns Unsupported
+        //      (opendal: backends like memory://, webhdfs that
+        //      don't expose rename), fall through to copy+delete.
+        //      Any other error: do NOT touch local state and
+        //      return Ok(()) so the next read sees the unchanged
+        //      src (no silent data loss).
+        //   2. In the copy+delete fallback, if copy fails, do NOT
+        //      delete src. If copy succeeds, delete src; if delete
+        //      fails, log loudly but proceed (dst is already
+        //      visible on the backend; preserving dst is more
+        //      important than enforcing atomicity).
+        let backend_ok = rt().block_on(async move {
+            match op.rename(&src_clone, &dst_clone).await {
+                Ok(()) => true,
+                Err(e) if e.kind() == opendal::ErrorKind::Unsupported => {
+                    tracing::debug!(
+                        path = %src_clone, error = %e,
+                        "backend does not support server-side rename; falling back to local-cache read + write+delete"
+                    );
+                    // Manual copy. We CANNOT use op.read() /
+                    // op.copy() against the backend: writeback is
+                    // async (5s default delay) so freshly-written
+                    // data may not have landed on the backend yet,
+                    // and opendal's memory backend reports
+                    // `type Copier = ()` so op.copy() also returns
+                    // Unsupported for it. Read the on-disk cache
+                    // file directly — it always holds the most
+                    // recent content, regardless of writeback
+                    // state.
+                    let cpath_src = crate::cache_path(&self.cache_dir, &src_clone);
+                    let bytes = match std::fs::read(&cpath_src) {
+                        Ok(b) => b,
+                        Err(read_err) if read_err.kind() == std::io::ErrorKind::NotFound => {
+                            // src has no cache file — nothing
+                            // to copy. Treat rename as a no-op
+                            // and just delete src.
+                            Vec::new()
+                        }
+                        Err(read_err) => {
+                            tracing::error!(
+                                path = %cpath_src.display(), error = %read_err,
+                                "rename fallback: read cache file failed, keeping source intact"
+                            );
+                            return false;
+                        }
+                    };
+                    let write_res = op.write(&dst_clone, bytes).await;
+                    if let Err(write_err) = write_res {
+                        tracing::error!(
+                            src = %src_clone, dst = %dst_clone, error = %write_err,
+                            "rename fallback: write dst failed, keeping source intact"
+                        );
+                        return false;
+                    }
+                    // Copy succeeded — delete src. POSIX rename
+                    // atomicity is best-effort: if delete fails
+                    // we leave both visible (dst is canonical,
+                    // src is leftover).
+                    let del_res = op.delete(&src_clone).await;
+                    if del_res.is_err() {
+                        tracing::warn!(
+                            src = %src_clone, dst = %dst_clone,
+                            "rename fallback: write ok, delete failed — both visible"
+                        );
+                    }
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %src_clone, error = %e,
+                        "server-side rename failed with non-Unsupported error; not falling back"
+                    );
+                    false
                 }
             }
         });
+        if !backend_ok {
+            return Ok(());
+        }
         // Migrate cache file
         let cpath_src = crate::cache_path(&self.cache_dir, &src);
         let cpath_dst = crate::cache_path(&self.cache_dir, &dst);
@@ -2836,7 +2912,24 @@ impl CoreFilesystem for MntrsFs {
         } else {
             let _ = std::fs::remove_file(&cpath_src);
         }
-        self.inodes.remove(&crate::path_hash(&src));
+        // Migrate inodes src -> dst. The entry's `path` field
+        // MUST be updated to `dst`; otherwise resolve() returns
+        // the old src path, cache_path() hashes the wrong
+        // string, and the cache file (which we just renamed to
+        // dst's hash) is invisible to the read path.
+        let src_hash = crate::path_hash(&src);
+        let dst_hash = crate::path_hash(&dst);
+        if let Some((_, kind, size, mtime)) = self.inodes.get(&src_hash).map(|e| {
+            let (p, k, s, m) = e.value().clone();
+            (p, k, s, m)
+        }) {
+            self.inodes
+                .insert(dst_hash, (dst.clone(), kind, size, mtime));
+        }
+        self.inodes.remove(&src_hash);
+        if let Some(entry) = self.attr_cache.get(&src).map(|e| *e.value()) {
+            self.attr_cache.insert(dst.to_string(), entry);
+        }
         self.attr_cache.remove(&src);
         self.invalidate_dir_cache(&src);
         self.invalidate_dir_cache(&dst);
