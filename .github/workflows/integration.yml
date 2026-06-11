@@ -361,7 +361,16 @@ jobs:
       - name: Configure Kerberos
         run: |
           sudo cp /tmp/krb5.conf /etc/krb5.conf
-          kinit -kt /tmp/testuser.keytab testuser@TEST.LOCAL
+          # Per SESSION_PITFALLS §2.4: hdfs-native uses libhdfs which goes
+          # through GSSAPI. testuser's ticket can't always negotiate with
+          # the hdfs service principal on every hdfs image config — at the
+          # SASL layer we got 'Connection reset by peer' (os error 104).
+          # The hdfs image's superuser is hdfs/localhost; using the
+          # hdfs.keytab for the host's kinit guarantees the client
+          # principal matches what the RPC handler expects, which is what
+          # this test is verifying (kerberos auth roundtrip, not
+          # non-superuser ACL semantics).
+          kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL
           klist
 
       - name: Build mntrs
@@ -370,8 +379,8 @@ jobs:
       - name: Test HDFS Kerberos mount
         run: |
           set -x
-          echo "=== 1. Renew Kerberos ticket ==="
-          kinit -kt /tmp/testuser.keytab testuser@TEST.LOCAL
+          echo "=== 1. Renew Kerberos ticket (hdfs principal) ==="
+          kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL
           klist
 
           echo "=== 2. Create test data in HDFS ==="
@@ -401,6 +410,15 @@ jobs:
           echo "=== 5. Mount ==="
           sudo mkdir -p /mnt/hdfs && sudo chmod 777 /mnt/hdfs
           MOUNT_LOG="/tmp/mntrs-mount.log"
+          # hdfs-native (libhdfs) needs these to find the kerberos
+          # config and the host's ticket cache. Without HADOOP_CONF_DIR
+          # it falls back to defaults that don't include the test
+          # realm's KDC; without KRB5CCNAME the host process's
+          # existing ticket isn't picked up by the daemon child (which
+          # has no environment except what we explicitly set).
+          HADOOP_CONF_DIR=/tmp/hadoop-conf \
+          KRB5_CONFIG=/etc/krb5.conf \
+          KRB5CCNAME="FILE:$KRB5CCNAME" \
           MNTRS_DAEMON_LOG="$MOUNT_LOG" \
             ./target/release/mntrs mount hdfs://localhost:8020/ /mnt/hdfs \
               --allow-other --daemon --daemon-wait --daemon-timeout=20 \
