@@ -510,19 +510,22 @@ impl MntrsFs {
         result
     }
 
-    fn list_op(&self, path: &str) -> Vec<(String, EntryMode, u64, SystemTime)> {
+    fn list_op(
+        &self,
+        path: &str,
+    ) -> Result<Vec<(String, EntryMode, u64, SystemTime)>, opendal::Error> {
         {
             if let Some(entry) = self.dir_cache.get(path) {
                 let (t, entries) = entry.value();
                 let age = t.elapsed();
                 if age < self.dir_cache_ttl {
-                    return entries
+                    return Ok(entries
                         .iter()
                         .map(|r| {
                             let (name, (mode, size, mtime)) = r.pair();
                             (name.clone(), *mode, *size, *mtime)
                         })
-                        .collect();
+                        .collect());
                 }
                 // Cache expired — drop and re-read from remote
                 drop(entry);
@@ -530,67 +533,74 @@ impl MntrsFs {
             }
         }
         let depth = path.matches('/').count();
-        let mut result = rt()
-            .block_on(async {
-                let op = self.op.clone();
-                let p = path.to_string();
-                let mut lister = op.lister(&p).await.ok()?;
-                let mut out = vec![];
-                while let Some(Ok(entry)) = lister.next().await {
-                    let name = entry.name().trim_end_matches('/').to_string();
-                    let mode = entry.metadata().mode();
-                    let content_length = entry.metadata().content_length();
-                    // Apply filters
-                    if let Some(max_depth) = self.max_depth
-                        && depth >= max_depth
-                        && mode == EntryMode::DIR
-                    {
-                        continue;
-                    }
-                    if let Some(ms) = self.max_size
-                        && content_length > ms
-                    {
-                        continue;
-                    }
-                    if let Some(ms) = self.min_size
-                        && content_length < ms
-                    {
-                        continue;
-                    }
-                    // exclude/include glob patterns
-                    if !self.exclude_patterns.is_empty() {
-                        let matched = self
-                            .exclude_patterns
-                            .iter()
-                            .any(|pat| fnmatch(pat, &name, self.ignore_case));
-                        if matched {
-                            continue;
-                        }
-                    }
-                    // Skip Apple Double files on macOS
-                    if self.no_apple_double && name.starts_with("._") {
-                        continue;
-                    }
-                    if !self.include_patterns.is_empty() {
-                        let matched = self
-                            .include_patterns
-                            .iter()
-                            .any(|pat| fnmatch(pat, &name, self.ignore_case));
-                        if !matched {
-                            continue;
-                        }
-                    }
-                    let size = content_length;
-                    let mtime = entry
-                        .metadata()
-                        .last_modified()
-                        .map(opendal_timestamp_to_system_time)
-                        .unwrap_or(SystemTime::UNIX_EPOCH);
-                    out.push((name, mode, size, mtime));
+        // Per SESSION_PITFALLS §2.6: never swallow backend errors. A lister
+        // init failure (auth, permission, network reset) used to be
+        // silently dropped via .ok()?/.unwrap_or_default(), which made
+        // mntrs return an empty FUSE directory on every backend problem
+        // — debugging required guessing the root cause. Now we propagate
+        // the error so the FUSE reply carries EIO/ENOENT and the
+        // tracing pipeline (RUST_LOG + MNTRS_DAEMON_LOG) records the
+        // opendal error verbatim.
+        let mut result = rt().block_on(async {
+            let op = self.op.clone();
+            let p = path.to_string();
+            let mut lister = op.lister(&p).await?;
+            let mut out = vec![];
+            while let Some(item) = lister.next().await {
+                let entry = item?;
+                let name = entry.name().trim_end_matches('/').to_string();
+                let mode = entry.metadata().mode();
+                let content_length = entry.metadata().content_length();
+                // Apply filters
+                if let Some(max_depth) = self.max_depth
+                    && depth >= max_depth
+                    && mode == EntryMode::DIR
+                {
+                    continue;
                 }
-                Some(out)
-            })
-            .unwrap_or_default();
+                if let Some(ms) = self.max_size
+                    && content_length > ms
+                {
+                    continue;
+                }
+                if let Some(ms) = self.min_size
+                    && content_length < ms
+                {
+                    continue;
+                }
+                // exclude/include glob patterns
+                if !self.exclude_patterns.is_empty() {
+                    let matched = self
+                        .exclude_patterns
+                        .iter()
+                        .any(|pat| fnmatch(pat, &name, self.ignore_case));
+                    if matched {
+                        continue;
+                    }
+                }
+                // Skip Apple Double files on macOS
+                if self.no_apple_double && name.starts_with("._") {
+                    continue;
+                }
+                if !self.include_patterns.is_empty() {
+                    let matched = self
+                        .include_patterns
+                        .iter()
+                        .any(|pat| fnmatch(pat, &name, self.ignore_case));
+                    if !matched {
+                        continue;
+                    }
+                }
+                let size = content_length;
+                let mtime = entry
+                    .metadata()
+                    .last_modified()
+                    .map(opendal_timestamp_to_system_time)
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                out.push((name, mode, size, mtime));
+            }
+            Ok::<_, opendal::Error>(out)
+        })?;
         // Deduplicate by Unicode-normalized name if enabled
         if self.block_norm_dupes && !result.is_empty() {
             let mut seen = std::collections::HashSet::new();
@@ -600,14 +610,16 @@ impl MntrsFs {
                 seen.insert(norm)
             });
         }
-        // Store entries individually (like rclone DirEntry per name)
+        // Store entries individually (like rclone DirEntry per name).
+        // Only cache on success — caching an empty Vec from an error
+        // would propagate the failure for dir_cache_ttl.
         let dir_entries: dashmap::DashMap<String, (EntryMode, u64, SystemTime)> = result
             .iter()
             .map(|(name, mode, size, mtime)| (name.clone(), (*mode, *size, *mtime)))
             .collect();
         self.dir_cache
             .insert(path.to_string(), (std::time::Instant::now(), dir_entries));
-        result
+        Ok(result)
     }
 
     /// Add a single entry to directory cache (like rclone addObject).
@@ -820,8 +832,10 @@ impl Filesystem for MntrsFs {
                 );
             }
         } // Pre-populate root directory cache on mount if --vfs-refresh
-        if self.vfs_refresh {
-            let _ = self.list_op("");
+        if self.vfs_refresh
+            && let Err(e) = self.list_op("")
+        {
+            tracing::debug!(error = %e, "vfs_refresh: list_op root failed (non-fatal)");
         }
         Ok(())
     }
@@ -876,7 +890,15 @@ impl Filesystem for MntrsFs {
             reply.entry(&self.attr_ttl, &attr, Generation(0));
         } else if self.case_insensitive {
             // Fallback: search directory listing for case-insensitive match
-            let entries = self.list_op(&parent_path);
+            let entries = match self.list_op(&parent_path) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::debug!(path = %parent_path, error = %e,
+                        "case-insensitive lookup: list_op failed");
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            };
             let lower = name.to_lowercase();
             if let Some((matched_name, mode, ..)) =
                 entries.iter().find(|(n, ..)| n.to_lowercase() == lower)
@@ -961,11 +983,19 @@ impl Filesystem for MntrsFs {
     ) {
         let ino: u64 = ino.into();
         let path = self.resolve(ino).map(|(p, _, _, _)| p).unwrap_or_default();
+        let listed = match self.list_op(&path) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(path = %path, error = %e, "readdir: list_op failed");
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
         let mut entries: Vec<(String, FileType, u64, Option<SystemTime>)> = vec![
             (".".to_string(), FileType::Directory, 4096, None),
             ("..".to_string(), FileType::Directory, 4096, None),
         ];
-        for (name, mode, size, mtime) in self.list_op(&path) {
+        for (name, mode, size, mtime) in listed {
             let clean_name = name.trim_start_matches('/').trim_end_matches('/');
             let name = if clean_name.is_empty() {
                 name.clone()
@@ -1020,11 +1050,19 @@ impl Filesystem for MntrsFs {
     ) {
         let ino: u64 = ino.into();
         let path = self.resolve(ino).map(|(p, _, _, _)| p).unwrap_or_default();
+        let listed = match self.list_op(&path) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(path = %path, error = %e, "readdirplus: list_op failed");
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
         let mut entries: Vec<(String, FileType, u64, Option<SystemTime>)> = vec![
             (".".to_string(), FileType::Directory, 4096, None),
             ("..".to_string(), FileType::Directory, 4096, None),
         ];
-        for (name, mode, size, mtime) in self.list_op(&path) {
+        for (name, mode, size, mtime) in listed {
             let clean_name = name.trim_start_matches('/').trim_end_matches('/');
             let name = if clean_name.is_empty() {
                 name.clone()
@@ -2053,6 +2091,19 @@ impl CoreFilesystem for MntrsFs {
 
     fn readdir(&self, ino: u64) -> std::io::Result<Vec<CoreDirEntry>> {
         let path = self.resolve(ino).map(|(p, _, _, _)| p).unwrap_or_default();
+        let list_path = if path.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", path)
+        };
+        // Per SESSION_PITFALLS §2.6: propagate list_op errors to FUSE.
+        // A swallowed backend error used to surface as an empty
+        // directory (CI looked green, root cause was invisible).
+        let listed = self.list_op(&list_path).map_err(|e| {
+            tracing::warn!(path = %list_path, error = %e,
+                    "CoreFilesystem::readdir: list_op failed");
+            std::io::Error::other(e)
+        })?;
         let mut entries = vec![
             CoreDirEntry {
                 ino,
@@ -2065,11 +2116,6 @@ impl CoreFilesystem for MntrsFs {
                 name: "..".to_string(),
             },
         ];
-        let list_path = if path.is_empty() {
-            String::new()
-        } else {
-            format!("{}/", path)
-        };
         // hdfs-native quirk: the first entry of op.lister(p) is the queried
         // path itself. After trim_end_matches('/') inside list_op:
         //   lister("/")      → entries[0].name = ""       ← was caught
@@ -2094,7 +2140,7 @@ impl CoreFilesystem for MntrsFs {
             .next_back()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .unwrap_or_default();
-        for (name, mode, size, _mtime) in self.list_op(&list_path) {
+        for (name, mode, size, _mtime) in listed {
             if name.is_empty() || name == "/" || (name == queried_last && !queried_last.is_empty())
             {
                 continue;
