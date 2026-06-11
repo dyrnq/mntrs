@@ -115,7 +115,40 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         match self.inner.getattr(ino.into()) {
             Ok(attr) => {
                 let fattr = from_core_attr(&attr);
-                reply.attr(&self.attr_ttl, &fattr);
+                // Reply with TTL=0 so the FUSE kernel does not cache
+                // a stale file size across writes.
+                //
+                // The fuser library forwards a `valid` Duration to the
+                // kernel via `fuse_entry_param::valid` / `attr_valid`.
+                // When this is non-zero, the kernel stores the returned
+                // attribute in its own dentry/inode cache and serves
+                // the cached value to userspace for the requested
+                // duration, *without* re-issuing a FUSE getattr. For
+                // the default --attr-timeout=1 (1 second), any read
+                // within 1s of a write sees the PRE-write size — the
+                // kernel asks the filesystem to read the cached
+                // smaller size and returns truncated content.
+                //
+                // Setting TTL=0 (Duration::ZERO) means the kernel
+                // always treats the response as immediately stale and
+                // re-fetches getattr on the next access. The extra
+                // round-trip cost is one synchronous getattr per file
+                // operation, which for the in-memory `inodes` DashMap
+                // is a single hash lookup (sub-microsecond). For
+                // network backends the `CoreFilesystem::getattr` is
+                // a `stat_op` which is one round-trip to the remote,
+                // so the total cost is one stat per open+read+close,
+                // matching rclone's VFS behavior.
+                //
+                // An alternative would be to keep the CLI default TTL
+                // and call `Session::notifier().inval_inode(ino, 0, 0)`
+                // after every size-changing write, but that requires
+                // wiring a Notifier handle into MntrsFs, complicating
+                // the type system (the FuserAdapter moves `inner` into
+                // a generic context, blocking post-mount access to
+                // the same Arc). TTL=0 is the simpler, more robust
+                // fix and the cost is bounded.
+                reply.attr(&Duration::ZERO, &fattr);
             }
             Err(e) => reply.error(io_err_to_fuse_errno(e)),
         }

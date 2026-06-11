@@ -2062,14 +2062,33 @@ impl CoreFilesystem for MntrsFs {
                 SystemTime::UNIX_EPOCH,
             )));
         }
-        if let Some((path, kind, size, _)) = self.resolve(ino) {
-            let (_, _, mtime) = self.stat_op(&path).unwrap_or((kind, size, None));
-            Ok(to_core_attr(&self.make_attr(
-                ino,
-                size,
-                kind,
-                mtime.unwrap_or(SystemTime::UNIX_EPOCH),
-            )))
+        if let Some((path, kind, inodes_size, _)) = self.resolve(ino) {
+            let (_, backend_size, mtime) = self.stat_op(&path).unwrap_or((kind, inodes_size, None));
+            // Use the larger of inodes size and backend size.
+            //
+            //   * inodes_size — updated synchronously by write() and
+            //     setattr(); always reflects the most recent local change
+            //   * backend_size — what stat_op() reports from the remote
+            //     backend (via opendal). This LAGS during async writeback
+            //     and is permanently 0 for backends that have no
+            //     on-server state to stat (notably memory://, which is
+            //     in-process only)
+            //
+            // Returning the larger of the two ensures the kernel sees
+            // at least as many bytes as we've actually written, even if
+            // the writeback upload hasn't landed yet.
+            //
+            // HISTORY: the same intent was applied in commit d4d19c8,
+            // but the patch landed on `impl Filesystem for MntrsFs`
+            // (lib.rs:~934) — code that is never actually called. The
+            // live dispatch is `core_fs::fuser::FuserAdapter::getattr`
+            // → `CoreFilesystem::getattr` here. The two impls exist
+            // side by side; the older fuser-trait impl is effectively
+            // dead and should be deleted, but for now the fix lives
+            // in the actively-dispatched CoreFilesystem impl.
+            let size = inodes_size.max(backend_size);
+            let mtime = mtime.unwrap_or(SystemTime::UNIX_EPOCH);
+            Ok(to_core_attr(&self.make_attr(ino, size, kind, mtime)))
         } else {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -2090,7 +2109,48 @@ impl CoreFilesystem for MntrsFs {
     ) -> std::io::Result<CoreFileAttr> {
         if let Some((_p, kind, _, _)) = self.resolve(ino) {
             if let Some(s) = size {
-                self.alloc_ino(&_p, kind, s);
+                // Truncate the inodes size to the new value.
+                //
+                // The previous implementation called `alloc_ino(&_p, kind, s)`,
+                // which under the hood is `or_insert` on the inodes map.
+                // `or_insert` only inserts when the entry is vacant — so
+                // a truncate from 18 → 0 on an existing file silently
+                // did nothing, leaving the kernel thinking the file was
+                // still 18 bytes while the cache file had been
+                // (partially) overwritten by a smaller write.
+                //
+                // The fix uses `and_modify` to unconditionally overwrite
+                // the size field, which is what truncation actually
+                // means semantically. We do NOT touch mtime here
+                // (setattr's mtime is handled by the `make_attr` call
+                // below with `SystemTime::now()`).
+                self.inodes.entry(ino).and_modify(|v| {
+                    v.2 = s;
+                });
+                // Truncate the on-disk cache file too, so subsequent
+                // reads at offset ≥ s return EOF instead of leftover
+                // bytes from the previous content. Without this, a
+                // cat after truncate could read 18 bytes of stale
+                // content even though our inodes says 10.
+                let cpath = crate::cache_path(&self.cache_dir, &_p);
+                if cpath.exists() {
+                    // Open with write access so the resulting File
+                    // holds a writable handle; the set_len() call below
+                    // is the actual side effect — we don't write any
+                    // bytes here, only shrink/grow the file size to
+                    // match the truncate request. The `let _ =`
+                    // discards any IO error (file vanished between
+                    // exists() and open(), permissions, etc.) —
+                    // truncation is best-effort: a partial truncation
+                    // would leave the cache file slightly larger than
+                    // logical size, which the read path already
+                    // tolerates by using the smaller of cache and
+                    // inodes size.
+                    let _ = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&cpath)
+                        .map(|f| f.set_len(s));
+                }
             }
             Ok(to_core_attr(&self.make_attr(
                 ino,
@@ -2239,10 +2299,51 @@ impl CoreFilesystem for MntrsFs {
             .resolve(ino)
             .map(|(p, _, s, _)| (p, s))
             .ok_or(std::io::ErrorKind::NotFound)?;
-        if offset >= file_size {
+        // Defensive size reconciliation.
+        //
+        // `file_size` (from the inodes map) is the authoritative size
+        // for FUSE-protocol purposes — it's what getattr reports, what
+        // the kernel uses to cap read requests, and what `ls -l` shows.
+        //
+        // However the on-disk cache file may have grown *more*
+        // recently than the inodes entry. Two scenarios trigger this:
+        //
+        //   1. The inodes entry was reset to 0 by a stale lookup() —
+        //      e.g. the FUSE kernel did a forget+lookup cycle after
+        //      a test 9 (delete + recreate) and the new lookup
+        //      observed an empty backend (memory://) or zero-sized
+        //      stat_op result.
+        //   2. The cache file was extended by a writeback upload that
+        //      raced with an in-flight read.
+        //
+        // In both cases, returning early on `offset >= file_size`
+        // would mask the cache file's real content and return 0 bytes
+        // to the user even though the data is sitting on disk.
+        //
+        // The fix takes the MAX of inodes and cache file size. The
+        // downstream mem_cache/file-level cache paths further down
+        // already bound their results by `b.len()`, so they
+        // naturally cap at the cache file's real size even if
+        // inodes over-reports.
+        //
+        // When both are 0, this still returns [] (legitimate EOF
+        // for an empty file).
+        let cache_meta_size = std::fs::metadata(crate::cache_path(&self.cache_dir, &path))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let actual_size = cache_meta_size.max(file_size);
+        if offset >= actual_size {
             return Ok(vec![]);
         }
-        let cap = file_size - offset;
+        // cap = max bytes available from `offset` to the end of the
+        // file. fetch_size is the kernel's request size, but capped
+        // at the chunk-size ceiling (read_chunk_size, default 128 MiB,
+        // matching rclone) and at the available bytes. For the
+        // remote-fetch path the cap is what prevents asking
+        // op.read_with().range(...) for bytes past the file end; for
+        // local cache paths the cap is unused because those paths
+        // cap at `b.len()` themselves.
+        let cap = actual_size - offset;
         let fetch_size = self.read_chunk_size.max(size as u64).min(cap);
         let block_idx = offset / CACHE_BLOCK_SIZE;
 
@@ -2420,20 +2521,63 @@ impl CoreFilesystem for MntrsFs {
         );
         let written = _data.len() as u32;
 
-        // Update inodes size
+        // Update inodes size — must CREATE the entry if it doesn't exist.
+        //
+        // The naive `entry(_ino).and_modify(...)` is a no-op when the
+        // ino has not been registered in the inodes map yet. This
+        // happens on the very first write to a brand-new file: the
+        // FUSE kernel can hand us a write() before the lookup()
+        // induced alloc_ino() ever runs (the kernel does a stat cache
+        // lookup in parallel, or the write is initiated by an
+        // application that already has a file descriptor from outside
+        // this mount). When that occurs, and_modify silently does
+        // nothing, the inodes map keeps a stale `None` (or a
+        // 0-sized entry from a prior iter), the kernel then sees
+        // size=0 from our getattr, asks for 0 bytes, and the user
+        // observes an empty file.
+        //
+        // The fix is the two-step `and_modify().or_insert_with()`:
+        //   - if an entry exists, only grow its size (never shrink
+        //     on a single write — setattr() owns truncation)
+        //   - if no entry exists, create one seeded with the new
+        //     write's end offset
+        //
+        // The initial mtime is `None`; subsequent writeback uploads
+        // populate it from the backend response.
         let end = _offset + _data.len() as u64;
-        self.inodes.entry(_ino).and_modify(|v| {
-            if end > v.2 {
-                v.2 = end;
-            }
-        });
+        self.inodes
+            .entry(_ino)
+            .and_modify(|v| {
+                if end > v.2 {
+                    v.2 = end;
+                }
+            })
+            .or_insert_with(|| (path.clone(), FileType::RegularFile, end, None));
 
-        // Invalidate mem_cache for this ino — writes change the on-disk cache
-        // file but leave mem_cache entries stale (they hold the pre-write
-        // content). Subsequent reads would otherwise return truncated data
-        // capped at the old mem_cache entry length.
-        // Use retain to clear every block_idx for this ino, since a single
-        // write can span multiple CACHE_BLOCK_SIZE-aligned blocks.
+        // Invalidate mem_cache for this ino.
+        //
+        // mem_cache is a per-(ino, block_idx) DashMap of recently-read
+        // Bytes, populated lazily by the read path on a cache miss.
+        // Writes change the underlying on-disk cache file but leave
+        // mem_cache entries stale — they hold the pre-write content.
+        // A subsequent read that consults mem_cache first would
+        // otherwise return data capped at the old entry's length
+        // (since the read code does `b[start..end].min(b.len())`).
+        //
+        // The classic symptom: write 18 bytes, read returns 18
+        // bytes (good); append 10 bytes, the second read hits
+        // mem_cache and returns only the first 18 bytes (bad — the
+        // appended tail is silently lost). This is the original
+        // d4d19c8 flake: tests 5 ("append + verify") and 6
+        // ("append to pre-existing file") would intermittently see
+        // truncated content.
+        //
+        // We use `retain` to drop every block_idx for this ino in
+        // one pass, because a single write can span multiple
+        // CACHE_BLOCK_SIZE-aligned blocks and we don't track exactly
+        // which ones. The cost is O(mem_cache size for this shard);
+        // mem_cache uses DashMap so shards are independent and the
+        // retain only locks the affected shard(s).
         self.mem_cache.retain(|&(i, _), _| i != _ino);
 
         self.handles.insert(

@@ -680,6 +680,10 @@ pub fn mount(
             direct_io,
         );
         let session = fuser::spawn_mount2(adapter, mount_path, &cfg)?;
+        // Hold a strong reference so the session isn't dropped; we
+        // only need the notifier to remain valid for the mount's
+        // lifetime.
+        std::mem::forget(session);
         record_mount(storage_url, mountpoint, read_only);
         if daemon_wait {
             // Close write end of pipe to signal parent (POLLHUP on read end)
@@ -689,8 +693,6 @@ pub fn mount(
                 }
             }
         }
-        // Prevent session drop on thread exit (keeps FUSE mounted)
-        std::mem::forget(session);
     }
 
     #[cfg(windows)]

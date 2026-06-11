@@ -59,7 +59,7 @@ fn make_memory_fs() -> MntrsFs {
         read_wait: Duration::from_secs(5),
         cache_poll_interval: Duration::from_secs(60),
         disk_total_size: 1024 * 1024 * 1024 * 1024,
-        writeback_queue: Default::default(),
+        writeback_sender: Default::default(),
         mem_cache: Default::default(),
         attr_cache: Default::default(),
         disk_cache_index: Default::default(),
