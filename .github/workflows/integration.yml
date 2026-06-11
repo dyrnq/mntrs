@@ -19,6 +19,12 @@ jobs:
       packages: write
     outputs:
       image: ghcr.io/${{ github.repository_owner }}/mntrs-hdfs:ci-test-${{ github.sha }}
+    env:
+      # Kerberos principal hostname baked into the image. The
+      # hdfs-kerberos job must run the container with
+      # `--hostname ${HDFS_HOSTNAME}` for SASL auth to work — see
+      # that job for details.
+      HDFS_HOSTNAME: hdfs.test
     steps:
       - uses: actions/checkout@v4
       - name: Log in to GHCR
@@ -33,6 +39,8 @@ jobs:
           context: docker/hdfs
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/mntrs-hdfs:ci-test-${{ github.sha }}
+          build-args: |
+            HDFS_HOSTNAME=${{ env.HDFS_HOSTNAME }}
 
   mount-tests:
     needs: build-hdfs-image
@@ -298,10 +306,19 @@ jobs:
           sudo grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
 
       - name: Start HDFS container
+        env:
+          # MUST match the HDFS_HOSTNAME build-arg used in
+          # build-hdfs-image, otherwise the kerberos principal baked
+          # into the keytab won't match the runtime hostname and SASL
+          # auth will fail with 'Connection reset by peer'.
+          HDFS_HOSTNAME: hdfs.test
         run: |
           set -x
-          docker run -d --name hdfs -p 8020:8020 -p 88:88 -p 749:749             ${{ needs.build-hdfs-image.outputs.image }}
+          docker run -d --name hdfs --hostname "$HDFS_HOSTNAME" \
+            -p 8020:8020 -p 88:88 -p 749:749 \
+            ${{ needs.build-hdfs-image.outputs.image }}
           HDFS_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' hdfs)
+          echo "HDFS container hostname: $(docker exec hdfs hostname)"
           echo "HDFS container IP: $HDFS_IP"
 
           echo "=== Wait for KDC port 88 ==="
@@ -328,7 +345,7 @@ jobs:
           KINITED=0
           for i in $(seq 1 20); do
             echo "  attempt $i..."
-            if docker exec hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL 2>/dev/null; then
+            if docker exec hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/${HDFS_HOSTNAME}@TEST.LOCAL 2>/dev/null; then
               KINITED=1
             fi
             if [ $KINITED -eq 1 ] \
@@ -338,7 +355,7 @@ jobs:
             fi
             if [ $i -eq 20 ]; then
               echo "::error::HDFS did not become ready after 20 attempts (kinit_ok=$KINITED)"
-              docker exec hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL 2>&1
+              docker exec hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/${HDFS_HOSTNAME}@TEST.LOCAL 2>&1
               docker exec hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1
               docker logs hdfs 2>&1 | tail -30
               exit 1
@@ -354,37 +371,50 @@ jobs:
           docker cp hdfs:/tmp/testuser.keytab /tmp/testuser.keytab
           docker cp hdfs:/tmp/hdfs.keytab /tmp/hdfs.keytab
           docker cp hdfs:/etc/krb5.conf /tmp/krb5.conf
+          # Add both the kdc alias and the hdfs hostname to the host's
+          # /etc/hosts. The kdc alias points to the container's IP
+          # (where the KDC service is reachable); the hdfs hostname
+          # must point to 127.0.0.1 because docker's port forward
+          # exposes the container's 8020 on the host's loopback. If we
+          # pointed hdfs.test at the container IP, the hdfs client
+          # would try a direct TCP connection bypassing the port
+          # forward, which the container's iptables rules don't accept.
           echo "${HDFS_IP} kdc" | sudo tee -a /etc/hosts
+          echo "127.0.0.1 hdfs.test" | sudo tee -a /etc/hosts
           docker cp hdfs:/opt/hadoop/etc/hadoop/core-site.xml /tmp/core-site.xml
           docker cp hdfs:/opt/hadoop/etc/hadoop/hdfs-site.xml /tmp/hdfs-site.xml
 
       - name: Configure Kerberos
+        env:
+          HDFS_HOSTNAME: hdfs.test
         run: |
           sudo cp /tmp/krb5.conf /etc/krb5.conf
           # Per SESSION_PITFALLS §2.4: hdfs-native uses libhdfs which goes
           # through GSSAPI. testuser's ticket can't always negotiate with
           # the hdfs service principal on every hdfs image config — at the
           # SASL layer we got 'Connection reset by peer' (os error 104).
-          # The hdfs image's superuser is hdfs/localhost; using the
-          # hdfs.keytab for the host's kinit guarantees the client
-          # principal matches what the RPC handler expects, which is what
-          # this test is verifying (kerberos auth roundtrip, not
+          # The hdfs image's superuser is hdfs/${HDFS_HOSTNAME}; using
+          # the hdfs.keytab for the host's kinit guarantees the client
+          # principal matches what the RPC handler expects, which is
+          # what this test is verifying (kerberos auth roundtrip, not
           # non-superuser ACL semantics).
-          kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL
+          kinit -kt /tmp/hdfs.keytab hdfs/${HDFS_HOSTNAME}@TEST.LOCAL
           klist
 
       - name: Build mntrs
         run: cargo build --release -p mntrs
 
       - name: Test HDFS Kerberos mount
+        env:
+          HDFS_HOSTNAME: hdfs.test
         run: |
           set -x
           echo "=== 1. Renew Kerberos ticket (hdfs principal) ==="
-          kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL
+          kinit -kt /tmp/hdfs.keytab hdfs/${HDFS_HOSTNAME}@TEST.LOCAL
           klist
 
           echo "=== 2. Create test data in HDFS ==="
-          docker exec hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/localhost@TEST.LOCAL
+          docker exec hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/${HDFS_HOSTNAME}@TEST.LOCAL
           docker exec hdfs /opt/hadoop/bin/hdfs dfs -mkdir -p /test
           docker exec hdfs /opt/hadoop/bin/hdfs dfs -chmod 777 /test
           echo "hello kerberos hdfs" | docker exec -i hdfs /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt
@@ -405,7 +435,7 @@ jobs:
           cat /etc/krb5.conf
           echo "---"
           echo "/etc/hosts:"
-          grep kdc /etc/hosts || echo "(no kdc entry)"
+          grep -E 'kdc|hdfs.test' /etc/hosts || echo "(no entries)"
 
           echo "=== 5. Mount ==="
           sudo mkdir -p /mnt/hdfs && sudo chmod 777 /mnt/hdfs
@@ -415,14 +445,17 @@ jobs:
           # it falls back to defaults that don't include the test
           # realm's KDC; without KRB5CCNAME the host process's
           # existing ticket isn't picked up by the daemon child (which
-          # has no environment except what we explicitly set).
+          # has no environment except what we explicitly set). Mount
+          # via the hdfs hostname (not localhost) so the GSSAPI
+          # service principal matches what the hdfs server registered
+          # under at kadmin time.
           HADOOP_CONF_DIR=/tmp/hadoop-conf \
           KRB5_CONFIG=/etc/krb5.conf \
           KRB5CCNAME="FILE:$KRB5CCNAME" \
           MNTRS_DAEMON_LOG="$MOUNT_LOG" \
-            ./target/release/mntrs mount hdfs://localhost:8020/ /mnt/hdfs \
+            ./target/release/mntrs mount hdfs://${HDFS_HOSTNAME}:8020/ /mnt/hdfs \
               --allow-other --daemon --daemon-wait --daemon-timeout=20 \
-              --opt dfs.namenode.kerberos.principal=hdfs/localhost@TEST.LOCAL \
+              --opt dfs.namenode.kerberos.principal=hdfs/${HDFS_HOSTNAME}@TEST.LOCAL \
               > "$MOUNT_LOG" 2>&1 &
 
           # Readiness probe: wait up to 60s for mount + ls to both succeed
