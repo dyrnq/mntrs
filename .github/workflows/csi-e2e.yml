@@ -1,0 +1,122 @@
+name: CSI e2e
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'csi/**'
+      - 'tests/e2e/**'
+      - 'docker/csi/**'
+      - '.github/workflows/csi-e2e.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'csi/**'
+      - 'tests/e2e/**'
+      - 'docker/csi/**'
+      - '.github/workflows/csi-e2e.yml'
+  workflow_dispatch:
+  schedule:
+    # weekly regression sweep
+    - cron: '0 6 * * 0'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+
+  csi-e2e-s3:
+    name: csi-e2e (S3 / MinIO)
+    runs-on: ubuntu-latest
+
+    services:
+      minio:
+        image: minio/minio:latest
+        command: server /data --address :9000
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        ports:
+          - 9000:9000
+        # MinIO needs /data to exist on the host; the service uses an
+        # ephemeral container so /data goes away with the runner.
+
+    env:
+      # Distinct tag from .github/workflows/csi-integration.yml (which
+      # uses ci-test-${{ github.sha }}) so the two workflows can be
+      # operated independently without colliding on a shared image name.
+      IMAGE: ghcr.io/${{ github.repository_owner }}/mntrs-csi:ci-test-e2e-${{ github.sha }}
+      KUBECONFIG: /tmp/kubeconfig
+      REGISTRY: ghcr.io
+      REGISTRY_USER: ${{ github.actor }}
+      REGISTRY_PASS: ${{ secrets.GITHUB_TOKEN }}
+      # MinIO is provided as a service below; tell s3.sh to skip the
+      # in-cluster MinIO deployment and use the services host directly.
+      MINIO_ENDPOINT: http://localhost:9000
+      KEEP_MINIO: '1'
+      KEEP_ON_FAIL: '1'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install k3s
+        run: |
+          curl -sfL https://get.k3s.io | sh -
+          sudo mkdir -p /root/.kube
+          sudo cp /etc/rancher/k3s/k3s.yaml /tmp/kubeconfig
+          sudo chown "$(id -u)":"$(id -g)" /tmp/kubeconfig
+          mkdir -p ~/.kube
+          cp /tmp/kubeconfig ~/.kube/config
+          kubectl --kubeconfig /tmp/kubeconfig wait --for=condition=Ready node --all --timeout=60s
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools protobuf-compiler
+          # musl build is fine for k3s + GHCR; the Dockerfile pins a base
+          # that can run it.
+
+      - name: Build mntrs-csi (static musl)
+        run: |
+          cargo build --release --package mntrs-csi --target x86_64-unknown-linux-musl
+
+      - name: Stage docker context
+        run: |
+          mkdir -p docker/csi
+          cp target/x86_64-unknown-linux-musl/release/mntrs-csi docker/csi/
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push CSI image
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/csi
+          push: true
+          tags: ${{ env.IMAGE }}
+
+      - name: Run e2e
+        env:
+          KUBECONFIG: /tmp/kubeconfig
+        run: |
+          bash tests/e2e/csi/s3.sh
+
+      - name: Dump on failure
+        if: failure()
+        run: |
+          echo "=== csi-mntrs pods ==="
+          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs get pods -o wide
+          echo
+          echo "=== csi-controller log (last 50) ==="
+          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs logs -l app=csi-controller-mntrs --tail=50 2>&1 || true
+          echo
+          echo "=== csi-nodeplugin log (last 50) ==="
+          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs logs -l app=csi-nodeplugin-mntrs --tail=50 2>&1 || true
+          echo
+          echo "=== test pod events ==="
+          kubectl --kubeconfig /tmp/kubeconfig describe pod mntrs-csi-e2e 2>&1 || true
