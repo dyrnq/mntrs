@@ -159,6 +159,7 @@ jobs:
             # parent, which exits immediately after spawning the daemon —
             # see SESSION_PITFALLS §2.2). Without this, daemon's tracing
             # output goes to /dev/null and the artifact is empty.
+            KRB5CCNAME="${KRB5CCNAME}" \
             MNTRS_DAEMON_LOG="$MOUNT_LOG" \
               ./target/release/mntrs mount ${{ matrix.backend.storage }} /mnt/mntrs-test $MOUNT_OPTS --allow-other --daemon --daemon-wait --daemon-timeout=20 > "$MOUNT_LOG" 2>&1 &
           else
@@ -486,6 +487,7 @@ jobs:
           echo "=== 5. Mount ==="
           sudo mkdir -p /mnt/hdfs && sudo chmod 777 /mnt/hdfs
           MOUNT_LOG="/tmp/mntrs-mount.log"
+          KRB5CCNAME=$(klist 2>/dev/null | sed -n 's/^Ticket cache: //p')
           # hdfs-native (libhdfs) needs these to find the kerberos
           # config and the host's ticket cache. Without HADOOP_CONF_DIR
           # it falls back to defaults that don't include the test
@@ -497,8 +499,8 @@ jobs:
           # under at kadmin time.
           HADOOP_CONF_DIR=/tmp/hadoop-conf \
           KRB5_CONFIG=/etc/krb5.conf \
-          KRB5CCNAME="FILE:$KRB5CCNAME" \
-          MNTRS_DAEMON_LOG="$MOUNT_LOG" \
+          KRB5CCNAME="${KRB5CCNAME}" \
+            MNTRS_DAEMON_LOG="$MOUNT_LOG" \
             ./target/release/mntrs mount hdfs://${HDFS_HOSTNAME}:8020/ /mnt/hdfs \
               --allow-other --daemon --daemon-wait --daemon-timeout=20 \
               --opt dfs.namenode.kerberos.principal=hdfs/${HDFS_HOSTNAME}@TEST.LOCAL \
