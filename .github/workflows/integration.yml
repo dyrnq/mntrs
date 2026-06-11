@@ -342,20 +342,25 @@ jobs:
           # more seconds to bootstrap, and the first kinit may race the
           # kadmind startup. Retry kinit until it succeeds, then poll
           # dfsadmin for the live datanode.
+          # kinit must run as the same user (mntrs) that the subsequent
+          # hdfs dfsadmin runs as — ticket caches are per-uid, and
+          # hdfs.keytab must be readable by mntrs (chmod 644 in the image
+          # already handles that). Running kinit as root would put
+          # the ticket in /tmp/krb5cc_0 which mntrs can't see.
           KINITED=0
           for i in $(seq 1 20); do
             echo "  attempt $i..."
-            if docker exec hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/${HDFS_HOSTNAME}@TEST.LOCAL 2>/dev/null; then
+            if docker exec -u mntrs hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/${HDFS_HOSTNAME}@TEST.LOCAL 2>/dev/null; then
               KINITED=1
             fi
             if [ $KINITED -eq 1 ] \
-               && docker exec hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | grep -q "Live datanodes"; then
+               && docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | grep -q "Live datanodes"; then
               echo "HDFS ready (kinit took attempt $i)"
               break
             fi
             if [ $i -eq 20 ]; then
               echo "::error::HDFS did not become ready after 20 attempts (kinit_ok=$KINITED)"
-              docker exec hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/${HDFS_HOSTNAME}@TEST.LOCAL 2>&1
+              docker exec -u mntrs hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/${HDFS_HOSTNAME}@TEST.LOCAL 2>&1
               docker exec hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1
               docker logs hdfs 2>&1 | tail -30
               exit 1
@@ -414,12 +419,12 @@ jobs:
           klist
 
           echo "=== 2. Create test data in HDFS ==="
-          docker exec hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/${HDFS_HOSTNAME}@TEST.LOCAL
-          docker exec hdfs /opt/hadoop/bin/hdfs dfs -mkdir -p /test
-          docker exec hdfs /opt/hadoop/bin/hdfs dfs -chmod 777 /test
-          echo "hello kerberos hdfs" | docker exec -i hdfs /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt
-          docker exec hdfs /opt/hadoop/bin/hdfs dfs -chmod 644 /test/hello.txt
-          docker exec hdfs /opt/hadoop/bin/hdfs dfs -ls /test/
+          docker exec -u mntrs hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/${HDFS_HOSTNAME}@TEST.LOCAL
+          docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -mkdir -p /test
+          docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -chmod 777 /test
+          echo "hello kerberos hdfs" | docker exec -i -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt
+          docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -chmod 644 /test/hello.txt
+          docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -ls /test/
 
           echo "=== 3. Export Hadoop config for OpenDAL native HDFS backend ==="
           mkdir -p /tmp/hadoop-conf
