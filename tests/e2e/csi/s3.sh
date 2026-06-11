@@ -233,15 +233,17 @@ fi
 
 # ---------- 4. create test bucket ----------
 log "[4/9] creating test bucket ${MINIO_BUCKET}..."
-if [[ -z "${MINIO_ENDPOINT}" ]]; then
-    MINIO_POD_IP=$(${KUBECTL} -n "${MINIO_NAMESPACE}" get pod -l app=minio -o jsonpath='{.items[0].status.podIP}')
-    MINIO_ENDPOINT="http://${MINIO_POD_IP}:9000"
-    log "  MinIO pod IP: ${MINIO_POD_IP}"
-else
-    log "  using MINIO_ENDPOINT override: ${MINIO_ENDPOINT}"
+# Always use the in-cluster MinIO endpoint for the create-bucket job, which
+# runs inside k3s and cannot reach host-level endpoints like localhost:9000.
+MINIO_POD_IP=$(${KUBECTL} -n "${MINIO_NAMESPACE}" get pod -l app=minio -o jsonpath='{.items[0].status.podIP}')
+MINIO_POD_EP="http://${MINIO_POD_IP}:9000"
+log "  MinIO pod IP: ${MINIO_POD_IP}"
+if [[ -n "${MINIO_ENDPOINT}" ]]; then
+    log "  (MINIO_ENDPOINT override ${MINIO_ENDPOINT} ignored for in-cluster job)"
 fi
 # Strip http:// or https:// prefix for the Host header
-MINIO_HOST=$(echo "${MINIO_ENDPOINT}" | sed -E 's|^https?://||')
+# Use pod endpoint host for the create-bucket job Host header
+MINIO_HOST=$(echo "${MINIO_POD_EP}" | sed -E 's|^https?://||')
 
 ${KUBECTL} -n "${MINIO_NAMESPACE}" delete job create-bucket --ignore-not-found 2>/dev/null
 cat <<EOF | ${KUBECTL} apply -f -
@@ -259,7 +261,7 @@ spec:
         args:
         - |
           import urllib.request, hashlib, hmac, datetime
-          MINIO = "${MINIO_ENDPOINT}"
+          MINIO = "${MINIO_POD_EP}"
           AK, SK = "${MINIO_ROOT_USER}", "${MINIO_ROOT_PASSWORD}"
           REGION = "us-east-1"
           def sign(k,m): return hmac.new(k, m.encode(), hashlib.sha256).digest()
@@ -303,13 +305,11 @@ log "  bucket ready"
 
 # ---------- 5. create PV + PVC + test pod ----------
 log "[5/9] creating PV + PVC + test pod..."
-if [[ -z "${MINIO_ENDPOINT}" ]]; then
-    MINIO_SVC_IP=$(${KUBECTL} -n "${MINIO_NAMESPACE}" get svc minio -o jsonpath='{.spec.clusterIP}')
-    MINIO_ENDPOINT="http://${MINIO_SVC_IP}:9000"
-    log "  MinIO service IP: ${MINIO_SVC_IP}"
-else
-    log "  using MINIO_ENDPOINT override: ${MINIO_ENDPOINT}"
-fi
+# Always use the in-cluster MinIO service for K8s resources (PV/PVC/StorageClass),
+# since the CSI driver pods run inside k3s and need a cluster-reachable endpoint.
+MINIO_SVC_IP=$(${KUBECTL} -n "${MINIO_NAMESPACE}" get svc minio -o jsonpath='{.spec.clusterIP}')
+MINIO_ENDPOINT="http://${MINIO_SVC_IP}:9000"
+log "  MinIO service IP: ${MINIO_SVC_IP}"
 
 cat <<EOF | ${KUBECTL} apply -f -
 apiVersion: v1
@@ -463,7 +463,7 @@ PV_HANDLE=$(${KUBECTL} get pv "${PV_NAME}" -o jsonpath='{.spec.csi.volumeHandle}
 log "  volumeHandle: ${PV_HANDLE}"
 [[ -n "${PV_HANDLE}" ]] || fail "dynamic PV has empty volumeHandle"
 PV_EP=$(${KUBECTL} get pv "${PV_NAME}" -o jsonpath='{.spec.csi.volumeAttributes.endpoint}')
-assert_in "dynamic PV inherited endpoint param" "minio" "${PV_EP}"
+assert_in "dynamic PV inherited endpoint param" "9000" "${PV_EP}"
 
 log "  creating test pod ${DYN_POD_NAME}..."
 cat <<EOF | ${KUBECTL} apply -f -
