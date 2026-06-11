@@ -128,7 +128,8 @@ jobs:
           for i in $(seq 1 30); do
             # Probe readiness by attempting a real write instead of parsing
             # dfsadmin text output — avoids brittle regex on format changes.
-            if echo "probe" | docker exec -i -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -put - /_readiness_probe 2>/dev/null                && docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -rm /_readiness_probe >/dev/null 2>&1; then
+            if echo "probe" | docker exec -i -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -put - /_readiness_probe 2>/dev/null \
+               && docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -rm /_readiness_probe >/dev/null 2>&1; then
               echo "HDFS ready after ${i} attempts"
               break
             fi
@@ -244,8 +245,8 @@ jobs:
             echo "--- 5. append write + verify ---"
             echo "more data" >> /mnt/mntrs-test/_ci_small.txt 2>/dev/null && echo "append OK" || { echo "append FAIL"; FAIL=1; }
             GOT=$(cat /mnt/mntrs-test/_ci_small.txt 2>/dev/null)
-            if [ "$GOT" = "hello from ${{ matrix.backend.name }}
-more data" ]; then echo "append verify OK"
+            EXPECTED=$(printf "hello from ${{ matrix.backend.name }}\nmore data")
+            if [ "$GOT" = "$EXPECTED" ]; then echo "append verify OK"
             else echo "::error::append verify FAIL: got '$GOT'"; FAIL=1; fi
 
             echo "--- 6. append to pre-existing file ---"
@@ -595,8 +596,9 @@ more data" ]; then echo "append verify OK"
             echo "--- append ---"
             echo "more" >> /mnt/hdfs/_ci_small.txt 2>/dev/null && echo "append OK" || { echo "append FAIL"; FAIL=1; }
             GOT=$(cat /mnt/hdfs/_ci_small.txt 2>/dev/null)
-            if [ "$GOT" = "hello kerberos${NEWLINE}more" ]; then echo "append verify OK"
-            else echo "(append verify: got '$GOT')"; fi
+            EXPECTED=$(printf "hello kerberos\nmore")
+            if [ "$GOT" = "$EXPECTED" ]; then echo "append verify OK"
+            else echo "::error::append verify FAIL: got '$GOT'"; FAIL=1; fi
 
             echo "--- append to pre-existing file ---"
             echo "appended" >> /mnt/hdfs/test/hello.txt 2>/dev/null && echo "append pre-existing OK" || { echo "append pre-existing FAIL"; FAIL=1; }
