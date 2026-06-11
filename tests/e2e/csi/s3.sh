@@ -74,26 +74,31 @@ pass() { printf '\033[1;32m[PASS]\033[0m %s\n' "$*" >&2; }
 
 # shellcheck disable=SC2329  # invoked via trap below
 cleanup() {
+    # Capture the script's exit code BEFORE running any other command
+    # (the trap fires on script exit; subsequent commands in this
+    # function would otherwise overwrite $? and the real failure mode
+    # would be lost).
     local exit_code=$?
     log "cleanup (exit=$exit_code)..."
-    set +e
-    # Static PV e2e resources
-    ${KUBECTL} delete pod "${E2E_POD_NAME}" -n "${E2E_NAMESPACE}" --force --grace-period=0 --ignore-not-found 2>/dev/null
-    ${KUBECTL} delete pvc "${E2E_PVC_NAME}" -n "${E2E_NAMESPACE}" --ignore-not-found 2>/dev/null
-    ${KUBECTL} delete pv "${E2E_PV_NAME}" --ignore-not-found 2>/dev/null
+    # Each cleanup line uses `|| true` so set -e from the top of the
+    # script remains in effect. The --ignore-not-found + 2>/dev/null
+    # suppress noise; || true keeps errexit happy.
+    ${KUBECTL} delete pod "${E2E_POD_NAME}" -n "${E2E_NAMESPACE}" --force --grace-period=0 --ignore-not-found 2>/dev/null || true
+    ${KUBECTL} delete pvc "${E2E_PVC_NAME}" -n "${E2E_NAMESPACE}" --ignore-not-found 2>/dev/null || true
+    ${KUBECTL} delete pv "${E2E_PV_NAME}" --ignore-not-found 2>/dev/null || true
     # Dynamic provision e2e resources (phase 7/8)
-    ${KUBECTL} delete pod "mntrs-csi-e2e-dyn" -n "${E2E_NAMESPACE}" --force --grace-period=0 --ignore-not-found 2>/dev/null
-    ${KUBECTL} delete pvc "mntrs-csi-e2e-dyn" -n "${E2E_NAMESPACE}" --ignore-not-found 2>/dev/null
-    # Any PVs created by the dynamic SC get reclaimPolicy=Delete, so the PVC
-    # delete above will cascade. No explicit PV delete needed.
-    ${KUBECTL} delete sc "mntrs-dyn-e2e" --ignore-not-found 2>/dev/null
-    ${KUBECTL} delete job -n "${MINIO_NAMESPACE}" -l app=mntrs-e2e --ignore-not-found 2>/dev/null
+    ${KUBECTL} delete pod "mntrs-csi-e2e-dyn" -n "${E2E_NAMESPACE}" --force --grace-period=0 --ignore-not-found 2>/dev/null || true
+    ${KUBECTL} delete pvc "mntrs-csi-e2e-dyn" -n "${E2E_NAMESPACE}" --ignore-not-found 2>/dev/null || true
+    # PVs created by the dynamic SC have reclaimPolicy=Delete, so the
+    # PVC delete above cascades. No explicit PV delete needed.
+    ${KUBECTL} delete sc "mntrs-dyn-e2e" --ignore-not-found 2>/dev/null || true
+    ${KUBECTL} delete job -n "${MINIO_NAMESPACE}" -l app=mntrs-e2e --ignore-not-found 2>/dev/null || true
     if [[ "${SKIP_DEPLOY:-0}" != "1" && -n "${DEPLOY_DIR:-}" ]]; then
-        ${KUBECTL} delete -f "${DEPLOY_DIR}/" --ignore-not-found 2>/dev/null
+        ${KUBECTL} delete -f "${DEPLOY_DIR}/" --ignore-not-found 2>/dev/null || true
         rm -rf "${DEPLOY_DIR}"
     fi
     if [[ "${KEEP_MINIO:-0}" != "1" ]]; then
-        ${KUBECTL} delete namespace "${MINIO_NAMESPACE}" --ignore-not-found 2>/dev/null
+        ${KUBECTL} delete namespace "${MINIO_NAMESPACE}" --ignore-not-found 2>/dev/null || true
     fi
     exit "$exit_code"
 }
