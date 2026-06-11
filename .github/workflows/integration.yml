@@ -354,7 +354,7 @@ jobs:
           set -x
           docker run -d --name hdfs --hostname "$HDFS_HOSTNAME" \
             --add-host nameservice:127.0.0.1 \
-            -p 8020:8020 -p 88:88 -p 749:749 \
+            -p 8020:8020 -p 88:88 -p 749:749 -p 9866:9866 -p 9864:9864 \
             -v /tmp/core-site-ha-krb.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro \
             -v /tmp/hdfs-site-ha-krb.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro \
             ${{ needs.build-hdfs-image.outputs.image }}
@@ -436,6 +436,13 @@ jobs:
           HDFS_HOSTNAME: hdfs.test
         run: |
           sudo cp /tmp/krb5.conf /etc/krb5.conf
+          # Fix GSSAPI hostname canonicalization: MIT Kerberos's
+          # krb5_sname_to_principal uses getaddrinfo(AI_CANONNAME) which
+          # may return 'localhost' instead of the actual hostname when
+          # /etc/hosts has multiple names on the 127.0.0.1 line.
+          # rdns=false disables reverse-DNS canonicalization;
+          # dns_lookup_kdc/realm=false avoids blocking DNS URI queries.
+          sudo sed -i '/^\[libdefaults\]/a\\trdns = false\n\tdns_lookup_kdc = false\n\tdns_lookup_realm = false' /etc/krb5.conf
           # Per SESSION_PITFALLS §2.4: hdfs-native uses libhdfs which goes
           # through GSSAPI. testuser's ticket can't always negotiate with
           # the hdfs service principal on every hdfs image config — at the
