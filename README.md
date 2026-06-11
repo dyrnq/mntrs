@@ -416,12 +416,13 @@ cargo bench                         # micro-benchmarks
 
 | Workflow | Environment | Scope |
 |----------|-------------|-------|
-| `ci-core` | Linux | FUSE + CSI build + test + clippy + fmt |
-| `ci-hdfs` | Linux | Java + libhdfs3 + `--features hdfs-jni` |
-| `ci-windows` | Windows | WinFSP + release build + 15 mount integration tests |
-| `ci-macos` | macOS | macFUSE + FUSE build + test |
-| `bench` | Linux (weekly) | vs rclone benchmark (MinIO) |
-| `integration` | Linux | KDC + hdfs-native + csi-sanity |
+| `CI` | Linux | Build + test + clippy + fmt |
+| `CI - Windows` | Windows | WinFSP + release build + 15 mount integration tests |
+| `CI - macOS` | macOS | macFUSE + build + test |
+| `Integration Tests` | Linux | S3 / HDFS / memory mount tests + HDFS Kerberos auth |
+| `CSI Integration Test` | Linux (k3s) | CSI driver e2e with HDFS backend |
+| `CSI e2e` | Linux (k3s) | CSI driver e2e with S3 (MinIO) backend |
+| `Benchmark` | Linux | vs rclone performance (MinIO) |
 
 ---
 
