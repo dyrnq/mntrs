@@ -88,8 +88,9 @@ cleanup() {
     # delete above will cascade. No explicit PV delete needed.
     ${KUBECTL} delete sc "mntrs-dyn-e2e" --ignore-not-found 2>/dev/null
     ${KUBECTL} delete job -n "${MINIO_NAMESPACE}" -l app=mntrs-e2e --ignore-not-found 2>/dev/null
-    if [[ "${SKIP_DEPLOY:-0}" != "1" ]]; then
+    if [[ "${SKIP_DEPLOY:-0}" != "1" && -n "${DEPLOY_DIR:-}" ]]; then
         ${KUBECTL} delete -f "${DEPLOY_DIR}/" --ignore-not-found 2>/dev/null
+        rm -rf "${DEPLOY_DIR}"
     fi
     if [[ "${KEEP_MINIO:-0}" != "1" ]]; then
         ${KUBECTL} delete namespace "${MINIO_NAMESPACE}" --ignore-not-found 2>/dev/null
@@ -110,12 +111,12 @@ log "  cluster reachable: $(${KUBECTL} get nodes -o jsonpath='{range .items[*]}{
 if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
     log "[1/9] skip build (SKIP_BUILD=1), using ${IMAGE}"
 else
-    log "[1/9] building mntrs-csi (glibc)..."
-    (cd "${REPO_ROOT}" && cargo build --release --package mntrs-csi -p mntrs)
+    log "[1/9] building mntrs-csi (musl static)..."
+    rustup target add x86_64-unknown-linux-musl 2>/dev/null || true
+    (cd "${REPO_ROOT}" && cargo build --release --package mntrs-csi --target x86_64-unknown-linux-musl)
+    cp "${REPO_ROOT}/target/x86_64-unknown-linux-musl/release/mntrs-csi" "${REPO_ROOT}/docker/csi/mntrs-csi"
 
-    log "  preparing docker context..."
-    mkdir -p "${REPO_ROOT}/docker/csi"
-    cp "${REPO_ROOT}/target/release/mntrs-csi" "${REPO_ROOT}/docker/csi/mntrs-csi"
+    log "  building image ${IMAGE}..."
     (cd "${REPO_ROOT}/docker/csi" && docker build -t "${IMAGE}" .)
 
     log "  logging in to ${REGISTRY}..."
@@ -197,7 +198,6 @@ if [[ "${SKIP_DEPLOY:-0}" == "1" ]]; then
 else
     log "[3/9] deploying csi-mntrs to ${CSI_NAMESPACE}..."
     DEPLOY_DIR="$(mktemp -d)"
-    trap 'rm -rf "${DEPLOY_DIR}"; cleanup' EXIT
     SRC="${REPO_ROOT}/csi/deploy/kubernetes/1.20"
     for f in 00-namespace.yaml 01-csidriver.yaml 02-controller-rbac.yaml \
              03-controller.yaml 04-nodeplugin-rbac.yaml 05-nodeplugin.yaml \

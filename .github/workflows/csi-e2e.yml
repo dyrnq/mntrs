@@ -79,6 +79,7 @@ jobs:
 
       - name: Build mntrs-csi (static musl)
         run: |
+          rustup target add x86_64-unknown-linux-musl
           cargo build --release --package mntrs-csi --target x86_64-unknown-linux-musl
 
       - name: Stage docker context
