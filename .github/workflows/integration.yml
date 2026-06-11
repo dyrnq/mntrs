@@ -124,20 +124,22 @@ jobs:
             -v /tmp/hdfs-site-simple.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro \
             ghcr.io/dyrnq/mntrs-hdfs:ci-test-${{ github.sha }}
 
-          # Wait for NameNode + DataNode
-          for i in $(seq 1 20); do
-            echo "  attempt $i..."
-            if docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfsadmin -report >/dev/null 2>&1; then
-              echo "HDFS ready"
+          # Wait for NameNode + DataNode (must have ≥1 live datanode)
+          for i in $(seq 1 30); do
+            REPORT=$(docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1)
+            LIVE=$(echo "$REPORT" | grep -oP 'Live datanodes.*?:\s+\K\d+' || echo "0")
+            if [[ "$LIVE" -ge 1 ]]; then
+              echo "HDFS ready (live datanodes: $LIVE) after ${i} attempts"
               break
             fi
-            if [ $i -eq 20 ]; then
-              echo "::error::HDFS not ready after 20 attempts"
-              docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 || true
+            echo "  attempt $i: waiting for datanode (live=$LIVE)..."
+            if [ $i -eq 30 ]; then
+              echo "::error::HDFS not ready after 30 attempts"
+              echo "$REPORT"
               docker logs hdfs 2>&1 | tail -20
               exit 1
             fi
-            sleep 5
+            sleep 3
           done
           docker logs hdfs 2>&1 | tail -5
           docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | head -10
