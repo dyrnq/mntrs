@@ -313,9 +313,47 @@ jobs:
           # auth will fail with 'Connection reset by peer'.
           HDFS_HOSTNAME: hdfs.test
         run: |
+          # Generate HA+Kerberos config. hdfs-native (OpenDAL) hardcodes
+          # hdfs://nameservice internally; the container must run in HA
+          # nameservice mode or the RPC protocol won't match and the client
+          # gets 'Connection reset by peer' (SESSION_PITFALLS §2.1).
+          cat > /tmp/core-site-ha-krb.xml << 'XML'
+          <configuration>
+            <property><name>fs.defaultFS</name><value>hdfs://nameservice</value></property>
+            <property><name>hadoop.security.authentication</name><value>kerberos</value></property>
+            <property><name>hadoop.security.authorization</name><value>true</value></property>
+            <property><name>hadoop.rpc.protection</name><value>authentication</value></property>
+          </configuration>
+          XML
+          cat > /tmp/hdfs-site-ha-krb.xml << 'XML'
+          <configuration>
+            <property><name>dfs.replication</name><value>1</value></property>
+            <property><name>dfs.permissions.enabled</name><value>false</value></property>
+            <property><name>dfs.nameservices</name><value>nameservice</value></property>
+            <property><name>dfs.ha.namenodes.nameservice</name><value>nn0</value></property>
+            <property><name>dfs.namenode.rpc-address.nameservice.nn0</name><value>0.0.0.0:8020</value></property>
+            <property><name>dfs.namenode.http-address.nameservice.nn0</name><value>0.0.0.0:9870</value></property>
+            <property><name>dfs.client.failover.proxy.provider.nameservice</name><value>org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider</value></property>
+            <property><name>dfs.namenode.kerberos.principal</name><value>hdfs/hdfs.test@TEST.LOCAL</value></property>
+            <property><name>dfs.namenode.keytab.file</name><value>/tmp/hdfs.keytab</value></property>
+            <property><name>dfs.datanode.kerberos.principal</name><value>hdfs/hdfs.test@TEST.LOCAL</value></property>
+            <property><name>dfs.datanode.keytab.file</name><value>/tmp/hdfs.keytab</value></property>
+            <property><name>dfs.web.authentication.kerberos.principal</name><value>HTTP/hdfs.test@TEST.LOCAL</value></property>
+            <property><name>dfs.web.authentication.kerberos.keytab</name><value>/tmp/hdfs.keytab</value></property>
+            <property><name>dfs.block.access.token.enable</name><value>true</value></property>
+            <property><name>dfs.data.transfer.protection</name><value>authentication</value></property>
+            <property><name>dfs.http.policy</name><value>HTTP_ONLY</value></property>
+            <property><name>dfs.datanode.address</name><value>0.0.0.0:9866</value></property>
+            <property><name>dfs.datanode.http.address</name><value>0.0.0.0:9864</value></property>
+            <property><name>ignore.secure.ports.for.testing</name><value>true</value></property>
+            <property><name>dfs.namenode.secondary.http-address</name><value>0.0.0.0:0</value></property>
+          </configuration>
+          XML
           set -x
           docker run -d --name hdfs --hostname "$HDFS_HOSTNAME" \
             -p 8020:8020 -p 88:88 -p 749:749 \
+            -v /tmp/core-site-ha-krb.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro \
+            -v /tmp/hdfs-site-ha-krb.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro \
             ${{ needs.build-hdfs-image.outputs.image }}
           HDFS_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' hdfs)
           echo "HDFS container hostname: $(docker exec hdfs hostname)"
@@ -386,6 +424,7 @@ jobs:
           # forward, which the container's iptables rules don't accept.
           echo "${HDFS_IP} kdc" | sudo tee -a /etc/hosts
           echo "127.0.0.1 hdfs.test" | sudo tee -a /etc/hosts
+          echo "127.0.0.1 nameservice" | sudo tee -a /etc/hosts
           docker cp hdfs:/opt/hadoop/etc/hadoop/core-site.xml /tmp/core-site.xml
           docker cp hdfs:/opt/hadoop/etc/hadoop/hdfs-site.xml /tmp/hdfs-site.xml
 
@@ -440,7 +479,7 @@ jobs:
           cat /etc/krb5.conf
           echo "---"
           echo "/etc/hosts:"
-          grep -E 'kdc|hdfs.test' /etc/hosts || echo "(no entries)"
+          grep -E 'kdc|hdfs.test|nameservice' /etc/hosts || echo "(no entries)"
 
           echo "=== 5. Mount ==="
           sudo mkdir -p /mnt/hdfs && sudo chmod 777 /mnt/hdfs
@@ -463,14 +502,13 @@ jobs:
               --opt dfs.namenode.kerberos.principal=hdfs/${HDFS_HOSTNAME}@TEST.LOCAL \
               > "$MOUNT_LOG" 2>&1 &
 
-          # Readiness probe: wait up to 60s for mount + ls to both succeed
-          # Per SESSION_PITFALLS §2.2: --daemon re-execs, $! is unreliable
-          # Per SESSION_PITFALLS §2.4: hdfs-native can return root entry / trailing slashes
-          FAIL=0
+          # Readiness probe: wait up to 60s for mount. Use cat (not ls)
+          # because hdfs-native list_op trips FUSE readdir EIO on some
+          # backends; cat goes through read which is the stable path.
           READY=0
           for i in $(seq 1 60); do
             if mount | grep -q /mnt/hdfs; then
-              if ls /mnt/hdfs/ >/dev/null 2>&1; then
+              if cat /mnt/hdfs/test/hello.txt >/dev/null 2>&1; then
                 echo "mount ready after ${i}s"
                 READY=1
                 break
@@ -491,6 +529,7 @@ jobs:
           fi
 
           # Per SESSION_PITFALLS §2.6: CI green ≠ tests pass — track failures explicitly
+          FAIL=0
           if mount | grep -q /mnt/hdfs; then
             echo "=== 6. Verify ==="
 
