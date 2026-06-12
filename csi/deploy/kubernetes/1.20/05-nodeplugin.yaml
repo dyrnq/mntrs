@@ -17,7 +17,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: node-driver-registrar
-          image: k8s.gcr.io/sig-storage/csi-node-driver-registrar:v2.4.0
+          image: dyrnq/csi-node-driver-registrar:v2.9.4
           # NOTE: preStop hook removed. The previous
           #   preStop.exec: /bin/sh -c "rm -rf /registration/csi-mntrs ..."
           # ran on a distroless image (no /bin/sh), failed silently, and

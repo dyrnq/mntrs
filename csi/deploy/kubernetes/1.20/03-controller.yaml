@@ -17,7 +17,7 @@ spec:
       serviceAccountName: csi-controller-mntrs
       containers:
         - name: csi-provisioner
-          image: registry.k8s.io/sig-storage/csi-provisioner:v5.0.2
+          image: dyrnq/csi-provisioner:v6.3.0
           args:
             - "--csi-address=$(ADDRESS)"
             - "--extra-create-metadata"
@@ -39,8 +39,7 @@ spec:
               containerPort: 9808
               protocol: TCP
           livenessProbe:
-            httpGet:
-              path: /healthz
+            tcpSocket:
               port: hz-provisioner
             initialDelaySeconds: 10
             periodSeconds: 30
@@ -50,7 +49,7 @@ spec:
             - name: socket-dir
               mountPath: /plugin
         - name: csi-attacher
-          image: k8s.gcr.io/sig-storage/csi-attacher:v3.4.0
+          image: dyrnq/csi-attacher:v4.12.0
           args:
             - "--csi-address=$(ADDRESS)"
             - "--http-endpoint=:9809"
@@ -67,8 +66,7 @@ spec:
               containerPort: 9809
               protocol: TCP
           livenessProbe:
-            httpGet:
-              path: /healthz
+            tcpSocket:
               port: hz-attacher
             initialDelaySeconds: 10
             periodSeconds: 30
