@@ -18,14 +18,16 @@ spec:
       containers:
         - name: node-driver-registrar
           image: k8s.gcr.io/sig-storage/csi-node-driver-registrar:v2.4.0
-          lifecycle:
-            preStop:
-              exec:
-                # preStop is fine here: the registrar is distroless too, but
-                # preStop exec failure only blocks shutdown, not steady-state
-                # liveness. If this ever fails we'll see it once in the journal,
-                # not in a 30s restart loop.
-                command: ["/bin/sh", "-c", "rm -rf /registration/csi-mntrs /registration/csi-mntrs-reg.sock"]
+          # NOTE: preStop hook removed. The previous
+          #   preStop.exec: /bin/sh -c "rm -rf /registration/csi-mntrs ..."
+          # ran on a distroless image (no /bin/sh), failed silently, and
+          # forced kubelet to fall back to its full 30s terminationGracePeriod
+          # before csi.sock was actually released — which in turn meant the
+          # 13× `MountVolume.MountDevice failed ... use of closed network
+          # connection` errors on the dynamic test pod (the mount RPC landed
+          # while kubelet was still draining the registrar). Kubelet cleans
+          # up the /registration/csi-mntrs* files on its own when the pod
+          # is removed, so removing the hook is safe.
           args:
             - --v=1
             - --csi-address=/plugin/csi.sock

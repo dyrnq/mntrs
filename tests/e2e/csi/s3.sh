@@ -202,6 +202,28 @@ if [[ "${SKIP_DEPLOY:-0}" == "1" ]]; then
     log "[3/9] skip deploy (SKIP_DEPLOY=1)"
 else
     log "[3/9] deploying csi-mntrs to ${CSI_NAMESPACE}..."
+
+    # Pre-create the docker-registry secret so the pod templates can
+    # reference it directly. Earlier versions of this script did
+    # `kubectl apply` (without imagePullSecrets) and then `kubectl patch`
+    # to add the secret afterwards. That patch mutates the DaemonSet /
+    # StatefulSet pod template, which k3s's controller picks up on its
+    # next 30s ResyncPeriod reconcile — long after `kubectl wait` reports
+    # the pods Ready. The rolling restart then tears csi.sock down
+    # mid-test and the dynamic mount RPCs land on a closed socket
+    # (visible in the k3s journal as 13×
+    #   "MountVolume.MountDevice failed ... use of closed network connection"
+    # and eventually
+    #   "driver name csi-mntrs not found in the list of registered CSI
+    #    drivers").
+    log "  creating docker-registry secret reg-e2e in ${CSI_NAMESPACE}..."
+    ${KUBECTL} -n "${CSI_NAMESPACE}" create secret docker-registry reg-e2e \
+        --docker-server="${REGISTRY}" \
+        --docker-username="${REGISTRY_USER}" \
+        --docker-password="${REGISTRY_PASS}" \
+        --docker-email=e2e@example.com \
+        --dry-run=client -o yaml | ${KUBECTL} apply -f -
+
     DEPLOY_DIR="$(mktemp -d)"
     SRC="${REPO_ROOT}/csi/deploy/kubernetes/1.20"
     for f in 00-namespace.yaml 01-csidriver.yaml 02-controller-rbac.yaml \
@@ -210,21 +232,17 @@ else
         sed "s|image: csi-mntrs:latest|image: ${IMAGE}|" \
             "${SRC}/${f}" > "${DEPLOY_DIR}/${f}"
     done
+    # Inject imagePullSecrets into the pod spec of the StatefulSet and
+    # DaemonSet so the apply below lands with the secret already wired up.
+    # This is what avoids the post-apply 30s rolling restart.
+    for f in 03-controller.yaml 05-nodeplugin.yaml; do
+        sed -i "/^      serviceAccountName: csi-/a\\
+      imagePullSecrets:\\
+        - name: reg-e2e" \
+            "${DEPLOY_DIR}/${f}"
+    done
+
     ${KUBECTL} apply -f "${DEPLOY_DIR}/"
-
-    log "  creating docker-registry secret in ${CSI_NAMESPACE}..."
-    ${KUBECTL} -n "${CSI_NAMESPACE}" create secret docker-registry reg-e2e \
-        --docker-server="${REGISTRY}" \
-        --docker-username="${REGISTRY_USER}" \
-        --docker-password="${REGISTRY_PASS}" \
-        --docker-email=e2e@example.com \
-        --dry-run=client -o yaml | ${KUBECTL} apply -f -
-
-    log "  patching controller + nodeplugin with imagePullSecrets..."
-    ${KUBECTL} -n "${CSI_NAMESPACE}" patch statefulset csi-controller-mntrs --type=json \
-        -p='[{"op":"add","path":"/spec/template/spec/imagePullSecrets","value":[{"name":"reg-e2e"}]}]'
-    ${KUBECTL} -n "${CSI_NAMESPACE}" patch daemonset csi-nodeplugin-mntrs --type=json \
-        -p='[{"op":"add","path":"/spec/template/spec/imagePullSecrets","value":[{"name":"reg-e2e"}]}]'
 
     log "  waiting for csi-mntrs pods Ready..."
     ${KUBECTL} -n "${CSI_NAMESPACE}" wait --for=condition=Ready pod -l app=csi-controller-mntrs --timeout=120s
