@@ -35,13 +35,13 @@ spec:
           # failureThreshold×periodSeconds restart loop that tore csi.sock
           # down mid-mount.
           ports:
-            - name: healthz-provisioner
+            - name: hz-provisioner
               containerPort: 9808
               protocol: TCP
           livenessProbe:
             httpGet:
               path: /healthz
-              port: healthz-provisioner
+              port: hz-provisioner
             initialDelaySeconds: 10
             periodSeconds: 30
             failureThreshold: 3
@@ -63,13 +63,13 @@ spec:
           # differs (healthz-attacher) so the probe resolves to csi-attacher's
           # own :9809, not the first /healthz named port in the pod.
           ports:
-            - name: healthz-attacher
+            - name: hz-attacher
               containerPort: 9809
               protocol: TCP
           livenessProbe:
             httpGet:
               path: /healthz
-              port: healthz-attacher
+              port: hz-attacher
             initialDelaySeconds: 10
             periodSeconds: 30
             failureThreshold: 3
