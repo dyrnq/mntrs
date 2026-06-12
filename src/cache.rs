@@ -100,6 +100,84 @@ pub trait MemCache: Send + Sync {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Atomic-monotonic snapshot of cache counters + current
+    /// state. `Relaxed` ordering on every field — these are
+    /// observability, not correctness. Each implementation must
+    /// update the relevant counter on every `get` (hit/miss) and
+    /// `put` (insert, including any evictions triggered to make
+    /// room). Callers should not rely on the snapshot being a
+    /// consistent cross-field view: under concurrent traffic, an
+    /// `inserts += 1` may be visible before its corresponding
+    /// `used_bytes += size` (or vice versa). The point is to
+    /// answer "what does the cache look like right now" and
+    /// "is it hot", not "did this exact op land".
+    fn stats(&self) -> MemCacheStats;
+}
+
+/// Snapshot returned by `MemCache::stats()`. All counters are
+/// monotonic since cache creation. `capacity_bytes` is `0` for
+/// implementations that don't enforce a limit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemCacheStats {
+    /// Number of `get` calls that returned `Some(_)`.
+    pub hits: u64,
+    /// Number of `get` calls that returned `None`.
+    pub misses: u64,
+    /// Number of `put` calls that landed (whether or not they
+    /// triggered an eviction; evictions are counted separately).
+    pub inserts: u64,
+    /// Number of cache entries evicted to make room for a
+    /// newer insert. Zero for unbounded caches.
+    pub evictions: u64,
+    /// Current number of entries.
+    pub entries: u64,
+    /// Current approximate byte usage.
+    pub used_bytes: u64,
+    /// Configured byte limit. `0` means "unbounded".
+    pub capacity_bytes: u64,
+}
+
+impl MemCacheStats {
+    /// Hit rate in `[0.0, 1.0]`. Returns `0.0` if no `get`
+    /// has happened yet.
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
+    }
+
+    /// Capacity utilization in `[0.0, +∞)`. Returns `0.0` for
+    /// unbounded caches.
+    pub fn utilization(&self) -> f64 {
+        if self.capacity_bytes == 0 {
+            0.0
+        } else {
+            self.used_bytes as f64 / self.capacity_bytes as f64
+        }
+    }
+
+    /// Render as a single-line tracing-friendly string. Format
+    /// is stable enough to grep on (e.g. `mntrs_mem_cache_stats`
+    /// events in `RUST_LOG=mntrs` output). The compactness
+    /// keeps the log volume low when emitted every second.
+    pub fn format(&self) -> String {
+        format!(
+            "hits={} misses={} hit_rate={:.2}% inserts={} evictions={} entries={} used={}B/{}B util={:.1}%",
+            self.hits,
+            self.misses,
+            self.hit_rate() * 100.0,
+            self.inserts,
+            self.evictions,
+            self.entries,
+            self.used_bytes,
+            self.capacity_bytes,
+            self.utilization() * 100.0,
+        )
+    }
 }
 
 /// Concrete `MemCache` backed by a `DashMap` with an LRU eviction
@@ -142,6 +220,13 @@ pub struct DashMapMemCache {
     /// eviction storms. Currently hard-coded to 5s — same
     /// value the pre-PoC code used.
     back_pressure_deadline: Duration,
+    /// Observability counters. All `Relaxed` — these are
+    /// monitoring-only and intentionally cheap. See
+    /// `MemCache::stats()` for the read side.
+    hits: AtomicU64,
+    misses: AtomicU64,
+    inserts: AtomicU64,
+    evictions: AtomicU64,
 }
 
 impl DashMapMemCache {
@@ -155,15 +240,26 @@ impl DashMapMemCache {
             mem_limit,
             used: AtomicU64::new(0),
             back_pressure_deadline: Duration::from_secs(5),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            inserts: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
         }
     }
 }
 
 impl MemCache for DashMapMemCache {
     fn get(&self, ino: u64, block_idx: u64) -> Option<Bytes> {
-        self.inner
+        let result = self
+            .inner
             .get(&(ino, block_idx))
-            .map(|entry| entry.value().clone())
+            .map(|entry| entry.value().clone());
+        if result.is_some() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
 
     fn put(&self, ino: u64, block_idx: u64, data: Bytes) {
@@ -188,6 +284,7 @@ impl MemCache for DashMapMemCache {
                     Some(v) => {
                         if let Some((_, removed)) = self.inner.remove(&v) {
                             self.used.fetch_sub(removed.len() as u64, Ordering::Relaxed);
+                            self.evictions.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     None => break, // empty cache but limit still exceeded — nothing to evict
@@ -218,6 +315,7 @@ impl MemCache for DashMapMemCache {
         }
         self.inner.insert(key, data);
         self.used.fetch_add(size, Ordering::Relaxed);
+        self.inserts.fetch_add(1, Ordering::Relaxed);
         self.order.lock().unwrap().push_back(key);
         // Note: we push the key even if it was a re-insert;
         // the LRU queue may thus have stale keys for evicted
@@ -279,6 +377,25 @@ impl MemCache for DashMapMemCache {
 
     fn used_bytes(&self) -> u64 {
         self.used.load(Ordering::Relaxed)
+    }
+
+    fn stats(&self) -> MemCacheStats {
+        // `Relaxed` everywhere: observability, not correctness.
+        // The values may not be a perfectly consistent snapshot
+        // (e.g. `inserts` may have advanced but the inner
+        // insert's `used_bytes` update hasn't been observed yet),
+        // but for monitoring that's fine — what matters is the
+        // shape of the numbers over time, not the exact
+        // cross-field relationship at one instant.
+        MemCacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            inserts: self.inserts.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+            entries: self.inner.len() as u64,
+            used_bytes: self.used.load(Ordering::Relaxed),
+            capacity_bytes: self.mem_limit,
+        }
     }
 }
 
@@ -353,5 +470,72 @@ mod tests {
         assert_eq!(cache.used_bytes(), 50, "after replace");
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.get(1, 0).unwrap().len(), 50);
+    }
+
+    /// `stats()` reflects get/put/eviction counters correctly.
+    /// This is the contract the periodic metrics logger depends
+    /// on (see `cmd::mount`); if a counter drifts, the printed
+    /// hit rate / utilization values become misleading.
+    #[test]
+    fn stats_reflects_get_put_and_eviction() {
+        let cache = DashMapMemCache::new(0);
+
+        // Cold cache: every get is a miss.
+        assert!(cache.get(1, 0).is_none());
+        let s = cache.stats();
+        assert_eq!(s.hits, 0);
+        assert_eq!(s.misses, 1);
+        assert_eq!(s.inserts, 0);
+        assert_eq!(s.evictions, 0);
+        assert_eq!(s.entries, 0);
+        assert_eq!(s.used_bytes, 0);
+        assert_eq!(s.capacity_bytes, 0); // unbounded
+
+        // One insert → one hit on the same key.
+        cache.put(1, 0, Bytes::from_static(b"hello"));
+        let s = cache.stats();
+        assert_eq!(s.hits, 0);
+        assert_eq!(s.misses, 1);
+        assert_eq!(s.inserts, 1);
+        assert_eq!(s.entries, 1);
+        assert_eq!(s.used_bytes, 5);
+        assert!(cache.get(1, 0).is_some());
+        let s = cache.stats();
+        assert_eq!(s.hits, 1);
+        assert_eq!(s.misses, 1);
+        assert!((s.hit_rate() - 0.5).abs() < 1e-9);
+
+        // Replacement of the same key still counts as one insert
+        // (the doc says inserts are *successful puts*, not
+        // *unique keys*). The byte count must update.
+        cache.put(1, 0, Bytes::from_static(b"hi"));
+        let s = cache.stats();
+        assert_eq!(s.inserts, 2);
+        assert_eq!(s.used_bytes, 2);
+        assert_eq!(s.entries, 1); // still 1 entry, not 2
+
+        // Other ino: separate counters.
+        assert!(cache.get(2, 0).is_none());
+        let s = cache.stats();
+        assert_eq!(s.hits, 1);
+        assert_eq!(s.misses, 2);
+    }
+
+    /// Eviction bumps the `evictions` counter; the periodic
+    /// metrics logger uses this to surface "cache is too small
+    /// for the working set" symptoms.
+    #[test]
+    fn stats_eviction_counter_advances_under_pressure() {
+        // 1 KiB limit, two 600-byte blocks: the second one
+        // forces one eviction.
+        let cache = DashMapMemCache::new(1024);
+        cache.put(1, 0, Bytes::from(vec![0u8; 600]));
+        cache.put(2, 0, Bytes::from(vec![1u8; 600]));
+        let s = cache.stats();
+        assert_eq!(s.evictions, 1, "second put should evict the first");
+        assert_eq!(s.entries, 1);
+        assert_eq!(s.used_bytes, 600);
+        assert_eq!(s.capacity_bytes, 1024);
+        assert!((s.utilization() - 600.0 / 1024.0).abs() < 1e-9);
     }
 }
