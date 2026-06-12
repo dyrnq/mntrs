@@ -77,6 +77,33 @@ jobs:
           cp /tmp/kubeconfig ~/.kube/config
           kubectl --kubeconfig /tmp/kubeconfig wait --for=condition=Ready node --all --timeout=60s
 
+      # FUSE is required for mntrs' FUSE mounts. The GitHub runner's
+      # Ubuntu image ships without fuse3 userland tools and without
+      # /dev/fuse, so the csi-mntrs nodeplugin (privileged but
+      # nothing to mount with) hangs NodeStageVolume until the
+      # 120s `kubectl wait` blows up. Install the kernel module,
+      # userland tools, the device node, and the FUSE policy — same
+      # recipe csi-integration.yml has been using all along.
+      - name: Install FUSE prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          set +e
+          sudo modprobe fuse 2>/dev/null
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-3
+          if [ ! -e /dev/fuse ]; then
+            sudo mknod /dev/fuse c 10 229
+            sudo chmod 666 /dev/fuse
+          fi
+          sudo grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null || \
+            echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+          echo "--- /dev/fuse ---"
+          ls -la /dev/fuse
+          echo "--- /etc/fuse.conf ---"
+          cat /etc/fuse.conf
+          echo "--- fusermount3 ---"
+          which fusermount3 && fusermount3 --version 2>&1 | head -1 || echo "fusermount3 missing"
+
       - name: Install build deps
         run: |
           sudo apt-get update
