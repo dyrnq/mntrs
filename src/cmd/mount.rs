@@ -234,6 +234,7 @@ pub fn mount_internal(
         false,                    // allow_idmap
         0,                        // vfs_cache_max_size (off)
         256,                      // mem_limit
+        0,                        // mem_cache_metrics_interval_secs (off)
         5,                        // vfs_write_back
         "off",                    // vfs_cache_mode
         0,                        // vfs_read_ahead (off)
@@ -370,6 +371,17 @@ pub fn mount(
     _allow_idmap: bool,
     vfs_cache_max_size: u64,
     mem_limit: u64,
+    // Seconds between mem_cache stats tracing events. 0 = off
+    // (no background thread spawned). When > 0, one
+    // structured `tracing::info!(target: "mntrs::mem_cache",
+    // ...)` event is emitted per tick — the building block for
+    // a future Prometheus exporter or log-scraper dashboard.
+    // The goal of the work in `cache.rs` is to give every
+    // `MemCache` impl a uniform `stats()` view so that, when
+    // a moka impl lands, the same `tracing` event format
+    // works for both, and a head-to-head comparison is one
+    // log filter away.
+    mem_cache_metrics_interval_secs: u64,
     vfs_write_back: u64,
     vfs_cache_mode: &str,
     vfs_read_ahead: u64,
@@ -677,6 +689,55 @@ pub fn mount(
     {
         use crate::core_fs::fuser::FuserAdapter;
         fs.start_cache_poller();
+        // mem_cache observability: when --mem-cache-metrics-interval
+        // > 0, spawn a background thread that emits one structured
+        // tracing event per tick with the current counters. The
+        // `MemCache::stats()` snapshot is the source of truth (see
+        // the `MemCacheStats` docstring in `cache.rs`); this loop
+        // just gives it an output channel. We use tracing's
+        // structured fields rather than `format!` so log
+        // aggregators (Loki, Datadog, etc.) can index each
+        // counter without parsing a freeform string.
+        //
+        // `Relaxed` snapshots are fine for monitoring: the
+        // counters may briefly be inconsistent across fields
+        // under concurrent traffic (e.g. `inserts` may have
+        // advanced but its `used_bytes` update hasn't been
+        // observed yet). The shape of the numbers over time is
+        // what we want; a single-instant exact cross-field view
+        // is not.
+        //
+        // The thread runs until the mount is killed. It owns its
+        // own clone of the mem_cache `Arc`, so dropping `fs`
+        // when the adapter is consumed doesn't drop the cache
+        // out from under the logger.
+        if mem_cache_metrics_interval_secs > 0 {
+            let mem_cache_for_metrics = fs.mem_cache.clone();
+            use crate::cache::MemCache;
+            let interval = std::time::Duration::from_secs(mem_cache_metrics_interval_secs);
+            std::thread::Builder::new()
+                .name("mem_cache_metrics".into())
+                .spawn(move || {
+                    loop {
+                        std::thread::sleep(interval);
+                        let s = mem_cache_for_metrics.stats();
+                        tracing::info!(
+                            target: "mntrs::mem_cache",
+                            hits = s.hits,
+                            misses = s.misses,
+                            hit_rate_pct = format!("{:.2}", s.hit_rate() * 100.0),
+                            inserts = s.inserts,
+                            evictions = s.evictions,
+                            entries = s.entries,
+                            used_bytes = s.used_bytes,
+                            capacity_bytes = s.capacity_bytes,
+                            utilization_pct = format!("{:.1}", s.utilization() * 100.0),
+                            "mem_cache_stats"
+                        );
+                    }
+                })
+                .map_err(|e| anyhow!("failed to spawn mem_cache metrics thread: {e}"))?;
+        }
         let adapter = FuserAdapter::new(
             fs,
             std::time::Duration::from_secs(dir_cache_time),

@@ -89,6 +89,15 @@ enum Commands {
         vfs_cache_max_size: u64,
         #[arg(long, default_value = "256")]
         mem_limit: u64,
+        /// Emit mem_cache stats (hits/misses/inserts/evictions/
+        /// entries/used/capacity) as one structured tracing
+        /// event every N seconds. 0 = off (no background thread
+        /// spawned). The numbers come from `MemCache::stats()`
+        /// and use the same shape across all implementations
+        /// (DashMap today, moka once it lands) so a
+        /// head-to-head comparison is one log filter away.
+        #[arg(long, default_value = "0")]
+        mem_cache_metrics_interval: u64,
         /// Write-back delay in seconds before uploading dirty cache files (default: 5)
         #[arg(long, default_value = "5")]
         vfs_write_back: u64,
@@ -295,6 +304,7 @@ fn main() -> anyhow::Result<()> {
             allow_idmap,
             vfs_cache_max_size,
             mem_limit,
+            mem_cache_metrics_interval,
             vfs_write_back,
             vfs_cache_mode,
             vfs_read_ahead,
@@ -376,6 +386,7 @@ fn main() -> anyhow::Result<()> {
                 allow_idmap,
                 vfs_cache_max_size,
                 mem_limit,
+                mem_cache_metrics_interval,
                 vfs_write_back,
                 &vfs_cache_mode,
                 vfs_read_ahead,
