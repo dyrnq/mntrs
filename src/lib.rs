@@ -24,6 +24,8 @@ use std::time::{Duration, SystemTime};
 use crate::cache::MemCache;
 
 #[cfg(unix)]
+use crate::core_fs::fuser::io_err_to_fuse_errno;
+#[cfg(unix)]
 use fuser::{
     AccessFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
     INodeNo, KernelConfig, LockOwner, OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
@@ -169,7 +171,11 @@ impl FileHandleState {
 #[allow(clippy::type_complexity)]
 #[allow(dead_code)]
 pub struct MntrsFs {
-    pub(crate) op: Arc<Operator>,
+    /// Underlying OpenDAL operator. Exposed `pub` so the integration
+    /// tests in `tests/` can seed fixtures (write initial files,
+    /// verify backend state) without going through the FUSE layer.
+    /// Production code paths use the helper methods.
+    pub op: Arc<Operator>,
     inodes: dashmap::DashMap<u64, (String, FileType, u64, Option<std::time::SystemTime>)>,
     dir_cache: dashmap::DashMap<
         String,
@@ -238,6 +244,32 @@ pub struct MntrsFs {
     disk_cache_index: dashmap::DashMap<String, (u64, std::time::SystemTime)>,
     out_of_space: std::sync::atomic::AtomicBool,
     pub(crate) storage_class: Option<String>,
+}
+
+/// Convert an opendal::Error to std::io::Error, preserving the kind so
+/// FUSE callers (via `io_err_to_fuse_errno`) get the right POSIX errno.
+///
+/// Without this, every backend failure collapsed to
+/// `ErrorKind::Other` → `Errno::EIO`, which broke POSIX semantics
+/// (unlink on missing file, rmdir on non-empty dir, etc.).
+///
+/// `pub` so the integration tests in `tests/bug_regression_test.rs`
+/// can verify the mapping directly without going through the FUSE
+/// adapter (Bug D fix). The function is otherwise an internal
+/// helper used by the CoreFilesystem impls.
+pub fn opendal_to_io_error(e: &opendal::Error, op: &str) -> std::io::Error {
+    use opendal::ErrorKind;
+    use std::io::ErrorKind as IoKind;
+    let kind = match e.kind() {
+        ErrorKind::NotFound => IoKind::NotFound,
+        ErrorKind::AlreadyExists => IoKind::AlreadyExists,
+        ErrorKind::PermissionDenied => IoKind::PermissionDenied,
+        ErrorKind::IsADirectory => IoKind::IsADirectory,
+        ErrorKind::NotADirectory => IoKind::NotADirectory,
+        ErrorKind::Unsupported => IoKind::Unsupported,
+        _ => IoKind::Other,
+    };
+    std::io::Error::new(kind, format!("{op} failed: {e}"))
 }
 
 /// Convert OpenDAL Timestamp to std::time::SystemTime, clamped to UNIX_EPOCH.
@@ -462,6 +494,104 @@ impl MntrsFs {
         ino
     }
 
+    /// Same as `alloc_ino` but seeds the inodes entry's mtime slot
+    /// with the given timestamp. Used by mkdir/create so that
+    /// `getattr` can fall back to it when `stat_op` returns None
+    /// (Bug C — see `CoreFilesystem::getattr`). The 4-tuple's mtime
+    /// was always `None` before this helper; we still keep the
+    /// 3-arg `alloc_ino` for callers that don't have a meaningful
+    /// mtime at hand (e.g. internal re-lookups).
+    fn alloc_ino_with_mtime(
+        &self,
+        path: &str,
+        kind: FileType,
+        size: u64,
+        mtime: SystemTime,
+    ) -> u64 {
+        let ino = NEXT_INO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inodes
+            .entry(ino)
+            .and_modify(|v| v.2 = size)
+            .or_insert((path.to_string(), kind, size, Some(mtime)));
+        ino
+    }
+
+    /// Look up the ino currently registered for `path` (linear scan — the
+    /// inodes map is small, typically O(open-files) plus cached lookups).
+    ///
+    /// Needed because `inodes` is keyed by the `NEXT_INO` counter that
+    /// `alloc_ino` mints, *not* by `path_hash`. Operations that receive a
+    /// full path (mkdir/rmdir/unlink) and need to remove the ino entry
+    /// must look up the counter by path before calling `inodes.remove`.
+    /// Using `path_hash(&path)` here — as the rename pre-fix code did —
+    /// is a silent no-op: the FUSE kernel then keeps using the stale
+    /// ino for subsequent operations on the same path, and a recreate
+    /// at the same path collides with the lingering entry.
+    ///
+    /// `pub(crate)` so integration tests in `tests/` can verify the
+    /// rename/rmdir/unlink leak fix.
+    pub(crate) fn find_ino_by_path(&self, path: &str) -> Option<u64> {
+        self.inodes
+            .iter()
+            .find(|e| e.value().0 == path)
+            .map(|e| *e.key())
+    }
+
+    /// Recursively create `full_path` (and any missing parents) on the
+    /// backend. Returns Ok(()) when every level either was created or
+    /// already existed; propagates only *non-recoverable* errors
+    /// (network/auth/permission).
+    ///
+    /// Error policy (per backend quirks surfaced in the e2e tests):
+    ///
+    ///   * `Unsupported` — some backends (e.g. flat-namespace stores)
+    ///     do not implement `create_dir` because directories are
+    ///     implicit. Treat as success: the dir is "known" by virtue
+    ///     of objects living under it.
+    ///   * `AlreadyExists` — idempotent. mkdir -p on an existing
+    ///     tree must not fail.
+    ///   * `NotFound` for an *intermediate* — only happens if the
+    ///     backend has no implicit-dir semantics. We surface it as
+    ///     an error so the caller (mkdir) can decide what to do.
+    ///   * Anything else — propagate.
+    fn mkdir_chain(&self, full_path: &str) -> std::io::Result<()> {
+        // Collect every dir level we need to ensure exists, leaf last.
+        // For full_path = "a/b/c" we walk up: ["a/b/c/", "a/b/", "a/"].
+        // Reversed: ["a/", "a/b/", "a/b/c/"].
+        let mut chain: Vec<String> = Vec::new();
+        let mut cur = full_path.trim_end_matches('/').to_string();
+        while !cur.is_empty() {
+            chain.push(format!("{}/", cur));
+            match cur.rfind('/') {
+                Some(pos) => cur.truncate(pos),
+                None => cur.clear(),
+            }
+        }
+        chain.reverse();
+
+        let op = self.op.clone();
+        rt().block_on(async move {
+            for p in &chain {
+                match op.create_dir(p).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == opendal::ErrorKind::Unsupported => {
+                        tracing::debug!(path = %p,
+                            "backend does not support create_dir; treating as implicit dir");
+                    }
+                    Err(e) if e.kind() == opendal::ErrorKind::AlreadyExists => {
+                        // Idempotent — the dir is already there.
+                    }
+                    Err(e) => {
+                        return Err(std::io::Error::other(format!(
+                            "create_dir({p}) failed: {e}"
+                        )));
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
     fn stat_op(&self, path: &str) -> Option<(FileType, u64, Option<SystemTime>)> {
         // Check attr cache first
         if let Some(entry) = self.attr_cache.get(path) {
@@ -541,10 +671,31 @@ impl MntrsFs {
         // the error so the FUSE reply carries EIO/ENOENT and the
         // tracing pipeline (RUST_LOG + MNTRS_DAEMON_LOG) records the
         // opendal error verbatim.
+        //
+        // Bug B follow-up: the *one* exception is `NotFound`, which on
+        // most backends means "the dir exists in our model but the
+        // backend has no record of it" (e.g. an empty dir on S3, or
+        // a just-mkdir'd dir on memory before any child was written).
+        // For implicit-dir semantics (the default, matching rclone
+        // VFS), an empty listing is the right answer. We still return
+        // a cached empty entry so subsequent readdirs don't pay the
+        // backend round-trip cost.
         let mut result = rt().block_on(async {
             let op = self.op.clone();
             let p = path.to_string();
-            let mut lister = op.lister(&p).await?;
+            // Bug B follow-up: if the lister init returns NotFound,
+            // treat it as "this dir exists in our model but has no
+            // entries on the backend right now" — return an empty
+            // listing rather than propagating EIO. This matches
+            // rclone VFS implicit-dir semantics. We still surface
+            // every other lister-init error (auth, permission, network).
+            let mut lister = match op.lister(&p).await {
+                Ok(l) => l,
+                Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+                    return Ok::<_, opendal::Error>(Vec::new());
+                }
+                Err(e) => return Err(e),
+            };
             let mut out = vec![];
             while let Some(item) = lister.next().await {
                 let entry = item?;
@@ -623,7 +774,18 @@ impl MntrsFs {
     }
 
     /// Add a single entry to directory cache (like rclone addObject).
-    /// Called after create() to avoid full directory re-read.
+    /// Called after create() / mkdir() to avoid full directory re-read.
+    ///
+    /// Bug B fix: the pre-fix version only updated an *existing* cache
+    /// entry. When mkdir -p created a chain like `a/b/c` and the
+    /// parent's dir_cache was cold (no prior readdir had populated
+    /// it), the new entry was silently dropped. The next readdir on
+    /// the parent fell through to the backend, where the path was
+    /// empty/missing, and the user got EIO. The fix initializes the
+    /// cache with just the new entry when the parent slot is empty,
+    /// so the subsequent readdir sees it. (A later readdir that
+    /// actually hits the backend will re-merge; that's harmless —
+    /// the cache-add path is idempotent for the same name+mode.)
     fn cache_add_entry(
         &self,
         parent_path: &str,
@@ -635,6 +797,14 @@ impl MntrsFs {
         if let Some(entry) = self.dir_cache.get(parent_path) {
             let (_, entries) = entry.value();
             entries.insert(name.to_string(), (mode, size, mtime));
+        } else {
+            let entries: dashmap::DashMap<String, (EntryMode, u64, SystemTime)> =
+                dashmap::DashMap::new();
+            entries.insert(name.to_string(), (mode, size, mtime));
+            self.dir_cache.insert(
+                parent_path.to_string(),
+                (std::time::Instant::now(), entries),
+            );
         }
     }
 
@@ -1060,10 +1230,14 @@ impl Filesystem for MntrsFs {
                 format!("{}/{}", path, name)
             };
             let ino = self.alloc_ino(&cp, *kind, *size);
-            let mut attr = self.make_attr(ino, *size, *kind, SystemTime::UNIX_EPOCH);
-            if let Some(mt) = mtime {
-                attr.mtime = *mt;
-            }
+            // Bug C fix: pass the backend's mtime through. The previous
+            // version passed UNIX_EPOCH and then overwrote mtime in the
+            // next two lines, leaving atime/ctime/crtime at 1970-01-01.
+            // For dir entries with no backend mtime (e.g. just-created
+            // dirs not yet written through), fall back to now() so the
+            // FUSE kernel shows a sane timestamp in `ls -la` output.
+            let effective_mtime = mtime.unwrap_or_else(SystemTime::now);
+            let attr = self.make_attr(ino, *size, *kind, effective_mtime);
             if reply.add(
                 INodeNo(ino),
                 (i + 1) as u64,
@@ -1135,20 +1309,19 @@ impl Filesystem for MntrsFs {
                 dirty_since: None,
             },
         );
+        // Bug C fix: a freshly-created file should have current
+        // mtime/atime/ctime, not 1970-01-01. The previous version
+        // passed UNIX_EPOCH to make_attr, so stat (and tools like
+        // `ls -la`) showed every new file with the Unix epoch.
+        let now = SystemTime::now();
         reply.created(
             &self.attr_ttl,
-            &self.make_attr(ino, 0, FileType::RegularFile, SystemTime::UNIX_EPOCH),
+            &self.make_attr(ino, 0, FileType::RegularFile, now),
             Generation(0),
             FileHandle(fh),
             FopenFlags::empty(),
         );
-        self.cache_add_entry(
-            &parent_path,
-            &name,
-            EntryMode::FILE,
-            0,
-            SystemTime::UNIX_EPOCH,
-        );
+        self.cache_add_entry(&parent_path, &name, EntryMode::FILE, 0, now);
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
@@ -1588,27 +1761,20 @@ impl Filesystem for MntrsFs {
         } else {
             format!("{}/{}", parent_path, name)
         };
-        let dir_path = format!("{}/", full_path.trim_end_matches('/'));
-        let op = self.op.clone();
-        let p = dir_path.clone();
-        match rt().block_on(async move { op.create_dir(&p).await }) {
-            Ok(_) => {
-                let ino = self.alloc_ino(&full_path, FileType::Directory, 4096);
-                reply.entry(
-                    &self.attr_ttl,
-                    &self.make_attr(ino, 4096, FileType::Directory, SystemTime::UNIX_EPOCH),
-                    Generation(0),
-                );
-                self.cache_add_entry(
-                    &parent_path,
-                    &name,
-                    EntryMode::DIR,
-                    4096,
-                    SystemTime::UNIX_EPOCH,
-                );
-            }
-            Err(_) => reply.error(Errno::EIO),
+        // Bug A fix: same recursive-chain mkdir used by the active
+        // CoreFilesystem impl. See `mkdir_chain` for the rationale.
+        if let Err(e) = self.mkdir_chain(&full_path) {
+            reply.error(io_err_to_fuse_errno(e));
+            return;
         }
+        let now = SystemTime::now();
+        let ino = self.alloc_ino(&full_path, FileType::Directory, 4096);
+        reply.entry(
+            &self.attr_ttl,
+            &self.make_attr(ino, 4096, FileType::Directory, now),
+            Generation(0),
+        );
+        self.cache_add_entry(&parent_path, &name, EntryMode::DIR, 4096, now);
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
@@ -1626,8 +1792,17 @@ impl Filesystem for MntrsFs {
         let op = self.op.clone();
         let p = dir_path.clone();
         let p2 = p.clone();
-        if rt().block_on(async move { op.delete(&p2).await }).is_err() {
-            tracing::debug!(path=%p, "rmdir delete failed");
+        // Bug D fix: propagate backend errors. POSIX requires
+        // rmdir("non-empty-dir") to return EEXIST, and rmdir of a
+        // missing path to return ENOENT. The previous "swallow + ok"
+        // pattern returned success for both, breaking `rm -rf` and
+        // any other userland tool that checks the return code.
+        if let Err(e) = rt()
+            .block_on(async move { op.delete(&p2).await })
+            .map_err(|e| opendal_to_io_error(&e, "rmdir"))
+        {
+            reply.error(io_err_to_fuse_errno(e));
+            return;
         }
         // Clean cache entries
         let prefix = format!("{:020x}_", crate::path_hash(&full_path));
@@ -1641,7 +1816,13 @@ impl Filesystem for MntrsFs {
             }
         }
         self.disk_cache_index.remove(&full_path as &str);
-        self.inodes.remove(&path_hash(&full_path));
+        // Bug E fix: inodes is keyed by NEXT_INO counter, not
+        // path_hash. The pre-fix code's `inodes.remove(&path_hash(p))`
+        // was a no-op; the stale ino would then collide with any
+        // future mkdir at the same path.
+        if let Some(ino) = self.find_ino_by_path(&full_path) {
+            self.inodes.remove(&ino);
+        }
         self.attr_cache.remove(&full_path);
         self.cache_remove_entry(&parent_path, &name);
         self.invalidate_dir_cache(&full_path);
@@ -1869,10 +2050,18 @@ impl Filesystem for MntrsFs {
             format!("{}/{}", parent_path, name)
         };
         let op = self.op.clone();
-        let p = full_path.clone();
         let p2 = full_path.clone();
-        if rt().block_on(async move { op.delete(&p2).await }).is_err() {
-            tracing::debug!(path=%p, "unlink remote failed");
+        // Bug D fix: propagate the backend error. unlink on a missing
+        // file must return ENOENT (POSIX). The previous code logged
+        // and returned ok, which caused `rm` to exit 0 even when the
+        // backend had no record of the file — silently destructive
+        // for any cleanup script that branches on the error code.
+        if let Err(e) = rt()
+            .block_on(async move { op.delete(&p2).await })
+            .map_err(|e| opendal_to_io_error(&e, "unlink"))
+        {
+            reply.error(io_err_to_fuse_errno(e));
+            return;
         }
         let cpath = cache_path(&self.cache_dir, &full_path);
         if let Err(e) = fs::remove_file(&cpath) {
@@ -1890,7 +2079,10 @@ impl Filesystem for MntrsFs {
             }
         }
         self.disk_cache_index.remove(&full_path as &str);
-        self.inodes.remove(&path_hash(&full_path));
+        // Bug E fix: see rmdir above.
+        if let Some(ino) = self.find_ino_by_path(&full_path) {
+            self.inodes.remove(&ino);
+        }
         self.attr_cache.remove(&full_path);
         self.cache_remove_entry(&parent_path, &name);
         reply.ok();
@@ -2048,8 +2240,9 @@ impl CoreFilesystem for MntrsFs {
                 SystemTime::UNIX_EPOCH,
             )));
         }
-        if let Some((path, kind, inodes_size, _)) = self.resolve(ino) {
-            let (_, backend_size, mtime) = self.stat_op(&path).unwrap_or((kind, inodes_size, None));
+        if let Some((path, kind, inodes_size, inodes_mtime)) = self.resolve(ino) {
+            let (_, backend_size, backend_mtime) =
+                self.stat_op(&path).unwrap_or((kind, inodes_size, None));
             // Use the larger of inodes size and backend size.
             //
             //   * inodes_size — updated synchronously by write() and
@@ -2073,7 +2266,22 @@ impl CoreFilesystem for MntrsFs {
             // dead and should be deleted, but for now the fix lives
             // in the actively-dispatched CoreFilesystem impl.
             let size = inodes_size.max(backend_size);
-            let mtime = mtime.unwrap_or(SystemTime::UNIX_EPOCH);
+            // Bug C fix (deeper layer): prefer the backend's mtime
+            // (when it has one — e.g. the user opted into
+            // `use_server_modtime`), then fall back to the inodes
+            // entry's mtime (which `alloc_ino` and the write path
+            // populate with `now()`), and only then to UNIX_EPOCH.
+            //
+            // The pre-fix `mtime.unwrap_or(UNIX_EPOCH)` discarded
+            // the inodes mtime entirely, so a freshly-mkdir'd or
+            // freshly-written file's stat always showed 1970-01-01
+            // regardless of how the upper layers set the timestamp.
+            // This was masked by callers that did `let _ =` on
+            // stat_op's None return, but the visible symptom — `ls
+            // -la` showing 1970 — is exactly what the audit caught.
+            let mtime = backend_mtime
+                .or(inodes_mtime)
+                .unwrap_or(SystemTime::UNIX_EPOCH);
             Ok(to_core_attr(&self.make_attr(ino, size, kind, mtime)))
         } else {
             Err(std::io::Error::new(
@@ -2527,17 +2735,21 @@ impl CoreFilesystem for MntrsFs {
         //   - if no entry exists, create one seeded with the new
         //     write's end offset
         //
-        // The initial mtime is `None`; subsequent writeback uploads
-        // populate it from the backend response.
+        // The initial mtime is set to `now()` (Bug C fix); the
+        // and_modify branch also updates it on every subsequent write
+        // so a read-after-write sees a fresh mtime even before the
+        // writeback upload has landed.
         let end = _offset + _data.len() as u64;
+        let write_mtime = std::time::SystemTime::now();
         self.inodes
             .entry(_ino)
             .and_modify(|v| {
                 if end > v.2 {
                     v.2 = end;
                 }
+                v.3 = Some(write_mtime);
             })
-            .or_insert_with(|| (path.clone(), FileType::RegularFile, end, None));
+            .or_insert_with(|| (path.clone(), FileType::RegularFile, end, Some(write_mtime)));
 
         // Invalidate mem_cache for this ino.
         //
@@ -2683,11 +2895,15 @@ impl CoreFilesystem for MntrsFs {
         let op = self.op.clone();
         let p = full_path.clone();
         rt().block_on(async move { op.write(&p, Vec::<u8>::new()).await })
-            .map_err(|_| std::io::Error::other("create failed"))?;
+            .map_err(|e| opendal_to_io_error(&e, "create"))?;
         let (kind, size, mtime) =
             self.stat_op(&full_path)
                 .unwrap_or((FileType::RegularFile, 0, None));
-        let ino = self.alloc_ino(&full_path, kind, size);
+        // Bug C fix: seed the inodes mtime so a follow-up getattr
+        // (before the backend's stat_op caches anything) doesn't
+        // fall back to UNIX_EPOCH.
+        let now = SystemTime::now();
+        let ino = self.alloc_ino_with_mtime(&full_path, kind, size, mtime.unwrap_or(now));
         // Insert Write handle so follow-up write() can find the path
         // Create cache file for write handle
         let cpath = crate::cache_path(&self.cache_dir, &full_path);
@@ -2740,18 +2956,28 @@ impl CoreFilesystem for MntrsFs {
         } else {
             format!("{}/{}", parent_path, name)
         };
-        let dir_path = format!("{}/", full_path.trim_end_matches('/'));
-        let op = self.op.clone();
-        let p = dir_path.clone();
-        rt().block_on(async move { op.create_dir(&p).await })
-            .map_err(|_| std::io::Error::other("mkdir failed"))?;
-        let ino = self.alloc_ino(&full_path, FileType::Directory, 4096);
-        self.cache_add_entry(&parent_path, name, EntryMode::DIR, 4096, SystemTime::now());
+        // Recursively create the entire path (parents + leaf).
+        // Bug A fix: a single create_dir on "a/b/c/" leaves "a/" and
+        // "a/b/" un-created on flat-namespace backends, so subsequent
+        // `ls a/` returns EIO. mkdir_chain walks up and creates each
+        // level, treating Unsupported (implicit-dir backends) and
+        // AlreadyExists (idempotent) as success.
+        self.mkdir_chain(&full_path)?;
+        let now = SystemTime::now();
+        // Bug C follow-up: use the mtime-aware allocator so the
+        // inodes entry's mtime slot is populated. The pre-fix
+        // `alloc_ino` left it as `None`, and `getattr` would
+        // then fall back to UNIX_EPOCH (see Bug C fix in
+        // `CoreFilesystem::getattr`).
+        let ino = self.alloc_ino_with_mtime(&full_path, FileType::Directory, 4096, now);
+        // Bug B fix: prime the parent's dir_cache so a readdir on the
+        // parent sees this new entry without a full backend re-list.
+        self.cache_add_entry(&parent_path, name, EntryMode::DIR, 4096, now);
         Ok(to_core_attr(&self.make_attr(
             ino,
             4096,
             FileType::Directory,
-            SystemTime::now(),
+            now,
         )))
     }
 
@@ -2767,8 +2993,15 @@ impl CoreFilesystem for MntrsFs {
         };
         let op = self.op.clone();
         let p = full_path.clone();
+        // Bug D fix: preserve the opendal error kind so POSIX callers
+        // get the right errno (NotFound→ENOENT, IsADirectory→EISDIR,
+        // etc.) instead of a blanket EIO. The previous
+        // `map_err(|_| Error::other("unlink failed"))` swallowed the
+        // kind, which meant unlink on a non-existent file returned
+        // EIO — apps like rm would treat it as a generic I/O error
+        // and refuse to continue.
         rt().block_on(async move { op.delete(&p).await })
-            .map_err(|_| std::io::Error::other("unlink failed"))?;
+            .map_err(|e| opendal_to_io_error(&e, "unlink"))?;
         let cpath = crate::cache_path(&self.cache_dir, &full_path);
         let _ = std::fs::remove_file(&cpath);
         // Clean block-level cache entries
@@ -2783,7 +3016,16 @@ impl CoreFilesystem for MntrsFs {
             }
         }
         self.disk_cache_index.remove(&full_path);
-        self.inodes.remove(&crate::path_hash(&full_path));
+        // Bug E fix: inodes is keyed by the NEXT_INO counter, not
+        // path_hash. Use find_ino_by_path to locate the correct ino
+        // before removing. path_hash(&full_path) was a no-op
+        // (path_hash is FNV-1a of the path, NEXT_INO is a monotonic
+        // counter — they almost never coincide), so the inodes entry
+        // leaked across the unlink, and a subsequent create at the
+        // same path collided with the stale ino.
+        if let Some(ino) = self.find_ino_by_path(&full_path) {
+            self.inodes.remove(&ino);
+        }
         self.attr_cache.remove(&full_path);
         self.cache_remove_entry(&parent_path, name);
         Ok(())
@@ -2802,9 +3044,17 @@ impl CoreFilesystem for MntrsFs {
         let dir_path = format!("{}/", full_path.trim_end_matches('/'));
         let op = self.op.clone();
         let p = dir_path.clone();
+        // Bug D fix: same as unlink — preserve the opendal error
+        // kind. POSIX requires rmdir on a non-empty directory to
+        // return EEXIST ("EEXIST: directory not empty"); the previous
+        // blanket EIO left rm -rf in an undefined state on such
+        // backends (some pre-check emptyness, some don't).
         rt().block_on(async move { op.delete(&p).await })
-            .map_err(|_| std::io::Error::other("rmdir failed"))?;
-        self.inodes.remove(&crate::path_hash(&full_path));
+            .map_err(|e| opendal_to_io_error(&e, "rmdir"))?;
+        // Bug E fix: inodes keyed by NEXT_INO, not path_hash.
+        if let Some(ino) = self.find_ino_by_path(&full_path) {
+            self.inodes.remove(&ino);
+        }
         self.attr_cache.remove(&full_path);
         self.cache_remove_entry(&parent_path, name);
         self.invalidate_dir_cache(&full_path);

@@ -44,7 +44,11 @@ fn from_core_attr(a: &CoreFileAttr) -> FileAttr {
     }
 }
 
-fn io_err_to_fuse_errno(e: std::io::Error) -> Errno {
+/// Convert a `std::io::Error` into the closest `fuser::Errno`. Public to
+/// `crate` so the legacy `impl Filesystem for MntrsFs` in `lib.rs` can
+/// reuse the same mapping (it predates the `CoreFilesystem` adapter but
+/// shares dispatch through `reply.error(...)`).
+pub(crate) fn io_err_to_fuse_errno(e: std::io::Error) -> Errno {
     match e.kind() {
         std::io::ErrorKind::NotFound => Errno::ENOENT,
         std::io::ErrorKind::PermissionDenied => Errno::EACCES,
