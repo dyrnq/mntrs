@@ -671,3 +671,34 @@ jobs:
           name: mount-log-hdfs-kerberos
           path: /tmp/mntrs-mount.log
           if-no-files-found: warn
+
+  # Stress loop on the memory backend — surfaces flakes that
+  # single-run tests miss. The memory backend has no remote
+  # state, so a flake here is purely an mntrs-side bug. The
+  # script runs 50 iterations of the 11 sub-tests + rename.
+  memory-stress-loop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev fuse3
+          sudo grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+
+      - name: Build mntrs
+        run: cargo build --release -p mntrs
+
+      - name: Run 50-iteration stress loop
+        run: |
+          chmod +x ./tests/e2e/mount/stress_loop.sh
+          ./tests/e2e/mount/stress_loop.sh 50
+
+      - name: Cleanup
+        if: always()
+        run: |
+          fusermount3 -uz /tmp/mntrs-test 2>/dev/null || fusermount -uz /tmp/mntrs-test 2>/dev/null || true
+          pkill -9 -f "target/release/mntrs mount" 2>/dev/null || true
