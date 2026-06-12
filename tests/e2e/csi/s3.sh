@@ -216,14 +216,6 @@ else
     # and eventually
     #   "driver name csi-mntrs not found in the list of registered CSI
     #    drivers").
-    log "  creating docker-registry secret reg-e2e in ${CSI_NAMESPACE}..."
-    ${KUBECTL} -n "${CSI_NAMESPACE}" create secret docker-registry reg-e2e \
-        --docker-server="${REGISTRY}" \
-        --docker-username="${REGISTRY_USER}" \
-        --docker-password="${REGISTRY_PASS}" \
-        --docker-email=e2e@example.com \
-        --dry-run=client -o yaml | ${KUBECTL} apply -f -
-
     DEPLOY_DIR="$(mktemp -d)"
     SRC="${REPO_ROOT}/csi/deploy/kubernetes/1.20"
     for f in 00-namespace.yaml 01-csidriver.yaml 02-controller-rbac.yaml \
@@ -241,6 +233,20 @@ else
         - name: reg-e2e" \
             "${DEPLOY_DIR}/${f}"
     done
+
+    # Apply 00-namespace.yaml first so the reg-e2e secret we create next
+    # lands in a real namespace. Then create the secret, then apply the
+    # rest of the manifests.
+    log "  creating namespace ${CSI_NAMESPACE}..."
+    ${KUBECTL} apply -f "${DEPLOY_DIR}/00-namespace.yaml"
+
+    log "  creating docker-registry secret reg-e2e in ${CSI_NAMESPACE}..."
+    ${KUBECTL} -n "${CSI_NAMESPACE}" create secret docker-registry reg-e2e \
+        --docker-server="${REGISTRY}" \
+        --docker-username="${REGISTRY_USER}" \
+        --docker-password="${REGISTRY_PASS}" \
+        --docker-email=e2e@example.com \
+        --dry-run=client -o yaml | ${KUBECTL} apply -f -
 
     ${KUBECTL} apply -f "${DEPLOY_DIR}/"
 
