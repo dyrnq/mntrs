@@ -21,19 +21,31 @@ spec:
           args:
             - "--csi-address=$(ADDRESS)"
             - "--extra-create-metadata"
+            - "--http-endpoint=:9808"
             - "--v=1"
           env:
             - name: ADDRESS
               value: /plugin/csi.sock
           imagePullPolicy: Always
+          # httpGet probe: csi-provisioner's --http-endpoint serves a /healthz
+          # that 200s when the provisioner can reach csi.sock. Replaces the
+          # old `exec: /bin/sh -c "ls /plugin/csi.sock ..."` probe, which
+          # 100% failed because csi-provisioner v5.0.2 is
+          # gcr.io/distroless/static:latest (no /bin/sh) and triggered a
+          # failureThreshold×periodSeconds restart loop that tore csi.sock
+          # down mid-mount.
+          ports:
+            - name: healthz
+              containerPort: 9808
+              protocol: TCP
           livenessProbe:
-            exec:
-              command:
-                - /bin/sh
-                - -c
-                - "ls /plugin/csi.sock > /dev/null 2>&1 || exit 1"
+            httpGet:
+              path: /healthz
+              port: healthz
             initialDelaySeconds: 10
             periodSeconds: 30
+            failureThreshold: 3
+            timeoutSeconds: 10
           volumeMounts:
             - name: socket-dir
               mountPath: /plugin
@@ -41,19 +53,25 @@ spec:
           image: k8s.gcr.io/sig-storage/csi-attacher:v3.4.0
           args:
             - "--csi-address=$(ADDRESS)"
+            - "--http-endpoint=:9809"
             - "--v=1"
           env:
             - name: ADDRESS
               value: /plugin/csi.sock
           imagePullPolicy: Always
+          # see livenessProbe note on csi-provisioner above
+          ports:
+            - name: healthz
+              containerPort: 9809
+              protocol: TCP
           livenessProbe:
-            exec:
-              command:
-                - /bin/sh
-                - -c
-                - "ls /plugin/csi.sock > /dev/null 2>&1 || exit 1"
+            httpGet:
+              path: /healthz
+              port: healthz
             initialDelaySeconds: 10
             periodSeconds: 30
+            failureThreshold: 3
+            timeoutSeconds: 10
           volumeMounts:
             - name: socket-dir
               mountPath: /plugin

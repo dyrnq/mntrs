@@ -21,16 +21,37 @@ spec:
           lifecycle:
             preStop:
               exec:
+                # preStop is fine here: the registrar is distroless too, but
+                # preStop exec failure only blocks shutdown, not steady-state
+                # liveness. If this ever fails we'll see it once in the journal,
+                # not in a 30s restart loop.
                 command: ["/bin/sh", "-c", "rm -rf /registration/csi-mntrs /registration/csi-mntrs-reg.sock"]
           args:
             - --v=1
             - --csi-address=/plugin/csi.sock
             - --kubelet-registration-path=/var/lib/kubelet/plugins/csi-mntrs/csi.sock
+            - --http-endpoint=:9810
           env:
             - name: KUBE_NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+          # httpGet probe: csi-node-driver-registrar v2.4.0's --http-endpoint
+          # serves a /healthz that 200s when the registration socket is
+          # reachable. Replaces the old /bin/sh exec probe that 100% failed
+          # on this distroless image.
+          ports:
+            - name: healthz
+              containerPort: 9810
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+            timeoutSeconds: 10
           volumeMounts:
             - name: plugin-dir
               mountPath: /plugin
@@ -54,6 +75,11 @@ spec:
             - name: CSI_ENDPOINT
               value: unix://plugin/csi.sock
           imagePullPolicy: Always
+          # exec /bin/sh probe is OK here: the mntrs image is alpine:3.21 +
+          # fuse3-libs, which has /bin/sh. The probe is a weak "socket file
+          # exists" check (not gRPC Identity.Probe) — that's a known
+          # limitation; promoting it to a real gRPC probe would need a
+          # tiny client binary, out of scope here.
           livenessProbe:
             exec:
               command:
@@ -62,6 +88,7 @@ spec:
                 - "ls /plugin/csi.sock > /dev/null 2>&1 || exit 1"
             initialDelaySeconds: 10
             periodSeconds: 30
+            failureThreshold: 3
           volumeMounts:
             - name: plugin-dir
               mountPath: /plugin
