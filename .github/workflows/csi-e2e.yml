@@ -116,7 +116,21 @@ jobs:
           MINIO_ENDPOINT: ${{ env.MINIO_ENDPOINT }}
           KEEP_ON_FAIL: ${{ env.KEEP_ON_FAIL }}
         run: |
-          bash tests/e2e/csi/s3.sh
+          set +e
+          bash tests/e2e/csi/s3.sh 2>&1 | tee /tmp/s3-e2e.log
+          SCRIPT_EXIT=${PIPESTATUS[0]}
+          echo "=== s3.sh exit code: ${SCRIPT_EXIT} ==="
+          # Force the workflow step to fail with the script's real exit code
+          # (PIPESTATUS survives only within this same shell, so we exit here)
+          exit "${SCRIPT_EXIT}"
+
+      - name: Upload s3.sh log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3-e2e-log
+          path: /tmp/s3-e2e.log
+          if-no-files-found: warn
 
       - name: Dump on failure
         if: failure()
