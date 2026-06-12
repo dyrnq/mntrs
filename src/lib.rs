@@ -176,7 +176,13 @@ pub struct MntrsFs {
     /// verify backend state) without going through the FUSE layer.
     /// Production code paths use the helper methods.
     pub op: Arc<Operator>,
-    inodes: dashmap::DashMap<u64, (String, FileType, u64, Option<std::time::SystemTime>)>,
+    /// Per-inode metadata. Exposed `pub` so the integration tests
+    /// in `tests/bug_regression_test.rs` can simulate a `BATCHFORGET`
+    /// by removing the ino entry, then re-lookup to verify the new
+    /// ino is self-consistent with the cache-file state (Bug F fix
+    /// — `CoreFilesystem::lookup` / `getattr` now consider the
+    /// local cache file's size, not just the backend).
+    pub inodes: dashmap::DashMap<u64, (String, FileType, u64, Option<std::time::SystemTime>)>,
     dir_cache: dashmap::DashMap<
         String,
         (
@@ -184,7 +190,10 @@ pub struct MntrsFs {
             dashmap::DashMap<String, (EntryMode, u64, std::time::SystemTime)>,
         ),
     >,
-    cache_dir: PathBuf,
+    /// Local on-disk cache directory. `pub` so integration tests
+    /// can construct / inspect cache-file paths (e.g. for the Bug F
+    /// regression test that simulates a pending writeback).
+    pub cache_dir: PathBuf,
     handles: dashmap::DashMap<u64, FileHandleState>,
     pub(crate) dir_cache_ttl: Duration,
     pub(crate) attr_ttl: Duration,
@@ -2198,8 +2207,23 @@ impl CoreFilesystem for MntrsFs {
         // delay). If the backend says "not found" but a cache
         // file exists, trust the cache file. Same pattern as
         // read() and the rename fallback.
+        //
+        // Pre-existing-bug fix (CI test 6, HDFS append): when the
+        // backend reports a small size but the local cache file
+        // is larger (a recent write hasn't been uploaded yet),
+        // the larger cache-file size wins. The previous version
+        // blindly used the backend's size, so a follow-up
+        // `cat <file>` after `echo "x" >> <file>` reported the
+        // pre-append size and truncated the read to that. The
+        // FUSE kernel uses our getattr-returned size as the
+        // authoritative EOF, so a stale lookup made every
+        // post-write read see the old length. Lookup is the
+        // first call after a `BATCHFORGET`, so it has to be
+        // self-consistent with the cache-file state.
         let (kind, size, mtime) = if let Some((k, s, m)) = self.stat_op(&full_path) {
-            (k, s, m)
+            let cpath = crate::cache_path(&self.cache_dir, &full_path);
+            let cache_size = std::fs::metadata(&cpath).map(|m| m.len()).unwrap_or(0);
+            (k, s.max(cache_size), m)
         } else {
             let cpath = crate::cache_path(&self.cache_dir, &full_path);
             match std::fs::metadata(&cpath) {
@@ -2243,7 +2267,8 @@ impl CoreFilesystem for MntrsFs {
         if let Some((path, kind, inodes_size, inodes_mtime)) = self.resolve(ino) {
             let (_, backend_size, backend_mtime) =
                 self.stat_op(&path).unwrap_or((kind, inodes_size, None));
-            // Use the larger of inodes size and backend size.
+            // Use the larger of inodes size, backend size, and the
+            // on-disk cache file size.
             //
             //   * inodes_size — updated synchronously by write() and
             //     setattr(); always reflects the most recent local change
@@ -2252,20 +2277,19 @@ impl CoreFilesystem for MntrsFs {
             //     and is permanently 0 for backends that have no
             //     on-server state to stat (notably memory://, which is
             //     in-process only)
-            //
-            // Returning the larger of the two ensures the kernel sees
-            // at least as many bytes as we've actually written, even if
-            // the writeback upload hasn't landed yet.
-            //
-            // HISTORY: the same intent was applied in commit d4d19c8,
-            // but the patch landed on `impl Filesystem for MntrsFs`
-            // (lib.rs:~934) — code that is never actually called. The
-            // live dispatch is `core_fs::fuser::FuserAdapter::getattr`
-            // → `CoreFilesystem::getattr` here. The two impls exist
-            // side by side; the older fuser-trait impl is effectively
-            // dead and should be deleted, but for now the fix lives
-            // in the actively-dispatched CoreFilesystem impl.
-            let size = inodes_size.max(backend_size);
+            //   * cache_size — the local cache file's byte length.
+            //     This is the source of truth for the most-recent
+            //     write that the user has issued but the backend
+            //     hasn't seen yet (writeback delay). The previous
+            //     version ignored it; the FUSE kernel then saw a
+            //     pre-write size for a freshly-appended file and
+            //     truncated the read to that. The same pattern is
+            //     now applied to `lookup` (see that function's
+            //     comment).
+            let cache_size = std::fs::metadata(crate::cache_path(&self.cache_dir, &path))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let size = inodes_size.max(backend_size).max(cache_size);
             // Bug C fix (deeper layer): prefer the backend's mtime
             // (when it has one — e.g. the user opted into
             // `use_server_modtime`), then fall back to the inodes

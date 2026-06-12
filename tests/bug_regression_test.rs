@@ -297,3 +297,83 @@ fn bug_e_unlink_clears_inodes_so_recreate_works() {
     // not that the ino was reused).
     let _ = first.ino;
 }
+
+// =====================================================================
+// Bug F (pre-existing, surfaced during HDFS local repro):
+// `lookup` and `getattr` ignored the local cache file's size, so
+// after `echo "x" >> pre_existing_file` a fresh `cat` saw the
+// pre-append size and truncated the read.
+// =====================================================================
+
+/// After the FUSE kernel forgets an ino and re-lookups it, the
+/// new ino's size must take the local cache file's bytes into
+/// account. Pre-fix, the lookup used `stat_op`'s backend size
+/// (small, because writeback is async) and the read was truncated
+/// to that — classic stale-EOF after a fresh write.
+///
+/// Reproduction: write a small file via the backend, then append
+/// a tail to the *cache file* (simulating a write whose upload
+/// hasn't landed yet), then re-lookup. The size must be
+/// `max(backend_size, cache_size)`, not just `backend_size`.
+#[test]
+fn bug_f_lookup_considers_cache_file_size() {
+    use mntrs::core_fs::CoreFilesystem;
+    let fs = Arc::new(make_memory_fs());
+
+    // 1. Create a small file on the backend (5 bytes).
+    let op = fs.op.clone();
+    futures::executor::block_on(async {
+        op.write("file.bin", "hello".as_bytes().to_vec())
+            .await
+            .unwrap();
+    });
+    // stat_op on memory backend reports the bytes we just wrote.
+    assert_eq!(
+        futures::executor::block_on(async { op.stat("file.bin").await.unwrap().content_length() }),
+        5
+    );
+
+    // 2. Simulate a pending write by extending the cache file to
+    // 20 bytes WITHOUT uploading to the backend (so the backend
+    // still reports 5, but the cache file is 20). This is the
+    // state the filesystem is in for ~5s after a real write,
+    // before the writeback worker uploads the cache file.
+    let cpath = mntrs::cache_path(&fs.cache_dir, "file.bin");
+    let cache_content = b"hello_world_appended!";
+    std::fs::write(&cpath, cache_content).unwrap();
+    assert_eq!(
+        std::fs::metadata(&cpath).unwrap().len() as usize,
+        cache_content.len()
+    );
+
+    // 3. First lookup: must reflect the larger cache file.
+    let attr1 = CoreFilesystem::lookup(&*fs, 1, "file.bin").unwrap();
+    assert_eq!(
+        attr1.size as usize,
+        cache_content.len(),
+        "lookup should use max(backend=5, cache=20), got {} (stale EOF?)",
+        attr1.size
+    );
+
+    // 4. Second lookup via a fresh ino (simulates BATCHFORGET +
+    //    re-resolve). Same expectation: size = 20.
+    let ino_a = attr1.ino;
+    // Forget the ino from the inodes map to force a fresh allocation.
+    fs.inodes.remove(&ino_a);
+    let attr2 = CoreFilesystem::lookup(&*fs, 1, "file.bin").unwrap();
+    assert_eq!(
+        attr2.size as usize,
+        cache_content.len(),
+        "second lookup (fresh ino) should also use max(backend, cache) = 20, got {}",
+        attr2.size
+    );
+
+    // 5. getattr on the new ino must agree with lookup.
+    let g = CoreFilesystem::getattr(&*fs, attr2.ino).unwrap();
+    assert_eq!(
+        g.size as usize,
+        cache_content.len(),
+        "getattr should also use max(backend, cache) = 20, got {}",
+        g.size
+    );
+}
