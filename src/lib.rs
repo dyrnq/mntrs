@@ -21,7 +21,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use crate::cache::MemCache;
+// `MemCache` trait is in scope via the `pub mem_cache:
+// Arc<dyn MemCache>` field declaration below; no explicit
+// `use` needed because the call sites use method syntax
+// (`.get(...)`, `.put(...)`, etc.) which is dispatched
+// dynamically through the trait object.
 
 #[cfg(unix)]
 use crate::core_fs::fuser::io_err_to_fuse_errno;
@@ -239,7 +243,15 @@ pub struct MntrsFs {
     pub(crate) disk_total_size: u64,
     writeback_sender: std::sync::OnceLock<writeback::Sender>,
 
-    mem_cache: std::sync::Arc<crate::cache::DashMapMemCache>,
+    /// Per-(inode, block) in-memory read cache. Held as a
+    /// `dyn MemCache` trait object so the underlying
+    /// implementation can be swapped (DashMap today, moka
+    /// behind a flag) without touching the read/write call
+    /// sites. All impls are `Send + Sync` (the trait bound),
+    /// so the `Arc<dyn MemCache>` is safe to share across the
+    /// FUSE worker threads + the metrics logger thread + the
+    /// writeback task.
+    pub mem_cache: std::sync::Arc<dyn crate::cache::MemCache>,
     attr_cache: dashmap::DashMap<
         String,
         (

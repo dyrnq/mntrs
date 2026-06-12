@@ -89,6 +89,14 @@ enum Commands {
         vfs_cache_max_size: u64,
         #[arg(long, default_value = "256")]
         mem_limit: u64,
+        /// Underlying `MemCache` impl: "dashmap" (default) or
+        /// "moka". Both honor the same `MemCache` trait, so
+        /// the choice is transparent to callers; it only
+        /// changes eviction policy (FIFO vs TinyLFU). Use
+        /// with `--mem-cache-metrics-interval` for a
+        /// head-to-head A/B.
+        #[arg(long, default_value = "dashmap", value_parser = ["dashmap", "moka"])]
+        mem_cache_impl: String,
         /// Emit mem_cache stats (hits/misses/inserts/evictions/
         /// entries/used/capacity) as one structured tracing
         /// event every N seconds. 0 = off (no background thread
@@ -304,6 +312,7 @@ fn main() -> anyhow::Result<()> {
             allow_idmap,
             vfs_cache_max_size,
             mem_limit,
+            mem_cache_impl,
             mem_cache_metrics_interval,
             vfs_write_back,
             vfs_cache_mode,
@@ -386,6 +395,7 @@ fn main() -> anyhow::Result<()> {
                 allow_idmap,
                 vfs_cache_max_size,
                 mem_limit,
+                &mem_cache_impl,
                 mem_cache_metrics_interval,
                 vfs_write_back,
                 &vfs_cache_mode,

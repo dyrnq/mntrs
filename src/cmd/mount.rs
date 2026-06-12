@@ -234,6 +234,7 @@ pub fn mount_internal(
         false,                    // allow_idmap
         0,                        // vfs_cache_max_size (off)
         256,                      // mem_limit
+        "dashmap",                // mem_cache_impl (default)
         0,                        // mem_cache_metrics_interval_secs (off)
         5,                        // vfs_write_back
         "off",                    // vfs_cache_mode
@@ -371,6 +372,18 @@ pub fn mount(
     _allow_idmap: bool,
     vfs_cache_max_size: u64,
     mem_limit: u64,
+    // Underlying `MemCache` impl to wire up. The PoC accepts
+    // two options:
+    //   * "dashmap" (default) — `DashMapMemCache`, the legacy
+    //     implementation. FIFO eviction, hand-rolled, ~5
+    //     crates. No new dep. Matches rclone parity and is
+    //     what every prior benchmark was run against.
+    //   * "moka" — `MokaMemCache` (moka::sync::Cache with
+    //     TinyLFU). Better skewed-access hit rates, but
+    //     pulls in parking_lot/crossbeam/arcshift and a
+    //     background maintenance thread. Use this for
+    //     head-to-head A/B via `--mem-cache-metrics-interval`.
+    mem_cache_impl: &str,
     // Seconds between mem_cache stats tracing events. 0 = off
     // (no background thread spawned). When > 0, one
     // structured `tracing::info!(target: "mntrs::mem_cache",
@@ -440,6 +453,33 @@ pub fn mount(
     } else {
         std::path::PathBuf::from(format!("{}/.cache/mntrs", home))
     };
+    // mem_limit is interpreted as MiB by the CLI; 0 means
+    // "unbounded" (still tracked, but no eviction triggered).
+    // Production default is 256 MiB (see `cli_defaults`
+    // above).
+    //
+    // The impl is selected by the `--mem-cache-impl` flag.
+    // Both impls are constructed as `Arc<dyn MemCache>`,
+    // so the call sites in `lib.rs` (which use method
+    // syntax) are unchanged — that's the whole point of
+    // the trait. We dispatch on a small string here
+    // rather than a full enum to keep the CLI surface
+    // stable across impl additions (moka and any future
+    // impl can be added without breaking the flag list).
+    let mem_cache_bytes = if mem_limit > 0 {
+        mem_limit * 1024 * 1024
+    } else {
+        0
+    };
+    let mem_cache: std::sync::Arc<dyn crate::cache::MemCache> = match mem_cache_impl {
+        "dashmap" => std::sync::Arc::new(crate::cache::DashMapMemCache::new(mem_cache_bytes)),
+        "moka" => std::sync::Arc::new(crate::cache::MokaMemCache::new(mem_cache_bytes)),
+        other => {
+            return Err(anyhow!(
+                "unknown --mem-cache-impl {other:?}; valid: dashmap, moka"
+            ));
+        }
+    };
     let fs = MntrsFs {
         op: Arc::new(op),
         inodes: dashmap::DashMap::new(),
@@ -495,15 +535,7 @@ pub fn mount(
         disk_total_size: vfs_disk_space_total_size * 1024 * 1024 * 1024 * 1024, // TB to bytes
         writeback_sender: std::sync::OnceLock::new(),
 
-        // mem_limit is interpreted as MiB by the CLI; 0 means
-        // "unbounded" (still tracked by DashMapMemCache, but
-        // no eviction triggered). Production default is 256 MiB
-        // (see `cli_defaults` above).
-        mem_cache: std::sync::Arc::new(crate::cache::DashMapMemCache::new(if mem_limit > 0 {
-            mem_limit * 1024 * 1024
-        } else {
-            0
-        })),
+        mem_cache,
         attr_cache: dashmap::DashMap::new(),
         disk_cache_index: dashmap::DashMap::new(),
         out_of_space: std::sync::atomic::AtomicBool::new(false),

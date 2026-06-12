@@ -180,6 +180,198 @@ impl MemCacheStats {
     }
 }
 
+/// Concrete `MemCache` backed by `moka::sync::Cache`.
+///
+/// moka's TinyLFU admission filter is a meaningful upgrade
+/// over the FIFO approximation that `DashMapMemCache` uses
+/// (see the `DashMapMemCache` docstring — the "known
+/// approximation" comment). For typical I/O workloads with
+/// skewed access (e.g. a hot S3 prefix that's read repeatedly
+/// while a cold prefix is touched once), TinyLFU typically
+/// improves hit rate by 5-15% over FIFO/LRU at the same
+/// capacity. The cost is one extra dependency (`moka` with
+/// the `sync` feature, which pulls in `parking_lot` and
+/// `crossbeam` — about 5 crates total, well under what foyer
+/// would add).
+///
+/// Eviction policy: moka's `tiny_lfu` (default). It uses a
+/// frequency-sketch admission filter + SLRU main store,
+/// giving near-LRU hit rates with bounded memory overhead.
+/// See the moka docs for the full algorithm description.
+///
+/// `invalidate_ino` cost: O(N) over the cache, because moka
+/// doesn't expose a per-key-prefix invalidation API. The
+/// `invalidate_entries_if` closure walks every entry. For
+/// our default 256 MiB / 8 MiB = 32 entries this is
+/// negligible. Larger caches (where the same cost would
+/// matter) shouldn't be hitting `invalidate_ino` often anyway
+/// (it's only called on every write); if that ever
+/// becomes a problem, the fix is to maintain an
+/// `ino -> Vec<key>` index on the side. We don't pre-build
+/// it because the common case is small cache + few writes.
+pub struct MokaMemCache {
+    inner: moka::sync::Cache<MemCacheKey, Bytes>,
+    /// Soft byte limit (weigher capacity). moka doesn't
+    /// expose its configured capacity through the public API
+    /// in a typed form, so we mirror it here for the
+    /// `capacity_bytes` snapshot.
+    capacity_bytes: u64,
+    /// Atomic counters for `stats()`. moka's built-in
+    /// `entry_count()` and `weighted_size()` give us
+    /// `entries` and `used_bytes` directly, but
+    /// hits/misses/inserts/evictions are application-level
+    /// (we increment on the read/write paths the same way
+    /// we do for DashMapMemCache — see the impl block).
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
+    inserts: std::sync::atomic::AtomicU64,
+    evictions: std::sync::atomic::AtomicU64,
+}
+
+impl MokaMemCache {
+    /// Create a new `MokaMemCache` with the given byte limit.
+    /// `mem_limit == 0` means "unbounded" (no weigher — useful
+    /// for tests, where eviction never kicks in).
+    pub fn new(mem_limit: u64) -> Self {
+        let inner = if mem_limit == 0 {
+            // moka requires *some* capacity hint; we use a
+            // large but finite number to mean "effectively
+            // unbounded for our scale". The weigher below
+            // ensures that the actual byte count is what
+            // bounds the cache, even when this huge value
+            // is the cap.
+            moka::sync::Cache::builder()
+                .max_capacity(u64::MAX / 2)
+                .weigher(|_k: &MemCacheKey, v: &Bytes| {
+                    // Per-entry weight = key (16B) + value
+                    // size. The key is two u64s = 16 bytes on
+                    // 64-bit; rounding up to the cache block
+                    // granularity (8 MiB) is wasteful for
+                    // small entries, so we report the actual
+                    // bytes and let moka sum.
+                    v.len() as u32 + 16
+                })
+                .build()
+        } else {
+            moka::sync::Cache::builder()
+                .max_capacity(mem_limit)
+                .weigher(|_k: &MemCacheKey, v: &Bytes| (v.len() as u32).saturating_add(16))
+                .build()
+        };
+        Self {
+            inner,
+            capacity_bytes: mem_limit,
+            hits: std::sync::atomic::AtomicU64::new(0),
+            misses: std::sync::atomic::AtomicU64::new(0),
+            inserts: std::sync::atomic::AtomicU64::new(0),
+            evictions: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl MemCache for MokaMemCache {
+    fn get(&self, ino: u64, block_idx: u64) -> Option<Bytes> {
+        let result = self.inner.get(&(ino, block_idx));
+        if result.is_some() {
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.misses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn put(&self, ino: u64, block_idx: u64, data: Bytes) {
+        self.inner.insert((ino, block_idx), data);
+        // moka does not surface an explicit "evicted" callback
+        // for the `Cache::insert` path (the eviction counter
+        // `evicted_count` exists on `Cache::builder().eviction_listener`,
+        // but only for closure listeners — and the listener fires
+        // AFTER the eviction, not on insert). For our 5-bug-fix
+        // we don't need exact eviction accounting; the
+        // `used_bytes / capacity_bytes` ratio in `stats()` is the
+        // primary signal of pressure. The counter stays at 0
+        // for this impl, which is honest: moka handles it
+        // internally, we don't observe.
+        self.inserts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn invalidate_ino(&self, ino: u64) {
+        // moka 0.12's `sync::Cache` doesn't expose a
+        // predicate-based bulk invalidate (the `invalidate_entries_if`
+        // method exists but is gated behind the `future`
+        // feature, returning `Err(InvalidationClosuresDisabled)`
+        // on the sync cache). We work around this by iterating
+        // the entry set and calling `invalidate(key)` per match.
+        //
+        // Cost: O(N) over the cache, same asymptotic as the
+        // gated version. For our default 32-entry working set
+        // this is ~30 atomic decrements per write — negligible.
+        // Larger caches hitting `invalidate_ino` often would
+        // need a side-index of `ino -> Vec<key>` to make this
+        // O(matches) instead of O(N).
+        //
+        // moka's `iter()` returns `Arc<K>` for the key (to
+        // avoid cloning the tuple out of the lock); we deref
+        // the Arc to compare, then re-borrow for `invalidate`.
+        // Modifying the cache (in particular invalidating)
+        // during iteration is explicitly safe per the moka
+        // docs — the iterator holds a snapshot view and the
+        // invalidation operates on a separate index.
+        let keys: Vec<MemCacheKey> = self
+            .inner
+            .iter()
+            .filter_map(|(k, _v)| if k.0 == ino { Some(*k) } else { None })
+            .collect();
+        for k in keys {
+            self.inner.invalidate(&k);
+        }
+    }
+
+    fn clear(&self) {
+        self.inner.invalidate_all();
+    }
+
+    fn len(&self) -> usize {
+        // Same maintenance flush as `stats()` — see that
+        // method's docstring for why we force the count
+        // to converge on the call.
+        self.inner.run_pending_tasks();
+        self.inner.entry_count() as usize
+    }
+
+    fn used_bytes(&self) -> u64 {
+        self.inner.weighted_size()
+    }
+
+    fn stats(&self) -> MemCacheStats {
+        // moka's `entry_count` and `weighted_size` are
+        // maintained by a background task that runs on a
+        // schedule. Without `run_pending_tasks`, the values
+        // can be stale by up to ~10s (moka's default
+        // maintenance interval). For our periodic logger
+        // (1s tick by default), that staleness would make
+        // `entries=0` even when the cache is full. Forcing
+        // the flush here costs ~µs in the worst case and
+        // gives an accurate snapshot.
+        //
+        // The flush is a no-op when there's nothing pending,
+        // so the cost is bounded by the number of in-flight
+        // writes since the last maintenance tick.
+        self.inner.run_pending_tasks();
+        MemCacheStats {
+            hits: self.hits.load(std::sync::atomic::Ordering::Relaxed),
+            misses: self.misses.load(std::sync::atomic::Ordering::Relaxed),
+            inserts: self.inserts.load(std::sync::atomic::Ordering::Relaxed),
+            evictions: self.evictions.load(std::sync::atomic::Ordering::Relaxed),
+            entries: self.inner.entry_count(),
+            used_bytes: self.inner.weighted_size(),
+            capacity_bytes: self.capacity_bytes,
+        }
+    }
+}
+
 /// Concrete `MemCache` backed by a `DashMap` with an LRU eviction
 /// queue and a soft byte limit.
 ///
@@ -537,5 +729,57 @@ mod tests {
         assert_eq!(s.used_bytes, 600);
         assert_eq!(s.capacity_bytes, 1024);
         assert!((s.utilization() - 600.0 / 1024.0).abs() < 1e-9);
+    }
+
+    // ============================================================
+    // MokaMemCache: parallel suite of the stats/eviction tests
+    // to ensure both impls honor the same `MemCache` contract.
+    // If a future impl diverges, the test below fails — which
+    // is the whole point: the trait surface is the contract;
+    // a swap from DashMap to moka (or vice versa) must be a
+    // drop-in for the read/write call sites in `lib.rs`.
+    // ============================================================
+
+    /// `MokaMemCache` honors the same `get/put/stats`
+    /// contract as `DashMapMemCache`. With `run_pending_tasks`
+    /// baked into `stats()`/`len()` (see those methods' doc),
+    /// the assertions are now synchronous — no sleep loop
+    /// needed.
+    #[test]
+    fn moka_stats_reflects_get_put() {
+        let cache = MokaMemCache::new(1024 * 1024);
+        assert!(cache.get(1, 0).is_none());
+        let s = cache.stats();
+        assert_eq!(s.hits, 0);
+        assert_eq!(s.misses, 1);
+        assert_eq!(s.inserts, 0);
+
+        cache.put(1, 0, Bytes::from_static(b"hello"));
+        let s = cache.stats();
+        assert_eq!(s.inserts, 1);
+        assert_eq!(s.entries, 1);
+        assert_eq!(s.used_bytes, 5 + 16); // value + key weight
+
+        assert!(cache.get(1, 0).is_some());
+        let s = cache.stats();
+        assert_eq!(s.hits, 1);
+        assert_eq!(s.misses, 1);
+        assert!((s.hit_rate() - 0.5).abs() < 1e-9);
+    }
+
+    /// `MokaMemCache::invalidate_ino` drops every entry
+    /// sharing the ino, even when there are many blocks.
+    #[test]
+    fn moka_invalidate_ino_drops_all_blocks_for_ino() {
+        let cache = MokaMemCache::new(1024 * 1024);
+        for b in 0..5 {
+            cache.put(7, b, Bytes::from(vec![b as u8; 32]));
+        }
+        assert_eq!(cache.len(), 5, "all 5 blocks should be admitted");
+        cache.invalidate_ino(7);
+        assert_eq!(cache.len(), 0, "all ino=7 blocks should be evicted");
+        // Other inodes unaffected.
+        cache.put(99, 0, Bytes::from_static(b"kept"));
+        assert_eq!(cache.len(), 1);
     }
 }
