@@ -80,7 +80,7 @@ pub fn spawn(
                 let remote = task.1;
                 let ino = task.0;
                 let cache_path = task.2;
-                // Upload in a separate task so DelayQueue keeps ticking
+                // Upload in a separate task so DelayQueue keeps ticking.
                 static UPLOAD_SEM: std::sync::LazyLock<Semaphore> =
                     std::sync::LazyLock::new(|| Semaphore::new(4));
                 let permit = UPLOAD_SEM.acquire().await.unwrap();
@@ -89,8 +89,9 @@ pub fn spawn(
                     let _permit = permit;
                     let mut last_err = None;
                     for attempt in 0..5 {
-                        match op.write(&remote, data.clone()).await {
-                            Ok(_) => {
+                        let write_fut = op.write(&remote, data.clone());
+                        match tokio::time::timeout(Duration::from_secs(120), write_fut).await {
+                            Ok(Ok(_)) => {
                                 // Only update mtime — do NOT update file size (v.2).
                                 // The write function tracks the correct logical size
                                 // via inodes. The cache file may be larger than the
@@ -106,12 +107,21 @@ pub fn spawn(
                                 let _ = std::fs::remove_file(cache_path.with_extension("dirty"));
                                 return;
                             }
-                            Err(e) if attempt < 4 => {
+                            Ok(Err(e)) if attempt < 4 => {
                                 last_err = Some(e);
                                 tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 last_err = Some(e);
+                            }
+                            Err(_elapsed) => {
+                                last_err = Some(opendal::Error::new(
+                                    opendal::ErrorKind::Unexpected,
+                                    format!(
+                                        "writeback upload timed out after 120s (attempt {}/5)",
+                                        attempt + 1
+                                    ),
+                                ));
                             }
                         }
                     }
