@@ -35,13 +35,13 @@ spec:
           # failureThreshold×periodSeconds restart loop that tore csi.sock
           # down mid-mount.
           ports:
-            - name: healthz
+            - name: healthz-provisioner
               containerPort: 9808
               protocol: TCP
           livenessProbe:
             httpGet:
               path: /healthz
-              port: healthz
+              port: healthz-provisioner
             initialDelaySeconds: 10
             periodSeconds: 30
             failureThreshold: 3
@@ -59,15 +59,17 @@ spec:
             - name: ADDRESS
               value: /plugin/csi.sock
           imagePullPolicy: Always
-          # see livenessProbe note on csi-provisioner above
+          # see livenessProbe note on csi-provisioner above. The port name
+          # differs (healthz-attacher) so the probe resolves to csi-attacher's
+          # own :9809, not the first /healthz named port in the pod.
           ports:
-            - name: healthz
+            - name: healthz-attacher
               containerPort: 9809
               protocol: TCP
           livenessProbe:
             httpGet:
               path: /healthz
-              port: healthz
+              port: healthz-attacher
             initialDelaySeconds: 10
             periodSeconds: 30
             failureThreshold: 3

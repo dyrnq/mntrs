@@ -251,8 +251,21 @@ else
     ${KUBECTL} apply -f "${DEPLOY_DIR}/"
 
     log "  waiting for csi-mntrs pods Ready..."
-    ${KUBECTL} -n "${CSI_NAMESPACE}" wait --for=condition=Ready pod -l app=csi-controller-mntrs --timeout=120s
-    ${KUBECTL} -n "${CSI_NAMESPACE}" wait --for=condition=Ready pod -l app=csi-nodeplugin-mntrs --timeout=120s
+    # kubectl wait does NOT wait for the labelled resources to appear; if the
+    # pod hasn't been created yet (StatefulSet/DaemonSet controllers are
+    # async and can take ~1-2s after apply), wait returns immediately with
+    # "no matching resources found" — which our trap then turns into a
+    # premature cleanup. Poll for at least one matching pod first, then
+    # wait for the Ready condition.
+    for label in app=csi-controller-mntrs app=csi-nodeplugin-mntrs; do
+        for i in $(seq 1 30); do
+            if ${KUBECTL} -n "${CSI_NAMESPACE}" get pod -l "$label" -o name 2>/dev/null | grep -q .; then
+                break
+            fi
+            sleep 1
+        done
+        ${KUBECTL} -n "${CSI_NAMESPACE}" wait --for=condition=Ready pod -l "$label" --timeout=120s
+    done
 fi
 
 # ---------- 4. create test bucket ----------

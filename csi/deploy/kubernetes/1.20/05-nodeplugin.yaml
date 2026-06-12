@@ -43,13 +43,13 @@ spec:
           # reachable. Replaces the old /bin/sh exec probe that 100% failed
           # on this distroless image.
           ports:
-            - name: healthz
+            - name: healthz-registrar
               containerPort: 9810
               protocol: TCP
           livenessProbe:
             httpGet:
               path: /healthz
-              port: healthz
+              port: healthz-registrar
             initialDelaySeconds: 10
             periodSeconds: 30
             failureThreshold: 3
