@@ -54,7 +54,7 @@ MINIO_BUCKET="${MINIO_BUCKET:-mntrs-csi-e2e}"
 # when the e2e job pod can't reach the in-cluster MinIO service (e.g. via
 # hostNetwork / firewall). Format: http://host:port (no trailing slash).
 MINIO_ENDPOINT="${MINIO_ENDPOINT:-}"
-MINIO_PV_SIZE="${MINIO_PV_SIZE:-50Gi}"
+# MINIO_PV_SIZE removed — MinIO uses emptyDir, no PV needed
 
 CSI_NAMESPACE="${CSI_NAMESPACE:-csi-mntrs}"
 E2E_NAMESPACE="${E2E_NAMESPACE:-default}"
@@ -148,16 +148,6 @@ spec:
   ports: [{name: api, port: 9000, targetPort: 9000}]
   selector: {app: minio}
 ---
-apiVersion: v1
-kind: PersistentVolume
-metadata: {name: minio-data}
-spec:
-  capacity: {storage: ${MINIO_PV_SIZE}}
-  accessModes: [ReadWriteOnce]
-  persistentVolumeReclaimPolicy: Retain
-  storageClassName: ""
-  hostPath: {path: /tmp/minio-data, type: DirectoryOrCreate}
----
 apiVersion: apps/v1
 kind: Deployment
 metadata: {name: minio, namespace: ${MINIO_NAMESPACE}}
@@ -182,16 +172,7 @@ spec:
           periodSeconds: 5
       volumes:
       - name: data
-        persistentVolumeClaim: {claimName: minio-data}
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata: {name: minio-data, namespace: ${MINIO_NAMESPACE}}
-spec:
-  accessModes: [ReadWriteOnce]
-  storageClassName: ""
-  volumeName: minio-data
-  resources: {requests: {storage: ${MINIO_PV_SIZE}}}
+        emptyDir: {}
 EOF
     log "  waiting for MinIO pod Ready..."
     ${KUBECTL} wait -n "${MINIO_NAMESPACE}" --for=condition=Available deploy/minio --timeout=120s
