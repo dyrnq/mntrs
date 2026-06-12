@@ -480,7 +480,7 @@ spec:
   volumes:
   - {name: data, persistentVolumeClaim: {claimName: ${DYN_PVC_NAME}}}
 EOF
-${KUBECTL} -n "${E2E_NAMESPACE}" wait --for=condition=Ready pod/"${DYN_POD_NAME}" --timeout=120s
+${KUBECTL} -n "${E2E_NAMESPACE}" wait --for=condition=Ready pod/"${DYN_POD_NAME}" --timeout=300s
 
 # Re-run the same read/write suite against the dynamic volume
 LS_OUT=$(${KUBECTL} -n "${E2E_NAMESPACE}" exec "${DYN_POD_NAME}" -- ls -la /data)

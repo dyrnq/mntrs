@@ -159,6 +159,24 @@ jobs:
           path: /tmp/s3-e2e.log
           if-no-files-found: warn
 
+      # Capture the actual kubelet errors via systemd journald. CI runners
+      # run k3s as a systemd service, so mount failures and CSI socket
+      # timeouts only show up here, not in `kubectl describe` (which is
+      # post-mortem on already-cleaned-up resources).
+      - name: Capture kubelet journal (always, for postmortem)
+        if: always()
+        run: |
+          sudo journalctl -u k3s --since "10 minutes ago" --no-pager > /tmp/k3s-journal.log 2>&1 || true
+          echo "k3s journal size: $(wc -l < /tmp/k3s-journal.log) lines"
+
+      - name: Upload kubelet journal
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k3s-journal
+          path: /tmp/k3s-journal.log
+          if-no-files-found: warn
+
       - name: Dump on failure
         if: failure()
         run: |
@@ -171,5 +189,11 @@ jobs:
           echo "=== csi-nodeplugin log (last 50) ==="
           kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs logs -l app=csi-nodeplugin-mntrs --tail=50 2>&1 || true
           echo
-          echo "=== test pod events ==="
+          echo "=== test pod events (dynamic) ==="
+          kubectl --kubeconfig /tmp/kubeconfig describe pod mntrs-csi-e2e-dyn 2>&1 || true
+          echo
+          echo "=== test pod events (static) ==="
           kubectl --kubeconfig /tmp/kubeconfig describe pod mntrs-csi-e2e 2>&1 || true
+          echo
+          echo "=== recent events (last 30) ==="
+          kubectl --kubeconfig /tmp/kubeconfig get events --sort-by=.lastTimestamp 2>&1 | tail -30 || true
