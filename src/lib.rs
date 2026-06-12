@@ -2001,9 +2001,35 @@ impl CoreFilesystem for MntrsFs {
         } else {
             format!("{}/{}", parent_path, name)
         };
-        let (kind, size, mtime) = self
-            .stat_op(&full_path)
-            .ok_or(std::io::ErrorKind::NotFound)?;
+        // stat_op talks to the backend, but freshly-written data
+        // is still in the local cache file (5s async writeback
+        // delay). If the backend says "not found" but a cache
+        // file exists, trust the cache file. Same pattern as
+        // read() and the rename fallback.
+        let (kind, size, mtime) = if let Some((k, s, m)) = self.stat_op(&full_path) {
+            (k, s, m)
+        } else {
+            let cpath = crate::cache_path(&self.cache_dir, &full_path);
+            match std::fs::metadata(&cpath) {
+                Ok(meta) => {
+                    let mt = meta.modified().ok();
+                    (FileType::RegularFile, meta.len(), mt)
+                }
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "lookup: not on backend, no cache file",
+                    ));
+                }
+            }
+        };
+        // Allocate a new ino for this lookup. alloc_ino's
+        // NEXT_INO counter is the canonical ino; the FUSE
+        // kernel stores whatever we return here and reuses
+        // it for subsequent open/read/write. or_insert on the
+        // inodes map is fine — if the entry exists, we keep
+        // the previous (path, kind, size, mtime); if not, we
+        // create one with the values we just resolved.
         let ino = self.alloc_ino(&full_path, kind, size);
         Ok(to_core_attr(&self.make_attr(
             ino,
@@ -2390,9 +2416,7 @@ impl CoreFilesystem for MntrsFs {
                 self.mem_cache.put(ino, offset / CACHE_BLOCK_SIZE, b);
                 Ok(data)
             }
-            Err(e) => {
-                Err(std::io::Error::other("read failed"))
-            }
+            Err(_) => Err(std::io::Error::other("read failed")),
         }
     }
 
@@ -2841,23 +2865,10 @@ impl CoreFilesystem for MntrsFs {
                         path = %src_clone, error = %e,
                         "backend does not support server-side rename; falling back to local-cache read + write+delete"
                     );
-                    // Manual copy. We CANNOT use op.read() /
-                    // op.copy() against the backend: writeback is
-                    // async (5s default delay) so freshly-written
-                    // data may not have landed on the backend yet,
-                    // and opendal's memory backend reports
-                    // `type Copier = ()` so op.copy() also returns
-                    // Unsupported for it. Read the on-disk cache
-                    // file directly — it always holds the most
-                    // recent content, regardless of writeback
-                    // state.
                     let cpath_src = crate::cache_path(&self.cache_dir, &src_clone);
                     let bytes = match std::fs::read(&cpath_src) {
                         Ok(b) => b,
                         Err(read_err) if read_err.kind() == std::io::ErrorKind::NotFound => {
-                            // src has no cache file — nothing
-                            // to copy. Treat rename as a no-op
-                            // and just delete src.
                             Vec::new()
                         }
                         Err(read_err) => {
@@ -2876,10 +2887,6 @@ impl CoreFilesystem for MntrsFs {
                         );
                         return false;
                     }
-                    // Copy succeeded — delete src. POSIX rename
-                    // atomicity is best-effort: if delete fails
-                    // we leave both visible (dst is canonical,
-                    // src is leftover).
                     let del_res = op.delete(&src_clone).await;
                     if del_res.is_err() {
                         tracing::warn!(
@@ -2912,21 +2919,28 @@ impl CoreFilesystem for MntrsFs {
         } else {
             let _ = std::fs::remove_file(&cpath_src);
         }
-        // Migrate inodes src -> dst. The entry's `path` field
-        // MUST be updated to `dst`; otherwise resolve() returns
-        // the old src path, cache_path() hashes the wrong
-        // string, and the cache file (which we just renamed to
-        // dst's hash) is invisible to the read path.
-        let src_hash = crate::path_hash(&src);
-        let dst_hash = crate::path_hash(&dst);
-        if let Some((_, kind, size, mtime)) = self.inodes.get(&src_hash).map(|e| {
-            let (p, k, s, m) = e.value().clone();
-            (p, k, s, m)
-        }) {
-            self.inodes
-                .insert(dst_hash, (dst.clone(), kind, size, mtime));
+        // Migrate inodes src -> dst. The inodes map is keyed by
+        // the NEXT_INO counter (alloc_ino), not by path_hash —
+        // so the FUSE kernel, which already knows the ino for
+        // the source file, will keep using that same ino for
+        // the destination after rename. All we need to do is
+        // change the entry's `path` field from src to dst; the
+        // ino stays the same. This avoids the previous
+        // implementation's mistake of inserting at path_hash
+        // (which is a different number from the counter) and
+        // leaving the FUSE kernel with a stale ino->path map.
+        let src_ino = self
+            .inodes
+            .iter()
+            .find(|e| e.value().0 == src)
+            .map(|e| *e.key());
+        if let Some(src_ino) = src_ino {
+            // In-place path update. Size/mtime/ino are unchanged.
+            self.inodes.entry(src_ino).and_modify(|v| {
+                v.0 = dst.clone();
+            });
         }
-        self.inodes.remove(&src_hash);
+
         if let Some(entry) = self.attr_cache.get(&src).map(|e| *e.value()) {
             self.attr_cache.insert(dst.to_string(), entry);
         }
@@ -3057,7 +3071,6 @@ pub fn install_panic_logger() {
         let backtrace = std::backtrace::Backtrace::force_capture();
         let report = format!("{msg}\n  at {location}\n  backtrace:\n{backtrace}\n");
         // Always write to stderr
-        eprintln!("{report}");
         // Also write to file
         if let Ok(path) = std::env::var("MNTRS_PANIC_LOG") {
             let _ = std::fs::write(&path, &report);
