@@ -3,7 +3,6 @@ use crate::MntrsFs;
 use anyhow::{Result, anyhow};
 #[cfg(not(windows))]
 use fuser::MountOption;
-use once_cell::sync::OnceCell;
 use opendal::Operator;
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
 use opendal::services::{
@@ -23,9 +22,13 @@ fn rt_block_on<F, T>(f: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
-    static RT: OnceCell<tokio::runtime::Runtime> = OnceCell::new();
-    let rt = RT.get_or_init(|| tokio::runtime::Runtime::new().expect("tokio rt"));
-    rt.block_on(f)
+    // Originally: independent OnceCell<Runtime> (see below).
+    // Cross-runtime .await on an Operator's HTTP client deadlocks.
+    crate::rt().block_on(f)
+    // Original code:
+    // static RT: OnceCell<tokio::runtime::Runtime> = OnceCell::new();
+    // let rt = RT.get_or_init(|| tokio::runtime::Runtime::new().expect("tokio rt"));
+    // rt.block_on(f)
 }
 
 fn mounts_db() -> String {
@@ -301,15 +304,15 @@ pub fn unmount_internal(mountpoint: &str) -> anyhow::Result<()> {
     // Phase 0: note cache dir for cleanup after unmount
     let _cache_dir = cache_dir_for_mount(mountpoint);
 
-    // Phase 1: wait for writeback queue to drain
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
-    while std::time::Instant::now() < deadline {
-        let pending = crate::cmd::mount::pending_writebacks();
-        if pending == 0 {
-            break;
-        }
-        tracing::info!(mountpoint, pending, "waiting for writeback to complete");
-        std::thread::sleep(std::time::Duration::from_secs(5));
+    // Phase 1: writeback drain skipped in CSI path to avoid blocking gRPC server.
+    // Writeback continues in background; dirty files will be recovered on next mount.
+    let pending = crate::cmd::mount::pending_writebacks();
+    if pending > 0 {
+        tracing::info!(
+            mountpoint,
+            pending,
+            "unmount with pending writeback (background upload continues)"
+        );
     }
     // Phase 2: unmount
     if let Err(e) = crate::cmd::unmount::unmount(mountpoint) {
