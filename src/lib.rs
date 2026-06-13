@@ -479,31 +479,49 @@ impl MntrsFs {
     /// Recover writeback queue + spawn worker. Shared by fuser + CoreFilesystem init.
     fn common_init_wb(&self) {
         self.alloc_ino("", FileType::Directory, 4096);
-        // Recover writeback queue from dirty sidecars
-        if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.extension().is_some_and(|ext| ext == "dirty") {
-                    let cache_path = p.with_extension("");
-                    if let Ok(remote) = std::fs::read_to_string(&p) {
-                        let remote = remote.trim().to_string();
-                        if let Some(tx) = self.writeback_sender.get() {
-                            tx.send((0, remote, cache_path.clone())).ok();
-                        }
-                    }
-                    if let Err(e) = std::fs::remove_file(&p) {
-                        tracing::warn!(error=%e, path=?p, "dirty recovery remove failed");
-                    }
-                }
-            }
-        }
-        // Spawn writeback worker (tokio, requires runtime)
+
+        // Spawn writeback worker FIRST so the sender is available
+        // for the recovery scan below. Previously the scan ran before
+        // spawn, so writeback_sender.get() always returned None and
+        // recovery tasks were silently dropped while .dirty sidecars
+        // were deleted — causing permanent data loss on crash restart.
         crate::rt();
         let op = self.op.clone();
         let delay = self.write_back_delay;
         let inodes = Arc::new(self.inodes.clone());
         let (tx, _handle) = crate::writeback::spawn(op, inodes, delay);
         self.writeback_sender.set(tx).ok();
+
+        // Recover writeback queue from dirty sidecars.
+        // Do NOT delete .dirty here — the upload completion handler
+        // (writeback.rs) removes it after a successful upload.
+        // Deleting before upload completes would cause data loss if
+        // the process crashes again before the upload finishes.
+        if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().is_some_and(|ext| ext == "dirty") {
+                    let cache_path = p.with_extension("");
+                    if !cache_path.exists() {
+                        // Orphan sidecar — cache file missing, safe to remove
+                        tracing::debug!(sidecar=?p, "removing orphan dirty sidecar");
+                        let _ = std::fs::remove_file(&p);
+                        continue;
+                    }
+                    if let Ok(remote) = std::fs::read_to_string(&p) {
+                        let remote = remote.trim().to_string();
+                        if let Some(tx) = self.writeback_sender.get() {
+                            tracing::info!(path=%remote, ?cache_path, "recovering dirty writeback");
+                            // ino=0: inode mapping is not populated at this
+                            // point; the mtime update in the upload completion
+                            // handler will be a no-op.  Acceptable — the next
+                            // stat() will refresh mtime from the remote.
+                            tx.send((0, remote, cache_path)).ok();
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn alloc_ino(&self, path: &str, kind: FileType, size: u64) -> u64 {
