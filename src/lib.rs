@@ -4,6 +4,7 @@
 pub mod cache;
 pub mod cmd;
 pub mod core_fs;
+pub mod http_client;
 pub mod path;
 pub mod prefetcher;
 pub mod writeback;

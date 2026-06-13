@@ -977,7 +977,21 @@ fn apply_operator_with_tls(
             .layer(ConcurrentLimitLayer::new(16))
             .finish()
     } else {
+        // Non-TLS path: still wrap an explicit HttpClientLayer so we never
+        // touch opendal's `GLOBAL_REWQEST_CLIENT` LazyLock. Otherwise that
+        // client gets instantiated lazily on the first .await, binding its
+        // hyper connector to whichever tokio runtime Handle::current()
+        // happens to be at that moment — and if writeback (in crate::rt())
+        // ever drives an op that ends up the first caller, the binding
+        // mismatches the rt_block_on / cmd/mount runtime and we deadlock
+        // (see src/http_client.rs for the full root cause). Using
+        // `shared()` here forces the binding to happen on the first
+        // apply_operator_with_tls call, which always runs inside
+        // `crate::rt()` via `rt_block_on`.
         Operator::new(builder)?
+            .layer(opendal::layers::HttpClientLayer::new(
+                opendal::raw::HttpClient::with(crate::http_client::shared().clone()),
+            ))
             .layer(TimeoutLayer::new().with_io_timeout(std::time::Duration::from_secs(30)))
             .layer(RetryLayer::new().with_max_times(3).with_factor(2.0))
             .layer(ConcurrentLimitLayer::new(16))
