@@ -22,8 +22,33 @@
 #                     which after a full re-read is roughly
 #                     the same — but the transient churn
 #                     behavior can differ)
-#   Phase 4 — random: pick 200 random (file, offset) reads
-#                     (forces misses regardless of policy)
+#   Phase 4 — Zipfian hot reads: 200 reads with a 80/20
+#                     access skew (80% of reads go to 20% of
+#                     files) — the textbook production
+#                     workload. moka's TinyLFU should retain
+#                     the hot 20% across the cold 80%
+#                     churn; DashMap's FIFO evicts the
+#                     oldest-inserted regardless of access
+#                     recency.
+#   Phase 5 — sequential scan: read all 64 files in order
+#                     (the `find`/`tar`/backup pattern). Tests
+#                     whether the cache survives a forward
+#                     iteration that touches every key once.
+#                     FIFO is disadvantaged here (it must
+#                     keep the previous block while reading
+#                     the next); TinyLFU's tiny ghost sketch
+#                     remembers the recent pattern.
+#   Phase 6 — mixed read-write with temporal locality: 60
+#                     cycles of "write small file → read
+#                     it back" on a small set of files
+#                     (editor / build-tool pattern). The
+#                     write path triggers `invalidate_ino`;
+#                     the read path then refills the cache.
+#                     This is the workload where FIFO hurts
+#                     the most: the most-recently-written
+#                     block is also the most-recently-read
+#                     block, but FIFO evicts on insert
+#                     order, not on access recency.
 #
 # The benchmark runs 3 iterations per impl to average out
 # mount-time noise (cold first-call cost). Each iteration is
@@ -132,11 +157,35 @@ run_one() {
     # Mount with metrics logger at 1s tick — fine enough
     # to capture the per-phase transitions, coarse enough
     # to keep log volume readable.
+    #
+    # MEM_LIMIT (env) overrides the default 256 MiB cache
+    # cap. Set to a small value (e.g. 16) to force the
+    # eviction policy to actually run on every workload,
+    # exposing the impl difference. With the default cap,
+    # our working set fits in cache and both impls
+    # converge to 100% on the hot set.
+    #
+    # CACHE_MODE (env) defaults to whatever the binary
+    # defaults to ("writes"). Set to "off" to bypass the
+    # on-disk cache layer entirely — this makes
+    # `mem_cache` the only cache in front of the backend,
+    # which is the right setting to stress-test the
+    # mem_cache eviction policy. With the disk cache
+    # enabled, every working-set entry has a hot disk
+    # shadow and mem_cache rarely has to evict.
+    local extra_mount_args=()
+    if [ -n "${MEM_LIMIT:-}" ]; then
+        extra_mount_args+=(--mem-limit "$MEM_LIMIT")
+    fi
+    if [ -n "${CACHE_MODE:-}" ]; then
+        extra_mount_args+=(--vfs-cache-mode "$CACHE_MODE")
+    fi
     RUST_LOG=info \
     "$BIN" mount "$url" "$MP" \
         --cache-dir "$CACHE" \
         "${opts[@]}" \
         --mem-cache-impl "$impl" \
+        "${extra_mount_args[@]}" \
         --mem-cache-metrics-interval 1 \
         > "$LOG" 2>&1 &
     local MPID=$!
@@ -179,10 +228,52 @@ run_one() {
         cat "$MP/file_$(printf %03d $i).dat" >/dev/null 2>&1
     done
 
-    # Phase 4: random access (200 random reads)
+    # Phase 4: Zipfian hot reads (200 reads, 80/20 skew).
+    # We approximate a Zipfian distribution by partitioning
+    # the 64 files into a "hot 20%" set (indices 1..13,
+    # approx 12.5 files) and a "cold 80%" set, then
+    # drawing 80% of reads from the hot set and 20% from
+    # the cold set. Real Zipfian would be a power law, but
+    # the binary split is a sharper test of the eviction
+    # policy — DashMap's FIFO evicts the cold set as
+    # they're touched (the hot set was inserted first, so
+    # they come out first), while TinyLFU's admission
+    # filter locks the hot set in.
     for i in $(seq 1 200); do
-        local idx=$((RANDOM % 64 + 1))
+        if [ $((RANDOM % 100)) -lt 80 ]; then
+            local idx=$((RANDOM % 13 + 1))   # hot set
+        else
+            local idx=$((RANDOM % 51 + 14))  # cold set (14..64)
+        fi
         cat "$MP/file_$(printf %03d $idx).dat" >/dev/null 2>&1
+    done
+
+    # Phase 5: sequential scan. Read all 64 files in
+    # order, twice. The first pass warms the cache; the
+    # second pass is the test (will it all still hit after
+    # a full rotation?).
+    for round in 1 2; do
+        for i in $(seq -f "%03g" 1 64); do
+            cat "$MP/file_${i}.dat" >/dev/null 2>&1
+        done
+    done
+
+    # Phase 6: mixed read-write with temporal locality.
+    # 60 cycles of (write, read) on 5 files. This is the
+    # editor/build-tool pattern: open file, write a small
+    # change, read it back. The write triggers
+    # `invalidate_ino`; the read refills the cache. The
+    # critical question: does the cache *survive* the
+    # write-then-read pattern? FIFO evicts on insert
+    # (the most-recent write), so the immediately-following
+    # read is a guaranteed miss. TinyLFU's admission
+    # filter sees the read right after the insert and
+    # promotes the entry to the protected segment.
+    for cycle in $(seq 1 60); do
+        local idx=$((cycle % 5 + 1))  # round-robin over 5 files
+        local file="$MP/file_$(printf %03d $idx).dat"
+        echo "edit_$cycle" >> "$file" 2>/dev/null
+        cat "$file" >/dev/null 2>&1
     done
 
     # Cleanup
