@@ -855,6 +855,34 @@ impl MntrsFs {
             .collect();
         self.dir_cache
             .insert(path.to_string(), (std::time::Instant::now(), dir_entries));
+
+        // Also pre-populate attr_cache for every entry. The FUSE
+        // kernel follows `readdir` with one `lookup` per entry, and
+        // `lookup` calls `stat_op` which by default issues a backend
+        // HEAD/STAT. S3/GCS/OSS/COS all return size + last_modified
+        // inline in the list response (we already extracted them
+        // above), so we can serve the post-readdir lookups from
+        // memory instead of N extra round-trips. For a 500-file
+        // directory, this turns 500 HEADs into 0.
+        //
+        // Cache TTL is the same `attr_ttl` used everywhere else so
+        // the entries are treated as fresh for the same window.
+        for (name, mode, size, mtime) in &result {
+            let kind = match mode {
+                EntryMode::DIR => FileType::Directory,
+                _ => FileType::RegularFile,
+            };
+            let full = if path.is_empty() {
+                name.clone()
+            } else {
+                format!("{}/{}", path, name)
+            };
+            self.attr_cache.insert(
+                full,
+                (kind, *size, Some(*mtime), std::time::Instant::now()),
+            );
+        }
+
         Ok(result)
     }
 
