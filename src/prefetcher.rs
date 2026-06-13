@@ -48,26 +48,42 @@ impl PartQueue {
     }
 
     pub fn pop(&mut self, offset: u64) -> Option<Part> {
-        loop {
-            if let Some(front) = self.parts.front() {
-                if front.offset <= offset && offset < front.offset + front.data.len() as u64 {
-                    let part = self.parts.pop_front().unwrap();
-                    self.current_bytes -= part.data.len() as u64;
-                    return Some(part);
-                }
-                if front.offset > offset {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    continue;
-                }
-                let _stale = self.parts.pop_front().unwrap();
-                self.current_bytes -= _stale.data.len() as u64;
+        // Non-blocking. Returns:
+        //   - Some(part) if a part covering `offset` is in the queue
+        //   - None if the queue is empty (prefetcher hasn't fetched yet
+        //     or it's finished/dropped) OR if a part for a *later*
+        //     offset is queued but the requested offset isn't covered
+        //
+        // The read path's contract: a None here means "no prefetched
+        // data ready, fall through to disk cache or remote fetch". A
+        // blocking pop would deadlock FUSE workers when the prefetcher
+        // is slow or stalled, since every FUSE worker would park here
+        // until the (single) prefetcher thread finished — and the
+        // prefetcher thread itself can stall on backend latency.
+        //
+        // Drop stale parts (whose [offset, offset+len) is entirely
+        // before the requested offset) without blocking, then check
+        // the new head. Bounded by the inner queue size.
+        while let Some(front) = self.parts.front() {
+            if front.offset <= offset && offset < front.offset + front.data.len() as u64 {
+                let part = self.parts.pop_front().unwrap();
+                self.current_bytes -= part.data.len() as u64;
+                return Some(part);
+            }
+            if front.offset + front.data.len() as u64 <= offset {
+                // Stale (front ends before the requested offset). Drop.
+                let stale = self.parts.pop_front().unwrap();
+                self.current_bytes -= stale.data.len() as u64;
                 continue;
             }
-            if self.finished || self.error.is_some() {
-                return None;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            // Front starts after the requested offset. No match and no
+            // more stale parts to drop; return None.
+            break;
         }
+        if self.finished || self.error.is_some() {
+            return None;
+        }
+        None
     }
 
     pub fn set_finished(&mut self) {
