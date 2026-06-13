@@ -120,6 +120,13 @@ static CLEANUP_MP: OnceLock<String> = OnceLock::new();
 static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Active FUSE BackgroundSession. Stored by mount() so that
+/// unmount_internal() can gracefully shut down the FUSE daemon thread
+/// (umount_and_join) instead of leaking it via std::mem::forget.
+#[cfg(not(windows))]
+static FUSE_SESSION: std::sync::Mutex<Option<fuser::BackgroundSession>> =
+    std::sync::Mutex::new(None);
+
 extern "C" fn cleanup() {
     if let Some(mp) = CLEANUP_MP.get() {
         let _ = Command::new("fusermount3")
@@ -316,10 +323,38 @@ pub fn unmount_internal(mountpoint: &str) -> anyhow::Result<()> {
             "unmount with pending writeback (background upload continues)"
         );
     }
-    // Phase 2: unmount
+    // Phase 2: try graceful shutdown via FUSE session.
+    // Take the BackgroundSession and call umount_and_join(), which does
+    // fusermount3 -u internally then joins the daemon thread. This
+    // guarantees the daemon has exited and released all resources.
+    let session = FUSE_SESSION.lock().ok().and_then(|mut g| g.take());
+    if let Some(session) = session {
+        tracing::debug!(mountpoint, "graceful FUSE session shutdown");
+        if session.umount_and_join().is_ok() {
+            // Success — wait for mount to fully disappear from /proc/mounts
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if !is_mount_point(mountpoint) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let cache_dir = cache_dir_for_mount(mountpoint);
+            if let Err(e) = std::fs::remove_dir_all(&cache_dir) {
+                tracing::warn!(cache_dir, error=%e, "cache cleanup failed");
+            }
+            return Ok(());
+        }
+        tracing::warn!(
+            mountpoint,
+            "umount_and_join failed, falling back to fusermount3"
+        );
+    }
+
+    // Phase 3: fallback — raw fusermount3 unmount
     if let Err(e) = crate::cmd::unmount::unmount(mountpoint) {
         tracing::warn!(mountpoint, error=%e, "regular unmount failed, trying lazy");
-        // Phase 3: lazy unmount fallback
+        // Phase 4: lazy unmount fallback
         let _ = std::process::Command::new("fusermount3")
             .arg("-u")
             .arg("-z")
@@ -333,7 +368,15 @@ pub fn unmount_internal(mountpoint: &str) -> anyhow::Result<()> {
                     .status()
             });
     }
-    // Phase 4: clean up isolated cache directory
+    // Wait for mount to disappear from /proc/mounts (up to 5s)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if !is_mount_point(mountpoint) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // Phase 5: clean up isolated cache directory
     let cache_dir = cache_dir_for_mount(mountpoint);
     if let Err(e) = std::fs::remove_dir_all(&cache_dir) {
         tracing::warn!(cache_dir, error=%e, "cache cleanup failed");
@@ -777,10 +820,11 @@ pub fn mount(
             direct_io,
         );
         let session = fuser::spawn_mount2(adapter, mount_path, &cfg)?;
-        // Hold a strong reference so the session isn't dropped; we
-        // only need the notifier to remain valid for the mount's
-        // lifetime.
-        std::mem::forget(session);
+        // Store session so unmount_internal can gracefully shut it down
+        // instead of leaking the daemon thread via std::mem::forget.
+        if let Ok(mut guard) = FUSE_SESSION.lock() {
+            *guard = Some(session);
+        }
         record_mount(storage_url, mountpoint, read_only);
         if daemon_wait {
             // Close write end of pipe to signal parent (POLLHUP on read end)
@@ -837,14 +881,7 @@ pub fn mount(
         }
     }
 
-    if daemon {
-        // Keep the process alive indefinitely (FUSE session runs in background thread).
-        // Ctrl-C or SIGTERM will trigger cleanup via atexit.
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(3600));
-        }
-    }
-
+    // Set up signal handling for clean shutdown.
     CLEANUP_MP.set(mountpoint.to_string()).ok();
     unsafe {
         libc::atexit(cleanup);
@@ -854,14 +891,55 @@ pub fn mount(
         libc::signal(libc::SIGTERM, handler as *const () as libc::sighandler_t);
     }
 
-    loop {
-        if SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
-            tracing::info!("shutdown requested, cleaning up...");
-            cleanup();
-            std::process::exit(0);
+    // Spawn a watcher thread: when a signal sets SHUTDOWN_REQUESTED,
+    // call fusermount3 -u so the FUSE daemon gets ENODEV and exits.
+    #[cfg(not(windows))]
+    {
+        let mp = mountpoint.to_string();
+        std::thread::Builder::new()
+            .name("fuse-signal-watcher".into())
+            .spawn(move || {
+                while !SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                tracing::info!("signal received, unmounting...");
+                let _ = Command::new("fusermount3")
+                    .arg("-u")
+                    .arg(&mp)
+                    .status()
+                    .or_else(|_| Command::new("fusermount").arg("-u").arg(&mp).status());
+            })
+            .ok();
+
+        // Block until the FUSE session ends.
+        // This happens when:
+        //   - unmount_internal() takes the session and calls umount_and_join()
+        //   - External fusermount3 -u disconnects the kernel side
+        //   - A signal triggers the watcher thread above to call fusermount3 -u
+        let session = FUSE_SESSION.lock().ok().and_then(|mut g| g.take());
+        if let Some(session) = session {
+            if let Err(e) = session.join() {
+                tracing::warn!(error=%e, "FUSE session ended with error");
+            }
+        } else {
+            // Session was taken by unmount_internal — wait for mount to disappear
+            while is_mount_point(mountpoint) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
         }
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        // Signal the watcher thread to exit (it loops on SHUTDOWN_REQUESTED)
+        SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        remove_mount(mountpoint);
     }
+
+    #[cfg(windows)]
+    {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    }
+
+    Ok(())
 }
 
 fn apply_operator_with_tls(
