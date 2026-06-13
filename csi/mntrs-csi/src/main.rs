@@ -17,26 +17,44 @@ mod csi;
 // VolumeID Encoding — bucket:prefix → volume_id
 // ============================================================
 
-/// Encode bucket + prefix into a volume ID
+/// Encode a storage URL into a K8s volume ID.
+/// Uses `_XX` hex escaping for `:`, `/`, and `_` so the encoding
+/// is fully reversible and never ambiguous (unlike the old `-`
+/// replacement which collapsed `://`, `/`, `:` and `-` all to `-`).
 fn encode_volume_id(storage_url: &str) -> String {
-    // Replace special chars to make a valid K8s volume ID
-    storage_url
-        .replace("://", "-")
-        .replace('/', "-")
-        .replace(':', "-")
+    let mut out = String::with_capacity(storage_url.len());
+    for c in storage_url.chars() {
+        match c {
+            ':' => out.push_str("_3a"),
+            '/' => out.push_str("_2f"),
+            '_' => out.push_str("_5f"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
-/// Decode volume ID back to storage URL  
+/// Decode a volume ID back to a storage URL (exact inverse of encode).
 fn decode_volume_id(volume_id: &str) -> String {
-    // Reverse: restore s3://bucket/prefix format
-    // Simple heuristic: first '-' after scheme becomes '://'
-    if let Some(idx) = volume_id.find('-') {
-        let scheme = &volume_id[..idx];
-        let rest = &volume_id[idx + 1..];
-        format!("{}:{}", scheme, rest.replace('-', "/"))
-    } else {
-        volume_id.to_string()
+    let mut out = String::with_capacity(volume_id.len());
+    let mut chars = volume_id.chars();
+    while let Some(c) = chars.next() {
+        if c == '_' {
+            let hex: String = chars.by_ref().take(2).collect();
+            if hex.len() == 2 {
+                if let Ok(b) = u8::from_str_radix(&hex, 16) {
+                    out.push(b as char);
+                    continue;
+                }
+            }
+            // Malformed or incomplete escape — pass through literally
+            out.push('_');
+            out.push_str(&hex);
+        } else {
+            out.push(c);
+        }
     }
+    out
 }
 
 // ============================================================
@@ -546,10 +564,24 @@ impl node_server::Node for NodeService {
 // CSI Helpers
 // ============================================================
 
-/// Check if a path is a mountpoint
+/// Check if `path` appears as an exact mount target in the given mounts content.
+/// Extracted from `is_mountpoint` so it can be unit-tested with synthetic data.
+fn is_mountpoint_in(path: &str, mounts_content: &str) -> bool {
+    for line in mounts_content.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2 && parts[1] == path {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if a path is a mountpoint — exact match on the mount target field.
+/// Previous `contains(path)` was a substring match that could return true
+/// when a different volume's path was a prefix of the queried path.
 fn is_mountpoint(path: &str) -> bool {
     if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
-        mounts.lines().any(|l| l.contains(path))
+        is_mountpoint_in(path, &mounts)
     } else {
         false
     }
@@ -659,6 +691,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::{decode_volume_id, encode_volume_id, is_mountpoint_in};
     use std::collections::HashMap;
 
     // ============================================================
@@ -714,5 +747,105 @@ mod tests {
         ctx2.insert("readOnly".to_string(), "false".to_string());
         let ro2 = ctx2.get("readOnly").map(|v| v == "true").unwrap_or(false);
         assert!(!ro2);
+    }
+
+    // ============================================================
+    // is_mountpoint_in — exact match regression tests
+    // ============================================================
+
+    #[test]
+    fn mountpoint_exact_match() {
+        let mounts = "mntrs /a/pvc-old/globalmount fuse mntrs rw 0 0\n";
+        assert!(is_mountpoint_in("/a/pvc-old/globalmount", mounts));
+    }
+
+    #[test]
+    fn mountpoint_substring_no_false_positive() {
+        // The old contains() bug: /a/pvc-old/globalmount in /proc/mounts
+        // should NOT match /a/pvc-old/globalmountx
+        let mounts = "mntrs /a/pvc-old/globalmount fuse mntrs rw 0 0\n";
+        assert!(!is_mountpoint_in("/a/pvc-old/globalmountx", mounts));
+    }
+
+    #[test]
+    fn mountpoint_prefix_no_false_positive() {
+        // /a/pvc-old/globalmount should NOT match /a/pvc-old
+        let mounts = "mntrs /a/pvc-old/globalmount fuse mntrs rw 0 0\n";
+        assert!(!is_mountpoint_in("/a/pvc-old", mounts));
+    }
+
+    #[test]
+    fn mountpoint_not_found() {
+        let mounts = "mntrs /a/pvc-old/globalmount fuse mntrs rw 0 0\n";
+        assert!(!is_mountpoint_in("/a/pvc-new/globalmount", mounts));
+    }
+
+    #[test]
+    fn mountpoint_empty_mounts() {
+        assert!(!is_mountpoint_in("/anything", ""));
+    }
+
+    // ============================================================
+    // volume_id encode/decode — round-trip tests
+    // ============================================================
+
+    #[test]
+    fn volume_id_roundtrip_basic() {
+        let url = "s3://bucket/prefix";
+        assert_eq!(decode_volume_id(&encode_volume_id(url)), url);
+    }
+
+    #[test]
+    fn volume_id_roundtrip_hyphens() {
+        let url = "s3://my-custom-bucket/some/path";
+        assert_eq!(decode_volume_id(&encode_volume_id(url)), url);
+    }
+
+    #[test]
+    fn volume_id_roundtrip_oss() {
+        let url = "oss://endpoint-bucket/data";
+        assert_eq!(decode_volume_id(&encode_volume_id(url)), url);
+    }
+
+    #[test]
+    fn volume_id_roundtrip_no_path() {
+        let url = "s3://b1";
+        assert_eq!(decode_volume_id(&encode_volume_id(url)), url);
+    }
+
+    #[test]
+    fn volume_id_no_ambiguity() {
+        // These two URLs must produce DIFFERENT volume IDs
+        let a = encode_volume_id("s3://a/b-c");
+        let b = encode_volume_id("s3://a-b/c");
+        assert_ne!(a, b, "different URLs must not collide");
+        assert_eq!(decode_volume_id(&a), "s3://a/b-c");
+        assert_eq!(decode_volume_id(&b), "s3://a-b/c");
+    }
+
+    #[test]
+    fn volume_id_roundtrip_underscores() {
+        let url = "s3://my_bucket/my_path";
+        assert_eq!(decode_volume_id(&encode_volume_id(url)), url);
+    }
+
+    #[test]
+    fn volume_id_malformed_short_escape() {
+        // _3 (only 1 hex digit) should NOT decode to 0x03
+        assert_eq!(decode_volume_id("_3"), "_3");
+        assert_eq!(decode_volume_id("_"), "_");
+        assert_eq!(decode_volume_id("_zz"), "_zz");
+    }
+
+    #[test]
+    fn mountpoint_multiple_entries() {
+        let mounts = "\
+mntrs /a/pvc-1/globalmount fuse mntrs rw 0 0
+mntrs /a/pvc-2/globalmount fuse mntrs rw 0 0
+s3fs /a/pvc-3/s3mount fuse s3fs rw 0 0
+";
+        assert!(is_mountpoint_in("/a/pvc-2/globalmount", mounts));
+        assert!(!is_mountpoint_in("/a/pvc-2", mounts));
+        assert!(!is_mountpoint_in("/a/pvc-2/globalmount/extra", mounts));
     }
 }
