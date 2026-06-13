@@ -419,11 +419,11 @@ jobs:
           done
 
           echo "=== Wait for NameNode + DataNode (kinit retry inside loop) ==="
-          # s6-overlay starts krb5kdc, kadmin, namenode, datanode concurrently.
-          # Even after KDC port 88 is open, the kadmin realm can take a few
-          # more seconds to bootstrap, and the first kinit may race the
-          # kadmind startup. Retry kinit until it succeeds, then poll
-          # dfsadmin for the live datanode.
+          # s6-overlay starts krb5kdc first, then kadmin (depends on krb5kdc),
+          # then namenode (depends on krb5kdc), then datanode (depends on namenode).
+          # Even with correct ordering, kinit may need a few retries before the
+          # KDC database is fully loaded. Retry kinit until it succeeds, then
+          # poll dfsadmin for the live datanode.
           # kinit must run as the same user (mntrs) that the subsequent
           # hdfs dfsadmin runs as — ticket caches are per-uid, and
           # hdfs.keytab must be readable by mntrs (chmod 644 in the image
