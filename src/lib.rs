@@ -1048,12 +1048,16 @@ impl Filesystem for MntrsFs {
             format!("{}/{}", parent_path, name2)
         };
         if let Some((kind, size, mtime)) = self.stat_op(&full_path) {
-            let mut attr = self.make_attr(
-                self.alloc_ino(&full_path, kind, size),
-                size,
-                kind,
-                mtime.unwrap_or(SystemTime::UNIX_EPOCH),
-            );
+            // Reuse existing ino for this path so the mem_cache key
+            // (ino, block_idx) stays stable across kernel LOOKUPs.
+            // Previously alloc_ino() was called unconditionally,
+            // giving a fresh ino each time — the kernel caches these
+            // but evicts under memory pressure, causing mem_cache
+            // misses on every re-lookup.
+            let ino = self
+                .find_ino_by_path(&full_path)
+                .unwrap_or_else(|| self.alloc_ino(&full_path, kind, size));
+            let mut attr = self.make_attr(ino, size, kind, mtime.unwrap_or(SystemTime::UNIX_EPOCH));
             if let Some(mt) = mtime {
                 attr.mtime = mt;
             }
