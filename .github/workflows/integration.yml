@@ -702,3 +702,91 @@ jobs:
         run: |
           fusermount3 -uz /tmp/mntrs-test 2>/dev/null || fusermount -uz /tmp/mntrs-test 2>/dev/null || true
           pkill -9 -f "target/release/mntrs mount" 2>/dev/null || true
+
+  # Mount/unmount lifecycle stress — catches process leaks, FD leaks,
+  # session.join() regressions, and signal handling issues.
+  lifecycle-stress:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev fuse3
+          sudo grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+
+      - name: Build mntrs
+        run: cargo build --release -p mntrs
+
+      - name: Lifecycle stress (memory, 50 iterations)
+        run: |
+          chmod +x ./tests/e2e/mount/lifecycle_stress.sh
+          ./tests/e2e/mount/lifecycle_stress.sh 50 target/release/mntrs /tmp/mntrs-lifecycle
+
+      - name: Cleanup
+        if: always()
+        run: |
+          fusermount3 -uz /tmp/mntrs-lifecycle 2>/dev/null || true
+          pkill -9 -f "target/release/mntrs mount.*lifecycle" 2>/dev/null || true
+
+  # S3 lifecycle stress + writeback crash recovery — verifies
+  # mount/unmount cleanup and dirty-cache recovery against real S3.
+  s3-lifecycle-stress:
+    runs-on: ubuntu-latest
+    services:
+      minio:
+        image: minio/minio:latest
+        command: server /data
+        options: --health-cmd "curl -sf http://localhost:9000/minio/health/live || exit 1" --health-interval 5s
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        ports:
+          - 9000:9000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev fuse3
+          sudo grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+
+      - name: Install mc (MinIO client)
+        run: go install github.com/minio/mc@latest
+
+      - name: Build mntrs
+        run: cargo build --release -p mntrs
+
+      - name: Create S3 bucket
+        run: |
+          mc alias set ci http://localhost:9000 minioadmin minioadmin
+          mc mb ci/ci-lifecycle-test 2>/dev/null || true
+
+      - name: S3 lifecycle stress (30 iterations)
+        run: |
+          chmod +x ./tests/e2e/mount/lifecycle_stress.sh
+          export LIFECYCLE_S3_URL="s3://ci-lifecycle-test"
+          export LIFECYCLE_S3_OPTS="--opt endpoint=http://localhost:9000 --opt access-key=minioadmin --opt secret-key=minioadmin --opt region=us-east-1"
+          ./tests/e2e/mount/lifecycle_stress.sh 30 target/release/mntrs /tmp/mntrs-s3-lifecycle
+
+      - name: Writeback crash recovery
+        run: |
+          chmod +x ./tests/e2e/mount/writeback_recovery.sh
+          export WB_S3_ENDPOINT="http://localhost:9000"
+          export WB_S3_ACCESS="minioadmin"
+          export WB_S3_SECRET="minioadmin"
+          ./tests/e2e/mount/writeback_recovery.sh target/release/mntrs /tmp/mntrs-wb-cache
+
+      - name: Cleanup
+        if: always()
+        run: |
+          fusermount3 -uz /tmp/mntrs-s3-lifecycle 2>/dev/null || true
+          fusermount3 -uz /tmp/mntrs-wb-recovery 2>/dev/null || true
+          pkill -9 -f "target/release/mntrs mount" 2>/dev/null || true
