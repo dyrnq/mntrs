@@ -397,8 +397,8 @@ pub struct DashMapMemCache {
     /// this, every write to a 1KB file in a CSI mount with
     /// 1000+ cached files does a full O(N) scan of `inner`
     /// + the LRU queue, which costs ~5ms at 1000 entries
-    /// and scales linearly. With it, invalidate is essentially
-    /// free for small writes.
+    ///   and scales linearly. With it, invalidate is essentially
+    ///   free for small writes.
     ///
     /// Stale entries (the corresponding `inner` key was evicted
     /// by mem_limit) are tolerated: `invalidate_ino` does an
@@ -523,10 +523,7 @@ impl MemCache for DashMapMemCache {
         // O(N) over the whole cache. The per-ino HashSet is
         // dropped after each invalidate, so stale entries (from
         // mem_limit-driven eviction) don't accumulate.
-        self.by_ino
-            .entry(ino)
-            .or_insert_with(std::collections::HashSet::new)
-            .insert(key);
+        self.by_ino.entry(ino).or_default().insert(key);
         self.used.fetch_add(size, Ordering::Relaxed);
         self.inserts.fetch_add(1, Ordering::Relaxed);
         self.order.lock().unwrap().push_back(key);
