@@ -1561,11 +1561,12 @@ impl Filesystem for MntrsFs {
             *last_offset = offset + size as u64;
             *cs = chunk_size;
         }
-        let fetch_size = if self.read_chunk_size > 0 {
-            self.read_chunk_size.max(size as u64)
-        } else {
-            chunk_size.max(size as u64)
-        };
+        // Use adaptive chunk_size (grows on sequential, resets on seek).
+        // Previously read_chunk_size (128MB) was always used, causing
+        // head -c 10K to fetch the entire file. Now partial reads
+        // (head/tail/small seeks) only fetch what's needed.
+        // Refs: https://github.com/dyrnq/mntrs/issues/10
+        let fetch_size = chunk_size.max(size as u64);
         let op = self.op.clone();
         let p = path.clone();
         let streams = self.read_chunk_streams.max(1);
