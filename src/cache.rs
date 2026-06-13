@@ -391,6 +391,22 @@ impl MemCache for MokaMemCache {
 /// shard iteration) without changing the trait surface.
 pub struct DashMapMemCache {
     inner: DashMap<MemCacheKey, Bytes>,
+    /// Reverse index: per-ino set of cache keys, so
+    /// `invalidate_ino` is O(K) where K is the number of blocks
+    /// for THAT ino, not O(N) over the whole cache. Without
+    /// this, every write to a 1KB file in a CSI mount with
+    /// 1000+ cached files does a full O(N) scan of `inner`
+    /// + the LRU queue, which costs ~5ms at 1000 entries
+    /// and scales linearly. With it, invalidate is essentially
+    /// free for small writes.
+    ///
+    /// Stale entries (the corresponding `inner` key was evicted
+    /// by mem_limit) are tolerated: `invalidate_ino` does an
+    /// `inner.remove(k)` that returns `None` and is silently
+    /// skipped, so a stale `by_ino[ino]` entry is harmless.
+    /// The per-ino HashSet itself is dropped after use, so
+    /// stale entries don't accumulate over time.
+    by_ino: DashMap<u64, std::collections::HashSet<MemCacheKey>>,
     /// FIFO order of insertion; front is the eviction candidate.
     /// Kept separate from the DashMap to avoid leaking its
     /// internal lock type.
@@ -423,6 +439,7 @@ impl DashMapMemCache {
     pub fn new(mem_limit: u64) -> Self {
         Self {
             inner: DashMap::new(),
+            by_ino: DashMap::new(),
             order: Mutex::new(VecDeque::new()),
             mem_limit,
             used: AtomicU64::new(0),
@@ -501,6 +518,15 @@ impl MemCache for DashMapMemCache {
             self.used.fetch_sub(old.len() as u64, Ordering::Relaxed);
         }
         self.inner.insert(key, data);
+        // Update reverse index: track this (ino, block_idx) so
+        // `invalidate_ino` is O(K) over this ino's blocks, not
+        // O(N) over the whole cache. The per-ino HashSet is
+        // dropped after each invalidate, so stale entries (from
+        // mem_limit-driven eviction) don't accumulate.
+        self.by_ino
+            .entry(ino)
+            .or_insert_with(std::collections::HashSet::new)
+            .insert(key);
         self.used.fetch_add(size, Ordering::Relaxed);
         self.inserts.fetch_add(1, Ordering::Relaxed);
         self.order.lock().unwrap().push_back(key);
@@ -516,38 +542,30 @@ impl MemCache for DashMapMemCache {
     }
 
     fn invalidate_ino(&self, ino: u64) {
-        // Two-phase: first snapshot the keys to drop, then
-        // remove from both the DashMap and the LRU queue. The
-        // DashMap retains all the data we need atomically per
-        // shard; doing it in a single `retain` is also possible
-        // but we'd need to subtract each removed entry's size
-        // from `used` while holding the shard lock. Snapshot
-        // + remove keeps the accounting simple and correct.
+        // O(K) via the per-ino reverse index (see `by_ino`).
+        // Without it this was a full O(N) scan of `inner` +
+        // `order`, which costs ~5ms at N=1000 cached entries
+        // and was the dominant cost of every small write
+        // (issue #15: write 1K-1M 3-4× slower than rclone).
+        //
+        // Stale keys (the corresponding `inner` entry was
+        // mem_limit-evicted) are tolerated: `inner.remove(k)`
+        // returns `None` and the entry's size wasn't added to
+        // `total_removed` in the first place, so the `used`
+        // accounting stays correct.
+        let Some((_, keys)) = self.by_ino.remove(&ino) else {
+            return;
+        };
         let mut total_removed: u64 = 0;
-        let keys: Vec<MemCacheKey> = self
-            .inner
-            .iter()
-            .filter_map(|entry| {
-                let (i, _b) = entry.key();
-                if *i == ino {
-                    total_removed += entry.value().len() as u64;
-                    Some(*entry.key())
-                } else {
-                    None
-                }
-            })
-            .collect();
         for k in &keys {
-            self.inner.remove(k);
+            if let Some((_, v)) = self.inner.remove(k) {
+                total_removed += v.len() as u64;
+            }
         }
         if total_removed > 0 {
             self.used.fetch_sub(total_removed, Ordering::Relaxed);
         }
-        // LRU queue: drain anything matching. Quadratic in the
-        // queue size, but the queue is bounded by `len()` which
-        // is in turn bounded by `mem_limit / min_block_size`,
-        // and `invalidate_ino` is only called from the write
-        // path (a relatively rare event). Acceptable cost.
+        // LRU queue: drain anything matching. O(K) here too.
         let mut order = self.order.lock().unwrap();
         order.retain(|k| k.0 != ino);
     }
@@ -555,6 +573,7 @@ impl MemCache for DashMapMemCache {
     fn clear(&self) {
         self.inner.clear();
         self.order.lock().unwrap().clear();
+        self.by_ino.clear();
         self.used.store(0, Ordering::Relaxed);
     }
 
