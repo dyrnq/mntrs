@@ -570,10 +570,12 @@ impl MntrsFs {
     /// `pub(crate)` so integration tests in `tests/` can verify the
     /// rename/rmdir/unlink leak fix.
     pub(crate) fn find_ino_by_path(&self, path: &str) -> Option<u64> {
-        self.inodes
-            .iter()
-            .find(|e| e.value().0 == path)
-            .map(|e| *e.key())
+        for entry in self.inodes.iter() {
+            if entry.value().0 == path {
+                return Some(*entry.key());
+            }
+        }
+        None
     }
 
     /// Recursively create `full_path` (and any missing parents) on the
@@ -1087,12 +1089,11 @@ impl Filesystem for MntrsFs {
                     _ => FileType::RegularFile,
                 };
                 let (_, size, mtime) = self.stat_op(&mp).unwrap_or((kind, 0, None));
-                let mut attr = self.make_attr(
-                    self.alloc_ino(&mp, kind, size),
-                    size,
-                    kind,
-                    mtime.unwrap_or(SystemTime::UNIX_EPOCH),
-                );
+                let ino = self
+                    .find_ino_by_path(&mp)
+                    .unwrap_or_else(|| self.alloc_ino(&mp, kind, size));
+                let mut attr =
+                    self.make_attr(ino, size, kind, mtime.unwrap_or(SystemTime::UNIX_EPOCH));
                 if let Some(mt) = mtime {
                     attr.mtime = mt;
                 }
@@ -1206,12 +1207,10 @@ impl Filesystem for MntrsFs {
             } else {
                 format!("{}/{}", path, name)
             };
-            if reply.add(
-                INodeNo(self.alloc_ino(&cp, *kind, *size)),
-                (i + 1) as u64,
-                *kind,
-                name,
-            ) {
+            let reuse_ino = self
+                .find_ino_by_path(&cp)
+                .unwrap_or_else(|| self.alloc_ino(&cp, *kind, *size));
+            if reply.add(INodeNo(reuse_ino), (i + 1) as u64, *kind, name) {
                 break;
             }
         }
@@ -1272,7 +1271,9 @@ impl Filesystem for MntrsFs {
             } else {
                 format!("{}/{}", path, name)
             };
-            let ino = self.alloc_ino(&cp, *kind, *size);
+            let ino = self
+                .find_ino_by_path(&cp)
+                .unwrap_or_else(|| self.alloc_ino(&cp, *kind, *size));
             // Bug C fix: pass the backend's mtime through. The previous
             // version passed UNIX_EPOCH and then overwrote mtime in the
             // next two lines, leaving atime/ctime/crtime at 1970-01-01.
@@ -2056,7 +2057,9 @@ impl Filesystem for MntrsFs {
                 {
                     tracing::debug!(error=%e, path=?cpath, "setattr truncate failed");
                 }
-                self.alloc_ino(&p, kind, s);
+                let _ = self
+                    .find_ino_by_path(&p)
+                    .unwrap_or_else(|| self.alloc_ino(&p, kind, s));
             }
             // mode/uid/gid — just record them for now (S3 has no chmod)
             let mut perm = if kind == FileType::Directory {
@@ -2280,7 +2283,9 @@ impl CoreFilesystem for MntrsFs {
         // inodes map is fine — if the entry exists, we keep
         // the previous (path, kind, size, mtime); if not, we
         // create one with the values we just resolved.
-        let ino = self.alloc_ino(&full_path, kind, size);
+        let ino = self
+            .find_ino_by_path(&full_path)
+            .unwrap_or_else(|| self.alloc_ino(&full_path, kind, size));
         Ok(to_core_attr(&self.make_attr(
             ino,
             size,
