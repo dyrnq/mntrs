@@ -219,13 +219,17 @@ pub struct MokaMemCache {
     /// Atomic counters for `stats()`. moka's built-in
     /// `entry_count()` and `weighted_size()` give us
     /// `entries` and `used_bytes` directly, but
-    /// hits/misses/inserts/evictions are application-level
-    /// (we increment on the read/write paths the same way
+    /// hits/misses/inserts are application-level (we
+    /// increment on the read/write paths the same way
     /// we do for DashMapMemCache — see the impl block).
+    /// Evictions are tracked via moka's eviction_listener.
     hits: std::sync::atomic::AtomicU64,
     misses: std::sync::atomic::AtomicU64,
     inserts: std::sync::atomic::AtomicU64,
-    evictions: std::sync::atomic::AtomicU64,
+    /// Shared with moka's eviction_listener closure via Arc.
+    /// Only incremented for actual evictions (Size/Expired),
+    /// not for explicit removes or replacements.
+    evictions: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl MokaMemCache {
@@ -233,29 +237,30 @@ impl MokaMemCache {
     /// `mem_limit == 0` means "unbounded" (no weigher — useful
     /// for tests, where eviction never kicks in).
     pub fn new(mem_limit: u64) -> Self {
+        let evictions = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let make_listener = |counter: &std::sync::Arc<std::sync::atomic::AtomicU64>| {
+            let counter = counter.clone();
+            move |_k: std::sync::Arc<MemCacheKey>,
+                  _v: Bytes,
+                  cause: moka::notification::RemovalCause| {
+                if cause.was_evicted() {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        };
+
         let inner = if mem_limit == 0 {
-            // moka requires *some* capacity hint; we use a
-            // large but finite number to mean "effectively
-            // unbounded for our scale". The weigher below
-            // ensures that the actual byte count is what
-            // bounds the cache, even when this huge value
-            // is the cap.
             moka::sync::Cache::builder()
                 .max_capacity(u64::MAX / 2)
-                .weigher(|_k: &MemCacheKey, v: &Bytes| {
-                    // Per-entry weight = key (16B) + value
-                    // size. The key is two u64s = 16 bytes on
-                    // 64-bit; rounding up to the cache block
-                    // granularity (8 MiB) is wasteful for
-                    // small entries, so we report the actual
-                    // bytes and let moka sum.
-                    v.len() as u32 + 16
-                })
+                .weigher(|_k: &MemCacheKey, v: &Bytes| v.len() as u32 + 16)
+                .eviction_listener(make_listener(&evictions))
                 .build()
         } else {
             moka::sync::Cache::builder()
                 .max_capacity(mem_limit)
                 .weigher(|_k: &MemCacheKey, v: &Bytes| (v.len() as u32).saturating_add(16))
+                .eviction_listener(make_listener(&evictions))
                 .build()
         };
         Self {
@@ -264,7 +269,7 @@ impl MokaMemCache {
             hits: std::sync::atomic::AtomicU64::new(0),
             misses: std::sync::atomic::AtomicU64::new(0),
             inserts: std::sync::atomic::AtomicU64::new(0),
-            evictions: std::sync::atomic::AtomicU64::new(0),
+            evictions,
         }
     }
 }
@@ -283,16 +288,6 @@ impl MemCache for MokaMemCache {
 
     fn put(&self, ino: u64, block_idx: u64, data: Bytes) {
         self.inner.insert((ino, block_idx), data);
-        // moka does not surface an explicit "evicted" callback
-        // for the `Cache::insert` path (the eviction counter
-        // `evicted_count` exists on `Cache::builder().eviction_listener`,
-        // but only for closure listeners — and the listener fires
-        // AFTER the eviction, not on insert). For our 5-bug-fix
-        // we don't need exact eviction accounting; the
-        // `used_bytes / capacity_bytes` ratio in `stats()` is the
-        // primary signal of pressure. The counter stays at 0
-        // for this impl, which is honest: moka handles it
-        // internally, we don't observe.
         self.inserts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
