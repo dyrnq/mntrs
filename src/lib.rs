@@ -208,6 +208,15 @@ pub struct MntrsFs {
     pub(crate) write_back_delay: Duration,
     pub(crate) cache_mode: String,
     pub(crate) read_ahead: u64,
+    /// Minimum file size (bytes) for which the read-path prefetcher
+    /// is activated on open(). 0 disables prefetching entirely.
+    /// Default: 64 MiB. See `maybe_create_prefetcher` for the
+    /// activation logic and issue #16 for the cat-100M motivation.
+    pub(crate) prefetch_threshold: u64,
+    /// Upper bound (MiB) on the prefetch in-memory PartQueue.
+    /// Caps the cost of a file that's opened but only partially
+    /// read. Default: 64 MiB.
+    pub(crate) prefetch_queue_mb: u64,
     pub(crate) read_chunk_size: u64,
     pub(crate) read_chunk_size_limit: u64,
     pub(crate) read_chunk_streams: u32,
@@ -304,26 +313,45 @@ fn opendal_timestamp_to_system_time(ts: impl Into<std::time::SystemTime>) -> std
     }
 }
 impl MntrsFs {
+    /// Create a background prefetcher for a file handle, or `None` if
+    /// the file is below `prefetch_threshold` or prefetching is
+    /// disabled. The prefetcher streams chunks into a bounded
+    /// PartQueue; the read-path pops them, so the FUSE `read()` for
+    /// sequential-from-start workloads (cat, dd, head -c large) lands
+    /// on already-fetched data instead of issuing 1 RTT per chunk.
+    ///
+    /// Previously gated on `read_chunk_streams > 1`, which made
+    /// prefetching unreachable for default configs (`read_chunk_streams`
+    /// defaults to 1, the serial-fetch path). The new gate is
+    /// `file_size >= prefetch_threshold`, default 64 MiB. Issue #16
+    /// (`cat 100M` 6.35× slower than rclone) was the motivation; the
+    /// existing 16 MiB chunk cap (commit fc5e974) still protects
+    /// `head -c1K` from over-fetch.
+    ///
+    /// Cancellation: the spawned downloader thread exits when
+    /// `release()` drops the handle and calls `HandlePrefetcher::cancel()`.
+    /// Without cancel, the thread would spin on a full queue forever
+    /// for partially-read files.
     fn maybe_create_prefetcher(
         &self,
         ino: u64,
         path: &str,
     ) -> Option<std::sync::Arc<prefetcher::HandlePrefetcher>> {
-        if self.read_chunk_streams > 1 {
-            let file_size = self.resolve(ino).map(|(_, _, s, _)| s).unwrap_or(0);
-            if file_size > 0 {
-                let chunk = self.read_chunk_size.max(131072);
-                let max_queue = chunk * self.read_chunk_streams as u64;
-                return Some(std::sync::Arc::new(prefetcher::HandlePrefetcher::new(
-                    self.op.as_ref().clone(),
-                    path.to_string(),
-                    file_size,
-                    max_queue,
-                    chunk,
-                )));
-            }
+        let file_size = self.resolve(ino).map(|(_, _, s, _)| s).unwrap_or(0);
+        if self.prefetch_threshold == 0 || file_size < self.prefetch_threshold {
+            return None;
         }
-        None
+        // chunk_size cap matches the read-path hard cap (16 MiB) so
+        // prefetched parts align with the mem_cache block size (8 MiB).
+        let chunk = self.read_chunk_size.clamp(131072, 16 * 1024 * 1024);
+        let max_queue = self.prefetch_queue_mb.max(1) * 1024 * 1024;
+        Some(std::sync::Arc::new(prefetcher::HandlePrefetcher::new(
+            self.op.as_ref().clone(),
+            path.to_string(),
+            file_size,
+            max_queue,
+            chunk,
+        )))
     }
 
     fn make_attr(&self, ino: u64, size: u64, kind: FileType, mtime: SystemTime) -> FileAttr {
@@ -1633,10 +1661,25 @@ impl Filesystem for MntrsFs {
             } = h.value()
             && let Some(part) = p.pop(offset)
         {
+            // Mirror the multi-block mem_cache population done by the
+            // remote-fetch paths (lib.rs:~1751-1773) so subsequent
+            // reads on the same block range hit the fast path
+            // (lib.rs:~1574) instead of re-fetching. part.data is up
+            // to 16 MiB and may span 1-2 CACHE_BLOCK_SIZE (8 MiB)
+            // blocks; cheap iteration.
+            let first_blk = part.offset / CACHE_BLOCK_SIZE;
+            let data = part.data.clone();
+            let n_blks = (data.len() as u64).div_ceil(CACHE_BLOCK_SIZE);
+            for i in 0..n_blks {
+                let s = (i * CACHE_BLOCK_SIZE) as usize;
+                let e = ((i + 1) * CACHE_BLOCK_SIZE) as usize;
+                self.mem_cache
+                    .put(ino, first_blk + i, data.slice(s..e.min(data.len())));
+            }
             let start = (offset - part.offset) as usize;
-            let end = (start + size as usize).min(part.data.len());
-            if start < part.data.len() {
-                reply.data(&part.data[start..end]);
+            let end = (start + size as usize).min(data.len());
+            if start < data.len() {
+                reply.data(&data[start..end]);
             } else {
                 reply.data(&[]);
             }
@@ -1775,51 +1818,6 @@ impl Filesystem for MntrsFs {
                 }
                 Err(_) => reply.error(Errno::EIO),
             }
-        }
-        // Read-ahead: pre-fetch next block into mem_cache (async, tokio)
-        if self.read_ahead > 0 {
-            let op = self.op.clone();
-            let p = path.clone();
-            let next = offset + size as u64;
-            let ahead = self.read_ahead;
-            let cdir = self.cache_dir.clone();
-            let _ino_save = ino;
-            rt().spawn(async move {
-                let result: Result<_, opendal::Error> = async {
-                    let data = op.read_with(&p).range(next..).await?;
-                    let bytes = bytes::Bytes::from(data.to_vec());
-                    // Store in disk cache for crash recovery
-                    let cpath = crate::cache_path(&cdir, &p);
-                    if let Some(parent) = cpath.parent()
-                        && let Err(e) = std::fs::create_dir_all(parent)
-                    {
-                        tracing::debug!(error=%e, "readahead mkdir failed");
-                    }
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .truncate(false)
-                        .write(true)
-                        .read(true)
-                        .open(&cpath)
-                    {
-                        use std::io::{Seek, Write};
-                        if f.seek(std::io::SeekFrom::Start(next)).is_err()
-                            || f.write_all(&bytes[..bytes.len().min(ahead as usize)])
-                                .is_err()
-                        {
-                            tracing::debug!("readahead disk write failed");
-                        }
-                    }
-                    Ok(bytes)
-                }
-                .await;
-                // Now populate mem_cache from the thread that has access to self
-                // Note: can't access self here — tokio task doesn't borrow self
-                // mem_cache is populated by the main read path on next hit
-                if let Err(e) = result {
-                    tracing::debug!(error=%e, "readahead fetch failed");
-                }
-            });
         }
     }
 
@@ -2342,7 +2340,19 @@ impl Filesystem for MntrsFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.handles.remove(&fh.into());
+        // Signal any active prefetcher to stop so its background
+        // thread doesn't keep fetching into a queue nobody reads.
+        // The downloader checks `cancelled` at the top of each loop
+        // iteration; the Arc<HandlePrefetcher> is dropped along with
+        // the FileHandleState when `handles.remove` returns.
+        if let Some((_, state)) = self.handles.remove(&fh.into())
+            && let FileHandleState::Read {
+                prefetcher: Some(p),
+                ..
+            } = state
+        {
+            p.cancel();
+        }
         reply.ok();
     }
 }
@@ -3677,6 +3687,8 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         write_back_delay: std::time::Duration::from_secs(1),
         cache_mode: "writes".into(),
         read_ahead: 0,
+        prefetch_threshold: 64 * 1024 * 1024,
+        prefetch_queue_mb: 64,
         read_chunk_size: 0,
         read_chunk_size_limit: 0,
         read_chunk_streams: 1,

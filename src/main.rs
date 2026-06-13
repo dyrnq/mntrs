@@ -208,6 +208,18 @@ enum Commands {
         /// Number of parallel read streams (default: 0 = serial, matches rclone)
         #[arg(long, default_value = "0")]
         vfs_read_chunk_streams: u32,
+        /// Min file size (bytes) to enable the read-path prefetcher
+        /// (default: 64 MiB; 0 = disabled). Speeds up sequential
+        /// reads on large files (cat, dd, head -c large) by issuing
+        /// the next chunk in the background while the kernel reads
+        /// the current one.
+        #[arg(long, default_value = "67108864")]
+        vfs_prefetch_threshold: u64,
+        /// Max prefetch in-memory queue size in MiB (default: 64).
+        /// Caps memory cost when a large file is opened but only
+        /// partially read.
+        #[arg(long, default_value = "64")]
+        vfs_prefetch_queue_mb: u64,
         /// Use fast fingerprint (size+mtime) instead of checksums
         #[arg(long)]
         vfs_fast_fingerprint: bool,
@@ -349,6 +361,8 @@ fn main() -> anyhow::Result<()> {
             max_read_ahead,
             vfs_read_chunk_size_limit,
             vfs_read_chunk_streams,
+            vfs_prefetch_threshold,
+            vfs_prefetch_queue_mb,
             vfs_fast_fingerprint,
             async_read,
             vfs_refresh,
@@ -432,6 +446,8 @@ fn main() -> anyhow::Result<()> {
                 max_read_ahead,
                 vfs_read_chunk_size_limit,
                 vfs_read_chunk_streams,
+                vfs_prefetch_threshold,
+                vfs_prefetch_queue_mb,
                 vfs_fast_fingerprint,
                 async_read,
                 vfs_refresh,

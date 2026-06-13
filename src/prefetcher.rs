@@ -81,6 +81,7 @@ impl PartQueue {
 /// Background downloader that fills a PartQueue.
 pub struct HandlePrefetcher {
     queue: Arc<Mutex<PartQueue>>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HandlePrefetcher {
@@ -92,10 +93,15 @@ impl HandlePrefetcher {
         chunk_size: u64,
     ) -> Self {
         let queue = Arc::new(Mutex::new(PartQueue::new(max_queue_bytes)));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let q = queue.clone();
+        let c = cancelled.clone();
         std::thread::spawn(move || {
             let mut offset = 0u64;
             while offset < file_size {
+                if c.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
                 let end = (offset + chunk_size).min(file_size);
                 let result =
                     crate::rt().block_on(async { op.read_with(&path).range(offset..end).await });
@@ -120,7 +126,15 @@ impl HandlePrefetcher {
             }
             q.lock().unwrap().set_finished();
         });
-        Self { queue }
+        Self { queue, cancelled }
+    }
+
+    /// Signal the background downloader to stop early. Used by
+    /// FUSE `release()` so a partially-read file's prefetcher
+    /// thread doesn't keep fetching into a queue nobody reads.
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn pop(&self, offset: u64) -> Option<Part> {

@@ -278,6 +278,8 @@ pub fn mount_internal(
         131072,                   // max_read_ahead
         0,                        // vfs_read_chunk_size_limit
         0,                        // vfs_read_chunk_streams (serial)
+        67108864,                 // vfs_prefetch_threshold (64 MiB)
+        64,                       // vfs_prefetch_queue_mb
         false,                    // vfs_fast_fingerprint
         false,                    // async_read
         false,                    // vfs_refresh
@@ -473,6 +475,8 @@ pub fn mount(
     _max_read_ahead: u64,
     vfs_read_chunk_size_limit: u64,
     vfs_read_chunk_streams: u32,
+    vfs_prefetch_threshold: u64,
+    vfs_prefetch_queue_mb: u64,
     vfs_fast_fingerprint: bool,
     async_read: bool,
     vfs_refresh: bool,
@@ -540,6 +544,8 @@ pub fn mount(
         read_chunk_size: vfs_read_chunk_size,
         read_chunk_size_limit: vfs_read_chunk_size_limit,
         read_chunk_streams: vfs_read_chunk_streams,
+        prefetch_threshold: vfs_prefetch_threshold,
+        prefetch_queue_mb: vfs_prefetch_queue_mb,
         uid,
         gid,
         umask,
