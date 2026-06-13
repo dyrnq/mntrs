@@ -2,7 +2,7 @@
 //!
 //! Why this exists:
 //!
-//! OpenDAL 0.57 ships a `GLOBAL_REQWEST_CLIENT: LazyLock<reqwest::Client>` in
+//! OpenDAL 0.57 ships a `GLOBAL_REWQEST_CLIENT: LazyLock<reqwest::Client>` in
 //! `opendal_core::raw::http_util::client` that the default `HttpClient::default()`
 //! returns. The first time it is instantiated it binds the underlying hyper
 //! connector's TcpStream I/O to whichever tokio runtime the calling thread is
@@ -35,17 +35,45 @@ static SHARED: OnceLock<reqwest::Client> = OnceLock::new();
 /// `tokio::runtime::Handle::current()` is `crate::rt()` (which is true for
 /// every operator build path in `src/cmd/mount.rs` — they all run inside
 /// `rt_block_on`, and `rt_block_on` now resolves to `crate::rt()` since
-/// commit 9809e91).
+/// commit 9809e91). The init-time assertion below catches the case where
+/// a future refactor calls `shared()` outside of `crate::rt()`, which
+/// would silently re-introduce the cross-runtime deadlock.
 pub fn shared() -> &'static reqwest::Client {
     SHARED.get_or_init(|| {
+        // Assert: init must happen from inside `crate::rt()`. If the
+        // surrounding context is a different (or no) tokio runtime,
+        // panic at startup with a clear message — never silently bind
+        // the hyper connector to the wrong runtime and then deadlock
+        // hours later in writeback.
+        let init_handle = tokio::runtime::Handle::current();
+        let expected = crate::rt().handle();
+        assert!(
+            init_handle.id() == expected.id(),
+            "crate::http_client::shared() must be initialized from inside crate::rt(); \
+             got a different (or no) tokio runtime. Callers should reach this via \
+             `apply_operator_with_tls`, which always runs inside `rt_block_on`."
+        );
+
         reqwest::Client::builder()
             // 5s for TCP/TLS handshake. OpenDAL's `TimeoutLayer` below adds
             // per-I/O timeouts; the connect-timeout here only guards the
             // very first byte of the connection.
             .connect_timeout(Duration::from_secs(5))
-            // 16 idle keep-alive connections per host. The `ConcurrentLimitLayer`
-            // in `apply_operator_with_tls` further caps in-flight requests at
-            // 16; idle-pool sizing is independent.
+            // 60s TCP keep-alive. CSI mounts can sit idle for tens of
+            // minutes between reads; without this, intermediate NAT /
+            // firewall devices may silently drop idle TCP connections,
+            // and the next read then sees "connection reset by peer"
+            // and pays a 1-2s reconnect cost.
+            .tcp_keepalive(Some(Duration::from_secs(60)))
+            // 5 min idle-pool timeout (reqwest default is 90s). Keeps
+            // keep-alive connections warm across the typical 1-5 min
+            // gap between CSI-mount reads. Matches rclone's VFS-mount
+            // default.
+            .pool_idle_timeout(Some(Duration::from_secs(300)))
+            // 16 idle keep-alive connections per host. The
+            // `ConcurrentLimitLayer` in `apply_operator_with_tls`
+            // further caps in-flight requests at 16; idle-pool sizing
+            // is independent.
             .pool_max_idle_per_host(16)
             // Build a fresh client per process. `reqwest::Client` is
             // `Clone` (Arc internally), so callers below just clone the
