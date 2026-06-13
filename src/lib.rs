@@ -613,8 +613,51 @@ impl MntrsFs {
 
         let op = self.op.clone();
         rt().block_on(async move {
-            for p in &chain {
-                match op.create_dir(p).await {
+            // Try just the leaf first. On S3/GCS/OSS/etc. (flat-namespace
+            // with implicit dirs) this is 1 round-trip and the
+            // intermediate "a/", "a/b/" don't need to exist as actual
+            // objects — they're "common prefixes" surfaced by list
+            // operations. The pre-fix code did 3 sequential PUTs for a
+            // 3-level path, which is what made `mkdir` 2-3× slower than
+            // rclone in the bench (issue #17).
+            let leaf = chain.last().expect("chain built from non-empty path");
+            match op.create_dir(leaf).await {
+                Ok(()) => return Ok(()),
+                Err(e)
+                    if e.kind() == opendal::ErrorKind::Unsupported
+                        || e.kind() == opendal::ErrorKind::AlreadyExists =>
+                {
+                    return Ok(());
+                }
+                Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+                    // Leaf create_dir returned NotFound — almost
+                    // certainly because an intermediate is missing on a
+                    // hierarchical-namespace backend (HDFS, WebHDFS).
+                    // Fall through to the full chain.
+                    tracing::debug!(path = %leaf,
+                        "leaf create_dir returned NotFound; \
+                         falling back to full mkdir_chain");
+                }
+                Err(e) => {
+                    // Other error on the leaf (e.g. auth, 5xx). Don't
+                    // try the chain — the chain would likely fail the
+                    // same way, and the additional 2 PUTs would
+                    // amplify the failure cost.
+                    return Err(std::io::Error::other(format!(
+                        "create_dir({leaf}) failed: {e}"
+                    )));
+                }
+            }
+
+            // Full chain (hierarchical-namespace fallback). The 3 PUTs
+            // are issued concurrently so wall-clock latency is 1
+            // round-trip (not 3). We can do this because the 3 levels
+            // are independent — no level depends on another's success
+            // for its own request to be well-formed.
+            let futs = chain.iter().map(|p| op.create_dir(p));
+            let results = futures::future::join_all(futs).await;
+            for (p, r) in chain.iter().zip(results) {
+                match r {
                     Ok(()) => {}
                     Err(e) if e.kind() == opendal::ErrorKind::Unsupported => {
                         tracing::debug!(path = %p,
