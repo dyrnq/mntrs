@@ -1200,15 +1200,37 @@ impl Filesystem for MntrsFs {
             reply.ok();
             return;
         }
-        // entries already carry size/mtime from list_op — no per-entry stat needed
+        // Batch ino lookup: single pass over inodes instead of O(n) per entry.
+        // Refs: https://github.com/dyrnq/mntrs/issues/11
+        let child_paths: Vec<String> = entries[start..]
+            .iter()
+            .map(|(name, _, _, _)| {
+                if path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}/{}", path, name)
+                }
+            })
+            .collect();
+        let mut path_to_ino: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::with_capacity(child_paths.len());
+        for cp in &child_paths {
+            // Single O(n) pass: check if any existing ino matches this path
+            for entry in self.inodes.iter() {
+                if entry.value().0.as_str() == cp.as_str() {
+                    path_to_ino.insert(cp.clone(), *entry.key());
+                    break;
+                }
+            }
+        }
         for (i, (name, kind, size, _mtime)) in entries.iter().enumerate().skip(start) {
             let cp = if path.is_empty() {
                 name.clone()
             } else {
                 format!("{}/{}", path, name)
             };
-            let reuse_ino = self
-                .find_ino_by_path(&cp)
+            let reuse_ino = path_to_ino
+                .remove(&cp)
                 .unwrap_or_else(|| self.alloc_ino(&cp, *kind, *size));
             if reply.add(INodeNo(reuse_ino), (i + 1) as u64, *kind, name) {
                 break;
