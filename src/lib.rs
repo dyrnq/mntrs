@@ -1632,15 +1632,23 @@ impl Filesystem for MntrsFs {
             } = *entry.value()
             {
                 if offset == *last_offset {
-                    // Sequential read: use configured chunk size if
-                    // available (cat 100M → one 128MB fetch), otherwise
-                    // double from previous for adaptive growth.
-                    // Refs: https://github.com/dyrnq/mntrs/issues/12
-                    if self.read_chunk_size > 0 {
+                    // Sequential read: grow up to user-configured, with
+                    // a hard 16MB cap regardless of `read_chunk_size`.
+                    // The cap is what protects `head -c1K 100M` from
+                    // downloading 128MB just to return 1KB (issue #12)
+                    // — without it, the d5f74ed "use user value" path
+                    // regresses head/tail to 64-272× slower than rclone.
+                    // 16MB is the smallest cap that still gives cat
+                    // 100M a sub-second cold-fetch (≈7 round-trips
+                    // at 130 ms each), and matches the original
+                    // pre-d5f74ed behavior of 8MB within 2×.
+                    let user_cap = if self.read_chunk_size > 0 {
                         self.read_chunk_size
                     } else {
-                        (cs * 2).min(8 * 1024 * 1024)
-                    }
+                        8 * 1024 * 1024
+                    };
+                    let hard_cap = 16 * 1024 * 1024;
+                    (cs * 2).min(user_cap).min(hard_cap)
                 } else {
                     // Random seek: reset to initial
                     131072
