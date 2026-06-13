@@ -13,11 +13,6 @@ pub mod writeback;
 pub const CACHE_BLOCK_SIZE: u64 = 8 * 1024 * 1024;
 pub type Inodes = Arc<dashmap::DashMap<u64, (String, FileType, u64, Option<SystemTime>)>>;
 
-#[cfg(unix)]
-use std::ffi::OsStr;
-use std::fs;
-#[cfg(unix)]
-use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -29,22 +24,7 @@ use std::time::{Duration, SystemTime};
 // dynamically through the trait object.
 
 #[cfg(unix)]
-use crate::core_fs::fuser::io_err_to_fuse_errno;
-#[cfg(unix)]
-use fuser::{
-    AccessFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, KernelConfig, LockOwner, OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
-    Request, TimeOrNow, WriteFlags,
-};
-#[cfg(all(unix, target_os = "linux"))]
-fn xattr_not_found() -> fuser::Errno {
-    Errno::ENODATA
-}
-#[cfg(all(unix, target_os = "macos"))]
-fn xattr_not_found() -> fuser::Errno {
-    Errno::ENOATTR
-}
+use fuser::{FileAttr, FileType, INodeNo};
 
 #[cfg(not(unix))]
 /// Stub type for non-Unix platforms — mirrors fuser::FileType variants used in shared state.
@@ -113,7 +93,6 @@ fn rt() -> &'static tokio::runtime::Runtime {
 }
 
 // TTL now comes from MntrsFs.attr_ttl field
-const FUSE_ROOT_INO: u64 = 1;
 static NEXT_INO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(2);
 static NEXT_HANDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 // DIR_CACHE_TTL now comes from MntrsFs.dir_cache_ttl field
@@ -495,20 +474,6 @@ pub fn load_cache_index(cache_dir: &Path) -> Vec<(String, u64, u64, std::time::S
 }
 
 #[cfg(unix)]
-fn validate_path_component(name: &str) -> Result<(), Errno> {
-    if name.is_empty() {
-        return Err(Errno::ENOENT);
-    }
-    if name == "." || name == ".." {
-        return Err(Errno::EEXIST);
-    }
-    if name.contains('/') || name.contains(' ') {
-        tracing::warn!(name, "path component contains separator or null");
-        return Err(Errno::EINVAL);
-    }
-    Ok(())
-}
-
 impl MntrsFs {
     fn resolve(&self, ino: u64) -> Option<(String, FileType, u64, Option<std::time::SystemTime>)> {
         self.inodes.get(&ino).map(|r| r.clone())
@@ -992,1369 +957,6 @@ impl MntrsFs {
             }
         }
     }
-
-    fn evict_lru(&self) {
-        if self.cache_max_size == 0 && self.cache_min_free_space == 0 {
-            return;
-        }
-        // Calculate total cache size and collect entries for LRU eviction.
-        // Uses a min-heap (BinaryHeap with Reverse) for O(k log n) vs O(n log n) sort.
-        use std::cmp::Reverse;
-        use std::collections::BinaryHeap;
-
-        let mut total: u64 = 0;
-        let mut heap: BinaryHeap<Reverse<(std::time::SystemTime, String, u64)>> = BinaryHeap::new();
-        for entry in self.disk_cache_index.iter() {
-            let path = entry.key().clone();
-            let (size, atime) = *entry.value();
-            total += size;
-            heap.push(Reverse((atime, path, size)));
-        }
-
-        // Check free disk space if configured
-        let need_free = if self.cache_min_free_space > 0 {
-            #[cfg(unix)]
-            {
-                if let Ok(fs_stat) = rustix::fs::statvfs(&self.cache_dir) {
-                    let free = fs_stat.f_bavail.saturating_mul(fs_stat.f_frsize);
-                    if free < self.cache_min_free_space {
-                        Some(self.cache_min_free_space - free)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                None
-            }
-        } else {
-            None
-        };
-        let size_limit = if self.cache_max_size > 0 {
-            total.saturating_sub(self.cache_max_size)
-        } else {
-            0
-        };
-        let to_free = size_limit.max(need_free.unwrap_or(0));
-        if to_free == 0 {
-            self.out_of_space
-                .store(false, std::sync::atomic::Ordering::Relaxed);
-            return;
-        }
-        self.out_of_space
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-
-        // Pop oldest entries from min-heap until enough space freed
-        let mut remaining = to_free;
-        let mut freed: u64 = 0;
-        while let Some(Reverse((_, path, size))) = heap.pop() {
-            if remaining == 0 {
-                break;
-            }
-            let cpath = cache_block_path(&self.cache_dir, &path, 0);
-            let _ = fs::remove_file(&cpath);
-            let _ = fs::remove_file(cpath.with_extension("meta"));
-            self.disk_cache_index.remove(&path as &str);
-            freed += size;
-            remaining = remaining.saturating_sub(size);
-        }
-        if freed >= to_free {
-            self.out_of_space
-                .store(false, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-}
-
-// writeback_worker has been moved to writeback.rs — use writeback::worker()
-
-#[cfg(unix)]
-impl Filesystem for MntrsFs {
-    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
-        self.common_init_wb();
-        if let Err(e) = fs::create_dir_all(&self.cache_dir) {
-            tracing::warn!(error=%e, "create_dir_all failed for cache");
-        }
-        // Enable readdirplus for stat+readdir in one round-trip
-        let _ = config.add_capabilities(fuser::InitFlags::FUSE_DO_READDIRPLUS);
-        // Recover disk cache index + attr_cache for restart warm cache
-        let cached_blocks = load_cache_index(&self.cache_dir);
-        if !cached_blocks.is_empty() {
-            tracing::info!(
-                count = cached_blocks.len(),
-                "disk cache blocks recovered for restart"
-            );
-        }
-        // Recover attr_cache from .meta sidecars
-        if let Ok(entries) = fs::read_dir(&self.cache_dir) {
-            let mut recovered = 0u64;
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.extension().is_some_and(|ext| ext == "meta")
-                    && let Ok(content) = fs::read_to_string(&p)
-                {
-                    let parts: Vec<&str> = content.split(' ').collect();
-                    if parts.len() >= 3 {
-                        let remote_path = parts[0].to_string();
-                        let size: u64 = parts[1].parse().unwrap_or(0);
-                        let kind_byte: u8 = parts[2].parse().unwrap_or(0);
-                        let kind = if kind_byte == 1 {
-                            FileType::Directory
-                        } else {
-                            FileType::RegularFile
-                        };
-                        let cpath = p.with_extension("");
-                        let mtime = std::fs::metadata(&cpath)
-                            .ok()
-                            .and_then(|m| m.modified().ok())
-                            .unwrap_or(std::time::UNIX_EPOCH);
-                        self.attr_cache.insert(
-                            remote_path,
-                            (kind, size, Some(mtime), std::time::Instant::now()),
-                        );
-                        recovered += 1;
-                    }
-                }
-            }
-            if recovered > 0 {
-                tracing::info!(
-                    count = recovered,
-                    "attr_cache recovered from .meta sidecars"
-                );
-            }
-        } // Pre-populate root directory cache on mount if --vfs-refresh
-        if self.vfs_refresh
-            && let Err(e) = self.list_op("")
-        {
-            tracing::debug!(error = %e, "vfs_refresh: list_op root failed (non-fatal)");
-        }
-        Ok(())
-    }
-
-    fn access(&self, _req: &Request, _ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
-        reply.ok();
-    }
-
-    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let name = name.to_string_lossy().to_string();
-        if let Err(e) = validate_path_component(&name) {
-            reply.error(e);
-            return;
-        }
-        let name2 = name.clone();
-        let parent: u64 = parent.into();
-        if name == "." || name == ".." {
-            let p = if name == "." { parent } else { FUSE_ROOT_INO };
-            let attr = self
-                .resolve(p)
-                .map(|(_, k, s, _)| self.make_attr(p, s, k, SystemTime::UNIX_EPOCH))
-                .unwrap_or_else(|| {
-                    self.make_attr(
-                        FUSE_ROOT_INO,
-                        4096,
-                        FileType::Directory,
-                        SystemTime::UNIX_EPOCH,
-                    )
-                });
-            reply.entry(&self.attr_ttl, &attr, Generation(0));
-            return;
-        }
-        let parent_path = self
-            .resolve(parent)
-            .map(|(p, _, _, _)| p)
-            .unwrap_or_default();
-        let full_path = if parent_path.is_empty() {
-            name2
-        } else {
-            format!("{}/{}", parent_path, name2)
-        };
-        if let Some((kind, size, mtime)) = self.stat_op(&full_path) {
-            // Reuse existing ino for this path so the mem_cache key
-            // (ino, block_idx) stays stable across kernel LOOKUPs.
-            // Previously alloc_ino() was called unconditionally,
-            // giving a fresh ino each time — the kernel caches these
-            // but evicts under memory pressure, causing mem_cache
-            // misses on every re-lookup.
-            let ino = self
-                .find_ino_by_path(&full_path)
-                .unwrap_or_else(|| self.alloc_ino(&full_path, kind, size));
-            let mut attr = self.make_attr(ino, size, kind, mtime.unwrap_or(SystemTime::UNIX_EPOCH));
-            if let Some(mt) = mtime {
-                attr.mtime = mt;
-            }
-            reply.entry(&self.attr_ttl, &attr, Generation(0));
-        } else if self.case_insensitive {
-            // Fallback: search directory listing for case-insensitive match
-            let entries = match self.list_op(&parent_path) {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::debug!(path = %parent_path, error = %e,
-                        "case-insensitive lookup: list_op failed");
-                    reply.error(Errno::EIO);
-                    return;
-                }
-            };
-            let lower = name.to_lowercase();
-            if let Some((matched_name, mode, ..)) =
-                entries.iter().find(|(n, ..)| n.to_lowercase() == lower)
-            {
-                let mp = if parent_path.is_empty() {
-                    matched_name.clone()
-                } else {
-                    format!("{}/{}", parent_path, matched_name)
-                };
-                let kind = match mode {
-                    EntryMode::DIR => FileType::Directory,
-                    _ => FileType::RegularFile,
-                };
-                let (_, size, mtime) = self.stat_op(&mp).unwrap_or((kind, 0, None));
-                let ino = self
-                    .find_ino_by_path(&mp)
-                    .unwrap_or_else(|| self.alloc_ino(&mp, kind, size));
-                let mut attr =
-                    self.make_attr(ino, size, kind, mtime.unwrap_or(SystemTime::UNIX_EPOCH));
-                if let Some(mt) = mtime {
-                    attr.mtime = mt;
-                }
-                reply.entry(&self.attr_ttl, &attr, Generation(0));
-            } else {
-                reply.error(Errno::ENOENT);
-            }
-        } else {
-            reply.error(Errno::ENOENT);
-        }
-    }
-
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        let ino: u64 = ino.into();
-        if ino == FUSE_ROOT_INO {
-            reply.attr(
-                &self.attr_ttl,
-                &self.make_attr(ino, 4096, FileType::Directory, SystemTime::UNIX_EPOCH),
-            );
-            return;
-        }
-        if let Some((path, kind, inodes_size, _)) = self.resolve(ino) {
-            let (_, backend_size, mtime) = self.stat_op(&path).unwrap_or((kind, 0, None));
-            // Use the larger of inodes size and backend size.
-            // The inodes map is updated immediately by write(), while the
-            // backend may lag behind due to async writeback.
-            let size = inodes_size.max(backend_size);
-            let mut attr = self.make_attr(ino, size, kind, mtime.unwrap_or(SystemTime::UNIX_EPOCH));
-            if let Some(mt) = mtime {
-                attr.mtime = mt;
-            }
-            reply.attr(&self.attr_ttl, &attr);
-        } else {
-            reply.error(Errno::ENOENT);
-        }
-    }
-
-    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-        // Report virtual unlimited space (S3 is effectively infinite)
-        const BLOCK_SIZE: u32 = 4096;
-        let total_blocks = if self.disk_total_size > 0 {
-            self.disk_total_size / BLOCK_SIZE as u64
-        } else {
-            256 * 1024 * 1024 // default ~1PB
-        };
-        let total_inodes = 1_000_000_000u64;
-        reply.statfs(
-            total_blocks,
-            total_blocks,
-            total_blocks,
-            total_inodes,
-            total_inodes,
-            BLOCK_SIZE,
-            255,
-            0,
-        );
-    }
-
-    fn readdir(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        _fh: FileHandle,
-        offset: u64,
-        mut reply: ReplyDirectory,
-    ) {
-        let ino: u64 = ino.into();
-        let path = self.resolve(ino).map(|(p, _, _, _)| p).unwrap_or_default();
-        let listed = match self.list_op(&path) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(path = %path, error = %e, "readdir: list_op failed");
-                reply.error(Errno::EIO);
-                return;
-            }
-        };
-        let mut entries: Vec<(String, FileType, u64, Option<SystemTime>)> = vec![
-            (".".to_string(), FileType::Directory, 4096, None),
-            ("..".to_string(), FileType::Directory, 4096, None),
-        ];
-        for (name, mode, size, mtime) in listed {
-            let clean_name = name.trim_start_matches('/').trim_end_matches('/');
-            let name = if clean_name.is_empty() {
-                name.clone()
-            } else {
-                clean_name.to_string()
-            };
-            // Skip root entry and empty names from list_op
-            if name.is_empty() || name == "/" {
-                continue;
-            }
-            entries.push((
-                name,
-                match mode {
-                    EntryMode::DIR => FileType::Directory,
-                    _ => FileType::RegularFile,
-                },
-                size,
-                Some(mtime),
-            ));
-        }
-        let start = offset as usize;
-        if start >= entries.len() {
-            reply.ok();
-            return;
-        }
-        // Batch ino lookup: single pass over inodes instead of O(n) per entry.
-        // Refs: https://github.com/dyrnq/mntrs/issues/11
-        let child_paths: Vec<String> = entries[start..]
-            .iter()
-            .map(|(name, _, _, _)| {
-                if path.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{}/{}", path, name)
-                }
-            })
-            .collect();
-        let mut path_to_ino: std::collections::HashMap<String, u64> =
-            std::collections::HashMap::with_capacity(child_paths.len());
-        for cp in &child_paths {
-            // Single O(n) pass: check if any existing ino matches this path
-            for entry in self.inodes.iter() {
-                if entry.value().0.as_str() == cp.as_str() {
-                    path_to_ino.insert(cp.clone(), *entry.key());
-                    break;
-                }
-            }
-        }
-        for (i, (name, kind, size, _mtime)) in entries.iter().enumerate().skip(start) {
-            let cp = if path.is_empty() {
-                name.clone()
-            } else {
-                format!("{}/{}", path, name)
-            };
-            let reuse_ino = path_to_ino
-                .remove(&cp)
-                .unwrap_or_else(|| self.alloc_ino(&cp, *kind, *size));
-            if reply.add(INodeNo(reuse_ino), (i + 1) as u64, *kind, name) {
-                break;
-            }
-        }
-        reply.ok();
-    }
-
-    fn readdirplus(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        _fh: FileHandle,
-        offset: u64,
-        mut reply: ReplyDirectoryPlus,
-    ) {
-        let ino: u64 = ino.into();
-        let path = self.resolve(ino).map(|(p, _, _, _)| p).unwrap_or_default();
-        let listed = match self.list_op(&path) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(path = %path, error = %e, "readdirplus: list_op failed");
-                reply.error(Errno::EIO);
-                return;
-            }
-        };
-        let mut entries: Vec<(String, FileType, u64, Option<SystemTime>)> = vec![
-            (".".to_string(), FileType::Directory, 4096, None),
-            ("..".to_string(), FileType::Directory, 4096, None),
-        ];
-        for (name, mode, size, mtime) in listed {
-            let clean_name = name.trim_start_matches('/').trim_end_matches('/');
-            let name = if clean_name.is_empty() {
-                name.clone()
-            } else {
-                clean_name.to_string()
-            };
-            // Skip root entry and empty names from list_op
-            if name.is_empty() || name == "/" {
-                continue;
-            }
-            entries.push((
-                name,
-                match mode {
-                    EntryMode::DIR => FileType::Directory,
-                    _ => FileType::RegularFile,
-                },
-                size,
-                Some(mtime),
-            ));
-        }
-        let start = offset as usize;
-        if start >= entries.len() {
-            reply.ok();
-            return;
-        }
-        for (i, (name, kind, size, mtime)) in entries.iter().enumerate().skip(start) {
-            let cp = if path.is_empty() {
-                name.clone()
-            } else {
-                format!("{}/{}", path, name)
-            };
-            let ino = self
-                .find_ino_by_path(&cp)
-                .unwrap_or_else(|| self.alloc_ino(&cp, *kind, *size));
-            // Bug C fix: pass the backend's mtime through. The previous
-            // version passed UNIX_EPOCH and then overwrote mtime in the
-            // next two lines, leaving atime/ctime/crtime at 1970-01-01.
-            // For dir entries with no backend mtime (e.g. just-created
-            // dirs not yet written through), fall back to now() so the
-            // FUSE kernel shows a sane timestamp in `ls -la` output.
-            let effective_mtime = mtime.unwrap_or_else(SystemTime::now);
-            let attr = self.make_attr(ino, *size, *kind, effective_mtime);
-            if reply.add(
-                INodeNo(ino),
-                (i + 1) as u64,
-                name.as_str(),
-                &self.attr_ttl,
-                &attr,
-                Generation(0),
-            ) {
-                break;
-            }
-        }
-        reply.ok();
-    }
-
-    fn opendir(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        reply.opened(FileHandle(1), FopenFlags::empty());
-    }
-    fn releasedir(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _fh: FileHandle,
-        _flags: OpenFlags,
-        reply: ReplyEmpty,
-    ) {
-        reply.ok();
-    }
-
-    fn create(
-        &self,
-        _req: &Request,
-        parent: INodeNo,
-        name: &OsStr,
-        _mode: u32,
-        _umask: u32,
-        _flags: i32,
-        reply: ReplyCreate,
-    ) {
-        let name = name.to_string_lossy();
-        let parent_path = self
-            .resolve(parent.into())
-            .map(|(p, _, _, _)| p)
-            .unwrap_or_default();
-        let full_path = if parent_path.is_empty() {
-            name.to_string()
-        } else {
-            format!("{}/{}", parent_path, name)
-        };
-        let ino = self.alloc_ino(&full_path, FileType::RegularFile, 0);
-        let fh = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let cpath = cache_path(&self.cache_dir, &full_path);
-        if let Some(parent) = cpath.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let cache_fd = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .read(true)
-            .open(&cpath)
-            .ok()
-            .map(|f| Arc::new(std::sync::Mutex::new(f)));
-        self.handles.insert(
-            fh,
-            FileHandleState::Write {
-                path: full_path.clone(),
-                cache_fd,
-                dirty: false,
-                dirty_since: None,
-            },
-        );
-        // Bug C fix: a freshly-created file should have current
-        // mtime/atime/ctime, not 1970-01-01. The previous version
-        // passed UNIX_EPOCH to make_attr, so stat (and tools like
-        // `ls -la`) showed every new file with the Unix epoch.
-        let now = SystemTime::now();
-        reply.created(
-            &self.attr_ttl,
-            &self.make_attr(ino, 0, FileType::RegularFile, now),
-            Generation(0),
-            FileHandle(fh),
-            FopenFlags::empty(),
-        );
-        self.cache_add_entry(&parent_path, &name, EntryMode::FILE, 0, now);
-    }
-
-    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let ino: u64 = ino.into();
-        let fh = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Some((path, FileType::RegularFile, _, _)) = self.resolve(ino) {
-            let is_write = !matches!(flags.acc_mode(), fuser::OpenAccMode::O_RDONLY);
-            if is_write {
-                let cpath = cache_path(&self.cache_dir, &path);
-                if let Some(parent) = cpath.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                // Pre-populate cache with remote content when empty (append fix)
-                let cache_empty = !cpath.exists()
-                    || std::fs::metadata(&cpath)
-                        .map(|m| m.len() == 0)
-                        .unwrap_or(true);
-                if cache_empty {
-                    let op = self.op.clone();
-                    let p = path.clone();
-                    let cp = cpath.clone();
-                    if let Ok(remote) = crate::rt().block_on(async { op.read(&p).await }) {
-                        let _ = std::fs::write(&cp, remote.to_vec());
-                    }
-                }
-                let cache_fd = std::fs::OpenOptions::new()
-                    .create(true)
-                    .truncate(false)
-                    .write(true)
-                    .read(true)
-                    .open(&cpath)
-                    .ok()
-                    .map(|f| Arc::new(std::sync::Mutex::new(f)));
-                self.handles.insert(
-                    fh,
-                    FileHandleState::Write {
-                        path: path.clone(),
-                        cache_fd,
-                        dirty: false,
-                        dirty_since: None,
-                    },
-                );
-            } else {
-                self.handles.insert(
-                    fh,
-                    FileHandleState::Read {
-                        path: path.clone(),
-                        last_offset: 0,
-                        chunk_size: 131072,
-                        prefetcher: self.maybe_create_prefetcher(ino, &path),
-                    },
-                );
-            }
-        }
-        reply.opened(FileHandle(fh), FopenFlags::empty());
-    }
-
-    fn read(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        _fh: FileHandle,
-        offset: u64,
-        size: u32,
-        _flags: OpenFlags,
-        _lock_owner: Option<LockOwner>,
-        reply: ReplyData,
-    ) {
-        let ino: u64 = ino.into();
-        let (path, file_size) = match self.resolve(ino) {
-            Some((p, _, s, _)) => (p, s),
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-        // EOF guard: offset past end → empty data
-        if offset >= file_size {
-            reply.data(&[]);
-            return;
-        }
-        let cap = file_size - offset;
-        // 1. Check memory cache first (fast path)
-        let block_idx = offset / CACHE_BLOCK_SIZE;
-        if let Some(data) = self.mem_cache.get(ino, block_idx) {
-            let start = offset as usize;
-            let end = (start + size as usize).min(data.len());
-            if start < data.len() {
-                reply.data(&data[start..end]);
-            } else {
-                reply.data(&[]);
-            }
-            return;
-        }
-        // 1.5 Check file-level cache (single cache file per handle)
-        if !self.direct_io {
-            let cpath = cache_path(&self.cache_dir, &path);
-            if cpath.exists()
-                && let Ok(data) = fs::read(&cpath)
-            {
-                let start = offset as usize;
-                let end = (start + size as usize).min(data.len());
-                let result = if start < data.len() {
-                    data[start..end].to_vec()
-                } else {
-                    vec![]
-                };
-                let b = bytes::Bytes::from(data);
-                self.mem_cache.put(ino, block_idx, b);
-                reply.data(&result);
-                return;
-            }
-        }
-        // 2. Check disk cache (with checksum validation, block-level)
-        if !self.direct_io {
-            let cpath = cache_block_path(&self.cache_dir, &path, block_idx);
-            if cpath.exists()
-                && let Ok(data) = fs::read(&cpath)
-            {
-                // Validate CRC64 checksum if present (last 8 bytes)
-                let valid = if data.len() > 8 {
-                    let (body, stored_bytes) = data.split_at(data.len() - 8);
-                    let stored = u64::from_le_bytes(stored_bytes.try_into().unwrap_or([0u8; 8]));
-                    stored == 0 || stored == crc64_checksum(body)
-                } else {
-                    true
-                };
-                if valid {
-                    let b = bytes::Bytes::from(data);
-                    let start = offset as usize;
-                    let end = (start + size as usize).min(b.len());
-                    if start < b.len() {
-                        reply.data(&b[start..end]);
-                    } else {
-                        reply.data(&[]);
-                    }
-                    self.mem_cache.put(ino, offset / CACHE_BLOCK_SIZE, b);
-                    return;
-                } else {
-                    tracing::warn!(path=?cpath, "cache checksum mismatch, re-fetching");
-                }
-            }
-        }
-        // 3.5 Try prefetcher (backpressure-aware background download)
-        let fh_val = u64::from(_fh);
-        if let Some(h) = self.handles.get(&fh_val)
-            && let FileHandleState::Read {
-                prefetcher: Some(p),
-                ..
-            } = h.value()
-            && let Some(part) = p.pop(offset)
-        {
-            // Mirror the multi-block mem_cache population done by the
-            // remote-fetch paths (lib.rs:~1751-1773) so subsequent
-            // reads on the same block range hit the fast path
-            // (lib.rs:~1574) instead of re-fetching. part.data is up
-            // to 16 MiB and may span 1-2 CACHE_BLOCK_SIZE (8 MiB)
-            // blocks; cheap iteration.
-            let first_blk = part.offset / CACHE_BLOCK_SIZE;
-            let data = part.data.clone();
-            let n_blks = (data.len() as u64).div_ceil(CACHE_BLOCK_SIZE);
-            for i in 0..n_blks {
-                let s = (i * CACHE_BLOCK_SIZE) as usize;
-                let e = ((i + 1) * CACHE_BLOCK_SIZE) as usize;
-                self.mem_cache
-                    .put(ino, first_blk + i, data.slice(s..e.min(data.len())));
-            }
-            let start = (offset - part.offset) as usize;
-            let end = (start + size as usize).min(data.len());
-            if start < data.len() {
-                reply.data(&data[start..end]);
-            } else {
-                reply.data(&[]);
-            }
-            return;
-        }
-        // 3. Fetch from remote
-        // Adaptive chunking: grow on sequential read, reset on seek
-        let fh_val = u64::from(_fh);
-        let chunk_size = if let Some(entry) = self.handles.get(&fh_val) {
-            if let FileHandleState::Read {
-                ref last_offset,
-                chunk_size: cs,
-                ..
-            } = *entry.value()
-            {
-                if offset == *last_offset {
-                    // Sequential read: grow up to user-configured, with
-                    // a hard 16MB cap regardless of `read_chunk_size`.
-                    // The cap is what protects `head -c1K 100M` from
-                    // downloading 128MB just to return 1KB (issue #12)
-                    // — without it, the d5f74ed "use user value" path
-                    // regresses head/tail to 64-272× slower than rclone.
-                    // 16MB is the smallest cap that still gives cat
-                    // 100M a sub-second cold-fetch (≈7 round-trips
-                    // at 130 ms each), and matches the original
-                    // pre-d5f74ed behavior of 8MB within 2×.
-                    let user_cap = if self.read_chunk_size > 0 {
-                        self.read_chunk_size
-                    } else {
-                        8 * 1024 * 1024
-                    };
-                    let hard_cap = 16 * 1024 * 1024;
-                    (cs * 2).min(user_cap).min(hard_cap)
-                } else {
-                    // Random seek: reset to initial
-                    131072
-                }
-            } else {
-                self.read_chunk_size.max(size as u64)
-            }
-        } else {
-            self.read_chunk_size.max(size as u64)
-        };
-        // Update handle chunk tracking
-        if let Some(mut entry) = self.handles.get_mut(&fh_val)
-            && let FileHandleState::Read {
-                ref mut last_offset,
-                chunk_size: ref mut cs,
-                ..
-            } = *entry.value_mut()
-        {
-            *last_offset = offset + size as u64;
-            *cs = chunk_size;
-        }
-        // Use adaptive chunk_size (grows on sequential, resets on seek).
-        // Previously read_chunk_size (128MB) was always used, causing
-        // head -c 10K to fetch the entire file. Now partial reads
-        // (head/tail/small seeks) only fetch what's needed.
-        // Refs: https://github.com/dyrnq/mntrs/issues/10
-        let fetch_size = chunk_size.max(size as u64);
-        let op = self.op.clone();
-        let p = path.clone();
-        let streams = self.read_chunk_streams.max(1);
-        if streams > 1 && fetch_size > 128 * 1024 {
-            // Multi-chunk concurrent fetch
-            let clamped_fetch = fetch_size.min(cap);
-            let clamped_size = (size as u64).min(cap) as u32;
-            let chunk_size = (clamped_fetch / streams as u64).max(64 * 1024);
-            let end = offset + clamped_fetch;
-            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(streams as usize));
-            let mut tasks = Vec::new();
-            let mut off = offset;
-            while off < end {
-                let e = (off + chunk_size).min(end);
-                let permit = sem.clone();
-                let op = op.clone();
-                let p = p.clone();
-                tasks.push(rt().spawn(async move {
-                    let _permit = permit.acquire().await;
-                    op.read_with(&p)
-                        .range(off..e)
-                        .await
-                        .map(|b| bytes::Bytes::from(b.to_vec()))
-                }));
-                off = e;
-            }
-            let results: Vec<_> = rt().block_on(futures::future::join_all(tasks));
-            let mut all_data = bytes::BytesMut::with_capacity(fetch_size as usize);
-            let mut ok = true;
-            for r in &results {
-                match r {
-                    Ok(Ok(data)) => all_data.extend_from_slice(data),
-                    _ => {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            if ok {
-                let b: bytes::Bytes = all_data.freeze();
-                let slice = &b[..(b.len() as u32).min(clamped_size) as usize];
-                reply.data(slice);
-                // Populate mem_cache for ALL blocks covered by this fetch,
-                // not just the first one. Bytes::slice is zero-copy.
-                // Refs: https://github.com/dyrnq/mntrs/issues/12
-                let first_blk = offset / CACHE_BLOCK_SIZE;
-                let n_blks = (b.len() as u64).div_ceil(CACHE_BLOCK_SIZE);
-                for i in 0..n_blks {
-                    let s = (i * CACHE_BLOCK_SIZE) as usize;
-                    let e = ((i + 1) * CACHE_BLOCK_SIZE) as usize;
-                    self.mem_cache
-                        .put(ino, first_blk + i, b.slice(s..e.min(b.len())));
-                }
-            } else {
-                reply.error(Errno::EIO);
-            }
-        } else {
-            // Single-chunk fetch (original path)
-            let clamped_fetch = fetch_size.min(cap);
-            let clamped_size = (size as u64).min(cap) as u32;
-            match rt().block_on(async move {
-                op.read_with(&p).range(offset..offset + clamped_fetch).await
-            }) {
-                Ok(buf) => {
-                    let b: bytes::Bytes = buf.to_vec().into();
-                    let slice = &b[..(b.len() as u32).min(clamped_size) as usize];
-                    reply.data(slice);
-                    let first_blk = offset / CACHE_BLOCK_SIZE;
-                    let n_blks = (b.len() as u64).div_ceil(CACHE_BLOCK_SIZE);
-                    for i in 0..n_blks {
-                        let s = (i * CACHE_BLOCK_SIZE) as usize;
-                        let e = ((i + 1) * CACHE_BLOCK_SIZE) as usize;
-                        self.mem_cache
-                            .put(ino, first_blk + i, b.slice(s..e.min(b.len())));
-                    }
-                }
-                Err(_) => reply.error(Errno::EIO),
-            }
-        }
-    }
-
-    fn write(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        fh: FileHandle,
-        offset: u64,
-        data: &[u8],
-        _write_flags: WriteFlags,
-        _flags: OpenFlags,
-        _lock_owner: Option<LockOwner>,
-        reply: ReplyWrite,
-    ) {
-        let fh_val: u64 = fh.into();
-        let path = match self
-            .handles
-            .get(&fh_val)
-            .map(|r| r.value().path().to_string())
-        {
-            Some(p) => p,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-        if self.direct_io {
-            let op = self.op.clone();
-            let p = path.clone();
-            let d = data.to_vec();
-            match rt().block_on(async move { op.write(&p, d).await }) {
-                Ok(_) => reply.written(data.len() as u32),
-                Err(_) => reply.error(Errno::EIO),
-            }
-            return;
-        }
-        // Check out_of_space backpressure
-        if self.out_of_space.load(std::sync::atomic::Ordering::Relaxed) {
-            self.evict_lru();
-            if self.out_of_space.load(std::sync::atomic::Ordering::Relaxed) {
-                reply.error(Errno::ENOSPC);
-                return;
-            }
-        }
-        // Write via single cache fd (like rclone RWFileHandle)
-        self.disk_cache_index.insert(
-            path.clone(),
-            (data.len() as u64, std::time::SystemTime::now()),
-        );
-        let end = offset + data.len() as u64;
-
-        let cache_fd = self.handles.get(&fh_val).and_then(|e| {
-            if let FileHandleState::Write {
-                cache_fd: Some(fd), ..
-            } = e.value()
-            {
-                Some(fd.clone())
-            } else {
-                None
-            }
-        });
-
-        let result = (|| -> std::io::Result<()> {
-            match &cache_fd {
-                Some(fd) => {
-                    let mut f = fd.lock().unwrap();
-                    let current_len = f.metadata()?.len();
-                    if end > current_len {
-                        f.set_len(end)?;
-                    }
-                    f.seek(SeekFrom::Start(offset))?;
-                    f.write_all(data)?;
-                    f.flush()?;
-                }
-                None => {
-                    let cpath = cache_path(&self.cache_dir, &path);
-                    if let Some(parent) = cpath.parent() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                    let mut f = fs::OpenOptions::new()
-                        .create(true)
-                        .truncate(false)
-                        .write(true)
-                        .read(true)
-                        .open(&cpath)?;
-                    let current_len = f.metadata()?.len();
-                    if end > current_len {
-                        f.set_len(end)?;
-                    }
-                    f.seek(SeekFrom::Start(offset))?;
-                    f.write_all(data)?;
-                    f.flush()?;
-                }
-            }
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                self.handles.insert(
-                    fh_val,
-                    FileHandleState::Write {
-                        path: path.clone(),
-                        cache_fd,
-                        dirty: true,
-                        dirty_since: Some(std::time::Instant::now()),
-                    },
-                );
-                reply.written(data.len() as u32);
-            }
-            Err(_) => reply.error(Errno::EIO),
-        }
-    }
-
-    fn mkdir(
-        &self,
-        _req: &Request,
-        parent: INodeNo,
-        name: &OsStr,
-        _mode: u32,
-        _umask: u32,
-        reply: ReplyEntry,
-    ) {
-        let name = name.to_string_lossy();
-        let parent_path = self
-            .resolve(parent.into())
-            .map(|(p, _, _, _)| p)
-            .unwrap_or_default();
-        let full_path = if parent_path.is_empty() {
-            name.to_string()
-        } else {
-            format!("{}/{}", parent_path, name)
-        };
-        // Bug A fix: same recursive-chain mkdir used by the active
-        // CoreFilesystem impl. See `mkdir_chain` for the rationale.
-        if let Err(e) = self.mkdir_chain(&full_path) {
-            reply.error(io_err_to_fuse_errno(e));
-            return;
-        }
-        let now = SystemTime::now();
-        let ino = self.alloc_ino(&full_path, FileType::Directory, 4096);
-        reply.entry(
-            &self.attr_ttl,
-            &self.make_attr(ino, 4096, FileType::Directory, now),
-            Generation(0),
-        );
-        self.cache_add_entry(&parent_path, &name, EntryMode::DIR, 4096, now);
-    }
-
-    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let name = name.to_string_lossy();
-        let parent_path = self
-            .resolve(parent.into())
-            .map(|(p, _, _, _)| p)
-            .unwrap_or_default();
-        let full_path = if parent_path.is_empty() {
-            name.to_string()
-        } else {
-            format!("{}/{}", parent_path, name)
-        };
-        let dir_path = format!("{}/", full_path.trim_end_matches('/'));
-        let op = self.op.clone();
-        let p = dir_path.clone();
-        let p2 = p.clone();
-        // Bug D fix: propagate backend errors. POSIX requires
-        // rmdir("non-empty-dir") to return EEXIST, and rmdir of a
-        // missing path to return ENOENT. The previous "swallow + ok"
-        // pattern returned success for both, breaking `rm -rf` and
-        // any other userland tool that checks the return code.
-        if let Err(e) = rt()
-            .block_on(async move { op.delete(&p2).await })
-            .map_err(|e| opendal_to_io_error(&e, "rmdir"))
-        {
-            reply.error(io_err_to_fuse_errno(e));
-            return;
-        }
-        // Clean cache entries. O(K) via inodes.size() (see
-        // `remove_block_cache_files` for the previous-O(N) bug this
-        // replaces). rmdir is rare in this codebase's CSI usage but
-        // the same fix applies for symmetry.
-        if let Some((_p, _kind, size, _mtime)) = self.inodes.iter().find_map(|entry| {
-            let (p, kind, sz, mtime) = entry.value();
-            if p == &full_path {
-                Some((p.clone(), *kind, *sz, *mtime))
-            } else {
-                None
-            }
-        }) {
-            remove_block_cache_files(&self.cache_dir, &full_path, size);
-        }
-        self.disk_cache_index.remove(&full_path as &str);
-        // Bug E fix: inodes is keyed by NEXT_INO counter, not
-        // path_hash. The pre-fix code's `inodes.remove(&path_hash(p))`
-        // was a no-op; the stale ino would then collide with any
-        // future mkdir at the same path.
-        if let Some(ino) = self.find_ino_by_path(&full_path) {
-            self.inodes.remove(&ino);
-        }
-        self.attr_cache.remove(&full_path);
-        self.cache_remove_entry(&parent_path, &name);
-        self.invalidate_dir_cache(&full_path);
-        reply.ok();
-    }
-
-    fn rename(
-        &self,
-        _req: &Request,
-        parent: INodeNo,
-        name: &OsStr,
-        newparent: INodeNo,
-        newname: &OsStr,
-        _flags: fuser::RenameFlags,
-        reply: ReplyEmpty,
-    ) {
-        let name = name.to_string_lossy();
-        let newname = newname.to_string_lossy();
-        let parent_path = self
-            .resolve(parent.into())
-            .map(|(p, _, _, _)| p)
-            .unwrap_or_default();
-        let newparent_path = self
-            .resolve(newparent.into())
-            .map(|(p, _, _, _)| p)
-            .unwrap_or_default();
-        let src = if parent_path.is_empty() {
-            name.to_string()
-        } else {
-            format!("{}/{}", parent_path, name)
-        };
-        let dst = if newparent_path.is_empty() {
-            newname.to_string()
-        } else {
-            format!("{}/{}", newparent_path, newname)
-        };
-        let op = self.op.clone();
-        let src_clone = src.clone();
-        let dst_clone = dst.clone();
-        let dst_clone2 = dst.clone();
-        // Pre-delete destination to match POSIX rename semantics
-        let op_del = op.clone();
-        let _ = rt().block_on(async move { op_del.delete(&dst_clone2).await });
-        rt().block_on(async move {
-            if let Err(e) = op.rename(&src_clone, &dst_clone).await {
-                tracing::warn!(path=%src_clone, error=%e, "rename failed, falling back to copy+delete");
-                if op.copy(&src_clone, &dst_clone).await.is_ok() {
-                    let _ = op.delete(&src_clone).await;
-                }
-            }
-        });
-        // Migrate cache file from src to dst (like rclone)
-        let cpath_src = cache_path(&self.cache_dir, &src);
-        let cpath_dst = cache_path(&self.cache_dir, &dst);
-        if cpath_src.exists() && !cpath_dst.exists() {
-            if let Some(parent) = cpath_dst.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::rename(&cpath_src, &cpath_dst);
-        } else {
-            let _ = fs::remove_file(&cpath_src);
-        }
-        // Clean block-level cache for src. O(K) via inodes.size()
-        // (see `remove_block_cache_files` for the rationale and the
-        // previous-O(N) bug this replaces).
-        if let Some(entry) = self.inodes.get(&path_hash(&src)).map(|e| e.value().clone()) {
-            remove_block_cache_files(&self.cache_dir, &src, entry.2);
-        }
-        self.disk_cache_index.remove(&src as &str);
-        // Migrate inode and attr_cache from src to dst
-        let src_hash = path_hash(&src);
-        let dst_hash = path_hash(&dst);
-        if let Some(entry) = self.inodes.get(&src_hash).map(|e| e.value().clone()) {
-            self.inodes.insert(dst_hash, entry);
-        }
-        self.inodes.remove(&src_hash);
-        if let Some(entry) = self.attr_cache.get(&src).map(|e| *e.value()) {
-            self.attr_cache.insert(dst.to_string(), entry);
-        }
-        self.attr_cache.remove(&src);
-        self.invalidate_dir_cache(&src);
-        self.invalidate_dir_cache(&dst);
-        reply.ok();
-    }
-
-    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, _size: u32, reply: ReplyXattr) {
-        let ino: u64 = ino.into();
-        let name = name.to_string_lossy();
-        if self.no_apple_xattr
-            && (name.starts_with("com.apple.") || name == "system.posix_acl_access")
-        {
-            reply.error(xattr_not_found());
-            return;
-        }
-        if let Some((path, kind, _, _)) = self.resolve(ino) {
-            if kind == FileType::Directory {
-                reply.error(xattr_not_found());
-                return;
-            }
-            // Fetch object metadata for ETag / storage-class
-            let op = self.op.clone();
-            let p = path.clone();
-            match rt().block_on(async move { op.stat(&p).await }) {
-                Ok(meta) => match name.as_ref() {
-                    "user.etag" | "s3.etag" => {
-                        if let Some(etag) = meta.etag() {
-                            reply.data(etag.as_bytes());
-                            return;
-                        }
-                        reply.error(xattr_not_found());
-                    }
-                    "user.content-type" | "s3.content-type" => {
-                        if let Some(ct) = meta.content_type() {
-                            reply.data(ct.as_bytes());
-                            return;
-                        }
-                        reply.error(xattr_not_found());
-                    }
-                    _ => reply.error(xattr_not_found()),
-                },
-                Err(_) => reply.error(Errno::EIO),
-            }
-        } else {
-            reply.error(Errno::ENOENT);
-        }
-    }
-    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
-        let ino: u64 = ino.into();
-        if let Some((_, kind, _, _)) = self.resolve(ino) {
-            if kind == FileType::Directory {
-                reply.error(xattr_not_found());
-                return;
-            }
-            // Return known xattr names
-            let attrs = b"user.etag user.content-type ";
-            if size == 0 {
-                reply.size(attrs.len() as u32);
-            } else if size < attrs.len() as u32 {
-                reply.error(Errno::ERANGE);
-            } else {
-                reply.data(attrs);
-            }
-        } else {
-            reply.error(Errno::ENOENT);
-        }
-    }
-
-    fn setattr(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        mode: Option<u32>,
-        uid: Option<u32>,
-        gid: Option<u32>,
-        size: Option<u64>,
-        _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
-        _ctime: Option<SystemTime>,
-        _fh: Option<FileHandle>,
-        _crtime: Option<SystemTime>,
-        _chgtime: Option<SystemTime>,
-        _bkuptime: Option<SystemTime>,
-        _flags: Option<fuser::BsdFileFlags>,
-        reply: ReplyAttr,
-    ) {
-        let ino: u64 = ino.into();
-        if let Some((p, kind, _, _)) = self.resolve(ino) {
-            if let Some(s) = size {
-                // Clear all block-level cache entries for this file.
-                // O(K) via inodes.size() (see `remove_block_cache_files`
-                // for the previous-O(N) bug this replaces).
-                remove_block_cache_files(&self.cache_dir, &p, s);
-                let cpath = cache_path(&self.cache_dir, &p);
-                if cpath.exists()
-                    && let Err(e) = fs::write(&cpath, &[] as &[u8])
-                {
-                    tracing::debug!(error=%e, path=?cpath, "setattr truncate failed");
-                }
-                let _ = self
-                    .find_ino_by_path(&p)
-                    .unwrap_or_else(|| self.alloc_ino(&p, kind, s));
-            }
-            // mode/uid/gid — just record them for now (S3 has no chmod)
-            let mut perm = if kind == FileType::Directory {
-                0o755u16
-            } else {
-                0o644u16
-            };
-            if let Some(m) = mode {
-                perm = (m & 0o7777) as u16;
-            }
-            let mut attr = self.make_attr(ino, size.unwrap_or(0), kind, SystemTime::now());
-            attr.perm = perm;
-            if let Some(u) = uid {
-                attr.uid = u;
-            }
-            if let Some(g) = gid {
-                attr.gid = g;
-            }
-            reply.attr(&self.attr_ttl, &attr);
-        } else {
-            reply.error(Errno::ENOENT);
-        }
-    }
-
-    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let name = name.to_string_lossy();
-        let parent_path = self
-            .resolve(parent.into())
-            .map(|(p, _, _, _)| p)
-            .unwrap_or_default();
-        let full_path = if parent_path.is_empty() {
-            name.to_string()
-        } else {
-            format!("{}/{}", parent_path, name)
-        };
-        let op = self.op.clone();
-        let p2 = full_path.clone();
-        // Bug D fix: propagate the backend error. unlink on a missing
-        // file must return ENOENT (POSIX). The previous code logged
-        // and returned ok, which caused `rm` to exit 0 even when the
-        // backend had no record of the file — silently destructive
-        // for any cleanup script that branches on the error code.
-        if let Err(e) = rt()
-            .block_on(async move { op.delete(&p2).await })
-            .map_err(|e| opendal_to_io_error(&e, "unlink"))
-        {
-            reply.error(io_err_to_fuse_errno(e));
-            return;
-        }
-        let cpath = cache_path(&self.cache_dir, &full_path);
-        if let Err(e) = fs::remove_file(&cpath) {
-            tracing::debug!(error=%e, path=?cpath, "unlink cache remove failed");
-        }
-        // Clean block-level cache entries
-        let prefix = format!("{:020x}_", crate::path_hash(&full_path));
-        if let Ok(entries) = fs::read_dir(&self.cache_dir) {
-            for e in entries.flatten() {
-                if let Some(name) = e.file_name().to_str()
-                    && name.starts_with(&prefix)
-                {
-                    let _ = fs::remove_file(e.path());
-                }
-            }
-        }
-        self.disk_cache_index.remove(&full_path as &str);
-        // Bug E fix: see rmdir above.
-        if let Some(ino) = self.find_ino_by_path(&full_path) {
-            self.inodes.remove(&ino);
-        }
-        self.attr_cache.remove(&full_path);
-        self.cache_remove_entry(&parent_path, &name);
-        reply.ok();
-    }
-
-    fn flush(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        fh: FileHandle,
-        _lock_owner: LockOwner,
-        reply: ReplyEmpty,
-    ) {
-        let fh_val: u64 = fh.into();
-        let (path, dirty) = {
-            let entry = self.handles.get(&fh_val).map(|r| r.clone());
-            if let Some(FileHandleState::Write {
-                path: p, dirty: d, ..
-            }) = entry
-            {
-                if d {
-                    let cpath = cache_block_path(&self.cache_dir, &p, 0);
-                    let fd = std::fs::OpenOptions::new()
-                        .create(true)
-                        .truncate(false)
-                        .write(true)
-                        .read(true)
-                        .open(&cpath)
-                        .ok()
-                        .map(|f| Arc::new(std::sync::Mutex::new(f)));
-                    self.handles.insert(
-                        fh_val,
-                        FileHandleState::Write {
-                            path: p.clone(),
-                            cache_fd: fd,
-                            dirty: false,
-                            dirty_since: None,
-                        },
-                    );
-                }
-                (p, d)
-            } else {
-                return reply.ok();
-            }
-        };
-        if dirty {
-            let block_idx = 0; // flush uses block 0 (main cache location)
-            let cpath = cache_block_path(&self.cache_dir, &path, block_idx);
-            if cpath.exists() {
-                // Write sidecar for crash recovery
-                let sidecar = cpath.with_extension("dirty");
-                if let Err(e) = fs::write(&sidecar, path.as_bytes()) {
-                    tracing::warn!(error=%e, path=?sidecar, "sidecar write failed");
-                }
-                if let Some(tx) = self.writeback_sender.get() {
-                    tx.send((_ino.into(), path, cpath)).ok();
-                }
-            }
-        }
-        // Queue the writeback; don't block FUSE thread waiting for upload.
-        // rclone does the same: close() returns immediately, upload happens async.
-        reply.ok();
-    }
-
-    fn release(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        fh: FileHandle,
-        _flags: OpenFlags,
-        _lock_owner: Option<LockOwner>,
-        _flush: bool,
-        reply: ReplyEmpty,
-    ) {
-        // Signal any active prefetcher to stop so its background
-        // thread doesn't keep fetching into a queue nobody reads.
-        // The downloader checks `cancelled` at the top of each loop
-        // iteration; the Arc<HandlePrefetcher> is dropped along with
-        // the FileHandleState when `handles.remove` returns.
-        if let Some((_, state)) = self.handles.remove(&fh.into())
-            && let FileHandleState::Read {
-                prefetcher: Some(p),
-                ..
-            } = state
-        {
-            p.cancel();
-        }
-        reply.ok();
-    }
 }
 
 use crate::core_fs::{CoreDirEntry, CoreFileAttr, CoreFileType, CoreFilesystem, CoreVolumeStat};
@@ -2687,53 +1289,33 @@ impl CoreFilesystem for MntrsFs {
                 },
             );
         } else {
+            // Activate the background prefetcher for files large enough
+            // to benefit (default threshold 64 MiB; see
+            // `maybe_create_prefetcher`). Called before the path move
+            // below so we don't have to clone.
+            let prefetcher = self.maybe_create_prefetcher(ino, &path);
             self.handles.insert(
                 fh,
                 FileHandleState::Read {
                     path,
                     last_offset: 0,
                     chunk_size: self.read_chunk_size.max(131072),
-                    prefetcher: None,
+                    prefetcher,
                 },
             );
         }
         Ok(fh)
     }
 
-    fn read(&self, ino: u64, _fh: u64, offset: u64, size: u32) -> std::io::Result<Vec<u8>> {
+    fn read(&self, ino: u64, fh: u64, offset: u64, size: u32) -> std::io::Result<Vec<u8>> {
         let (path, file_size) = self
             .resolve(ino)
             .map(|(p, _, s, _)| (p, s))
             .ok_or(std::io::ErrorKind::NotFound)?;
-        // Defensive size reconciliation.
-        //
-        // `file_size` (from the inodes map) is the authoritative size
-        // for FUSE-protocol purposes — it's what getattr reports, what
-        // the kernel uses to cap read requests, and what `ls -l` shows.
-        //
-        // However the on-disk cache file may have grown *more*
-        // recently than the inodes entry. Two scenarios trigger this:
-        //
-        //   1. The inodes entry was reset to 0 by a stale lookup() —
-        //      e.g. the FUSE kernel did a forget+lookup cycle after
-        //      a test 9 (delete + recreate) and the new lookup
-        //      observed an empty backend (memory://) or zero-sized
-        //      stat_op result.
-        //   2. The cache file was extended by a writeback upload that
-        //      raced with an in-flight read.
-        //
-        // In both cases, returning early on `offset >= file_size`
-        // would mask the cache file's real content and return 0 bytes
-        // to the user even though the data is sitting on disk.
-        //
-        // The fix takes the MAX of inodes and cache file size. The
-        // downstream mem_cache/file-level cache paths further down
-        // already bound their results by `b.len()`, so they
-        // naturally cap at the cache file's real size even if
-        // inodes over-reports.
-        //
-        // When both are 0, this still returns [] (legitimate EOF
-        // for an empty file).
+        // Defensive size reconciliation (see CoreFilesystem::read history
+        // for the full explanation). inodes is the FUSE-protocol
+        // authoritative size, but the on-disk cache file may have
+        // grown more recently than the inodes entry.
         let cache_meta_size = std::fs::metadata(crate::cache_path(&self.cache_dir, &path))
             .map(|m| m.len())
             .unwrap_or(0);
@@ -2741,21 +1323,12 @@ impl CoreFilesystem for MntrsFs {
         if offset >= actual_size {
             return Ok(vec![]);
         }
-        // cap = max bytes available from `offset` to the end of the
-        // file. fetch_size is the kernel's request size, but capped
-        // at the chunk-size ceiling (read_chunk_size, default 128 MiB,
-        // matching rclone) and at the available bytes. For the
-        // remote-fetch path the cap is what prevents asking
-        // op.read_with().range(...) for bytes past the file end; for
-        // local cache paths the cap is unused because those paths
-        // cap at `b.len()` themselves.
         let cap = actual_size - offset;
-        let fetch_size = self.read_chunk_size.max(size as u64).min(cap);
         let block_idx = offset / CACHE_BLOCK_SIZE;
 
-        // Try read from cache fd first (write handle still open)
+        // 1. Try read from cache fd first (write handle still open)
         if !self.direct_io {
-            let cache_fd = self.handles.get(&_fh).and_then(|e| {
+            let cache_fd = self.handles.get(&fh).and_then(|e| {
                 if let crate::FileHandleState::Read { .. } = e.value() {
                     None
                 } else if let crate::FileHandleState::Write {
@@ -2781,6 +1354,7 @@ impl CoreFilesystem for MntrsFs {
             }
         }
 
+        // 2. mem_cache fast path
         if let Some(data) = self.mem_cache.get(ino, block_idx) {
             let start = offset as usize;
             let end = (start + size as usize).min(data.len());
@@ -2790,8 +1364,39 @@ impl CoreFilesystem for MntrsFs {
                 Ok(vec![])
             };
         }
+
+        // 3. Try prefetcher (backpressure-aware background download)
+        if let Some(h) = self.handles.get(&fh)
+            && let FileHandleState::Read {
+                prefetcher: Some(p),
+                ..
+            } = h.value()
+            && let Some(part) = p.pop(offset)
+        {
+            // Populate mem_cache for the prefetched part so subsequent
+            // reads on the same block range hit the fast path above.
+            // part.data is up to 16 MiB (chunk_size cap) and may span
+            // 1-2 CACHE_BLOCK_SIZE blocks; cheap iteration.
+            let first_blk = part.offset / CACHE_BLOCK_SIZE;
+            let data = part.data.clone();
+            let n_blks = (data.len() as u64).div_ceil(CACHE_BLOCK_SIZE);
+            for i in 0..n_blks {
+                let s = (i * CACHE_BLOCK_SIZE) as usize;
+                let e = ((i + 1) * CACHE_BLOCK_SIZE) as usize;
+                self.mem_cache
+                    .put(ino, first_blk + i, data.slice(s..e.min(data.len())));
+            }
+            let start = (offset - part.offset) as usize;
+            let end = (start + size as usize).min(data.len());
+            return if start < data.len() {
+                Ok(data[start..end].to_vec())
+            } else {
+                Ok(vec![])
+            };
+        }
+
+        // 4. File-level disk cache (whole file)
         if !self.direct_io {
-            // Try file-level cache first (single cache file per handle)
             let fcpath = crate::cache_path(&self.cache_dir, &path);
             if fcpath.exists()
                 && let Ok(data) = std::fs::read(&fcpath)
@@ -2807,7 +1412,7 @@ impl CoreFilesystem for MntrsFs {
                 self.mem_cache.put(ino, offset / CACHE_BLOCK_SIZE, b);
                 return Ok(result);
             }
-            // Fallback to block-level cache
+            // 5. Block-level disk cache
             let cpath = crate::cache_block_path(&self.cache_dir, &path, block_idx);
             if cpath.exists()
                 && let Ok(data) = std::fs::read(&cpath)
@@ -2824,20 +1429,43 @@ impl CoreFilesystem for MntrsFs {
                 return Ok(result);
             }
         }
+
+        // 6. Remote fetch with 16 MiB cap (commit fc5e974) and 8 MiB
+        // block split for mem_cache. fetch_size is bounded by:
+        //   - user config (read_chunk_size, default 128 MiB)
+        //   - hard cap (16 MiB) protecting `head -c1K` from over-fetch
+        //   - cap (bytes remaining to file end)
+        let user_cap = if self.read_chunk_size > 0 {
+            self.read_chunk_size
+        } else {
+            8 * 1024 * 1024
+        };
+        let hard_cap = 16 * 1024 * 1024;
+        let fetch_size = user_cap.min(hard_cap).min(cap);
+
         let op = self.op.clone();
         let p = path.clone();
-        match rt()
+        let buf = rt()
             .block_on(async move { op.read_with(&p).range(offset..offset + fetch_size).await })
-        {
-            Ok(buf) => {
-                let b: bytes::Bytes = buf.to_vec().into();
-                let len = (b.len() as u32).min(size) as usize;
-                let data = b[..len].to_vec();
-                self.mem_cache.put(ino, offset / CACHE_BLOCK_SIZE, b);
-                Ok(data)
-            }
-            Err(_) => Err(std::io::Error::other("read failed")),
+            .map_err(|_| std::io::Error::other("read failed"))?;
+        let b: bytes::Bytes = buf.to_vec().into();
+        let len = (b.len() as u32).min(size) as usize;
+        let result = b[..len].to_vec();
+        // Populate mem_cache for ALL blocks covered by this fetch,
+        // not just the first one. Without this, a 16 MiB fetch
+        // would store the entire 16 MiB under one (ino, block_idx)
+        // key, evicting anything else in cache and forcing the
+        // next read on a neighbouring block to re-fetch from
+        // remote. Bytes::slice is zero-copy.
+        let first_blk = offset / CACHE_BLOCK_SIZE;
+        let n_blks = (b.len() as u64).div_ceil(CACHE_BLOCK_SIZE);
+        for i in 0..n_blks {
+            let s = (i * CACHE_BLOCK_SIZE) as usize;
+            let e = ((i + 1) * CACHE_BLOCK_SIZE) as usize;
+            self.mem_cache
+                .put(ino, first_blk + i, b.slice(s..e.min(b.len())));
         }
+        Ok(result)
     }
 
     fn write(&self, _ino: u64, _fh: u64, _offset: u64, _data: &[u8]) -> std::io::Result<u32> {
@@ -3636,22 +2264,6 @@ impl ChecksummedBytes {
     pub fn data(&self) -> &[u8] {
         &self.data
     }
-}
-
-/// Simple CRC64 checksum for cache integrity validation.
-fn crc64_checksum(data: &[u8]) -> u64 {
-    let mut crc: u64 = 0xFFFFFFFFFFFFFFFF;
-    for &byte in data {
-        crc ^= byte as u64;
-        for _ in 0..8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ 0xD800000000000000;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    crc ^ 0xFFFFFFFFFFFFFFFF
 }
 
 /// Compute CRC32C checksum.
