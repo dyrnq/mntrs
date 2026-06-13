@@ -436,11 +436,7 @@ pub fn cache_block_path(cache_dir: &Path, path: &str, block_idx: u64) -> PathBuf
 /// file on disk was missed) are tolerated: `remove_file` returns
 /// an error and we silently ignore it. A future `cache_index`
 /// rebuild at startup will surface any genuine orphans.
-pub(crate) fn remove_block_cache_files(
-    cache_dir: &Path,
-    full_path: &str,
-    size: u64,
-) {
+pub(crate) fn remove_block_cache_files(cache_dir: &Path, full_path: &str, size: u64) {
     let n_blocks = size.div_ceil(CACHE_BLOCK_SIZE);
     for blk in 0..n_blocks {
         let bpath = cache_block_path(cache_dir, full_path, blk);
@@ -904,10 +900,8 @@ impl MntrsFs {
             } else {
                 format!("{}/{}", path, name)
             };
-            self.attr_cache.insert(
-                full,
-                (kind, *size, Some(*mtime), std::time::Instant::now()),
-            );
+            self.attr_cache
+                .insert(full, (kind, *size, Some(*mtime), std::time::Instant::now()));
         }
 
         Ok(result)
@@ -2006,13 +2000,14 @@ impl Filesystem for MntrsFs {
         // `remove_block_cache_files` for the previous-O(N) bug this
         // replaces). rmdir is rare in this codebase's CSI usage but
         // the same fix applies for symmetry.
-        if let Some((_p, _kind, size, _mtime)) = self.inodes
-            .iter()
-            .find_map(|entry| {
-                let (p, kind, sz, mtime) = entry.value();
-                if p == &full_path { Some((p.clone(), *kind, *sz, *mtime)) } else { None }
-            })
-        {
+        if let Some((_p, _kind, size, _mtime)) = self.inodes.iter().find_map(|entry| {
+            let (p, kind, sz, mtime) = entry.value();
+            if p == &full_path {
+                Some((p.clone(), *kind, *sz, *mtime))
+            } else {
+                None
+            }
+        }) {
             remove_block_cache_files(&self.cache_dir, &full_path, size);
         }
         self.disk_cache_index.remove(&full_path as &str);
@@ -3223,13 +3218,14 @@ impl CoreFilesystem for MntrsFs {
         // Clean block-level cache entries. O(K) via inodes.size()
         // (see `remove_block_cache_files` for the rationale and the
         // previous-O(N) bug this replaces).
-        if let Some((_path, _kind, size, _mtime)) = self.inodes
-            .iter()
-            .find_map(|entry| {
-                let (p, kind, sz, mtime) = entry.value();
-                if p == &full_path { Some((p.clone(), *kind, *sz, *mtime)) } else { None }
-            })
-        {
+        if let Some((_path, _kind, size, _mtime)) = self.inodes.iter().find_map(|entry| {
+            let (p, kind, sz, mtime) = entry.value();
+            if p == &full_path {
+                Some((p.clone(), *kind, *sz, *mtime))
+            } else {
+                None
+            }
+        }) {
             remove_block_cache_files(&self.cache_dir, &full_path, size);
         }
         self.disk_cache_index.remove(&full_path);
