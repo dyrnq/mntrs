@@ -1561,8 +1561,15 @@ impl Filesystem for MntrsFs {
             } = *entry.value()
             {
                 if offset == *last_offset {
-                    // Sequential read: double chunk size, up to max
-                    (cs * 2).min(8 * 1024 * 1024)
+                    // Sequential read: use configured chunk size if
+                    // available (cat 100M → one 128MB fetch), otherwise
+                    // double from previous for adaptive growth.
+                    // Refs: https://github.com/dyrnq/mntrs/issues/12
+                    if self.read_chunk_size > 0 {
+                        self.read_chunk_size
+                    } else {
+                        (cs * 2).min(8 * 1024 * 1024)
+                    }
                 } else {
                     // Random seek: reset to initial
                     131072
@@ -1632,7 +1639,17 @@ impl Filesystem for MntrsFs {
                 let b: bytes::Bytes = all_data.freeze();
                 let slice = &b[..(b.len() as u32).min(clamped_size) as usize];
                 reply.data(slice);
-                self.mem_cache.put(ino, offset / CACHE_BLOCK_SIZE, b);
+                // Populate mem_cache for ALL blocks covered by this fetch,
+                // not just the first one. Bytes::slice is zero-copy.
+                // Refs: https://github.com/dyrnq/mntrs/issues/12
+                let first_blk = offset / CACHE_BLOCK_SIZE;
+                let n_blks = (b.len() as u64).div_ceil(CACHE_BLOCK_SIZE);
+                for i in 0..n_blks {
+                    let s = (i * CACHE_BLOCK_SIZE) as usize;
+                    let e = ((i + 1) * CACHE_BLOCK_SIZE) as usize;
+                    self.mem_cache
+                        .put(ino, first_blk + i, b.slice(s..e.min(b.len())));
+                }
             } else {
                 reply.error(Errno::EIO);
             }
@@ -1647,7 +1664,14 @@ impl Filesystem for MntrsFs {
                     let b: bytes::Bytes = buf.to_vec().into();
                     let slice = &b[..(b.len() as u32).min(clamped_size) as usize];
                     reply.data(slice);
-                    self.mem_cache.put(ino, offset / CACHE_BLOCK_SIZE, b);
+                    let first_blk = offset / CACHE_BLOCK_SIZE;
+                    let n_blks = (b.len() as u64).div_ceil(CACHE_BLOCK_SIZE);
+                    for i in 0..n_blks {
+                        let s = (i * CACHE_BLOCK_SIZE) as usize;
+                        let e = ((i + 1) * CACHE_BLOCK_SIZE) as usize;
+                        self.mem_cache
+                            .put(ino, first_blk + i, b.slice(s..e.min(b.len())));
+                    }
                 }
                 Err(_) => reply.error(Errno::EIO),
             }

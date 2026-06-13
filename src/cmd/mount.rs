@@ -978,7 +978,7 @@ fn apply_operator_with_tls(
             .finish()
     } else {
         // Non-TLS path: still wrap an explicit HttpClientLayer so we never
-        // touch opendal's `GLOBAL_REWQEST_CLIENT` LazyLock. Otherwise that
+        // touch opendal's `GLOBAL_REQWEST_CLIENT` LazyLock. Otherwise that
         // client gets instantiated lazily on the first .await, binding its
         // hyper connector to whichever tokio runtime Handle::current()
         // happens to be at that moment — and if writeback (in crate::rt())
