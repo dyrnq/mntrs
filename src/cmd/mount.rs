@@ -329,28 +329,33 @@ pub fn unmount_internal(mountpoint: &str) -> anyhow::Result<()> {
     // Take the BackgroundSession and call umount_and_join(), which does
     // fusermount3 -u internally then joins the daemon thread. This
     // guarantees the daemon has exited and released all resources.
-    let session = FUSE_SESSION.lock().ok().and_then(|mut g| g.take());
-    if let Some(session) = session {
-        tracing::debug!(mountpoint, "graceful FUSE session shutdown");
-        if session.umount_and_join().is_ok() {
-            // Success — wait for mount to fully disappear from /proc/mounts
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while std::time::Instant::now() < deadline {
-                if !is_mount_point(mountpoint) {
-                    break;
+    // FUSE_SESSION is a Unix-only static (#[cfg(not(windows))] above);
+    // WinFSP shutdown uses a different path.
+    #[cfg(not(windows))]
+    {
+        let session = FUSE_SESSION.lock().ok().and_then(|mut g| g.take());
+        if let Some(session) = session {
+            tracing::debug!(mountpoint, "graceful FUSE session shutdown");
+            if session.umount_and_join().is_ok() {
+                // Success — wait for mount to fully disappear from /proc/mounts
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while std::time::Instant::now() < deadline {
+                    if !is_mount_point(mountpoint) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                let cache_dir = cache_dir_for_mount(mountpoint);
+                if let Err(e) = std::fs::remove_dir_all(&cache_dir) {
+                    tracing::warn!(cache_dir, error=%e, "cache cleanup failed");
+                }
+                return Ok(());
             }
-            let cache_dir = cache_dir_for_mount(mountpoint);
-            if let Err(e) = std::fs::remove_dir_all(&cache_dir) {
-                tracing::warn!(cache_dir, error=%e, "cache cleanup failed");
-            }
-            return Ok(());
+            tracing::warn!(
+                mountpoint,
+                "umount_and_join failed, falling back to fusermount3"
+            );
         }
-        tracing::warn!(
-            mountpoint,
-            "umount_and_join failed, falling back to fusermount3"
-        );
     }
 
     // Phase 3: fallback — raw fusermount3 unmount
@@ -828,6 +833,8 @@ pub fn mount(
         let session = fuser::spawn_mount2(adapter, mount_path, &cfg)?;
         // Store session so unmount_internal can gracefully shut it down
         // instead of leaking the daemon thread via std::mem::forget.
+        // FUSE_SESSION is Unix-only (WinFSP uses a different teardown path).
+        #[cfg(not(windows))]
         if let Ok(mut guard) = FUSE_SESSION.lock() {
             *guard = Some(session);
         }
@@ -922,25 +929,31 @@ pub fn mount(
         //   - unmount_internal() takes the session and calls umount_and_join()
         //   - External fusermount3 -u disconnects the kernel side
         //   - A signal triggers the watcher thread above to call fusermount3 -u
-        let session = FUSE_SESSION.lock().ok().and_then(|mut g| g.take());
-        if let Some(session) = session {
-            if let Err(e) = session.join() {
-                tracing::warn!(error=%e, "FUSE session ended with error");
+        // FUSE_SESSION is Unix-only; on WinFSP, spawn_mount2 returns
+        // immediately and the daemon is supervised differently, so
+        // this entire block is Unix-only.
+        #[cfg(not(windows))]
+        {
+            let session = FUSE_SESSION.lock().ok().and_then(|mut g| g.take());
+            if let Some(session) = session {
+                if let Err(e) = session.join() {
+                    tracing::warn!(error=%e, "FUSE session ended with error");
+                }
+            } else {
+                // Session was taken by unmount_internal — wait for mount to disappear
+                while is_mount_point(mountpoint) {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
             }
-        } else {
-            // Session was taken by unmount_internal — wait for mount to disappear
-            while is_mount_point(mountpoint) {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
+            // Signal the watcher thread to exit (it loops on SHUTDOWN_REQUESTED)
+            SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+            remove_mount(mountpoint);
         }
-        // Signal the watcher thread to exit (it loops on SHUTDOWN_REQUESTED)
-        SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
-        remove_mount(mountpoint);
-    }
 
-    #[cfg(windows)]
-    {
+        #[cfg(windows)]
         loop {
+            // spawn_mount2 on WinFSP returns once the mount is registered;
+            // keep the process alive until unmount/shutdown is requested.
             std::thread::sleep(std::time::Duration::from_secs(3600));
         }
     }
