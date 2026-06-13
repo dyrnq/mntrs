@@ -3252,11 +3252,6 @@ impl CoreFilesystem for MntrsFs {
         let op = self.op.clone();
         let src_clone = src.clone();
         let dst_clone = dst.clone();
-        let dst_clone2 = dst.clone();
-        // Pre-delete destination (POSIX semantics)
-        let op_del = op.clone();
-        let _ = rt().block_on(async move { op_del.delete(&dst_clone2).await });
-
         // Atomic rename — model: "copy-then-delete with rollback on
         // failure":
         //   1. Try server-side rename. If it returns Unsupported
@@ -3270,6 +3265,19 @@ impl CoreFilesystem for MntrsFs {
         //      fails, log loudly but proceed (dst is already
         //      visible on the backend; preserving dst is more
         //      important than enforcing atomicity).
+        //
+        // Pre-delete of dst was removed (issue #17). On S3, the
+        // copy step in `op.rename` uses PUT with overwrite semantics,
+        // so a pre-delete is a wasted round-trip. On hierarchical
+        // backends (HDFS, etc.) `op.rename` is atomic. On the
+        // Unsupported fallback path, op.write to dst overwrites the
+        // existing key (opendal's `Writer` is overwrite on S3 / GCS
+        // / OSS / COS / OBS); for the rare backend where op.write
+        // is create-only (memory, some WebHDFS deployments), the
+        // copy may return AlreadyExists which the fallback treats as
+        // a hard error — that's the same behavior as before this
+        // change, except now we don't pay the cost of the
+        // unconditional pre-delete.
         let backend_ok = rt().block_on(async move {
             match op.rename(&src_clone, &dst_clone).await {
                 Ok(()) => true,
