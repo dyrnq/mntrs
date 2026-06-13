@@ -3050,12 +3050,21 @@ impl CoreFilesystem for MntrsFs {
         let p = full_path.clone();
         rt().block_on(async move { op.write(&p, Vec::<u8>::new()).await })
             .map_err(|e| opendal_to_io_error(&e, "create"))?;
-        let (kind, size, mtime) =
-            self.stat_op(&full_path)
-                .unwrap_or((FileType::RegularFile, 0, None));
+        // Synthesize metadata: we just wrote an empty file via op.write,
+        // so the size is 0 and the kind is RegularFile. No need for a
+        // post-write HEAD/stat to fetch what we already know — that was
+        // 1 extra round-trip per `touch new` / `create` (issue #17).
+        // mtime is `now()` because the write just happened.
+        // (The pre-fix `stat_op` was returning (FileType::RegularFile,
+        // 0, None) anyway via its `unwrap_or` fallback when the
+        // backend hadn't yet propagated, so the mtime slot was already
+        // unreliable — we now make it explicit and save the round-trip.)
+        let (kind, size, mtime) = (FileType::RegularFile, 0u64, Some(SystemTime::now()));
         // Bug C fix: seed the inodes mtime so a follow-up getattr
         // (before the backend's stat_op caches anything) doesn't
-        // fall back to UNIX_EPOCH.
+        // fall back to UNIX_EPOCH. mtime is now always Some(_), so
+        // unwrap_or is dead — the fallback remains defensive in case
+        // someone refactors mtime back to Option.
         let now = SystemTime::now();
         let ino = self.alloc_ino_with_mtime(&full_path, kind, size, mtime.unwrap_or(now));
         // Insert Write handle so follow-up write() can find the path
