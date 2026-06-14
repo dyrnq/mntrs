@@ -366,7 +366,36 @@ impl MntrsFs {
 }
 
 pub fn path_hash(path: &str) -> u64 {
-    let mut h: u64 = 0x811c9dc5;
+    use std::sync::OnceLock;
+    // Process-wide random salt, picked at first call. The salt is
+    // mixed into the FNV-1a state to make birthday-bound collisions
+    // effectively impossible (a 2^32-entry attacker would need to
+    // know the salt to engineer a collision). Unsaltened FNV-1a
+    // has ~50% collision probability at 2^32 entries, which is
+    // well within CSI range for busy volumes.
+    //
+    // The salt is per-process, not per-cache, so the existing
+    // on-disk cache files become unreachable across mntrs
+    // restarts. This is acceptable: the cache is best-effort
+    // (warm-cache is bonus, not a correctness contract), and
+    // persisting the salt would itself become an attack surface
+    // (a copied salt defeats the point). A persistent salt can
+    // be added later if cold-cache-hit-after-restart becomes a
+    // measured regression.
+    static SALT: OnceLock<u64> = OnceLock::new();
+    let salt = SALT.get_or_init(|| {
+        use std::time::SystemTime;
+        let t = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        // XOR with ASLR'd address to get more entropy even when
+        // start times are close together. The Box deref is a stable
+        // way to obtain a per-process runtime address.
+        let addr = (&t as *const _) as usize as u64;
+        t ^ addr.rotate_left(17) ^ 0x9E3779B97F4A7C15
+    });
+    let mut h: u64 = 0x811c9dc5 ^ *salt;
     for b in path.bytes() {
         h = h.wrapping_mul(0x01000193) ^ b as u64;
     }
