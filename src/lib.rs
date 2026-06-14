@@ -1590,12 +1590,61 @@ impl CoreFilesystem for MntrsFs {
         let hard_cap = 16 * 1024 * 1024;
         let fetch_size = user_cap.min(hard_cap).min(cap);
 
-        let op = self.op.clone();
-        let p = path.clone();
-        let buf = rt()
-            .block_on(async move { op.read_with(&p).range(offset..offset + fetch_size).await })
-            .map_err(|_| std::io::Error::other("read failed"))?;
-        let b: bytes::Bytes = buf.to_vec().into();
+        // Parallel fetch: if `read_chunk_streams > 1` and the fetch
+        // is large enough to be worth splitting, issue N concurrent
+        // GETs against the backend and concatenate the results.
+        // rclone does the same with `--vfs-read-chunk-streams`.
+        //
+        // Threshold: 128 KiB minimum. Below that the round-trip
+        // overhead of splitting + joining exceeds the parallelism
+        // win against a single in-flight request — the backend is
+        // already pipelining. We also don't parallelize for reads
+        // that span only a partial block; those are dominated by
+        // the FUSE reply path, not by backend latency.
+        let streams = self.read_chunk_streams.max(1) as u64;
+        let use_parallel = streams > 1 && fetch_size > 128 * 1024;
+        let b: bytes::Bytes = if use_parallel {
+            // Split fetch_size into N equal chunks, fetch
+            // concurrently. Each chunk populates mem_cache and
+            // disk block cache on its own.
+            let op = self.op.clone();
+            let p = path.clone();
+            let chunk_bytes = fetch_size.div_ceil(streams);
+            let ends_at = offset + fetch_size;
+            let mut off = offset;
+            let mut results: Vec<bytes::Bytes> = Vec::with_capacity(streams as usize);
+            while off < ends_at {
+                let e = (off + chunk_bytes).min(ends_at);
+                let op_c = op.clone();
+                let p_c = p.clone();
+                let r = rt().block_on(async move { op_c.read_with(&p_c).range(off..e).await });
+                match r {
+                    Ok(b) => results.push(bytes::Bytes::from(b.to_vec())),
+                    Err(_) => {
+                        return Err(std::io::Error::other("read failed"));
+                    }
+                }
+                off = e;
+            }
+            // Concatenate in order. For the common case where
+            // `size <= fetch_size` (kernel asked for a small
+            // window), the first chunk is all we need; but we
+            // still need to populate caches for the rest, hence
+            // doing the full parallel fetch.
+            let total: usize = results.iter().map(|b| b.len()).sum();
+            let mut combined = bytes::BytesMut::with_capacity(total);
+            for chunk in results {
+                combined.extend_from_slice(&chunk);
+            }
+            combined.freeze()
+        } else {
+            let op = self.op.clone();
+            let p = path.clone();
+            rt().block_on(async move { op.read_with(&p).range(offset..offset + fetch_size).await })
+                .map_err(|_| std::io::Error::other("read failed"))?
+                .to_vec()
+                .into()
+        };
         let len = (b.len() as u32).min(size) as usize;
         let result = b[..len].to_vec();
         // Populate mem_cache for ALL blocks covered by this fetch,
