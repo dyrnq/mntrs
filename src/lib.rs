@@ -473,7 +473,6 @@ pub fn load_cache_index(cache_dir: &Path) -> Vec<(String, u64, u64, std::time::S
     entries
 }
 
-#[cfg(unix)]
 impl MntrsFs {
     fn resolve(&self, ino: u64) -> Option<(String, FileType, u64, Option<std::time::SystemTime>)> {
         self.inodes.get(&ino).map(|r| r.clone())
