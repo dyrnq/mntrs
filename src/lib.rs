@@ -1732,6 +1732,26 @@ impl CoreFilesystem for MntrsFs {
             false
         };
 
+        // Signal any in-flight prefetcher to stop. Without this, a
+        // partially-read file (e.g. `head -c 1K 100M`) leaves its
+        // background downloader thread running until either the queue
+        // fills (then it spin-sleeps forever) or it reaches EOF on
+        // its own. For a long-running mntrs process that opens many
+        // large files, that adds up to a slow resource leak.
+        //
+        // `cancel()` only flips an AtomicBool; the downloader
+        // checks it at the top of its next loop iteration and
+        // exits cleanly. Cheap and safe to call on None.
+        if let Some(entry) = self.handles.get(&fh) {
+            if let crate::FileHandleState::Read {
+                prefetcher: Some(p),
+                ..
+            } = entry.value()
+            {
+                p.cancel();
+            }
+        }
+
         if self.handle_caching > std::time::Duration::ZERO && !was_dirty {
             // Keep handle alive for handle_caching duration so reopen can reuse cache fd
             let fd_to_keep = self.handles.get(&fh).and_then(|e| {
