@@ -2373,6 +2373,22 @@ impl CoreFilesystem for MntrsFs {
         self.attr_cache.remove(&src);
         self.invalidate_dir_cache(&src);
         self.invalidate_dir_cache(&dst);
+        // Invalidate the PARENT dir's listing cache too —
+        // otherwise the next readdir on the parent returns the
+        // stale listing (with the now-renamed src still present,
+        // and missing the freshly-created dst). invalidate_dir_cache
+        // only removes keys exactly matching the path or prefixed
+        // with `path/`, so a top-level file's rename never reaches
+        // the root cache slot ("") unless we do this explicitly.
+        // This is the actual root cause of CI run #27492796860
+        // `memory-stress-loop` reporting `rename src still exists`
+        // — see issue #18.
+        if let Some(parent_src) = std::path::Path::new(&src).parent().and_then(|p| p.to_str()) {
+            self.invalidate_dir_cache(parent_src);
+        }
+        if let Some(parent_dst) = std::path::Path::new(&dst).parent().and_then(|p| p.to_str()) {
+            self.invalidate_dir_cache(parent_dst);
+        }
         Ok(())
     }
 
