@@ -1950,14 +1950,13 @@ impl CoreFilesystem for MntrsFs {
         // `cancel()` only flips an AtomicBool; the downloader
         // checks it at the top of its next loop iteration and
         // exits cleanly. Cheap and safe to call on None.
-        if let Some(entry) = self.handles.get(&fh) {
-            if let crate::FileHandleState::Read {
+        if let Some(entry) = self.handles.get(&fh)
+            && let crate::FileHandleState::Read {
                 prefetcher: Some(p),
                 ..
             } = entry.value()
-            {
-                p.cancel();
-            }
+        {
+            p.cancel();
         }
 
         if self.handle_caching > std::time::Duration::ZERO && !was_dirty {
