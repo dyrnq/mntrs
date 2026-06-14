@@ -174,9 +174,14 @@ jobs:
           # Readiness probe: wait up to 60s for mount + ls to both succeed
           # Per SESSION_PITFALLS §2.2/§2.4/§2.6
           MOUNT_LOG="/tmp/mntrs-mount-csi-${{ matrix.test.name }}.log"
-          # Re-direct mount output to MOUNT_LOG (was /dev/null, lost debug info)
+          # Re-direct mount output to MOUNT_LOG (was /dev/null, lost debug info).
+          # MNTRS_DAEMON_LOG redirects the daemon child's tracing output
+          # to the same file (parent shell's stdout/stderr alone wouldn't
+          # capture it because --daemon --daemon-wait forks a child that
+          # holds the FUSE session after the parent exits).
           if [ "${{ matrix.test.name }}" = "hdfs" ]; then
-            ./target/release/mntrs mount ${{ matrix.test.storage }} /mnt/mntrs-test $MOUNT_OPTS --allow-other --daemon --daemon-wait --daemon-timeout=20 > "$MOUNT_LOG" 2>&1 &
+            MNTRS_DAEMON_LOG="$MOUNT_LOG" \
+              ./target/release/mntrs mount ${{ matrix.test.storage }} /mnt/mntrs-test $MOUNT_OPTS --allow-other --daemon --daemon-wait --daemon-timeout=20 > "$MOUNT_LOG" 2>&1 &
           else
             ./target/release/mntrs mount ${{ matrix.test.storage }} /mnt/mntrs-test $MOUNT_OPTS > "$MOUNT_LOG" 2>&1 &
           fi
@@ -282,6 +287,20 @@ jobs:
             sudo fusermount3 -u /mnt/mntrs-test
           fi
           docker rm -f hdfs 2>/dev/null || true
+
+      # Per SESSION_PITFALLS §2.6: CI green ≠ tests pass — on failure,
+      # preserve the mount log for post-mortem. The mount itself
+      # redirected to MOUNT_LOG above (line ~176), and MNTRS_DAEMON_LOG
+      # in the daemon branch, so this file holds both the parent
+      # shell's stdout/stderr and the daemon's tracing output.
+      # Pattern adapted from integration.yml.
+      - name: Upload mount log (failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mount-log-csi-${{ matrix.test.name }}
+          path: /tmp/mntrs-mount-csi-${{ matrix.test.name }}.log
+          if-no-files-found: warn
 
   cleanup-image:
     needs: csi-test
