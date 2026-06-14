@@ -695,7 +695,16 @@ jobs:
       - name: Run 50-iteration stress loop
         run: |
           chmod +x ./tests/e2e/mount/stress_loop.sh
-          ./tests/e2e/mount/stress_loop.sh 50
+          STRESS_LOG=/tmp/mntrs-stress-loop.log
+          ./tests/e2e/mount/stress_loop.sh 50 > "$STRESS_LOG" 2>&1
+
+      - name: Upload stress log (failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-loop-log
+          path: /tmp/mntrs-stress-loop.log
+          if-no-files-found: warn
 
       - name: Cleanup
         if: always()
@@ -724,7 +733,16 @@ jobs:
       - name: Lifecycle stress (memory, 50 iterations)
         run: |
           chmod +x ./tests/e2e/mount/lifecycle_stress.sh
-          ./tests/e2e/mount/lifecycle_stress.sh 50 target/release/mntrs /tmp/mntrs-lifecycle
+          LIFECYCLE_LOG=/tmp/mntrs-lifecycle-stress.log
+          ./tests/e2e/mount/lifecycle_stress.sh 50 target/release/mntrs /tmp/mntrs-lifecycle > "$LIFECYCLE_LOG" 2>&1
+
+      - name: Upload lifecycle stress log (failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lifecycle-stress-log
+          path: /tmp/mntrs-lifecycle-stress.log
+          if-no-files-found: warn
 
       - name: Cleanup
         if: always()
@@ -774,7 +792,8 @@ jobs:
           chmod +x ./tests/e2e/mount/lifecycle_stress.sh
           export LIFECYCLE_S3_URL="s3://ci-lifecycle-test"
           export LIFECYCLE_S3_OPTS="--opt endpoint=http://localhost:9000 --opt access-key=minioadmin --opt secret-key=minioadmin --opt region=us-east-1"
-          ./tests/e2e/mount/lifecycle_stress.sh 30 target/release/mntrs /tmp/mntrs-s3-lifecycle
+          S3_LIFECYCLE_LOG=/tmp/mntrs-s3-lifecycle-stress.log
+          ./tests/e2e/mount/lifecycle_stress.sh 30 target/release/mntrs /tmp/mntrs-s3-lifecycle > "$S3_LIFECYCLE_LOG" 2>&1
 
       - name: Writeback crash recovery
         run: |
@@ -782,7 +801,18 @@ jobs:
           export WB_S3_ENDPOINT="http://localhost:9000"
           export WB_S3_ACCESS="minioadmin"
           export WB_S3_SECRET="minioadmin"
-          ./tests/e2e/mount/writeback_recovery.sh target/release/mntrs /tmp/mntrs-wb-cache
+          WB_RECOVERY_LOG=/tmp/mntrs-writeback-recovery.log
+          ./tests/e2e/mount/writeback_recovery.sh target/release/mntrs /tmp/mntrs-wb-cache > "$WB_RECOVERY_LOG" 2>&1
+
+      - name: Upload s3 lifecycle + writeback logs (failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3-lifecycle-stress-log
+          path: |
+            /tmp/mntrs-s3-lifecycle-stress.log
+            /tmp/mntrs-writeback-recovery.log
+          if-no-files-found: warn
 
       - name: Cleanup
         if: always()
