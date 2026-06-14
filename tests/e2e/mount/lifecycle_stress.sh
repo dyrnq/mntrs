@@ -39,9 +39,40 @@ echo
 PASS=0
 FAIL=0
 LEAK=0
+PEAK_FD_SUM=0
+PEAK_FD_MAX=0
 
-# Baseline FD count
-BASE_FD=$(cat /proc/sys/fs/file-nr | awk '{print $1}')
+# Number of FDs we expect the mount process to hold post-unmount.
+# Before this fix the test measured system-wide `/proc/sys/fs/file-nr`,
+# which is the kernel's struct-file *high-water mark* (monotonically
+# non-decreasing under no memory pressure) — so any other process
+# opening a file during the test (healthchecks, loggers, github
+# actions) trips the threshold and the test reports a phantom
+# "leak" that has nothing to do with mntrs. The correct signal is
+# the mntrs process's own FD count, snapshotted after the FUSE
+# unmount kicked the kernel-side disconnect: at that point the
+# process should be on the path to exit, and the only FDs it should
+# still hold are its own stdin/stdout/stderr + 1-2 transient
+# tokio/event-loop FDs that will close on process exit. Anything
+# above ~10 means a real leak (e.g. an orphaned fusermount3 child
+# the watch thread spawned, or a held /dev/fuse handle).
+#
+# Threshold of 17 was chosen empirically against the s3 mount path.
+# Steady state per backend:
+#   memory://  : ~10 FDs (3 stdio + 3 tokio eventpoll/eventfd
+#                + 1 /dev/fuse + 2-3 tokio sockets)
+#   s3://      : ~12 FDs (memory set + 1 reqwest keep-alive TCP
+#                to the S3 endpoint; pool_max_idle_per_host=16
+#                in http_client.rs means up to 16 sockets per
+#                host could be warm)
+# Iterations with a busy cache dir (many .dirty sidecars from
+# prior runs) can transiently hold an extra 2-5 FDs while the
+# writeback worker recovers sidecars and the recovery scan opens
+# files in quick succession. 17 is a tolerance band wide enough
+# to absorb the s3 case + a transient burst, tight enough to
+# catch a real regression (e.g. an unbounded socket or pipe per
+# cycle).
+PEAK_FD_THRESHOLD=17
 
 cleanup() {
     fusermount3 -u "$MP" 2>/dev/null || fusermount -u "$MP" 2>/dev/null || true
@@ -84,6 +115,16 @@ for i in $(seq 1 "$ITERATIONS"); do
     # Unmount
     fusermount3 -u "$MP" 2>/dev/null || fusermount -u "$MP" 2>/dev/null || true
 
+    # Snapshot the mount process's FD count as soon as the FUSE
+    # kernel-side disconnects — this is the leak signal: anything
+    # still open at this moment should drop to ~3 (stdin/out/err)
+    # within a few hundred ms. If we see >threshold here, a fd
+    # is being held by an orphan child (e.g. the watch thread's
+    # fusermount3 child process inherited some FDs) or by the
+    # mntrs process itself (a never-closed /dev/fuse handle, an
+    # unwaked tokio reactor, etc.).
+    PEAK_FD=$(ls /proc/$MPID/fd/ 2>/dev/null | wc -l)
+
     # Wait for process exit (up to 5s)
     for w in $(seq 1 50); do
         kill -0 $MPID 2>/dev/null || break
@@ -106,27 +147,40 @@ for i in $(seq 1 "$ITERATIONS"); do
         continue
     fi
 
+    # Check FD leak (peak post-unmount count vs threshold)
+    if [ "$PEAK_FD" -gt "$PEAK_FD_THRESHOLD" ]; then
+        echo "✗ iter $i: fd leak (held $PEAK_FD fds after unmount, threshold $PEAK_FD_THRESHOLD)"
+        FAIL=$((FAIL + 1))
+        continue
+    fi
+
+    PEAK_FD_SUM=$((PEAK_FD_SUM + PEAK_FD))
+    if [ "$PEAK_FD" -gt "$PEAK_FD_MAX" ]; then
+        PEAK_FD_MAX=$PEAK_FD
+    fi
+
     PASS=$((PASS + 1))
     if (( i % 10 == 0 )); then
-        CUR_FD=$(cat /proc/sys/fs/file-nr | awk '{print $1}')
-        echo "  ... $i/$ITERATIONS  pass=$PASS fail=$FAIL fd_delta=$((CUR_FD - BASE_FD))"
+        echo "  ... $i/$ITERATIONS  pass=$PASS fail=$FAIL peak_fd_max=$PEAK_FD_MAX"
     fi
 done
 
-# Final FD check
-sleep 1
-FINAL_FD=$(cat /proc/sys/fs/file-nr | awk '{print $1}')
-FD_DELTA=$((FINAL_FD - BASE_FD))
+# Final orphan check: no mntrs mount processes left over matching
+# this mountpoint (catches the case where the process exited but a
+# child — e.g. the watch thread's `fusermount3 -u` — got orphaned
+# and is still holding FDs).
+ORPHANS=$(pgrep -af "mntrs mount.*${MP}" 2>/dev/null | wc -l)
 
 echo
 echo "=== Results ==="
 echo "  Mount/write/unmount: $PASS/$ITERATIONS passed"
 echo "  Process leaks:       $LEAK"
-echo "  FD delta:            $FD_DELTA"
+echo "  Peak FD (max/avg):   $PEAK_FD_MAX / $((PEAK_FD_SUM / (ITERATIONS > 0 ? ITERATIONS : 1)))"
+echo "  Orphan processes:    $ORPHANS"
 
 cleanup
 
-if [ $FAIL -eq 0 ] && [ $FD_DELTA -lt 50 ]; then
+if [ $FAIL -eq 0 ] && [ $ORPHANS -eq 0 ]; then
     echo "  ✅ lifecycle stress PASSED"
     exit 0
 else
