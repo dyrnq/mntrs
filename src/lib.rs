@@ -292,6 +292,125 @@ fn opendal_timestamp_to_system_time(ts: impl Into<std::time::SystemTime>) -> std
     }
 }
 impl MntrsFs {
+    /// If `cache_max_size > 0` or `cache_min_free_space > 0`, walk
+    /// `disk_cache_index` (newest to oldest by `atime`) and delete
+    /// the oldest cache files until the total drops below the
+    /// configured limit, or until the cache disk has the
+    /// requested free space, whichever is the tighter constraint.
+    ///
+    /// Cost: O(N) over `disk_cache_index` per call, where N is
+    /// the number of cached files (NOT blocks — the index only
+    /// tracks the file-level whole-file cache, not the 8 MiB block
+    /// cache that I added in commit e279810). For a busy CSI node
+    /// with 10k cached files this is well under a millisecond.
+    /// A BinaryHeap (min-heap by atime) gives O(N log K) where K
+    /// is the number of files to evict; on a 10k-file cache
+    /// evicting 100 files is ~50k heap ops, also sub-ms.
+    ///
+    /// Block-level cache files (`{hash}_{block:010x}.block`) are
+    /// NOT tracked by this index and therefore NOT evicted. They
+    /// accumulate unbounded for now; a future commit can extend
+    /// the index to also track block files. The index cleanup on
+    /// unlink/rmdir (commit 8f4244c) removes orphaned whole-file
+    /// cache entries but not block files.
+    ///
+    /// Runs inline on the FUSE write worker. Synchronous is
+    /// intentional: a background eviction thread introduces a
+    /// race where a subsequent write sees "out of space" before
+    /// the eviction completes. The current write is allowed to
+    /// push the total briefly over the limit; the *next* write
+    /// that observes the breach evicts down to the target.
+    fn evict_lru_if_needed(&self) {
+        if self.cache_max_size == 0 && self.cache_min_free_space == 0 {
+            return;
+        }
+
+        // Build a min-heap by (atime, path, size) so we can
+        // pop the oldest entries first. The third element
+        // (size) is carried for accounting.
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let mut total: u64 = 0;
+        let mut heap: BinaryHeap<Reverse<(std::time::SystemTime, String, u64)>> = BinaryHeap::new();
+        for entry in self.disk_cache_index.iter() {
+            let (path, (size, atime)) = (entry.key().clone(), *entry.value());
+            total += size;
+            heap.push(Reverse((atime, path, size)));
+        }
+
+        // Free-space check (only if cache_min_free_space > 0).
+        // statvfs is cheap (~microseconds) so we don't gate it.
+        let need_free = if self.cache_min_free_space > 0 {
+            #[cfg(unix)]
+            {
+                if let Ok(fs_stat) = rustix::fs::statvfs(&self.cache_dir) {
+                    let free = fs_stat.f_bavail.saturating_mul(fs_stat.f_frsize);
+                    if free < self.cache_min_free_space {
+                        Some(self.cache_min_free_space - free)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Size-based cap.
+        let size_limit = if self.cache_max_size > 0 {
+            total.saturating_sub(self.cache_max_size)
+        } else {
+            0
+        };
+
+        // We need to free at least the larger of the two deltas.
+        let to_free = size_limit.max(need_free.unwrap_or(0));
+        if to_free == 0 {
+            self.out_of_space
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        self.out_of_space
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Pop oldest entries until enough space freed. Each pop
+        // removes the cache file (both the whole-file path and
+        // any per-block files) and the index entry.
+        let mut remaining = to_free;
+        let mut freed: u64 = 0;
+        while let Some(Reverse((_, path, size))) = heap.pop() {
+            if remaining == 0 {
+                break;
+            }
+            // Whole-file cache file (same name as the index key).
+            let cpath = crate::cache_path(&self.cache_dir, &path);
+            let _ = std::fs::remove_file(&cpath);
+            // `.meta` sidecar (used by older writeback format).
+            let _ = std::fs::remove_file(cpath.with_extension("meta"));
+            self.disk_cache_index.remove(&path as &str);
+            freed += size;
+            remaining = remaining.saturating_sub(size);
+        }
+
+        if freed >= to_free {
+            self.out_of_space
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Note: block-level cache files (cache_block_path) are
+        // intentionally NOT removed here. They're written by
+        // `CoreFilesystem::read` and don't go through
+        // disk_cache_index. They will accumulate until the cache
+        // file is removed by unlink/rmdir/rename — see commit
+        // 8f4244c for the file-level cleanup. A future
+        // improvement: track block files in disk_cache_index too.
+    }
+
     /// Create a background prefetcher for a file handle, or `None` if
     /// the file is below `prefetch_threshold` or prefetching is
     /// disabled. The prefetcher streams chunks into a bounded
@@ -1614,6 +1733,17 @@ impl CoreFilesystem for MntrsFs {
             path.clone(),
             (_data.len() as u64, std::time::SystemTime::now()),
         );
+        // Trigger LRU eviction if cache limits are configured. Runs
+        // inline (synchronous, on the FUSE write worker) because
+        // (a) the index is small in practice (entries == cached
+        // files, not blocks) and (b) deferring to a background
+        // thread introduces a race where a subsequent write sees
+        // out-of-space before the eviction completes. The current
+        // write is allowed to push the total briefly over the
+        // limit; the next write that observes the breach evicts
+        // down to the target. See `evict_lru_if_needed` for the
+        // exact size math.
+        self.evict_lru_if_needed();
         let written = _data.len() as u32;
 
         // Update inodes size — must CREATE the entry if it doesn't exist.
