@@ -119,6 +119,17 @@ fn remove_mount(mountpoint: &str) {
 static CLEANUP_MP: OnceLock<String> = OnceLock::new();
 static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+/// Distinguishes "shutdown was triggered by SIGINT/SIGTERM" (the
+/// `handler` signal fn) from "shutdown was triggered by the FUSE
+/// session ending" (external `fusermount3 -u`, `umount_and_join`
+/// from `unmount_internal`, etc.). The fuse-signal-watcher thread
+/// only needs to spawn its own `fusermount3 -u` child in the first
+/// case; in the second case the mount is already gone and spawning
+/// a redundant child would orphan it on parent exit and leak 2
+/// pipe FDs + 1 devnull fd per cycle (lifecycle_stress catches
+/// this as a real 12-15 fd/post-unmount retention per mount).
+static SHUTDOWN_BY_SIGNAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Active FUSE BackgroundSession. Stored by mount() so that
 /// unmount_internal() can gracefully shut down the FUSE daemon thread
@@ -906,6 +917,26 @@ pub fn mount(
 
     // Spawn a watcher thread: when a signal sets SHUTDOWN_REQUESTED,
     // call fusermount3 -u so the FUSE daemon gets ENODEV and exits.
+    //
+    // FD-leak fix: previously the watcher unconditionally spawned a
+    // fusermount3 -u child once SHUTDOWN_REQUESTED was true. In the
+    // session-end path (external `fusermount3 -u` from the test, or
+    // `unmount_internal` → `umount_and_join`), the mount was already
+    // gone — the watcher's child was redundant and, because the
+    // parent process exits as soon as `session.join()` returns,
+    // the child got orphaned. Each orphan held 2 pipe FDs (the
+    // stdout/stderr pipes `Command::new(...).status()` opens)
+    // and got adopted by init, leaking 2 FDs per cycle. The
+    // lifecycle_stress test caught this as 12-15 fds/post-unmount.
+    //
+    // The signal handler now also sets SHUTDOWN_BY_SIGNAL, so the
+    // watcher can distinguish "I'm exiting because of a SIGTERM"
+    // (where spawning the unmount child is the whole point) from
+    // "the session ended on its own" (where the child is just
+    // noise). The check is racy with the signal handler but the
+    // worst case is a single missed unmount attempt on the signal
+    // path, which is harmless: the process is exiting anyway and
+    // the kernel cleans up the FUSE mount on process death.
     #[cfg(not(windows))]
     {
         let mp = mountpoint.to_string();
@@ -914,6 +945,9 @@ pub fn mount(
             .spawn(move || {
                 while !SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
                     std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                if !SHUTDOWN_BY_SIGNAL.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
                 }
                 tracing::info!("signal received, unmounting...");
                 let _ = Command::new("fusermount3")
@@ -1345,10 +1379,15 @@ async fn build_memory(_url: &url::Url, _opts: &HashMap<String, String>) -> Resul
     apply_operator_with_tls(builder, _opts)
 }
 
-/// Async-signal-safe: only sets an atomic flag.
-/// The main loop checks SHUTDOWN_REQUESTED and performs proper cleanup.
+/// Async-signal-safe: only sets atomic flags.
+/// The main loop checks SHUTDOWN_REQUESTED and performs proper
+/// cleanup; the watcher thread additionally checks
+/// SHUTDOWN_BY_SIGNAL to decide whether to spawn its own
+/// `fusermount3 -u` (only needed for the signal path — the
+/// session-end path is already unmounted externally).
 extern "C" fn handler(_: i32) {
     SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    SHUTDOWN_BY_SIGNAL.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 async fn build_webdav(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
