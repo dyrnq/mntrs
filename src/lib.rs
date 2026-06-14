@@ -1160,17 +1160,74 @@ impl CoreFilesystem for MntrsFs {
             let cache_size = std::fs::metadata(&cpath).map(|m| m.len()).unwrap_or(0);
             (k, s.max(cache_size), m)
         } else {
-            let cpath = crate::cache_path(&self.cache_dir, &full_path);
-            match std::fs::metadata(&cpath) {
-                Ok(meta) => {
-                    let mt = meta.modified().ok();
-                    (FileType::RegularFile, meta.len(), mt)
-                }
-                Err(_) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "lookup: not on backend, no cache file",
-                    ));
+            // HDFS implicit-directory fix: when `stat_op` returns NotFound
+            // (opendal hdfs-native: a directory that has no explicit INode
+            // record, only a child file), but the parent directory's
+            // readdir listing — which mntrs caches in `dir_cache` with
+            // `dir_cache_ttl` — contains `name` as a child, the path is
+            // a valid (implicit) entry on the backend. Without this
+            // fallback, `lookup` returns ENOENT and the FUSE reply makes
+            // `ls -laR` render the entry as `d?????????` (all attrs
+            // unknown), or the recursive opendir against the subdir
+            // fails entirely when the kernel's getattr→lookup→readdir
+            // pipeline rejects the ENOENT. This was the root cause of
+            // CI run 27485319055 `hdfs-kerberos` job failing at
+            // `ls: cannot open directory '/mnt/hdfs/test'`.
+            //
+            // Match the parent's cache slot: list_op stores entries
+            // under `format!("{}/", parent_path)` (or `""` for the
+            // root), so we look up exactly that key. Hit only if the
+            // entry's mode classifies it as a known directory or file
+            // — purely-default attrs would be a worse answer than
+            // ENOENT, because the caller (FUSE) would then treat
+            // something nonexistent as existent.
+            let parent_cache_key = if parent_path.is_empty() {
+                String::new()
+            } else {
+                format!("{}/", parent_path)
+            };
+            let implicit = self.dir_cache.get(&parent_cache_key).and_then(|entry| {
+                let (_t, entries) = entry.value();
+                entries
+                    .get(name)
+                    .map(|r| (r.value().0, r.value().1, r.value().2))
+            });
+            if let Some((mode, _im_size, _im_mtime)) = implicit {
+                let kind = match mode {
+                    EntryMode::DIR => FileType::Directory,
+                    _ => FileType::RegularFile,
+                };
+                // Size/mtime aren't authoritative for implicit dirs
+                // (opendal hdfs-native can't stat them), so return
+                // the cache file's size when we have one — same
+                // precedence rule as the explicit-stat branch — and
+                // 0 / Unknown for the dir case.
+                let cpath = crate::cache_path(&self.cache_dir, &full_path);
+                let (s, m) = match std::fs::metadata(&cpath) {
+                    Ok(meta) => {
+                        let mt = meta.modified().ok();
+                        if kind == FileType::Directory {
+                            (0u64, mt)
+                        } else {
+                            (meta.len(), mt)
+                        }
+                    }
+                    Err(_) => (0u64, None),
+                };
+                (kind, s, m)
+            } else {
+                let cpath = crate::cache_path(&self.cache_dir, &full_path);
+                match std::fs::metadata(&cpath) {
+                    Ok(meta) => {
+                        let mt = meta.modified().ok();
+                        (FileType::RegularFile, meta.len(), mt)
+                    }
+                    Err(_) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "lookup: not on backend, no cache file",
+                        ));
+                    }
                 }
             }
         };
