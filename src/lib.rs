@@ -1464,6 +1464,40 @@ impl CoreFilesystem for MntrsFs {
             self.mem_cache
                 .put(ino, first_blk + i, b.slice(s..e.min(b.len())));
         }
+        // Also populate block-level disk cache so subsequent reads
+        // of the same range hit the fast path on disk (rclone's
+        // `--vfs-cache-mode full` parity). Each block is a separate
+        // file under `cache_dir/{hash}_{block_idx:010x}.block`; the
+        // read path already checks for these (CoreFilesystem::read
+        // step 5) — they were just never written until now.
+        //
+        // `b.slice(s..e)` is a zero-copy Bytes view, and the file
+        // is opened with create+truncate(false) so a re-read
+        // overwrites the cached chunk in place. Write failures
+        // are non-fatal: log + continue. The mem_cache copy above
+        // is what the FUSE worker actually returns to the kernel.
+        if !self.direct_io {
+            for i in 0..n_blks {
+                let s = (i * CACHE_BLOCK_SIZE) as usize;
+                let e = ((i + 1) * CACHE_BLOCK_SIZE) as usize;
+                let blk_path = crate::cache_block_path(&self.cache_dir, &path, first_blk + i);
+                if let Some(parent) = blk_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(&blk_path)
+                {
+                    use std::io::Write;
+                    let slice = b.slice(s..e.min(b.len()));
+                    if let Err(e) = f.write_all(&slice) {
+                        tracing::debug!(?blk_path, error=%e, "block cache write failed");
+                    }
+                }
+            }
+        }
         Ok(result)
     }
 
