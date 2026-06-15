@@ -2319,7 +2319,6 @@ impl CoreFilesystem for MntrsFs {
         };
         submit_disk_write(job);
 
-        // (write path has been replaced with submit_disk_write below)
 
 
         // Index the whole-file cache entry. The key is
