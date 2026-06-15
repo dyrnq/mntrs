@@ -250,8 +250,22 @@ pub struct MntrsFs {
             std::time::Instant,
         ),
     >,
+    /// Index of every on-disk cache file (file-level *and*
+    /// block-level) for the LRU sweeper. The key is a
+    /// `(remote_path, Option<block_idx>)` tuple: `None`
+    /// means "the whole-file cache at `cache_path(p)`",
+    /// `Some(idx)` means "the per-block file at
+    /// `cache_block_path(p, idx)`". Tracked together so a
+    /// single `evict_lru` sweep removes the most-cold
+    /// entries across both layers, regardless of which
+    /// layer the read path populated. The value is
+    /// `(size_bytes, last_access_instant)` — the in-memory
+    /// `last_access_instant` is the source of truth for
+    /// LRU ordering (see `bump_in_memory_atime`); the
+    /// on-disk atime is unreliable on `relatime` mount
+    /// defaults.
     #[allow(clippy::type_complexity)]
-    disk_cache_index: dashmap::DashMap<String, (u64, std::time::SystemTime)>,
+    disk_cache_index: dashmap::DashMap<CacheKey, (u64, std::time::Instant)>,
     out_of_space: std::sync::atomic::AtomicBool,
     pub(crate) storage_class: Option<String>,
 }
@@ -325,17 +339,20 @@ impl MntrsFs {
             return;
         }
 
-        // Build a min-heap by (atime, path, size) so we can
-        // pop the oldest entries first. The third element
-        // (size) is carried for accounting.
+        // Build a min-heap by (last_access_instant, key, size)
+        // so we can pop the oldest entries first. The third
+        // element (size) is carried for accounting. The key is
+        // the full `CacheKey` (path + optional block_idx), so
+        // block-level and file-level cache files compete on
+        // equal footing for the eviction budget.
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
         let mut total: u64 = 0;
-        let mut heap: BinaryHeap<Reverse<(std::time::SystemTime, String, u64)>> = BinaryHeap::new();
+        let mut heap: BinaryHeap<Reverse<(std::time::Instant, CacheKey, u64)>> = BinaryHeap::new();
         for entry in self.disk_cache_index.iter() {
-            let (path, (size, atime)) = (entry.key().clone(), *entry.value());
+            let (key, (size, last_access)) = (entry.key().clone(), *entry.value());
             total += size;
-            heap.push(Reverse((atime, path, size)));
+            heap.push(Reverse((last_access, key, size)));
         }
 
         // Free-space check (only if cache_min_free_space > 0).
@@ -380,20 +397,26 @@ impl MntrsFs {
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Pop oldest entries until enough space freed. Each pop
-        // removes the cache file (both the whole-file path and
-        // any per-block files) and the index entry.
+        // removes the corresponding cache file (file-level
+        // via `cache_path`, block-level via `cache_block_path`)
+        // and the index entry.
         let mut remaining = to_free;
         let mut freed: u64 = 0;
-        while let Some(Reverse((_, path, size))) = heap.pop() {
+        while let Some(Reverse((_atime, (path, block_idx), size))) = heap.pop() {
             if remaining == 0 {
                 break;
             }
-            // Whole-file cache file (same name as the index key).
-            let cpath = crate::cache_path(&self.cache_dir, &path);
+            let cpath = match block_idx {
+                Some(idx) => crate::cache_block_path(&self.cache_dir, &path, idx),
+                None => crate::cache_path(&self.cache_dir, &path),
+            };
             let _ = std::fs::remove_file(&cpath);
-            // `.meta` sidecar (used by older writeback format).
-            let _ = std::fs::remove_file(cpath.with_extension("meta"));
-            self.disk_cache_index.remove(&path as &str);
+            // `.meta` sidecar (whole-file only — block files
+            // don't have one). Ignore the not-found error.
+            if block_idx.is_none() {
+                let _ = std::fs::remove_file(cpath.with_extension("meta"));
+            }
+            self.disk_cache_index.remove(&(path.clone(), block_idx));
             freed += size;
             remaining = remaining.saturating_sub(size);
         }
@@ -402,13 +425,6 @@ impl MntrsFs {
             self.out_of_space
                 .store(false, std::sync::atomic::Ordering::Relaxed);
         }
-        // Note: block-level cache files (cache_block_path) are
-        // intentionally NOT removed here. They're written by
-        // `CoreFilesystem::read` and don't go through
-        // disk_cache_index. They will accumulate until the cache
-        // file is removed by unlink/rmdir/rename — see commit
-        // 8f4244c for the file-level cleanup. A future
-        // improvement: track block files in disk_cache_index too.
     }
 
     /// Create a background prefetcher for a file handle, or `None` if
@@ -561,6 +577,40 @@ pub fn cache_path(cache_dir: &Path, path: &str) -> PathBuf {
     cache_path_block(cache_dir, path, 0)
 }
 
+/// Key for the disk-cache LRU index. `None` block_idx means
+/// the whole-file cache (`cache_path`); `Some(idx)` is the
+/// per-block cache (`cache_block_path`). The tuple is
+/// `Hash + Eq` out of the box (the String and the u64 are
+/// both `Hash + Eq`), so we don't need a custom newtype.
+///
+/// `CacheKey` is the source of truth for *what* a cache
+/// entry is. The corresponding on-disk path is rebuilt
+/// from the components (`cache_path` for `None`,
+/// `cache_block_path` for `Some`), so the index and the
+/// file system can't drift as long as both helpers
+/// produce deterministic names.
+pub type CacheKey = (String, Option<u64>);
+
+/// Refresh the in-memory `last_access_instant` for a
+/// cache entry. The on-disk atime is unreliable on
+/// `relatime` (the Linux default since 2.6.30) and is
+/// not consulted by the LRU sweeper — the sweeper sorts
+/// by the in-memory `Instant` recorded here. So every
+/// read-path cache hit must call this, otherwise the LRU
+/// degrades to FIFO (the insert time, never bumped).
+///
+/// Cost: one `DashMap::entry().and_modify()` per cache
+/// hit, which is a per-shard lock + a relaxed write. In
+/// the hot path that's a few ns.
+pub(crate) fn bump_in_memory_atime(
+    index: &dashmap::DashMap<CacheKey, (u64, std::time::Instant)>,
+    key: &CacheKey,
+) {
+    index
+        .entry(key.clone())
+        .and_modify(|(_sz, t)| *t = std::time::Instant::now());
+}
+
 /// Block-level cache path. block_index=0 means whole file (backward compatible).
 pub fn cache_path_block(cache_dir: &Path, path: &str, block_index: u64) -> PathBuf {
     let base = format!("{:020x}", path_hash(path));
@@ -576,6 +626,92 @@ pub fn cache_block_path(cache_dir: &Path, path: &str, block_idx: u64) -> PathBuf
     cache_dir.join(format!("{:020x}_{:010x}.block", path_hash(path), block_idx))
 }
 
+/// CRC32C trailer size, in bytes. The block cache file
+/// format is `content_bytes || crc32c_le(content)` for
+/// full blocks; partial blocks (`< CACHE_BLOCK_SIZE` — the
+/// last block of a file) carry no trailer because there's
+/// no canonical "expected length" to validate against
+/// without an extra sidecar.
+const BLOCK_CRC_TRAILER: usize = 4;
+
+/// Read a block cache file with optional CRC32C
+/// verification.
+///
+/// File layout:
+///   * `8 MiB`     — legacy / unprotected (backward
+///     compatible with cache files written before the
+///     CRC was added). Used as-is, no integrity check.
+///   * `8 MiB + 4` — protected: the last 4 bytes are a
+///     little-endian CRC32C of the first 8 MiB. On
+///     mismatch the file is unlinked (corrupt) and the
+///     function returns `None` so the caller falls back
+///     to a remote re-fetch.
+///   * `< 8 MiB`   — partial block (last block of a
+///     file). No trailer; used as-is.
+///   * `> 8 MiB + 4` — corrupt (writer overran or
+///     garbage). Unlinked, returns `None`.
+///
+/// Returns `Some(Bytes)` on a clean read (protected or
+/// unprotected) and `None` on a corrupt file (after
+/// unlinking it). The caller should treat `None` as a
+/// cache miss.
+fn read_block_cached(cpath: &Path) -> Option<bytes::Bytes> {
+    let metadata = std::fs::metadata(cpath).ok()?;
+    let size = metadata.len() as usize;
+    if size > CACHE_BLOCK_SIZE as usize + BLOCK_CRC_TRAILER {
+        // Writer overran or someone dropped garbage in
+        // the cache dir. Treat as corrupt.
+        let _ = std::fs::remove_file(cpath);
+        tracing::warn!(
+            ?cpath,
+            size,
+            "block cache file size exceeds format; unlinking"
+        );
+        return None;
+    }
+    let data = std::fs::read(cpath).ok()?;
+    if size == CACHE_BLOCK_SIZE as usize + BLOCK_CRC_TRAILER {
+        // Protected full block: verify CRC32C.
+        let (content, trailer) = data.split_at(CACHE_BLOCK_SIZE as usize);
+        let want = u32::from_le_bytes(trailer.try_into().unwrap_or([0u8; 4]));
+        let got = crc32c_checksum(content);
+        if want != got {
+            let _ = std::fs::remove_file(cpath);
+            tracing::warn!(
+                ?cpath,
+                stored = want,
+                computed = got,
+                "block cache CRC mismatch; unlinking and refetching"
+            );
+            return None;
+        }
+        Some(bytes::Bytes::copy_from_slice(content))
+    } else if size == CACHE_BLOCK_SIZE as usize {
+        // Legacy unprotected full block. We can't verify,
+        // so log once at debug level the first time a
+        // legacy block is hit (not all 256 of them).
+        tracing::debug!(?cpath, "block cache file is unprotected (legacy format)");
+        Some(bytes::Bytes::from(data))
+    } else if size < CACHE_BLOCK_SIZE as usize {
+        // Partial block (last block of a file). No CRC
+        // expected.
+        Some(bytes::Bytes::from(data))
+    } else {
+        // size > 8 MiB but <= 8 MiB + 4 — shouldn't
+        // happen (this is `CACHE_BLOCK_SIZE + 1 ..= 8
+        // MiB + 4`). The check above is for `> 8 MiB + 4`,
+        // so this is `8 MiB + 1 ..= 8 MiB + 4`. Treat as
+        // corrupt.
+        let _ = std::fs::remove_file(cpath);
+        tracing::warn!(
+            ?cpath,
+            size,
+            "block cache file size in no-man's-land; unlinking"
+        );
+        None
+    }
+}
+
 /// Remove block-level cache entries for a path. O(K) where K is
 /// the inodes.size() / CACHE_BLOCK_SIZE — direct `remove_file` per
 /// block, no `read_dir` over the whole cache dir.
@@ -589,8 +725,17 @@ pub fn cache_block_path(cache_dir: &Path, path: &str, block_idx: u64) -> PathBuf
 ///
 /// Stale block files (the inodes entry was removed but the block
 /// file on disk was missed) are tolerated: `remove_file` returns
-/// an error and we silently ignore it. A future `cache_index`
-/// rebuild at startup will surface any genuine orphans.
+/// an error and we silently ignore it.
+///
+/// **Note**: this helper only removes the *disk* files. The
+/// matching in-memory `disk_cache_index` entries (key
+/// `(path, Some(block_idx))`) must be removed by the caller —
+/// see the unlink/rmdir/rename impls in `CoreFilesystem`.
+/// Centralizing that cleanup in this helper would require
+/// passing the index in as a parameter, which would couple
+/// a pure disk operation to the in-memory state; keeping
+/// them separate lets the caller choose the right key
+/// shape.
 pub(crate) fn remove_block_cache_files(cache_dir: &Path, full_path: &str, size: u64) {
     let n_blocks = size.div_ceil(CACHE_BLOCK_SIZE);
     for blk in 0..n_blocks {
@@ -740,6 +885,83 @@ impl MntrsFs {
             }
         }
         None
+    }
+
+    /// Write a single block to the disk cache with optional
+    /// CRC32C trailer, and update `disk_cache_index` on success.
+    ///
+    /// Mirrors the read-side `read_block_cached`:
+    ///   * Full blocks (== `CACHE_BLOCK_SIZE`) are written as
+    ///     `data || crc32c_le(data)` (4-byte little-endian trailer).
+    ///   * Partial blocks (`< CACHE_BLOCK_SIZE` — the last
+    ///     block of a file) are written as-is, no trailer.
+    ///   * In `--direct-io` mode, returns `false` immediately
+    ///     (the cache is bypassed for direct I/O).
+    ///
+    /// Returns `true` if the file was successfully written
+    /// AND inserted into `disk_cache_index`. On any failure
+    /// (open / write / short write) the function logs at
+    /// `debug` level and returns `false`; the next read will
+    /// see a missing file and fall back to a remote re-fetch.
+    ///
+    /// This helper is the single point of truth for the
+    /// on-disk format of block cache files. Both the
+    /// synchronous read path (`CoreFilesystem::read`) and
+    /// the asynchronous prefetcher path (after a part is
+    /// popped from `HandlePrefetcher::PartQueue`) call it
+    /// so the two paths can't drift.
+    pub(crate) fn write_block_cached(&self, path: &str, block_idx: u64, slice: &[u8]) -> bool {
+        if self.direct_io {
+            return false;
+        }
+        let blk_path = crate::cache_block_path(&self.cache_dir, path, block_idx);
+        if let Some(parent) = blk_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Full blocks (== CACHE_BLOCK_SIZE) get a CRC32C
+        // trailer so the read path can detect corruption
+        // from interrupted writeback, disk-full half-writes,
+        // or stray files in the cache dir. Partial blocks
+        // (the last block of a file) carry no trailer —
+        // there's no canonical expected length to validate
+        // against without an external sidecar.
+        let is_full_block = slice.len() == CACHE_BLOCK_SIZE as usize;
+        let written_size: u64 = if is_full_block {
+            slice.len() as u64 + BLOCK_CRC_TRAILER as u64
+        } else {
+            slice.len() as u64
+        };
+        let wrote = if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&blk_path)
+        {
+            use std::io::Write;
+            let mut ok = f.write_all(slice).is_ok();
+            if ok && is_full_block {
+                let crc = crc32c_checksum(slice);
+                ok = f.write_all(&crc.to_le_bytes()).is_ok();
+            }
+            if !ok {
+                tracing::debug!(?blk_path, "block cache write failed");
+            }
+            ok
+        } else {
+            false
+        };
+        if wrote {
+            // The in-memory `Instant::now()` is the LRU sort
+            // key (see field doc on `disk_cache_index`); it's
+            // bumped to `now` on every read via
+            // `bump_in_memory_atime`. On-disk atime is
+            // unreliable on `relatime` mount defaults.
+            self.disk_cache_index.insert(
+                (path.to_string(), Some(block_idx)),
+                (written_size, std::time::Instant::now()),
+            );
+        }
+        wrote
     }
 
     /// Recursively create `full_path` (and any missing parents) on the
@@ -1560,7 +1782,28 @@ impl CoreFilesystem for MntrsFs {
 
         // 2. mem_cache fast path
         if let Some(data) = self.mem_cache.get(ino, block_idx) {
-            let start = offset as usize;
+            // mem_cache stores data aligned to CACHE_BLOCK_SIZE
+            // boundaries — entry (ino, block_idx) covers file
+            // bytes `[block_idx * CACHE_BLOCK_SIZE,
+            // (block_idx+1) * CACHE_BLOCK_SIZE)`. The slice
+            // `data` itself starts at the block boundary, NOT at
+            // the original read offset, so we must compute
+            // `start` relative to the block (not the file).
+            //
+            // Pre-fix: `start = offset` was used, which works
+            // when `offset == block_idx * CACHE_BLOCK_SIZE`
+            // (start = 0) but returns empty for any read at a
+            // non-zero intra-block offset because `start ==
+            // data.len()`. The bug was masked when read_chunk_size
+            // was small (each fetch = 1 block, so the kernel
+            // never asked for a non-zero intra-block offset on
+            // the cached block), but surfaces when read_chunk_size
+            // >= CACHE_BLOCK_SIZE: the first fetch populates
+            // mem_cache with 16 MiB, then a 256 KiB read at
+            // offset 8 MiB (the block boundary) hits mem_cache
+            // and returns empty.
+            let block_start = block_idx * CACHE_BLOCK_SIZE;
+            let start = (offset - block_start) as usize;
             let end = (start + size as usize).min(data.len());
             return if start < data.len() {
                 Ok(data[start..end].to_vec())
@@ -1581,14 +1824,26 @@ impl CoreFilesystem for MntrsFs {
             // reads on the same block range hit the fast path above.
             // part.data is up to 16 MiB (chunk_size cap) and may span
             // 1-2 CACHE_BLOCK_SIZE blocks; cheap iteration.
+            //
+            // Also write to the block-level disk cache so the
+            // data survives the FUSE session closing (e.g. a
+            // remount after a process restart, or a follow-up
+            // mount of the same backend). Without this, every
+            // remount re-fetches the same prefetched data from
+            // remote even though we already paid the network
+            // cost once. Uses the same `write_block_cached`
+            // helper as the cache-miss path below, so the on-
+            // disk format (CRC32C trailer, disk_cache_index
+            // insert) can't drift between the two paths.
             let first_blk = part.offset / CACHE_BLOCK_SIZE;
             let data = part.data.clone();
             let n_blks = (data.len() as u64).div_ceil(CACHE_BLOCK_SIZE);
             for i in 0..n_blks {
                 let s = (i * CACHE_BLOCK_SIZE) as usize;
                 let e = ((i + 1) * CACHE_BLOCK_SIZE) as usize;
-                self.mem_cache
-                    .put(ino, first_blk + i, data.slice(s..e.min(data.len())));
+                let slice = data.slice(s..e.min(data.len()));
+                self.mem_cache.put(ino, first_blk + i, slice.clone());
+                self.write_block_cached(&path, first_blk + i, &slice);
             }
             let start = (offset - part.offset) as usize;
             let end = (start + size as usize).min(data.len());
@@ -1606,6 +1861,13 @@ impl CoreFilesystem for MntrsFs {
                 && let Ok(data) = std::fs::read(&fcpath)
             {
                 let b = bytes::Bytes::from(data);
+                // Bug B fix: bump the in-memory LRU sort key
+                // on every cache hit. The on-disk atime is
+                // unreliable on `relatime` mount defaults, so
+                // the LRU sweeper consults the in-memory
+                // `Instant` recorded here (see `bump_in_memory_atime`
+                // and the field doc on `disk_cache_index`).
+                bump_in_memory_atime(&self.disk_cache_index, &(path.clone(), None));
                 let start = offset as usize;
                 let end = (start + size as usize).min(b.len());
                 let result = if start < b.len() {
@@ -1619,10 +1881,33 @@ impl CoreFilesystem for MntrsFs {
             // 5. Block-level disk cache
             let cpath = crate::cache_block_path(&self.cache_dir, &path, block_idx);
             if cpath.exists()
-                && let Ok(data) = std::fs::read(&cpath)
+                // Bug C fix: use the CRC-aware reader instead
+                // of plain `std::fs::read`. `read_block_cached`
+                // returns `None` on a corrupt block (CRC
+                // mismatch or size out-of-range), in which case
+                // we fall through to the remote-fetch path.
+                // The pre-fix code would have returned the
+                // (possibly truncated) `data` to the caller
+                // and *populated `mem_cache` with it* — silent
+                // data corruption.
+                && let Some(b) = read_block_cached(&cpath)
             {
-                let b = bytes::Bytes::from(data);
-                let start = offset as usize;
+                // Bug B fix (block-level): same LRU sort key
+                // bump as for the file-level hit. With block
+                // entries now in `disk_cache_index` (Bug A
+                // fix), this is the difference between "LRU
+                // sees a recent read on a hot block" and
+                // "evictor mistakes it for cold".
+                bump_in_memory_atime(&self.disk_cache_index, &(path.clone(), Some(block_idx)));
+                // read_block_cached returns the 8 MiB block
+                // (CRC trailer stripped). The block covers
+                // file bytes [block_idx * CACHE_BLOCK_SIZE,
+                // (block_idx+1) * CACHE_BLOCK_SIZE), so
+                // `start` must be offset-relative to the
+                // block, not the file. (Same shape of bug as
+                // the mem_cache fix above.)
+                let block_start = block_idx * CACHE_BLOCK_SIZE;
+                let start = (offset - block_start) as usize;
                 let end = (start + size as usize).min(b.len());
                 let result = if start < b.len() {
                     b[start..end].to_vec()
@@ -1730,27 +2015,18 @@ impl CoreFilesystem for MntrsFs {
         // overwrites the cached chunk in place. Write failures
         // are non-fatal: log + continue. The mem_cache copy above
         // is what the FUSE worker actually returns to the kernel.
-        if !self.direct_io {
-            for i in 0..n_blks {
-                let s = (i * CACHE_BLOCK_SIZE) as usize;
-                let e = ((i + 1) * CACHE_BLOCK_SIZE) as usize;
-                let blk_path = crate::cache_block_path(&self.cache_dir, &path, first_blk + i);
-                if let Some(parent) = blk_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .truncate(false)
-                    .write(true)
-                    .open(&blk_path)
-                {
-                    use std::io::Write;
-                    let slice = b.slice(s..e.min(b.len()));
-                    if let Err(e) = f.write_all(&slice) {
-                        tracing::debug!(?blk_path, error=%e, "block cache write failed");
-                    }
-                }
-            }
+        //
+        // `write_block_cached` is the single point of truth
+        // for the on-disk format (CRC32C trailer for full
+        // blocks, no trailer for partial, dashmap insert
+        // on success). The same helper is called from the
+        // prefetcher pop path below so the two paths
+        // can't drift.
+        for i in 0..n_blks {
+            let s = (i * CACHE_BLOCK_SIZE) as usize;
+            let e = ((i + 1) * CACHE_BLOCK_SIZE) as usize;
+            let slice = b.slice(s..e.min(b.len()));
+            self.write_block_cached(&path, first_blk + i, &slice);
         }
         Ok(result)
     }
@@ -1835,9 +2111,15 @@ impl CoreFilesystem for MntrsFs {
             }
         }
 
+        // Index the whole-file cache entry. The key is
+        // `(path, None)` to distinguish from block-level
+        // entries `(path, Some(idx))`. We use `Instant::now()`
+        // (the in-memory LRU sort key), not `SystemTime::now()`
+        // (the on-disk mtime, which `relatime` doesn't update
+        // on read).
         self.disk_cache_index.insert(
-            path.clone(),
-            (_data.len() as u64, std::time::SystemTime::now()),
+            (path.clone(), None),
+            (_data.len() as u64, std::time::Instant::now()),
         );
         // Trigger LRU eviction if cache limits are configured. Runs
         // inline (synchronous, on the FUSE write worker) because
@@ -2170,20 +2452,36 @@ impl CoreFilesystem for MntrsFs {
             .map_err(|e| opendal_to_io_error(&e, "unlink"))?;
         let cpath = crate::cache_path(&self.cache_dir, &full_path);
         let _ = std::fs::remove_file(&cpath);
-        // Clean block-level cache entries. O(K) via inodes.size()
-        // (see `remove_block_cache_files` for the rationale and the
-        // previous-O(N) bug this replaces).
-        if let Some((_path, _kind, size, _mtime)) = self.inodes.iter().find_map(|entry| {
-            let (p, kind, sz, mtime) = entry.value();
-            if p == &full_path {
-                Some((p.clone(), *kind, *sz, *mtime))
-            } else {
-                None
+        // Clean block-level cache entries (disk + index).
+        // O(K) via inodes.size() (see `remove_block_cache_files`
+        // for the rationale and the previous-O(N) bug this
+        // replaces). `size` is bound out of the `if let` so the
+        // block-level `disk_cache_index` cleanup below can use it
+        // (Bug A follow-up).
+        let file_size: u64 = self
+            .inodes
+            .iter()
+            .find_map(|entry| {
+                let (p, _kind, sz, _mtime) = entry.value();
+                if p == &full_path { Some(*sz) } else { None }
+            })
+            .unwrap_or(0);
+        if file_size > 0 {
+            remove_block_cache_files(&self.cache_dir, &full_path, file_size);
+            // Bug A follow-up: also remove the block-level
+            // entries from `disk_cache_index`. The disk file
+            // removal above (`remove_block_cache_files`) only
+            // touches the filesystem; the in-memory index
+            // entries `(path, Some(idx))` would otherwise leak
+            // and accumulate until the next process restart.
+            let n_blocks = file_size.div_ceil(CACHE_BLOCK_SIZE);
+            for blk in 0..n_blocks {
+                self.disk_cache_index
+                    .remove(&(full_path.clone(), Some(blk)));
             }
-        }) {
-            remove_block_cache_files(&self.cache_dir, &full_path, size);
         }
-        self.disk_cache_index.remove(&full_path);
+        // The whole-file entry (key `(path, None)`).
+        self.disk_cache_index.remove(&(full_path.clone(), None));
         // Bug E fix: inodes is keyed by the NEXT_INO counter, not
         // path_hash. Use find_ino_by_path to locate the correct ino
         // before removing. path_hash(&full_path) was a no-op
@@ -2289,36 +2587,42 @@ impl CoreFilesystem for MntrsFs {
                 Err(e) if e.kind() == opendal::ErrorKind::Unsupported => {
                     tracing::debug!(
                         path = %src_clone, error = %e,
-                        "backend does not support server-side rename; falling back to local-cache read + write+delete"
+                        "backend does not support server-side rename; falling back to op.copy + op.delete"
                     );
-                    let cpath_src = crate::cache_path(&self.cache_dir, &src_clone);
-                    let bytes = match std::fs::read(&cpath_src) {
-                        Ok(b) => b,
-                        Err(read_err) if read_err.kind() == std::io::ErrorKind::NotFound => {
-                            Vec::new()
-                        }
-                        Err(read_err) => {
-                            tracing::error!(
-                                path = %cpath_src.display(), error = %read_err,
-                                "rename fallback: read cache file failed, keeping source intact"
-                            );
-                            return false;
-                        }
-                    };
-                    let write_res = op.write(&dst_clone, bytes).await;
-                    if let Err(write_err) = write_res {
+                    // Use opendal's op.copy instead of reading the
+                    // local cache file: FUSE write data is in the
+                    // page cache (not on disk) for up to 5s (the
+                    // writeback delay), so a std::fs::read of the
+                    // cache file may return stale or 0-byte data.
+                    // opendal's op.copy goes through the operator's
+                    // reader, which for the memory backend reads the
+                    // BTreeMap directly (synchronous, no cache-flush
+                    // dependency), and for S3/HDFS reads from the
+                    // remote. The pre-fix memory-stress-loop
+                    // `rename src still exists` failure was caused by
+                    // the cache-file read returning 0 bytes (the
+                    // FUSE write hadn't hit disk yet), so the
+                    // fallback wrote 0 bytes to dst — leaving the
+                    // renamed file empty AND leaving src (the FUSE
+                    // create had already populated the backend with
+                    // 0 bytes) behind.
+                    let copy_res = op.copy(&src_clone, &dst_clone).await;
+                    if let Err(copy_err) = copy_res {
                         tracing::error!(
-                            src = %src_clone, dst = %dst_clone, error = %write_err,
-                            "rename fallback: write dst failed, keeping source intact"
+                            src = %src_clone, dst = %dst_clone, error = %copy_err,
+                            "rename fallback: op.copy failed, keeping source intact"
                         );
                         return false;
                     }
+                    tracing::debug!(src = %src_clone, dst = %dst_clone, "rename fallback: op.copy ok");
                     let del_res = op.delete(&src_clone).await;
-                    if del_res.is_err() {
+                    if let Err(del_err) = &del_res {
                         tracing::warn!(
-                            src = %src_clone, dst = %dst_clone,
-                            "rename fallback: write ok, delete failed — both visible"
+                            src = %src_clone, dst = %dst_clone, error = %del_err,
+                            "rename fallback: copy ok, delete failed — both visible"
                         );
+                    } else {
+                        tracing::debug!(src = %src_clone, "rename fallback: delete src ok");
                     }
                     true
                 }
@@ -2371,6 +2675,15 @@ impl CoreFilesystem for MntrsFs {
             self.attr_cache.insert(dst.to_string(), entry);
         }
         self.attr_cache.remove(&src);
+        // Drop the .dirty sidecar for src so the next mount's
+        // recovery scan (common_init_wb) doesn't re-upload the
+        // pre-rename cache content to the now-orphan src path.
+        // Without this, recovery would `op.write(src, cache_data)`
+        // and resurrect the source on the backend after the rename
+        // already deleted it (the same race the in-process
+        // writeback task hit, see writeback.rs).
+        let cpath_src = crate::cache_path(&self.cache_dir, &src);
+        let _ = std::fs::remove_file(cpath_src.with_extension("dirty"));
         self.invalidate_dir_cache(&src);
         self.invalidate_dir_cache(&dst);
         // Invalidate the PARENT dir's listing cache too —
@@ -2676,5 +2989,222 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         disk_cache_index: Default::default(),
         out_of_space: std::sync::atomic::AtomicBool::new(false),
         storage_class: None,
+    }
+}
+
+#[cfg(test)]
+mod disk_cache_crc_tests {
+    use super::{BLOCK_CRC_TRAILER, CACHE_BLOCK_SIZE, crc32c_checksum, read_block_cached};
+    use std::path::PathBuf;
+
+    /// Make a unique scratch dir for each test so the
+    /// unlink-on-corruption path doesn't race with siblings.
+    fn scratch(name: &str) -> PathBuf {
+        let p =
+            std::env::temp_dir().join(format!("mntrs-crc-test-{}-{}", name, std::process::id()));
+        let _ = std::fs::create_dir_all(&p);
+        p
+    }
+
+    #[test]
+    fn crc_round_trip_full_block() {
+        // A full block (8 MiB) written with a correct
+        // CRC trailer should be returned with the trailer
+        // stripped (size == 8 MiB, not 8 MiB + 4).
+        let dir = scratch("full");
+        let p = dir.join("block.bin");
+        let content: Vec<u8> = (0..CACHE_BLOCK_SIZE as u32)
+            .map(|i| (i & 0xff) as u8)
+            .collect();
+        let crc = crc32c_checksum(&content);
+        let mut buf = content.clone();
+        buf.extend_from_slice(&crc.to_le_bytes());
+        std::fs::write(&p, &buf).unwrap();
+        let out = read_block_cached(&p).expect("clean full block should be Some");
+        assert_eq!(out.len(), CACHE_BLOCK_SIZE as usize);
+        assert_eq!(out.as_ref(), content.as_slice());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn crc_corruption_triggers_unlink_and_returns_none() {
+        // A full block whose CRC doesn't match the
+        // content (i.e. someone flipped a byte on disk)
+        // should be unlinked, and the function should
+        // return None so the caller falls through to a
+        // remote re-fetch. Pre-fix, this exact scenario
+        // would have returned the corrupted bytes
+        // (silent data corruption).
+        let dir = scratch("corrupt");
+        let p = dir.join("block.bin");
+        let content: Vec<u8> = (0..CACHE_BLOCK_SIZE as u32)
+            .map(|i| (i & 0xff) as u8)
+            .collect();
+        let real_crc = crc32c_checksum(&content);
+        // Write a *wrong* CRC (flip a bit in it).
+        let mut bad_crc = real_crc.to_le_bytes();
+        bad_crc[0] ^= 0x01;
+        let mut buf = content.clone();
+        buf.extend_from_slice(&bad_crc);
+        std::fs::write(&p, &buf).unwrap();
+
+        let out = read_block_cached(&p);
+        assert!(out.is_none(), "corrupt CRC should return None");
+        assert!(!p.exists(), "corrupt file should be unlinked");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn crc_legacy_unprotected_block_8mib() {
+        // A pre-CRC file: exactly 8 MiB, no trailer.
+        // Read path should accept it as-is (no
+        // integrity check possible without an external
+        // length hint).
+        let dir = scratch("legacy");
+        let p = dir.join("block.bin");
+        let content: Vec<u8> = (0..CACHE_BLOCK_SIZE as u32)
+            .map(|i| (i & 0xff) as u8)
+            .collect();
+        std::fs::write(&p, &content).unwrap();
+        let out = read_block_cached(&p).expect("legacy unprotected block should be Some");
+        assert_eq!(out.len(), CACHE_BLOCK_SIZE as usize);
+        assert_eq!(out.as_ref(), content.as_slice());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn crc_partial_block_passes_through() {
+        // A partial block (< 8 MiB) — the last block of
+        // a file. No trailer; should pass through
+        // unmodified.
+        let dir = scratch("partial");
+        let p = dir.join("block.bin");
+        let content: Vec<u8> = (0..4096u32).map(|i| (i & 0xff) as u8).collect();
+        std::fs::write(&p, &content).unwrap();
+        let out = read_block_cached(&p).expect("partial block should be Some");
+        assert_eq!(out.len(), content.len());
+        assert_eq!(out.as_ref(), content.as_slice());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn crc_oversized_file_triggers_unlink() {
+        // A file larger than `8 MiB + 4` is corrupt
+        // (writer overran, or someone dropped garbage in
+        // the cache dir). Should be unlinked and return
+        // None.
+        let dir = scratch("oversized");
+        let p = dir.join("block.bin");
+        let content: Vec<u8> = vec![0xab; CACHE_BLOCK_SIZE as usize + BLOCK_CRC_TRAILER + 1];
+        std::fs::write(&p, &content).unwrap();
+
+        let out = read_block_cached(&p);
+        assert!(out.is_none(), "oversized file should return None");
+        assert!(!p.exists(), "oversized file should be unlinked");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---------------------------------------------------------------
+    // Disk cache #5: `write_block_cached` is the single point of
+    // truth for the on-disk block format. Both the cache-miss
+    // read path AND the prefetcher pop path call it, so a
+    // regression in either shows up as a format/CRC mismatch on
+    // the next read. The tests below exercise the helper
+    // directly; the FUSE e2e suite covers the end-to-end
+    // prefetcher-thread → disk-cache flow on a real mount.
+    // ---------------------------------------------------------------
+
+    use super::cache_block_path;
+    use super::new_test_fs;
+    use opendal::Operator;
+    use opendal::services::Memory;
+
+    fn make_fs() -> super::MntrsFs {
+        let op = Operator::new(Memory::default()).unwrap().finish();
+        let cache_dir = std::env::temp_dir().join(format!(
+            "mntrs-write-block-test-{}-{:x}",
+            std::process::id(),
+            line_addr()
+        ));
+        let _ = std::fs::create_dir_all(&cache_dir);
+        new_test_fs(op, cache_dir)
+    }
+
+    /// Line-based unique-ish suffix so parallel test runs don't
+    /// stomp on each other's cache dir. Same idea as
+    /// tests/bug_regression_test.rs::line_addr but inlined here
+    /// because the helper is not exported.
+    fn line_addr() -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::thread::current().id().hash(&mut h);
+        h.finish()
+    }
+
+    /// Full block (== CACHE_BLOCK_SIZE) gets a 4-byte CRC32C
+    /// trailer. The on-disk file is 8 MiB + 4, the index has the
+    /// entry with the on-disk size, and the CRC-aware reader
+    /// round-trips the original content.
+    #[test]
+    fn write_block_full_round_trip() {
+        let fs = make_fs();
+        let content: Vec<u8> = (0..CACHE_BLOCK_SIZE as u32)
+            .map(|i| (i & 0xff) as u8)
+            .collect();
+        assert!(fs.write_block_cached("full.bin", 0, &content));
+        let blk_path = cache_block_path(&fs.cache_dir, "full.bin", 0);
+        let meta = std::fs::metadata(&blk_path).unwrap();
+        assert_eq!(
+            meta.len() as usize,
+            CACHE_BLOCK_SIZE as usize + BLOCK_CRC_TRAILER
+        );
+        let entry = fs
+            .disk_cache_index
+            .get(&(String::from("full.bin"), Some(0)))
+            .expect("disk_cache_index should contain the entry");
+        assert_eq!(entry.value().0 as usize, meta.len() as usize);
+        // Round-trip through the CRC reader.
+        let bytes = read_block_cached(&blk_path).expect("clean full block");
+        assert_eq!(bytes.len(), CACHE_BLOCK_SIZE as usize);
+        assert_eq!(bytes.as_ref(), content.as_slice());
+    }
+
+    /// Partial block (< CACHE_BLOCK_SIZE) has no trailer — no
+    /// canonical expected length to validate against without an
+    /// external sidecar, so the on-disk file is the raw bytes.
+    #[test]
+    fn write_block_partial_no_trailer() {
+        let fs = make_fs();
+        let content: Vec<u8> = (0..4096u32).map(|i| (i & 0xff) as u8).collect();
+        assert!(fs.write_block_cached("tail.bin", 7, &content));
+        let blk_path = cache_block_path(&fs.cache_dir, "tail.bin", 7);
+        assert_eq!(std::fs::metadata(&blk_path).unwrap().len() as usize, 4096);
+    }
+
+    /// Mirrors the read path's prefetcher pop loop: write two
+    /// full blocks (the contents of a 16 MiB prefetch part) and
+    /// verify both are in `disk_cache_index` and readable from
+    /// disk. This is the contract the prefetcher pop branch now
+    /// depends on; a regression here means a remount would
+    /// re-fetch the same data from remote.
+    #[test]
+    fn write_block_prefetch_loop_writes_two_blocks() {
+        let fs = make_fs();
+        let full: Vec<u8> = (0..CACHE_BLOCK_SIZE as u32)
+            .map(|i| (i & 0xff) as u8)
+            .collect();
+        assert!(fs.write_block_cached("prefetched.bin", 0, &full));
+        assert!(fs.write_block_cached("prefetched.bin", 1, &full));
+        for blk in 0..2u64 {
+            let key = (String::from("prefetched.bin"), Some(blk));
+            assert!(
+                fs.disk_cache_index.contains_key(&key),
+                "block {blk} must be in disk_cache_index"
+            );
+            let p = cache_block_path(&fs.cache_dir, "prefetched.bin", blk);
+            let bytes = read_block_cached(&p).expect("round-trip read");
+            assert_eq!(bytes.len(), CACHE_BLOCK_SIZE as usize);
+            assert_eq!(bytes.as_ref(), full.as_slice());
+        }
     }
 }
