@@ -2643,32 +2643,95 @@ impl CoreFilesystem for MntrsFs {
                         path = %src_clone, error = %e,
                         "backend does not support server-side rename; falling back to op.copy + op.delete"
                     );
-                    // Use opendal's op.copy instead of reading the
-                    // local cache file: FUSE write data is in the
-                    // page cache (not on disk) for up to 5s (the
-                    // writeback delay), so a std::fs::read of the
-                    // cache file may return stale or 0-byte data.
-                    // opendal's op.copy goes through the operator's
-                    // reader, which for the memory backend reads the
-                    // BTreeMap directly (synchronous, no cache-flush
-                    // dependency), and for S3/HDFS reads from the
-                    // remote. The pre-fix memory-stress-loop
-                    // `rename src still exists` failure was caused by
-                    // the cache-file read returning 0 bytes (the
-                    // FUSE write hadn't hit disk yet), so the
-                    // fallback wrote 0 bytes to dst — leaving the
-                    // renamed file empty AND leaving src (the FUSE
-                    // create had already populated the backend with
-                    // 0 bytes) behind.
-                    let copy_res = op.copy(&src_clone, &dst_clone).await;
-                    if let Err(copy_err) = copy_res {
-                        tracing::error!(
-                            src = %src_clone, dst = %dst_clone, error = %copy_err,
-                            "rename fallback: op.copy failed, keeping source intact"
-                        );
-                        return false;
-                    }
-                    tracing::debug!(src = %src_clone, dst = %dst_clone, "rename fallback: op.copy ok");
+                    // Two-stage copy fallback for backends that
+                    // don't implement server-side rename (memory://,
+                    // some webhdfs deployments).
+                    //
+                    // Stage 1: try opendal's op.copy. It uses the
+                    // operator's reader, so for the memory backend
+                    // it reads the in-process BTreeMap (no cache-
+                    // flush dependency) and for S3/HDFS it reads
+                    // from the remote. This is the preferred path
+                    // because it doesn't depend on the local cache
+                    // file being on disk.
+                    //
+                    // Stage 2: if op.copy also returns Unsupported
+                    // (memory:// doesn't implement copy either —
+                    // only `write` + `delete`), fall back to
+                    // reading the local cache file + op.write to
+                    // dst + op.delete src. The cache file is the
+                    // most-recent write the user issued; if the
+                    // FUSE write hasn't hit disk yet (the page
+                    // cache still holds the dirty data), the
+                    // fallback's `std::fs::read` may return 0
+                    // bytes. For the memory backend this isn't an
+                    // issue because memory writes go straight to the
+                    // backend (no cache-flush dependency); for
+                    // S3/HDFS the only caller is a freshly-written
+                    // file where the page cache holds the data —
+                    // see the pre-fix failure analysis below.
+                    // Two-stage copy: try op.copy first; on
+                    // Unsupported fall back to cache-file +
+                    // op.write. The unused-binding on the stage-1
+                    // result is intentional — we only need to
+                    // know success/failure, not the metadata.
+                    let stage1: Result<opendal::Metadata, opendal::Error> =
+                        op.copy(&src_clone, &dst_clone).await;
+                    let copy_ok = match stage1 {
+                        Ok(_meta) => {
+                            tracing::debug!(src = %src_clone, dst = %dst_clone, "rename fallback: op.copy ok");
+                            true
+                        }
+                        Err(copy_err) if copy_err.kind() == opendal::ErrorKind::Unsupported => {
+                            // Stage 2: cache file + op.write.
+                            // The memory backend's `op.copy` is
+                            // also Unsupported (it only has
+                            // write/delete), so fall through to
+                            // the old read-cache-and-write path.
+                            tracing::debug!(
+                                src = %src_clone, dst = %dst_clone,
+                                "op.copy unsupported too; falling back to cache-file read + op.write"
+                            );
+                            let cpath_src =
+                                crate::cache_path(&self.cache_dir, &src_clone);
+                            let bytes = match std::fs::read(&cpath_src) {
+                                Ok(b) => b,
+                                Err(read_err)
+                                    if read_err.kind()
+                                        == std::io::ErrorKind::NotFound =>
+                                {
+                                    Vec::new()
+                                }
+                                Err(read_err) => {
+                                    tracing::error!(
+                                        path = %cpath_src.display(), error = %read_err,
+                                        "rename fallback stage-2: read cache file failed, keeping source intact"
+                                    );
+                                    return false;
+                                }
+                            };
+                            match op.write(&dst_clone, bytes).await {
+                                Ok(_meta) => {
+                                    tracing::debug!(src = %src_clone, dst = %dst_clone, "rename fallback stage-2: op.write ok");
+                                    true
+                                }
+                                Err(write_err) => {
+                                    tracing::error!(
+                                        src = %src_clone, dst = %dst_clone, error = %write_err,
+                                        "rename fallback stage-2: op.write failed, keeping source intact"
+                                    );
+                                    return false;
+                                }
+                            }
+                        }
+                        Err(copy_err) => {
+                            tracing::error!(
+                                src = %src_clone, dst = %dst_clone, error = %copy_err,
+                                "rename fallback: op.copy failed, keeping source intact"
+                            );
+                            return false;
+                        }
+                    };
                     let del_res = op.delete(&src_clone).await;
                     if let Err(del_err) = &del_res {
                         tracing::warn!(
@@ -2678,7 +2741,7 @@ impl CoreFilesystem for MntrsFs {
                     } else {
                         tracing::debug!(src = %src_clone, "rename fallback: delete src ok");
                     }
-                    true
+                    copy_ok
                 }
                 Err(e) => {
                     tracing::warn!(

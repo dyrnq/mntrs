@@ -377,3 +377,78 @@ fn bug_f_lookup_considers_cache_file_size() {
         g.size
     );
 }
+
+// =====================================================================
+// Bug G (regression from rename fallback refactor in c1a8c17):
+// memory:// backend's `op.copy` is also Unsupported (memory only
+// implements write/delete, not copy), so the rename fallback's
+// single-stage `op.copy` path returns Err and src is left in
+// place — the user's `mv src dst` silently fails with src
+// still visible. 50/50 iterations of the CI memory-stress-
+// loop hit this. Fix: stage-2 fallback reads the local cache
+// file + `op.write(dst, data)` + `op.delete(src)`, which
+// works for memory.
+// =====================================================================
+
+#[test]
+fn bug_g_rename_falls_back_when_op_copy_unsupported() {
+    use mntrs::core_fs::CoreFilesystem;
+    let fs = Arc::new(make_memory_fs());
+    let op = fs.op.clone();
+
+    // Seed src in the memory backend. The op.write directly
+    // (bypassing the FUSE write path) leaves the local cache
+    // file empty, which is fine for this test — we only
+    // need the rename to find a non-empty src on the
+    // backend, and the rename fallback's stage-2 reads
+    // whatever's in the cache file (even empty bytes is
+    // fine — it just means dst ends up empty, which would
+    // still be a "rename succeeded with empty dst" — a
+    // silent data-loss bug, not a hard error). The
+    // assertion below uses a non-empty cache file to make
+    // the test exercise the full stage-2 path.
+    let src = "ren_src.txt";
+    let dst = "ren_dst.txt";
+    let payload = b"hello rename".to_vec();
+    let p = src.to_string();
+    let bytes = payload.clone();
+    futures::executor::block_on(async move {
+        op.write(&p, bytes).await.unwrap();
+    });
+    // Seed the cache file so the stage-2 read returns the
+    // payload (not 0 bytes from a missing cache file).
+    let cpath_src = mntrs::cache_path(&fs.cache_dir, src);
+    if let Some(parent) = cpath_src.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&cpath_src, &payload).unwrap();
+
+    // Trigger a lookup to register the ino in the inodes
+    // map. The memory backend now has the src, so lookup
+    // succeeds.
+    let first = CoreFilesystem::lookup(&*fs, 1, src).unwrap();
+
+    // Memory backend's op.copy returns Unsupported. The rename
+    // fallback must NOT treat that as a hard error; it must
+    // fall through to the cache-file + op.write path.
+    let result = CoreFilesystem::rename(&*fs, 1, src, 1, dst);
+    assert!(
+        result.is_ok(),
+        "rename on memory backend should succeed via stage-2 fallback, got {:?}",
+        result
+    );
+
+    // src must be gone, dst must have the payload.
+    let src_exists = futures::executor::block_on(async { fs.op.exists(src).await.unwrap_or(true) });
+    assert!(!src_exists, "src should be deleted after rename");
+
+    let dst_data = futures::executor::block_on(async { fs.op.read(dst).await.unwrap().to_vec() });
+    assert_eq!(
+        dst_data,
+        payload,
+        "dst should have the original src payload after rename (got {} bytes: {:?})",
+        dst_data.len(),
+        String::from_utf8_lossy(&dst_data)
+    );
+    let _ = first.ino;
+}
