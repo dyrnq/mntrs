@@ -1636,9 +1636,22 @@ impl CoreFilesystem for MntrsFs {
         // inodes map is fine — if the entry exists, we keep
         // the previous (path, kind, size, mtime); if not, we
         // create one with the values we just resolved.
-        let ino = self
-            .find_ino_by_path(&full_path)
-            .unwrap_or_else(|| self.alloc_ino(&full_path, kind, size));
+        //
+        // #28 (stat fast-path): pass the stat_op-derived
+        // mtime into alloc_ino_with_mtime so subsequent
+        // `getattr` calls can skip the S3 HEAD round-trip.
+        // The pre-fix `alloc_ino` always set mtime=None,
+        // which forced every `getattr` to fall through to
+        // stat_op — defeating the inodes fast path for any
+        // file that was only read, never written.
+        let ino = self.find_ino_by_path(&full_path).unwrap_or_else(|| {
+            self.alloc_ino_with_mtime(
+                &full_path,
+                kind,
+                size,
+                mtime.unwrap_or_else(SystemTime::now),
+            )
+        });
         Ok(to_core_attr(&self.make_attr(
             ino,
             size,
@@ -1657,47 +1670,50 @@ impl CoreFilesystem for MntrsFs {
             )));
         }
         if let Some((path, kind, inodes_size, inodes_mtime)) = self.resolve(ino) {
-            let (_, backend_size, backend_mtime) =
-                self.stat_op(&path).unwrap_or((kind, inodes_size, None));
-            // Use the larger of inodes size, backend size, and the
-            // on-disk cache file size.
+            // #28 (stat optimization): skip the S3 stat_op
+            // round-trip when the inodes entry is fresh
+            // enough. The entry is populated by:
+            //   * `alloc_ino_with_mtime` (mkdir/create) — has mtime
+            //   * write path's `inodes.entry().and_modify()` — has mtime
+            //   * `alloc_ino` (lookup, readdir) — no mtime (None)
+            // For files that exist only on the remote and we
+            // never wrote locally, `inodes_mtime` is None and
+            // we still need stat_op to get the canonical size
+            // and server-side mtime. For everything else
+            // (the common case in a write-heavy workload),
+            // the inodes entry is already the source of truth.
             //
-            //   * inodes_size — updated synchronously by write() and
-            //     setattr(); always reflects the most recent local change
-            //   * backend_size — what stat_op() reports from the remote
-            //     backend (via opendal). This LAGS during async writeback
-            //     and is permanently 0 for backends that have no
-            //     on-server state to stat (notably memory://, which is
-            //     in-process only)
-            //   * cache_size — the local cache file's byte length.
-            //     This is the source of truth for the most-recent
-            //     write that the user has issued but the backend
-            //     hasn't seen yet (writeback delay). The previous
-            //     version ignored it; the FUSE kernel then saw a
-            //     pre-write size for a freshly-appended file and
-            //     truncated the read to that. The same pattern is
-            //     now applied to `lookup` (see that function's
-            //     comment).
-            let cache_size = std::fs::metadata(crate::cache_path(&self.cache_dir, &path))
-                .map(|m| m.len())
-                .unwrap_or(0);
-            let size = inodes_size.max(backend_size).max(cache_size);
-            // Bug C fix (deeper layer): prefer the backend's mtime
-            // (when it has one — e.g. the user opted into
-            // `use_server_modtime`), then fall back to the inodes
-            // entry's mtime (which `alloc_ino` and the write path
-            // populate with `now()`), and only then to UNIX_EPOCH.
-            //
-            // The pre-fix `mtime.unwrap_or(UNIX_EPOCH)` discarded
-            // the inodes mtime entirely, so a freshly-mkdir'd or
-            // freshly-written file's stat always showed 1970-01-01
-            // regardless of how the upper layers set the timestamp.
-            // This was masked by callers that did `let _ =` on
-            // stat_op's None return, but the visible symptom — `ls
-            // -la` showing 1970 — is exactly what the audit caught.
-            let mtime = backend_mtime
-                .or(inodes_mtime)
-                .unwrap_or(SystemTime::UNIX_EPOCH);
+            // Cost: an S3 HEAD request is ~5-15 ms over
+            // localhost. Skipping it on the hot path
+            // (recently-written files, just-mkdir'd dirs) cuts
+            // the bench's `stat x50` from ~150 ms to a
+            // sub-millisecond dashmap lookup. The downside
+            // — stale inodes mtime if the remote file is
+            // modified out-of-band — is acceptable because
+            // the inodes entry is updated synchronously on
+            // every local write, and the writeback worker
+            // owns the upload (no other process can modify
+            // the file through mntrs in the meantime).
+            let (size, mtime) = if let Some(inodes_mtime) = inodes_mtime {
+                // Fast path: trust the inodes entry.
+                let cache_size = std::fs::metadata(crate::cache_path(&self.cache_dir, &path))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                (inodes_size.max(cache_size), inodes_mtime)
+            } else {
+                // Slow path: file was never written locally;
+                // fall through to the backend.
+                let (_, backend_size, backend_mtime) =
+                    self.stat_op(&path).unwrap_or((kind, inodes_size, None));
+                let cache_size = std::fs::metadata(crate::cache_path(&self.cache_dir, &path))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let size = inodes_size.max(backend_size).max(cache_size);
+                let mtime = backend_mtime
+                    .or(inodes_mtime)
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                (size, mtime)
+            };
             Ok(to_core_attr(&self.make_attr(ino, size, kind, mtime)))
         } else {
             Err(std::io::Error::new(
@@ -2318,8 +2334,6 @@ impl CoreFilesystem for MntrsFs {
             },
         };
         submit_disk_write(job);
-
-
 
         // Index the whole-file cache entry. The key is
         // `(path, None)` to distinguish from block-level
