@@ -30,6 +30,13 @@ opendal = { version = "0.57", features = ["services-s3", "services-gcs", "servic
 # extensions. ~5-10× faster than the hand-rolled poly loop in
 # `crc32c_checksum` for 8 MiB blocks.
 crc32c = "0.6"
+# Lock-free MPMC channel for the disk-cache write thread pool.
+# `crossbeam-channel` was already in the dep graph via tokio;
+# pinning a direct version so we can break the dependency if
+# tokio ever drops it. Used by `src/disk_write_pool.rs` to
+# route FUSE-worker `write()` calls to the IO thread pool
+# without the per-write `std::thread::spawn` cost (~10 µs).
+crossbeam-channel = "0.5"
 
 
 

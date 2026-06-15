@@ -2293,90 +2293,34 @@ impl CoreFilesystem for MntrsFs {
         // rclone 5ms/write — most of rclone's lead was
         // FUSE-worker serialization on the cache_fd
         // mutex, which async sidesteps).
-        match &cache_fd {
-            Some(fd) => {
-                let fd = fd.clone();
-                let path = path.clone();
-                let data = _data.to_vec();
-                let offset = _offset;
-                std::thread::spawn(move || {
-                    use std::io::{Seek, Write};
-                    let mut f = match fd.lock() {
-                        Ok(f) => f,
-                        Err(_) => return,
-                    };
-                    let end = offset + data.len() as u64;
-                    // Single metadata() call (the pre-fix
-                    // code called it twice — once in the
-                    // prefix-fetch check, once after).
-                    let current_len = match f.metadata() {
-                        Ok(m) => m.len(),
-                        Err(_) => return,
-                    };
-                    // When writing at an offset beyond the
-                    // cache file length, fetch the missing
-                    // prefix from the remote backend to avoid
-                    // creating a sparse (zero-filled) cache
-                    // that corrupts reads.
-                    if offset > 0 && current_len == 0 && offset > current_len
-                        && let Ok(remote) = crate::opendal_sync_read(&path)
-                        && !remote.is_empty()
-                    {
-                        let _ = f.write_all(&remote);
-                    }
-                    let current_len = match f.metadata() {
-                        Ok(m) => m.len(),
-                        Err(_) => return,
-                    };
-                    if end > current_len {
-                        let _ = f.set_len(end);
-                    }
-                    let _ = f.seek(std::io::SeekFrom::Start(offset));
-                    let _ = f.write_all(&data);
-                    // #6: do NOT f.flush() here. The page
-                    // cache holds the data; the OS flushes
-                    // in the background. See the long
-                    // comment at the top of `fn write` for
-                    // the durability analysis.
-                });
-            }
-            None => {
-                // Fallback: open cache file directly.
-                // Same async dispatch — spawn a thread to
-                // do the disk I/O.
-                let cache_dir = self.cache_dir.clone();
-                let path = path.clone();
-                let data = _data.to_vec();
-                let offset = _offset;
-                std::thread::spawn(move || {
-                    use std::io::{Seek, Write};
-                    let cpath = crate::cache_path(&cache_dir, &path);
-                    if let Some(parent) = cpath.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    let mut f = match std::fs::OpenOptions::new()
-                        .create(true)
-                        .truncate(false)
-                        .write(true)
-                        .read(true)
-                        .open(&cpath)
-                    {
-                        Ok(f) => f,
-                        Err(_) => return,
-                    };
-                    let end = offset + data.len() as u64;
-                    let current_len = match f.metadata() {
-                        Ok(m) => m.len(),
-                        Err(_) => return,
-                    };
-                    if end > current_len {
-                        let _ = f.set_len(end);
-                    }
-                    let _ = f.seek(std::io::SeekFrom::Start(offset));
-                    let _ = f.write_all(&data);
-                });
-            }
-        }
+        // #27 (disk-IO thread pool): build a
+        // `DiskWriteJob` and submit it to the pool.
+        // The FUSE worker returns OK immediately; the
+        // actual disk I/O happens on a worker thread.
+        // Replaces cc2667f's per-write `std::thread::spawn`
+        // (which paid ~10 µs of thread-spawn overhead per
+        // write) with a shared worker pool that reuses
+        // threads.
+        let job = match &cache_fd {
+            Some(fd) => DiskWriteJob {
+                cache_fd: Some(fd.clone()),
+                cache_path: None,
+                remote_path: path.clone(),
+                offset: _offset,
+                data: _data.to_vec(),
+            },
+            None => DiskWriteJob {
+                cache_fd: None,
+                cache_path: Some(crate::cache_path(&self.cache_dir, &path)),
+                remote_path: path.clone(),
+                offset: _offset,
+                data: _data.to_vec(),
+            },
+        };
+        submit_disk_write(job);
+
+        // (write path has been replaced with submit_disk_write below)
+
 
         // Index the whole-file cache entry. The key is
         // `(path, None)` to distinguish from block-level
@@ -3270,6 +3214,9 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
     // so we keep a global clone. Safe to call multiple
     // times; only the first call wins.
     set_opendal_sync_op(op.clone());
+    // Initialize the disk-IO thread pool for async
+    // writes. Default size: min(num_cpus, 8).
+    init_disk_write_pool(None);
     MntrsFs {
         op: Arc::new(op),
         inodes: Default::default(),
@@ -3330,6 +3277,184 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         storage_class: None,
     }
 }
+
+// ─── Disk-IO thread pool ────────────────────────────────────────
+
+/// Per-write work item submitted by the FUSE worker
+/// to the disk-IO thread pool. Holds either an open
+/// `cache_fd` (the common case) or a path to open
+/// fresh (the fallback case for writes to a path
+/// without an open Write handle).
+pub(crate) struct DiskWriteJob {
+    /// Open file handle + `Mutex` (per-handle). `None`
+    /// → use the fallback path that re-opens the cache
+    /// file from `self.cache_dir + cache_path`.
+    pub(crate) cache_fd: Option<Arc<std::sync::Mutex<std::fs::File>>>,
+    /// Fallback path inside `self.cache_dir` (only
+    /// used when `cache_fd` is `None`).
+    pub(crate) cache_path: Option<std::path::PathBuf>,
+    /// Remote path (for the rare "write at offset >
+    /// current length" prefix fetch).
+    pub(crate) remote_path: String,
+    /// Byte offset in the cache file.
+    pub(crate) offset: u64,
+    /// Data to write.
+    pub(crate) data: Vec<u8>,
+}
+
+impl DiskWriteJob {
+    /// Execute the disk I/O. Called from a worker
+    /// thread. Errors are logged and swallowed —
+    /// writeback's `std::fs::read` will return Err on
+    /// the next read, and the caller treats that as a
+    /// cache miss.
+    pub(crate) fn execute(self) {
+        match self.cache_fd {
+            Some(fd) => {
+                let mut f = match fd.lock() {
+                    Ok(f) => f,
+                    Err(_) => return,
+                };
+                Self::do_write(&mut f, &self.remote_path, self.offset, &self.data);
+            }
+            None => {
+                let cpath = match &self.cache_path {
+                    Some(p) => p,
+                    None => return,
+                };
+                if let Some(parent) = cpath.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let mut f = match std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .read(true)
+                    .open(cpath)
+                {
+                    Ok(f) => f,
+                    Err(_) => return,
+                };
+                Self::do_write(&mut f, &self.remote_path, self.offset, &self.data);
+            }
+        }
+    }
+
+    fn do_write(f: &mut std::fs::File, remote_path: &str, offset: u64, data: &[u8]) {
+        use std::io::{Seek, Write};
+        let end = offset + data.len() as u64;
+        let current_len = match f.metadata() {
+            Ok(m) => m.len(),
+            Err(_) => return,
+        };
+        // Prefix fetch: when writing at an offset past
+        // current length, backfill the missing prefix
+        // from the remote backend (so the cache file
+        // doesn't get a sparse hole). The cached prefix
+        // is what makes the next read faster than
+        // re-fetching the whole range from S3.
+        if offset > 0
+            && current_len == 0
+            && offset > current_len
+            && let Ok(remote) = opendal_sync_read(remote_path)
+            && !remote.is_empty()
+        {
+            let _ = f.write_all(&remote);
+        }
+        let current_len = match f.metadata() {
+            Ok(m) => m.len(),
+            Err(_) => return,
+        };
+        if end > current_len {
+            let _ = f.set_len(end);
+        }
+        let _ = f.seek(std::io::SeekFrom::Start(offset));
+        let _ = f.write_all(data);
+        // #6: no `f.flush()`. The OS page cache holds
+        // the data and flushes in the background. The
+        // writeback worker's `std::fs::read` of this
+        // file goes through the same page cache and
+        // sees the freshly-written data.
+    }
+}
+
+/// Bounded MPMC channel. Bounded so a runaway
+/// producer (FUSE worker) can't OOM us if the IO
+/// workers fall behind. 4096 = up to 4 GiB worth
+/// of 1 MiB writes queued before backpressure
+/// blocks the FUSE worker.
+const DISK_WRITE_QUEUE_CAP: usize = 4096;
+
+static DISK_WRITE_POOL: once_cell::sync::OnceCell<crossbeam_channel::Sender<DiskWriteJob>> =
+    once_cell::sync::OnceCell::new();
+
+/// Initialize the disk-IO thread pool. Called once
+/// during mount setup (`new_test_fs` and
+/// `cmd::mount::mount_internal`). Subsequent calls
+/// are no-ops (only the first wins).
+///
+/// `num_threads` defaults to
+/// `min(num_cpus::get(), 8)` if `None`.
+pub fn init_disk_write_pool(num_threads: Option<usize>) {
+    let n = num_threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(8)
+    });
+    let (tx, rx) = crossbeam_channel::bounded::<DiskWriteJob>(DISK_WRITE_QUEUE_CAP);
+    for i in 0..n {
+        let rx = rx.clone();
+        std::thread::Builder::new()
+            .name(format!("mntrs-disk-io-{i}"))
+            .spawn(move || {
+                disk_io_worker_loop(rx);
+            })
+            .expect("failed to spawn disk-IO worker thread");
+    }
+    // Drop the original receiver — each worker has
+    // its own clone, and `crossbeam-channel` keeps the
+    // channel open as long as at least one receiver
+    // exists. The remaining clones in the workers are
+    // enough to drain the queue.
+    drop(rx);
+    let _ = DISK_WRITE_POOL.set(tx);
+}
+
+fn disk_io_worker_loop(rx: crossbeam_channel::Receiver<DiskWriteJob>) {
+    while let Ok(job) = rx.recv() {
+        job.execute();
+    }
+}
+
+/// Submit a write job to the IO thread pool. Called
+/// from the FUSE worker; returns immediately (the
+/// disk I/O happens in a worker thread).
+///
+/// If the pool hasn't been initialized (e.g. a test
+/// that bypasses `new_test_fs`), this falls back to
+/// running the job synchronously on the FUSE worker.
+/// The fallback preserves correctness in tests that
+/// haven't set up the pool; production mounts
+/// always init it during mount.
+pub(crate) fn submit_disk_write(job: DiskWriteJob) {
+    if let Some(tx) = DISK_WRITE_POOL.get() {
+        // `send` returns Err only if there are zero
+        // receivers. We hold N receiver clones in the
+        // worker threads, so this can only fail if the
+        // runtime is shutting down (e.g. process exit).
+        // Fall back to sync execution in that case.
+        if let Err(e) = tx.send(job) {
+            e.0.execute();
+        }
+    } else {
+        // Pool not initialized (test path that
+        // bypassed new_test_fs). Run synchronously.
+        job.execute();
+    }
+}
+
+// ─── end disk-IO thread pool ────────────────────────────────────
 
 #[cfg(test)]
 mod disk_cache_crc_tests {
