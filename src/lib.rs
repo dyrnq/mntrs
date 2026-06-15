@@ -2240,11 +2240,53 @@ impl CoreFilesystem for MntrsFs {
         // on success). The same helper is called from the
         // prefetcher pop path below so the two paths
         // can't drift.
-        for i in 0..n_blks {
-            let s = (i * CACHE_BLOCK_SIZE) as usize;
-            let e = ((i + 1) * CACHE_BLOCK_SIZE) as usize;
-            let slice = b.slice(s..e.min(b.len()));
-            self.write_block_cached(&path, first_blk + i, &slice);
+        //
+        // #29 (cold-read concurrency): submit N block
+        // writes to the disk-IO thread pool. The FUSE
+        // worker returns OK immediately; the workers
+        // run the block writes in parallel. Pre-fix this
+        // was a serial loop on the FUSE worker
+        // (`self.write_block_cached` for each block)
+        // — for a 50 MiB fetch with 16 MiB chunk size,
+        // 1 block is written synchronously, but for the
+        // 6-block bench workload, all 6 ran serially on
+        // the FUSE worker at ~5 ms each = 30 ms of
+        // cold-read latency the user paid synchronously.
+        // Off-thread parallel writes drop that to a
+        // single block's worth of disk I/O (~5 ms).
+        //
+        // Two pieces of work stay on the FUSE worker
+        // (cheap, in-memory, microseconds):
+        //   1. `direct_io` short-circuit — mirrors the
+        //      `write_block_cached` guard. In direct-io
+        //      mode the disk cache is bypassed entirely;
+        //      submitting jobs would just waste pool
+        //      capacity and write files no read would
+        //      ever consult.
+        //   2. `disk_cache_index.insert(...)` — the LRU
+        //      sort key. The pool worker can't update
+        //      this dashmap (it has no `&self` reference),
+        //      so we insert it inline. The insert is a
+        //      lock-free dashmap op (~ns), the file I/O
+        //      that takes ms is what we offload. If the
+        //      pool-side write later fails, the LRU sweep
+        //      will try to unlink a missing file (ignored)
+        //      and remove the stale index entry — same
+        //      recovery shape as a torn-down cache dir.
+        if !self.direct_io {
+            let cache_dir = self.cache_dir.clone();
+            for i in 0..n_blks {
+                let s = (i * CACHE_BLOCK_SIZE) as usize;
+                let e = ((i + 1) * CACHE_BLOCK_SIZE) as usize;
+                let slice = b.slice(s..e.min(b.len())).to_vec();
+                let block_idx = first_blk + i;
+                let written_size = (slice.len() + BLOCK_OVERHEAD) as u64;
+                submit_block_cache_write(&cache_dir, &path, block_idx, slice);
+                self.disk_cache_index.insert(
+                    (path.clone(), Some(block_idx)),
+                    (written_size, std::time::Instant::now()),
+                );
+            }
         }
         Ok(result)
     }
@@ -2324,6 +2366,7 @@ impl CoreFilesystem for MntrsFs {
                 remote_path: path.clone(),
                 offset: _offset,
                 data: _data.to_vec(),
+                block_cache: None,
             },
             None => DiskWriteJob {
                 cache_fd: None,
@@ -2331,6 +2374,7 @@ impl CoreFilesystem for MntrsFs {
                 remote_path: path.clone(),
                 offset: _offset,
                 data: _data.to_vec(),
+                block_cache: None,
             },
         };
         submit_disk_write(job);
@@ -3298,6 +3342,24 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
 /// `cache_fd` (the common case) or a path to open
 /// fresh (the fallback case for writes to a path
 /// without an open Write handle).
+///
+/// Three modes, distinguished by which optional fields
+/// are `Some`:
+///   * `cache_fd: Some(_)` — the Write handle has an
+///     open fd; the worker locks it and writes to the
+///     existing file handle.
+///   * `cache_path: Some(_)` — no open fd; the worker
+///     opens a fresh `std::fs::File` at this path. Used
+///     for the fallback `None`-case in `CoreFilesystem::write`.
+///   * `block_cache: Some(_)` — write a single
+///     block-cache file at the given on-disk path.
+///     Used by the read path after a remote S3 fetch
+///     to populate the block-level disk cache (so
+///     subsequent reads of the same range hit the fast
+///     path). Multiple block writes in a single read
+///     are submitted as a batch and run in parallel on
+///     the worker pool — that gives cold-read
+///     concurrency vs the cc2667f/23d22d9 serial loop.
 pub(crate) struct DiskWriteJob {
     /// Open file handle + `Mutex` (per-handle). `None`
     /// → use the fallback path that re-opens the cache
@@ -3307,12 +3369,27 @@ pub(crate) struct DiskWriteJob {
     /// used when `cache_fd` is `None`).
     pub(crate) cache_path: Option<std::path::PathBuf>,
     /// Remote path (for the rare "write at offset >
-    /// current length" prefix fetch).
+    /// current length" prefix fetch). Used by the
+    /// whole-file write modes; ignored when
+    /// `block_cache` is `Some` (the block-cache mode
+    /// stores its target path directly in
+    /// `block_cache` to avoid re-deriving it on the
+    /// pool worker).
     pub(crate) remote_path: String,
-    /// Byte offset in the cache file.
+    /// Byte offset in the cache file (whole-file mode).
     pub(crate) offset: u64,
     /// Data to write.
     pub(crate) data: Vec<u8>,
+    /// Block-cache write: full on-disk path of the
+    /// `.block` file to create. `Some` overrides
+    /// `cache_fd` / `cache_path` / `offset` / `remote_path`
+    /// — the worker writes the new format
+    /// (`MNCR || version || data || CRC32C`) at this
+    /// path. The dashmap LRU index update is done by
+    /// the caller (FUSE worker) before submit, since
+    /// the pool worker has no `&self` reference; see
+    /// `submit_block_cache_write` callers.
+    pub(crate) block_cache: Option<std::path::PathBuf>,
 }
 
 impl DiskWriteJob {
@@ -3322,6 +3399,14 @@ impl DiskWriteJob {
     /// the next read, and the caller treats that as a
     /// cache miss.
     pub(crate) fn execute(self) {
+        // Block-cache write takes precedence over the
+        // other two modes. Used by the read path after
+        // a remote S3 fetch to populate the block-level
+        // disk cache.
+        if let Some(path) = &self.block_cache {
+            Self::do_block_cache_write(path, &self.data);
+            return;
+        }
         match self.cache_fd {
             Some(fd) => {
                 let mut f = match fd.lock() {
@@ -3350,6 +3435,53 @@ impl DiskWriteJob {
                 };
                 Self::do_write(&mut f, &self.remote_path, self.offset, &self.data);
             }
+        }
+    }
+
+    /// Write a single block-cache file in the new
+    /// format (`MNCR || version || data || CRC32C`).
+    /// Mirrors the inline `write_block_cached` but
+    /// runs on a worker thread, so the FUSE worker
+    /// can submit N block writes for a single remote
+    /// fetch and have them all run in parallel on
+    /// the pool. This is the cold-read concurrency
+    /// win vs the cc2667f/23d22d9 serial loop.
+    ///
+    /// Note: this helper does NOT update
+    /// `disk_cache_index` (the in-memory LRU sort
+    /// key) — the caller does that synchronously
+    /// before submit, since the pool worker has no
+    /// `&self` reference. See `submit_block_cache_write`
+    /// callers.
+    fn do_block_cache_write(blk_path: &std::path::Path, data: &[u8]) {
+        use std::io::Write;
+        if let Some(parent) = blk_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut f = match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(blk_path)
+        {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        // Build the 8-byte header.
+        let mut header = [0u8; BLOCK_HEADER_SIZE];
+        header[0..4].copy_from_slice(BLOCK_MAGIC);
+        header[4..8].copy_from_slice(&BLOCK_FORMAT_VERSION.to_le_bytes());
+        let mut ok = f.write_all(&header).is_ok();
+        if ok {
+            ok = f.write_all(data).is_ok();
+        }
+        if ok {
+            let mut crc_buf = [0u8; BLOCK_CRC_TRAILER];
+            crc_buf.copy_from_slice(&crc32c_checksum_concat(&header, data).to_le_bytes());
+            ok = f.write_all(&crc_buf).is_ok();
+        }
+        if !ok {
+            tracing::debug!(?blk_path, "block cache write (pool) failed");
         }
     }
 
@@ -3465,6 +3597,32 @@ pub(crate) fn submit_disk_write(job: DiskWriteJob) {
         // bypassed new_test_fs). Run synchronously.
         job.execute();
     }
+}
+
+/// Submit a single block-cache write to the pool.
+/// Used by the read path after a remote S3 fetch:
+/// instead of writing N blocks serially in the FUSE
+/// worker, build N jobs and submit all of them; the
+/// pool's worker threads run them in parallel, so the
+/// cold-read latency drops from O(N × block_write) to
+/// O(max(worker_block_writes)) — typically just one
+/// block's worth of disk I/O.
+pub(crate) fn submit_block_cache_write(
+    cache_dir: &std::path::Path,
+    remote_path: &str,
+    block_idx: u64,
+    data: Vec<u8>,
+) {
+    let blk_path = crate::cache_block_path(cache_dir, remote_path, block_idx);
+    let job = DiskWriteJob {
+        cache_fd: None,
+        cache_path: None,
+        remote_path: remote_path.to_string(),
+        offset: 0,
+        data,
+        block_cache: Some(blk_path),
+    };
+    submit_disk_write(job);
 }
 
 // ─── end disk-IO thread pool ────────────────────────────────────
