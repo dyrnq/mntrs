@@ -900,8 +900,30 @@ pub fn mount(
             std::thread::Builder::new()
                 .name("mem_cache_metrics".into())
                 .spawn(move || {
-                    loop {
-                        std::thread::sleep(interval);
+                    // Issue #27: graceful shutdown. Pre-fix
+                    // this was a bare `loop { sleep }` with no
+                    // exit signal — the daemon's exit killed
+                    // the thread but unit tests that
+                    // constructed an adapter and dropped it
+                    // left an orphan thread.
+                    //
+                    // Reuse the existing
+                    // `SHUTDOWN_REQUESTED` AtomicBool that
+                    // both unmount_internal and the SIGINT/
+                    // SIGTERM handler set. Sleep in 100 ms
+                    // ticks so the longest exit latency is
+                    // ~100 ms regardless of the configured
+                    // metrics interval. Falls out of the
+                    // loop cleanly once flagged.
+                    let tick = std::time::Duration::from_millis(100);
+                    let mut elapsed = std::time::Duration::ZERO;
+                    while !SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::thread::sleep(tick);
+                        elapsed += tick;
+                        if elapsed < interval {
+                            continue;
+                        }
+                        elapsed = std::time::Duration::ZERO;
                         let s = mem_cache_for_metrics.stats();
                         tracing::info!(
                             target: "mntrs::mem_cache",
@@ -1247,7 +1269,17 @@ async fn build_azblob(url: &url::Url, opts: &HashMap<String, String>) -> Result<
 async fn build_hdfs_native(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
     let namenode = url.host_str().ok_or_else(|| anyhow!("missing namenode"))?;
     let port = url.port().unwrap_or(8020);
-    let addr = format!("{}:{}", namenode, port);
+    // Issue #22: opendal's `name_node` expects the full
+    // `hdfs://host:port` URI form. Pre-fix we passed bare
+    // `host:port`; it worked for single-NN setups because
+    // `init_hdfs_config` then injected the address into
+    // `dfs.namenode.rpc-address.nameservice.nn0` verbatim
+    // (and a bare `host:port` is what that config field
+    // accepts). But for HA multi-NN where namenode is
+    // already a comma-joined list, the missing scheme
+    // prefix wedged the per-NN split — opendal sees a
+    // single bogus URI with embedded commas.
+    let addr = format!("hdfs://{}:{}", namenode, port);
     let mut builder = HdfsNative::default().name_node(&addr);
     let p = url.path().trim_start_matches('/');
     if !p.is_empty() {
