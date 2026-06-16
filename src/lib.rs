@@ -2932,7 +2932,19 @@ impl CoreFilesystem for MntrsFs {
             // time to keep per-fetch memory bounded.
             16 * 1024 * 1024
         };
-        let fetch_size = user_cap.min(hard_cap).min(cap);
+        // Issue #10: cap fetch_size by the kernel-requested
+        // `size` so partial reads (head -c N, tail -c N,
+        // dd skip=...) don't pull the whole file from
+        // the backend. Pre-fix this was min(user_cap,
+        // hard_cap, cap) — for a 1 MiB file cap was
+        // 1 MiB regardless of `size`, so head -c 10K
+        // fetched the full 1 MiB block. The cold-read
+        // opt (whole file in 1 RTT for <=256 MiB files)
+        // is preserved for `cat` because cat issues a
+        // single FUSE_READ for the whole file — user_cap
+        // (= read_chunk_size) takes the hit there, not
+        // `size`.
+        let fetch_size = (size as u64).min(user_cap).min(hard_cap).min(cap);
 
         // Parallel fetch: if `read_chunk_streams > 1` and the fetch
         // is large enough to be worth splitting, issue N concurrent
