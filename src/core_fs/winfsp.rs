@@ -147,8 +147,12 @@ fn winfsp_access_to_open_flags(granted_access: winfsp_sys::FILE_ACCESS_RIGHTS) -
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const GENERIC_ALL: u32 = 0x1000_0000;
     const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
-    let rights = granted_access as u32;
-    let writes_granted = (rights
+    // `granted_access` is a `type FILE_ACCESS_RIGHTS = u32`
+    // alias, so the `as u32` is a no-op cast that
+    // `clippy::unnecessary_cast` flags on Windows CI. Linux
+    // CI doesn't compile this file, so the lint slipped
+    // through there.
+    let writes_granted = (granted_access
         & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE | GENERIC_ALL | MAXIMUM_ALLOWED))
         != 0;
     if writes_granted { 2 } else { 0 } // O_RDWR : O_RDONLY
