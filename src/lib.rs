@@ -3867,11 +3867,40 @@ static DISK_WRITE_POOL: once_cell::sync::OnceCell<crossbeam_channel::Sender<Disk
 /// Initialize the disk-IO thread pool. Called once
 /// during mount setup (`new_test_fs` and
 /// `cmd::mount::mount_internal`). Subsequent calls
-/// are no-ops (only the first wins).
+/// are true no-ops — guarded at entry by a
+/// `DISK_WRITE_POOL.get().is_some()` check, so a
+/// repeat call from a test that constructs multiple
+/// MntrsFs instances does NOT spawn additional
+/// fsync threads (Bug 5: pre-fix the IO workers
+/// self-cleaned via dropped sender, but the fsync
+/// thread spawn was unconditional and accumulated).
+///
+/// Lifetime contract: the pool threads (`mntrs-disk-io-*`
+/// and `mntrs-fsync`) are process-static. They block
+/// forever in `recv()` / `sleep()` and only exit when
+/// the process exits. This matches the daemon mount
+/// model — there's no in-process pool restart. If a
+/// future refactor introduces lifecycle (e.g. mount
+/// → unmount → re-mount in the same process), add an
+/// explicit `shutdown_disk_write_pool()` that closes
+/// the sender and joins workers.
 ///
 /// `num_threads` defaults to
-/// `min(num_cpus::get(), 8)` if `None`.
+/// `min(num_cpus::get(), 8)` if `None`. Ignored on
+/// repeat calls (the original pool size is kept).
 pub fn init_disk_write_pool(num_threads: Option<usize>) {
+    // Bug 5: idempotent. Check before any thread spawn
+    // so a repeat call doesn't leak a fsync thread.
+    // The TOCTOU between this `.get()` and the `.set()`
+    // below is benign — init is called from
+    // single-threaded mount setup; the worst case
+    // (two concurrent inits, one wins .set) is the
+    // pre-fix behaviour (workers self-clean via the
+    // dropped sender; one extra fsync leaks). The
+    // common case is now O(1) and leak-free.
+    if DISK_WRITE_POOL.get().is_some() {
+        return;
+    }
     let n = num_threads.unwrap_or_else(|| {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -3894,17 +3923,20 @@ pub fn init_disk_write_pool(num_threads: Option<usize>) {
     // exists. The remaining clones in the workers are
     // enough to drain the queue.
     drop(rx);
-    let _ = DISK_WRITE_POOL.set(tx);
+    // If a concurrent init raced us and set the pool
+    // first, our `tx` is dropped here — that closes
+    // our cloned receivers (the workers spawned above
+    // hold them), and those workers exit cleanly via
+    // the `while let Ok(_) = rx.recv()` returning Err.
+    // Net effect: at most one fsync thread per process,
+    // no IO-worker accumulation.
+    if DISK_WRITE_POOL.set(tx).is_err() {
+        return;
+    }
     // #8 (durability): spawn the periodic fsync thread
-    // alongside the IO worker pool. This follows the
-    // same all-or-nothing init pattern as the worker
-    // loop above (which spawns N threads even if
-    // OnceCell.set later fails): a duplicate
-    // init_disk_write_pool call would leak both the
-    // workers and an extra fsync thread, but in
-    // practice init is called once from main()/tests
-    // and the leaked threads sit in sleep / blocked
-    // recv with zero CPU cost.
+    // alongside the IO worker pool. Gated by the
+    // .set() success above so we never spawn a second
+    // fsync thread for a race that lost.
     spawn_fsync_thread();
 }
 
