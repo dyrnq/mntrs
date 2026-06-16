@@ -289,7 +289,7 @@ pub fn mount_internal(
         131072,                   // max_read_ahead
         0,                        // vfs_read_chunk_size_limit
         0,                        // vfs_read_chunk_streams (serial)
-        67108864,                 // vfs_prefetch_threshold (64 MiB)
+        16777216,                 // vfs_prefetch_threshold (16 MiB)
         64,                       // vfs_prefetch_queue_mb
         false,                    // vfs_fast_fingerprint
         false,                    // async_read

@@ -189,8 +189,18 @@ pub struct MntrsFs {
     pub(crate) read_ahead: u64,
     /// Minimum file size (bytes) for which the read-path prefetcher
     /// is activated on open(). 0 disables prefetching entirely.
-    /// Default: 64 MiB. See `maybe_create_prefetcher` for the
+    /// Default: 16 MiB. See `maybe_create_prefetcher` for the
     /// activation logic and issue #16 for the cat-100M motivation.
+    ///
+    /// 16 MiB matches the prefetcher's chunk-size cap (see
+    /// `maybe_create_prefetcher`): any file at or above this size
+    /// has ≥1 prefetchable chunk after the FUSE worker reads the
+    /// first one, so the prefetcher can run an extra fetch
+    /// concurrently with the user's read instead of serially.
+    /// Pre-change default 64 MiB excluded the 16-64 MiB range
+    /// (the bench's 50 MiB cold-read sat tied with rclone at
+    /// 160 ms — without prefetch, 4 chunks fetched serially;
+    /// with prefetch, chunks 2-4 overlap chunk 1's read).
     pub(crate) prefetch_threshold: u64,
     /// Upper bound (MiB) on the prefetch in-memory PartQueue.
     /// Caps the cost of a file that's opened but only partially
@@ -437,7 +447,7 @@ impl MntrsFs {
     /// Previously gated on `read_chunk_streams > 1`, which made
     /// prefetching unreachable for default configs (`read_chunk_streams`
     /// defaults to 1, the serial-fetch path). The new gate is
-    /// `file_size >= prefetch_threshold`, default 64 MiB. Issue #16
+    /// `file_size >= prefetch_threshold`, default 16 MiB. Issue #16
     /// (`cat 100M` 6.35× slower than rclone) was the motivation; the
     /// existing 16 MiB chunk cap (commit fc5e974) still protects
     /// `head -c1K` from over-fetch.
@@ -3295,7 +3305,7 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         write_back_delay: std::time::Duration::from_secs(1),
         cache_mode: "writes".into(),
         read_ahead: 0,
-        prefetch_threshold: 64 * 1024 * 1024,
+        prefetch_threshold: 16 * 1024 * 1024,
         prefetch_queue_mb: 64,
         read_chunk_size: 0,
         read_chunk_size_limit: 0,

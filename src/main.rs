@@ -209,11 +209,14 @@ enum Commands {
         #[arg(long, default_value = "0")]
         vfs_read_chunk_streams: u32,
         /// Min file size (bytes) to enable the read-path prefetcher
-        /// (default: 64 MiB; 0 = disabled). Speeds up sequential
+        /// (default: 16 MiB; 0 = disabled). Speeds up sequential
         /// reads on large files (cat, dd, head -c large) by issuing
         /// the next chunk in the background while the kernel reads
-        /// the current one.
-        #[arg(long, default_value = "67108864")]
+        /// the current one. 16 MiB matches the prefetcher chunk-size
+        /// cap — any file at or above this size has ≥1 prefetchable
+        /// chunk after the first read, so the threshold doesn't waste
+        /// thread spawns on files too small to overlap.
+        #[arg(long, default_value = "16777216")]
         vfs_prefetch_threshold: u64,
         /// Max prefetch in-memory queue size in MiB (default: 64).
         /// Caps memory cost when a large file is opened but only
