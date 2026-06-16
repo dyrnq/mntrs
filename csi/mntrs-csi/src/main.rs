@@ -294,9 +294,16 @@ impl controller_server::Controller for ControllerService {
 // Node Service
 // ============================================================
 
-#[allow(dead_code)]
+/// One per CSI volume that has been published to a target
+/// path on this node. Tracked in `NodeService.mounts` so
+/// `node_publish_volume` can short-circuit a duplicate
+/// publish with a different `target_path` — the existing
+/// `is_mountpoint()` check only catches the case where the
+/// original target is still bind-mounted, not the case
+/// where a previous publish was torn down and the kubelet
+/// (or some retried driver) re-issues publish for the same
+/// `volume_id` pointing at a fresh path.
 struct MountState {
-    storage_url: String,
     mountpoint: String,
 }
 
@@ -512,10 +519,40 @@ impl node_server::Node for NodeService {
             ));
         }
 
-        // Idempotency: already published?
+        // Idempotency: already published to this target?
         if is_mountpoint(&target_path) {
             tracing::info!(volume_id, target=%target_path, "already mounted (bind)");
+            // Reflect this in our internal map so a later
+            // unpublish for the same volume_id works
+            // through the normal remove path.
+            self.mounts.lock().unwrap().insert(
+                volume_id.clone(),
+                MountState {
+                    mountpoint: target_path.clone(),
+                },
+            );
             return Ok(Response::new(NodePublishVolumeResponse::default()));
+        }
+
+        // Idempotency: already published to a *different*
+        // target? This shouldn't happen in normal kubelet
+        // flow, but a re-PVC that re-uses the same
+        // volume_id with a fresh target_path can hit it.
+        // Without this check, the second publish would
+        // succeed (target_path is fresh, not a mountpoint)
+        // and we'd leak the first bind mount.
+        {
+            let mounts = self.mounts.lock().unwrap();
+            if let Some(prev) = mounts.get(&volume_id) {
+                if prev.mountpoint != target_path {
+                    return Err(Status::already_exists(format!(
+                        "volume {volume_id} already published to {} (requested {})",
+                        prev.mountpoint, target_path
+                    )));
+                }
+                tracing::info!(volume_id, target=%target_path, "already published (in-memory map)");
+                return Ok(Response::new(NodePublishVolumeResponse::default()));
+            }
         }
 
         // Ensure staging is mounted (FUSE mount done in NodeStageVolume)
@@ -544,7 +581,6 @@ impl node_server::Node for NodeService {
         mounts.insert(
             volume_id.clone(),
             MountState {
-                storage_url: staging_target_path.clone(),
                 mountpoint: target_path.clone(),
             },
         );
