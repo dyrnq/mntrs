@@ -111,9 +111,17 @@ pub fn spawn(
                                 // via inodes. The cache file may be larger than the
                                 // logical size due to set_len sparse extension, so
                                 // using cache metadata length would corrupt reads.
-                                inodes2.entry(ino).and_modify(|v| {
-                                    v.mtime = Some(std::time::SystemTime::now());
-                                });
+                                //
+                                // Bug 18: same INO_RECOVERY_SENTINEL skip as the
+                                // batched path below. Recovery uploads come through
+                                // this branch too; the and_modify on a missing
+                                // ino=0 is a silent no-op, but the explicit check
+                                // documents intent.
+                                if ino != crate::INO_RECOVERY_SENTINEL {
+                                    inodes2.entry(ino).and_modify(|v| {
+                                        v.mtime = Some(std::time::SystemTime::now());
+                                    });
+                                }
                                 // Keep cache file on disk as a read cache.
                                 // Only remove the .dirty sidecar to mark upload complete.
                                 // The cache eviction logic handles disk space separately.
@@ -229,10 +237,22 @@ pub fn worker(
 
         if upload_ok {
             let new_size = full_data.len() as u64;
-            inodes.entry(tasks[0].0).and_modify(|v| {
-                v.size = new_size;
-                v.mtime = Some(std::time::SystemTime::now());
-            });
+            // Bug 18: writeback recovery sends
+            // INO_RECOVERY_SENTINEL (= 0) for uploads
+            // recovered from dirty sidecars at mount
+            // init — no inode mapping exists yet. The
+            // mtime/size update would be a silent
+            // no-op against the missing inodes entry,
+            // but that's wasted work and an
+            // `entry(0).and_modify(...)` reads as a
+            // bug at first glance. Skip explicitly so
+            // the contract is visible.
+            if tasks[0].0 != crate::INO_RECOVERY_SENTINEL {
+                inodes.entry(tasks[0].0).and_modify(|v| {
+                    v.size = new_size;
+                    v.mtime = Some(std::time::SystemTime::now());
+                });
+            }
             for (_, _, cache_path) in &tasks {
                 let _ = std::fs::remove_file(cache_path);
                 let _ = std::fs::remove_file(cache_path.with_extension("dirty"));

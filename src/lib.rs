@@ -122,7 +122,39 @@ pub(crate) fn rt() -> &'static tokio::runtime::Runtime {
 }
 
 // TTL now comes from MntrsFs.attr_ttl field
+
+/// Monotonic source of inode numbers minted by
+/// `alloc_ino` / `alloc_ino_with_mtime`.
+///
+/// Starts at 2 to leave room for two reserved values
+/// in the low range:
+///   * `0` — sentinel used by writeback recovery for
+///     dirty-sidecar uploads recovered from a previous
+///     crash (no inode mapping exists yet at recovery
+///     time). See `INO_RECOVERY_SENTINEL`. Any
+///     `inodes.entry(0).and_modify(...)` is a silent
+///     no-op (the entry never exists), which matches
+///     the intended semantics (the next stat() refreshes
+///     mtime from the remote).
+///   * `1` — FUSE root inode. By POSIX/FUSE convention
+///     (and `fuser::FUSE_ROOT_ID`) the root directory's
+///     inode is always 1; the kernel's first
+///     `lookup(parent=1, name=...)` after mount
+///     references this. `MntrsFs::resolve(1)` is
+///     special-cased to return root-dir attrs without
+///     hitting `inodes`, so the slot doesn't need a
+///     concrete entry either.
 static NEXT_INO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(2);
+
+/// Pseudo-inode used by `writeback::spawn`'s recovery
+/// path when uploading a dirty cache file whose ino has
+/// not been mapped yet (recovery runs at mount init,
+/// before any FUSE `lookup` has had a chance to register
+/// the path). The writeback completion handler
+/// recognizes this value and skips the
+/// inodes-entry mtime update — the next `stat()` from
+/// user space will refresh mtime from the remote.
+pub(crate) const INO_RECOVERY_SENTINEL: u64 = 0;
 static NEXT_HANDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 // DIR_CACHE_TTL now comes from MntrsFs.dir_cache_ttl field
 
@@ -1205,11 +1237,20 @@ impl MntrsFs {
                         let remote = remote.trim().to_string();
                         if let Some(tx) = self.writeback_sender.get() {
                             tracing::info!(path=%remote, ?cache_path, "recovering dirty writeback");
-                            // ino=0: inode mapping is not populated at this
-                            // point; the mtime update in the upload completion
-                            // handler will be a no-op.  Acceptable — the next
-                            // stat() will refresh mtime from the remote.
-                            tx.send((0, remote, cache_path)).ok();
+                            // Bug 18: use the named sentinel
+                            // INO_RECOVERY_SENTINEL (= 0) instead of
+                            // the bare `0` literal. The writeback
+                            // completion handler explicitly checks
+                            // this value and skips its inodes mtime
+                            // update — without that branch, an
+                            // `entry(0).and_modify(...)` is a silent
+                            // no-op (ino 0 is reserved; see
+                            // NEXT_INO doc), but the silent no-op
+                            // obscured the intent. The sentinel
+                            // makes the contract grep-able + the
+                            // next stat() from user space refreshes
+                            // mtime from the remote anyway.
+                            tx.send((INO_RECOVERY_SENTINEL, remote, cache_path)).ok();
                         }
                     }
                 }
