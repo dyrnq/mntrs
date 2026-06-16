@@ -354,10 +354,20 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
 #[cfg(all(feature = "async-io", windows))]
 impl<F: CoreFilesystem + 'static> winfsp::filesystem::AsyncFileSystemContext for WinFspAdapter<F> {
     fn spawn_task(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
-        std::thread::spawn(|| {
-            tokio::runtime::Runtime::new()
-                .expect("winfsp tokio rt")
-                .block_on(future);
-        });
+        // Bug 12: pre-fix spawned a fresh OS thread +
+        // a fresh single-threaded tokio runtime per
+        // future. Each Runtime::new() builds its own
+        // worker pool, IO/timer drivers, allocs ~hundreds
+        // of KiB, and then is dropped after a single
+        // future. Under any nontrivial WinFSP call rate
+        // that's pure waste — and the thread spawn alone
+        // is ~10 µs per call.
+        //
+        // Reuse the shared multi-thread runtime already
+        // built once per process by `rt()` (the same
+        // runtime the synchronous read/write paths
+        // use). `spawn` is fire-and-forget; the future
+        // runs on the shared worker pool.
+        crate::rt().spawn(future);
     }
 }

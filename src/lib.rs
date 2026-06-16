@@ -109,7 +109,7 @@ pub struct FileAttr {
 use futures::StreamExt;
 use opendal::{EntryMode, Operator};
 
-fn rt() -> &'static tokio::runtime::Runtime {
+pub(crate) fn rt() -> &'static tokio::runtime::Runtime {
     static RT: once_cell::sync::OnceCell<tokio::runtime::Runtime> =
         once_cell::sync::OnceCell::new();
     RT.get_or_init(|| {
