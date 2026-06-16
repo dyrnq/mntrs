@@ -125,6 +125,50 @@ pub trait CoreFilesystem: Send + Sync {
     fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str)
     -> std::io::Result<()>;
 
+    /// Read the target of a symbolic link.
+    ///
+    /// Bug 17: pre-fix this method did not exist on the trait,
+    /// even though `CoreFileType::Symlink` was already in the
+    /// enum and the fuser adapter mapped it through. The kernel
+    /// would call FUSE `readlink(ino)` on any entry exposed as
+    /// `S_IFLNK`, and without a trait method to forward to, the
+    /// adapter's default behaviour (ENOSYS) propagated to user
+    /// space — `ls -la` showed the link with `??????????` perms
+    /// and `readlink` returned `Function not implemented`.
+    ///
+    /// Default implementation returns
+    /// `io::ErrorKind::Unsupported` (mapped to ENOSYS by the
+    /// fuser adapter). The current `MntrsFs` impl uses the
+    /// default because opendal 0.57's `EntryMode` doesn't
+    /// distinguish symlinks from regular files (the `fs` backend
+    /// follows links transparently), so we never produce a
+    /// `Symlink` entry in the first place. A future fs-backend
+    /// special case can override this with `std::fs::read_link`
+    /// against the local mount root.
+    fn readlink(&self, ino: u64) -> std::io::Result<Vec<u8>> {
+        let _ = ino;
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+
+    /// Create a symbolic link `name` under `parent` that points
+    /// at `target`. `target` is the literal link contents (may
+    /// be relative or absolute); it is NOT resolved here.
+    ///
+    /// Same Bug 17 rationale as `readlink`: the trait method
+    /// didn't exist, so creating a symlink on any FUSE mount
+    /// (regardless of backend capability) returned ENOSYS.
+    /// Default returns Unsupported; an fs-backend impl can
+    /// forward to `std::os::unix::fs::symlink`.
+    fn symlink(
+        &self,
+        parent: u64,
+        name: &str,
+        target: &std::path::Path,
+    ) -> std::io::Result<CoreFileAttr> {
+        let _ = (parent, name, target);
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+
     /// Get volume statistics.
     fn statfs(&self, ino: u64) -> std::io::Result<CoreVolumeStat>;
 

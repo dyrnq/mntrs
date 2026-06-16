@@ -514,6 +514,46 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         }
     }
 
+    /// Bug 17: forward readlink to the CoreFilesystem trait.
+    /// Pre-fix this handler didn't exist, so the kernel got
+    /// the fuser default which returns ENOSYS on every
+    /// readlink — the user-space `readlink` syscall then
+    /// produced "Function not implemented" even on backends
+    /// that COULD support symlinks. Now the trait default
+    /// returns Unsupported (mapped to ENOSYS by
+    /// `io_err_to_fuse_errno`), and a future fs-backend
+    /// override can return the real link target.
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        match self.inner.readlink(ino.into()) {
+            Ok(target) => reply.data(&target),
+            Err(e) => reply.error(io_err_to_fuse_errno(e)),
+        }
+    }
+
+    /// Bug 17 counterpart to `readlink`: forward symlink
+    /// creation to the trait. Pre-fix this also didn't
+    /// exist; FUSE's default symlink handler is ENOSYS
+    /// regardless of backend capability. The trait default
+    /// preserves that behaviour (Unsupported); an fs-backend
+    /// impl can override with `std::os::unix::fs::symlink`.
+    fn symlink(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        target: &std::path::Path,
+        reply: ReplyEntry,
+    ) {
+        let name = name.to_string_lossy();
+        match self.inner.symlink(parent.into(), &name, target) {
+            Ok(attr) => {
+                let fattr = from_core_attr(&attr);
+                reply.entry(&self.attr_ttl, &fattr, Generation(0));
+            }
+            Err(e) => reply.error(io_err_to_fuse_errno(e)),
+        }
+    }
+
     fn forget(&self, _req: &Request, _ino: INodeNo, _nlookup: u64) {
         self.inner.forget(_ino.into(), _nlookup);
     }
