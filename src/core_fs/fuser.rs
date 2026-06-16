@@ -109,6 +109,31 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         match self.inner.lookup(parent.into(), &name) {
             Ok(attr) => {
                 let fattr = from_core_attr(&attr);
+                // Bug 24: TTL = Duration::ZERO is intentional and
+                // asymmetric with the create-style replies below
+                // (mkdir / create / symlink — all `self.attr_ttl`).
+                //
+                // Rationale: lookup resolves an EXISTING entry,
+                // whose attrs (especially size) can change behind
+                // our back via:
+                //   * a concurrent write through another open
+                //     handle in this mount, or
+                //   * an out-of-band backend update (S3 PUT to
+                //     the same key from another client).
+                // If we returned `self.attr_ttl` here, the kernel
+                // would cache the lookup-time attrs and serve
+                // stale size to userspace for the TTL window —
+                // defeating the same protection that `getattr`
+                // provides (see getattr's long comment below for
+                // the truncated-read failure mode this prevents).
+                //
+                // The mkdir/create/symlink sites get to use
+                // `self.attr_ttl` because the kernel JUST issued
+                // the creation; the attrs we reply are
+                // authoritative for the immediate future (size=0
+                // for fresh create, size=4096 for fresh dir,
+                // immutable link target for symlink). The kernel
+                // can safely cache them until the TTL expires.
                 reply.entry(&Duration::ZERO, &fattr, Generation(0));
             }
             Err(e) => {
