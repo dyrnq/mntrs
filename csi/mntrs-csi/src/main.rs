@@ -568,16 +568,47 @@ impl node_server::Node for NodeService {
         let req = request.into_inner();
         let target_path = req.volume_path;
 
-        let stat = match std::fs::metadata(&target_path) {
-            Ok(m) => m,
-            Err(e) => return Err(Status::internal(format!("stat {target_path}: {e}"))),
-        };
+        // Bug 14: pre-fix this returned
+        // std::fs::metadata(target_path).len() as both
+        // `available` and `total`. `len()` on a directory
+        // is the directory inode size (4 KiB on most
+        // filesystems) — useless as a volume stat. Kubelet
+        // then exposed "4096 / 4096 bytes" for every
+        // mount, breaking VolumeStatsAggregation alerts
+        // and capacity-based scheduling.
+        //
+        // Fix: `statvfs(target_path)`. The syscall enters
+        // the kernel, sees the FUSE mount on `target_path`,
+        // and routes the request to mntrs's
+        // CoreFilesystem::statfs() — which returns the
+        // disk_total_size (or 256 MiB fallback) for the
+        // cache disk. That's the right source of truth
+        // for the CSI response; the actual S3 bucket
+        // has no fixed capacity, but the cache disk
+        // does, and an empty/full cache is what kubelet
+        // most cares about.
+        //
+        // Stat errors propagate as Status::internal so
+        // kubelet records the cause rather than seeing
+        // a silent zero.
+        let stat = rustix::fs::statvfs(target_path.as_str())
+            .map_err(|e| Status::internal(format!("statvfs({target_path}): {e}")))?;
+
+        let block_size = stat.f_frsize;
+        let total_bytes = stat.f_blocks.saturating_mul(block_size) as i64;
+        let available_bytes = stat.f_bavail.saturating_mul(block_size) as i64;
+        // Used = total - free (the bytes consumed by all
+        // users; vs `total - avail` which excludes
+        // reserved-for-root blocks too).
+        let free_bytes = stat.f_bfree.saturating_mul(block_size);
+        let used_bytes =
+            (stat.f_blocks.saturating_mul(block_size)).saturating_sub(free_bytes) as i64;
 
         Ok(Response::new(NodeGetVolumeStatsResponse {
             usage: vec![VolumeUsage {
-                available: stat.len() as i64,
-                total: stat.len() as i64,
-                used: 0,
+                available: available_bytes,
+                total: total_bytes,
+                used: used_bytes,
                 unit: volume_usage::Unit::Bytes as i32,
             }],
             volume_condition: Some(VolumeCondition {
@@ -652,20 +683,11 @@ fn is_mountpoint(path: &str) -> bool {
     }
 }
 
-/// Wait for a mountpoint to become available, with timeout
-fn wait_for_mount(path: &str, timeout: std::time::Duration) -> Result<(), Status> {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if is_mountpoint(path) {
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    Err(Status::deadline_exceeded(format!(
-        "mountpoint {} not ready after {:?}",
-        path, timeout
-    )))
-}
+// Bug 14 follow-up: removed `fn wait_for_mount` —
+// its only caller (node_stage_volume) was inlined in
+// Bug 13 to integrate with the mount-error channel
+// poll. No other call sites; rather than leave dead
+// code behind, drop it.
 
 /// Expand pathPattern placeholders like ${.PVC.namespace}/${.PVC.name}
 fn expand_path_pattern(pattern: &str, pvc_name: &str, pvc_namespace: &str) -> String {

@@ -21,6 +21,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 opendal = { version = "0.57", features = ["services-s3"] }
 tower = "0.5.3"
+# rustix gives a safe statvfs wrapper for
+# node_get_volume_stats (Bug 14). statvfs on the
+# mountpoint routes through FUSE into MntrsFs::statfs,
+# which is the right source of truth for the CSI
+# response — vs the pre-fix std::fs::metadata().len(),
+# which returned the mountpoint directory inode size
+# (4 KiB).
+rustix = { version = "1.1.4", features = ["fs"] }
 
 [build-dependencies]
 tonic-build = "0.12"
