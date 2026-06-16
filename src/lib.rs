@@ -4039,6 +4039,31 @@ fn disk_io_worker_loop(rx: crossbeam_channel::Receiver<DiskWriteJob>) {
 /// = fewer syscalls, more page-cache amortization).
 const FSYNC_INTERVAL_SECS: u64 = 5;
 
+/// Per-tick cap on how many cache files the fsync
+/// thread will sync_data() in one wake-up. At ~50 µs
+/// per `sync_data` syscall on a warm-page SSD, a
+/// 1024-entry batch is ~50 ms of work — bounded enough
+/// that the fsync thread doesn't sit blocked on disk I/O
+/// for half a second on a 10k+ dirty-paths backlog (Bug
+/// 10). Any overflow stays in `DIRTY_CACHE_PATHS` and
+/// rolls into the next tick.
+///
+/// Sustained throughput at this cap is 1024 / 5 s = ~200
+/// fsyncs/second per fsync thread. If a workload writes
+/// to more than 200 distinct cache files per second
+/// sustained, the backlog grows; `spawn_fsync_thread`
+/// emits a periodic `warn!` so the operator can either
+/// raise the cap or rein the workload in.
+const MAX_FSYNC_BATCH_PER_TICK: usize = 1024;
+
+/// Backlog factor above which the fsync thread starts
+/// logging a periodic warn (every Nth tick — see
+/// `BACKLOG_LOG_EVERY_N_TICKS`). 5× the batch cap means
+/// the queue is at least 25 s deep at the current
+/// drain rate. Below this we stay quiet.
+const FSYNC_BACKLOG_WARN_MULT: usize = 5;
+const BACKLOG_LOG_EVERY_N_TICKS: u64 = 6; // ~30 s at 5 s interval
+
 /// Cache file paths that have been written but may
 /// not yet be on disk. Inserted by the disk-IO pool
 /// workers after every successful write; drained by
@@ -4097,18 +4122,62 @@ fn spawn_fsync_thread() {
     std::thread::Builder::new()
         .name("mntrs-fsync".to_string())
         .spawn(|| {
+            // Bug 10 (alloc + batch): reuse a single
+            // Vec across ticks so a sustained
+            // workload doesn't churn the allocator
+            // with a fresh ~2 MiB Vec every 5 s. The
+            // `clear()` before `extend` preserves
+            // capacity; only the first tick allocates
+            // up to MAX_FSYNC_BATCH_PER_TICK PathBufs
+            // worth of pointer slots.
+            let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(MAX_FSYNC_BATCH_PER_TICK);
+            let mut tick: u64 = 0;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(FSYNC_INTERVAL_SECS));
-                // Snapshot to avoid holding the dashmap
-                // iterator across syscalls (other
-                // threads keep writing into the set).
-                let paths: Vec<std::path::PathBuf> =
-                    DIRTY_CACHE_PATHS.iter().map(|r| r.clone()).collect();
-                for path in paths {
-                    match std::fs::File::open(&path) {
+                tick = tick.wrapping_add(1);
+                // Bug 10 (batch cap): take at most
+                // MAX_FSYNC_BATCH_PER_TICK paths per
+                // tick. iter().take(N) bounds the
+                // iter lock-hold time (DashSet holds a
+                // per-shard read lock during the
+                // iterator's lifetime); processing
+                // the snapshot OUTSIDE the iter is
+                // unchanged. Overflow stays in the
+                // set and rolls into the next tick.
+                paths.clear();
+                paths.extend(
+                    DIRTY_CACHE_PATHS
+                        .iter()
+                        .take(MAX_FSYNC_BATCH_PER_TICK)
+                        .map(|r| r.clone()),
+                );
+                // Bug 10 (backlog warn): if the set
+                // still has FSYNC_BACKLOG_WARN_MULT× the
+                // batch worth of entries AFTER we
+                // took our slice, the fsync thread
+                // can't keep up. Log every
+                // BACKLOG_LOG_EVERY_N_TICKS ticks so a
+                // genuinely flooded mount surfaces in
+                // logs without spamming every tick.
+                if paths.len() == MAX_FSYNC_BATCH_PER_TICK
+                    && tick.is_multiple_of(BACKLOG_LOG_EVERY_N_TICKS)
+                {
+                    let remaining = DIRTY_CACHE_PATHS.len();
+                    if remaining >= MAX_FSYNC_BATCH_PER_TICK * FSYNC_BACKLOG_WARN_MULT {
+                        tracing::warn!(
+                            backlog = remaining,
+                            batch_cap = MAX_FSYNC_BATCH_PER_TICK,
+                            interval_secs = FSYNC_INTERVAL_SECS,
+                            "fsync backlog growing — the write rate exceeds the per-tick fsync \
+                             drain; durability window is widening past one interval"
+                        );
+                    }
+                }
+                for path in paths.iter() {
+                    match std::fs::File::open(path) {
                         Ok(f) => {
                             if f.sync_data().is_ok() {
-                                DIRTY_CACHE_PATHS.remove(&path);
+                                DIRTY_CACHE_PATHS.remove(path);
                             }
                             // Sync failed: keep in set,
                             // retry next tick. Don't
@@ -4121,7 +4190,7 @@ fn spawn_fsync_thread() {
                             // File was evicted between
                             // write and sync. Drop the
                             // tracking entry.
-                            DIRTY_CACHE_PATHS.remove(&path);
+                            DIRTY_CACHE_PATHS.remove(path);
                         }
                         Err(_) => {
                             // Transient open failure
