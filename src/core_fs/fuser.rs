@@ -231,6 +231,43 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        // Bug 32 (readdir pagination):
+        //
+        // What this code does today: `inner.readdir(ino)`
+        // returns the WHOLE directory entry list (capped
+        // at MAX_LIST_ENTRIES = 1M in list_op). The kernel
+        // calls readdir(offset=0), we fill the 4 KiB
+        // reply buffer with as many entries as fit, the
+        // kernel re-calls readdir(offset=N), we slice into
+        // the same materialized list and continue. The
+        // dir_cache TTL (300 s by default) keeps the
+        // materialized list around so subsequent pages
+        // don't re-hit list_op.
+        //
+        // What it doesn't do: true kernel pagination via
+        // backend continuation tokens. Beyond
+        // MAX_LIST_ENTRIES the listing is silently
+        // truncated (list_op logs a warn — see Bug 6).
+        // True streaming would need:
+        //   * per-fh lister state on the FileHandleState
+        //     enum (a Read variant that holds the opendal
+        //     Lister mid-iteration);
+        //   * a fh-aware CoreFilesystem::readdir that
+        //     pulls only the next page from the lister,
+        //     using offset as a continuation key;
+        //   * cross-backend continuation semantics
+        //     (S3 NextContinuationToken, HDFS startAfter,
+        //     fs:// ReadDir cursor, etc.).
+        // That's a meaningful refactor; for now the cap
+        // is the documented limit.
+        //
+        // The slice-indexing micro-fix below replaces a
+        // pre-fix `entries.iter().enumerate().skip(start)`
+        // which advanced the iterator one step at a time
+        // (O(offset) per page). For a 1M-entry dir paged
+        // in 4 KiB chunks, the original cost was
+        // 250 × O(500k) ≈ 125M iterations to fill 1M
+        // output. Slice indexing is O(1) per page.
         match self.inner.readdir(ino.into()) {
             Ok(entries) => {
                 let start = offset as usize;
@@ -238,7 +275,8 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
                     reply.ok();
                     return;
                 }
-                for (i, entry) in entries.iter().enumerate().skip(start) {
+                for (offset_i, entry) in entries[start..].iter().enumerate() {
+                    let i = start + offset_i;
                     if reply.add(
                         INodeNo(entry.ino),
                         (i + 1) as u64,
@@ -262,6 +300,15 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         offset: u64,
         mut reply: ReplyDirectoryPlus,
     ) {
+        // Bug 32: same slice-indexing fix as readdir
+        // above — see that function's comment for the
+        // full pagination story (cap, kernel page reuse
+        // via dir_cache, future-work true-streaming
+        // gap). readdirplus's extra cost is the per-
+        // entry lookup() which dominates anyway; the
+        // skip→slice change still matters because
+        // pre-fix the skip walked the iterator one
+        // entry at a time before the lookup ran.
         match self.inner.readdir(ino.into()) {
             Ok(entries) => {
                 let start = offset as usize;
@@ -269,7 +316,8 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
                     reply.ok();
                     return;
                 }
-                for (i, entry) in entries.iter().enumerate().skip(start) {
+                for (offset_i, entry) in entries[start..].iter().enumerate() {
+                    let i = start + offset_i;
                     // For each directory entry, do a lookup to get full attr
                     let attr = self.inner.lookup(ino.into(), &entry.name).ok();
                     let fattr = attr.as_ref().map(from_core_attr).unwrap_or_else(|| {
