@@ -199,11 +199,23 @@ static FUSE_SESSION: std::sync::Mutex<Option<fuser::BackgroundSession>> =
 
 extern "C" fn cleanup() {
     if let Some(mp) = CLEANUP_MP.get() {
-        let _ = Command::new("fusermount3")
-            .arg("-u")
-            .arg(mp)
-            .status()
-            .or_else(|_| Command::new("fusermount").arg("-u").arg(mp).status());
+        // Issue #24: skip the fusermount3 spawn if the
+        // signal watcher already did it (SHUTDOWN_BY_SIGNAL
+        // was set by the signal handler before the watcher
+        // ran). Pre-fix both paths fired fusermount3 in the
+        // signal-exit flow — second one was a no-op
+        // ("device not mounted") but produced a confusing
+        // error in trace logs. The remove_mount cleanup
+        // below still runs unconditionally — it's an
+        // in-process bookkeeping update, not an external
+        // side effect.
+        if !SHUTDOWN_BY_SIGNAL.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = Command::new("fusermount3")
+                .arg("-u")
+                .arg(mp)
+                .status()
+                .or_else(|_| Command::new("fusermount").arg("-u").arg(mp).status());
+        }
         remove_mount(mp);
     }
 }
