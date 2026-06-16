@@ -248,6 +248,29 @@ pub struct MntrsFs {
     /// forgotten maintenance site self-heals rather than
     /// losing the ino entirely.
     path_to_ino: dashmap::DashMap<String, u64>,
+    /// Per-ino kernel lookup reference count
+    /// (Bug 33). Tracks the FUSE protocol's `nlookup`
+    /// — the kernel increments its count by 1 on every
+    /// entry-returning op (lookup, mkdir, create,
+    /// symlink, and readdirplus entries) and decrements
+    /// by N on `forget(ino, nlookup)`.
+    ///
+    /// We mirror that count here so `forget` only
+    /// actually drops the inode + path_to_ino +
+    /// attr_cache + handle entries once the count reaches
+    /// zero. Pre-Bug-33 forget unconditionally dropped
+    /// on every call, which could prematurely free an
+    /// ino the kernel still referenced — subsequent ops
+    /// on that ino returned ENOENT and the kernel had
+    /// to re-lookup, costing ~1 round-trip per affected
+    /// op (significant on `find /mnt | xargs stat`-style
+    /// path-walking workloads where the kernel batches
+    /// forget calls).
+    ///
+    /// Root ino (=1) is never inserted — the kernel
+    /// doesn't ref-count root and never sends forget
+    /// for it.
+    lookup_count: dashmap::DashMap<u64, u64>,
     dir_cache: dashmap::DashMap<
         String,
         (
@@ -1399,6 +1422,28 @@ impl MntrsFs {
         }
     }
 
+    /// Bug 33: increment the per-ino kernel lookup
+    /// reference count. Called from every entry-returning
+    /// path (`lookup` / `mkdir` / `create` / `symlink` /
+    /// readdirplus per-entry). The kernel sends
+    /// `forget(ino, nlookup)` at some later point with
+    /// the total it accumulated; `forget` decrements and
+    /// only drops the inode state when the count
+    /// actually reaches zero.
+    ///
+    /// Root ino (=1) is never tracked here — the kernel
+    /// neither ref-counts root nor ever sends forget for
+    /// it.
+    fn bump_lookup_count(&self, ino: u64) {
+        if ino == 1 {
+            return;
+        }
+        self.lookup_count
+            .entry(ino)
+            .and_modify(|c| *c = c.saturating_add(1))
+            .or_insert(1);
+    }
+
     fn alloc_ino(&self, path: &str, kind: FileType, size: u64) -> u64 {
         let ino = NEXT_INO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inodes
@@ -2119,6 +2164,11 @@ impl CoreFilesystem for MntrsFs {
     fn lookup(&self, parent: u64, name: &str) -> std::io::Result<CoreFileAttr> {
         if name == "." || name == ".." {
             let p = if name == "." { parent } else { 1 };
+            // Bug 33: bump kernel lookup count.
+            // bump_lookup_count is a no-op for ino == 1,
+            // and for "." it tracks whichever ino the
+            // kernel just received an entry reply for.
+            self.bump_lookup_count(p);
             return Ok(to_core_attr(&self.make_attr(
                 p,
                 4096,
@@ -2249,6 +2299,10 @@ impl CoreFilesystem for MntrsFs {
                 mtime.unwrap_or_else(SystemTime::now),
             )
         });
+        // Bug 33: kernel will store this entry under
+        // its own dentry cache and ref-count it; mirror
+        // by bumping our per-ino lookup_count.
+        self.bump_lookup_count(ino);
         Ok(to_core_attr(&self.make_attr(
             ino,
             size,
@@ -3364,6 +3418,9 @@ impl CoreFilesystem for MntrsFs {
             size,
             mtime.unwrap_or(SystemTime::UNIX_EPOCH),
         );
+        // Bug 33: create reply.entry bumps kernel
+        // dentry count; mirror it.
+        self.bump_lookup_count(ino);
         Ok(to_core_attr(&self.make_attr(
             ino,
             size,
@@ -3396,6 +3453,9 @@ impl CoreFilesystem for MntrsFs {
         // Bug B fix: prime the parent's dir_cache so a readdir on the
         // parent sees this new entry without a full backend re-list.
         self.cache_add_entry(&parent_path, name, EntryMode::DIR, 4096, now);
+        // Bug 33: mkdir reply.entry bumps kernel
+        // dentry count for the new dir; mirror it.
+        self.bump_lookup_count(ino);
         Ok(to_core_attr(&self.make_attr(
             ino,
             4096,
@@ -3822,11 +3882,43 @@ impl CoreFilesystem for MntrsFs {
     }
 
     fn forget(&self, _ino: u64, _nlookup: u64) {
-        // FUSE forget: kernel no longer needs this inode.
-        // Clean up our local state to prevent leakage.
+        // FUSE forget: kernel says it had `nlookup`
+        // references to this inode and is now releasing
+        // them. We only drop the inode state when our
+        // mirrored count actually reaches zero (Bug 33).
         let ino = _ino;
-        // Don't forget root inode
+        // Don't forget root inode — kernel doesn't
+        // ref-count root and never sends forget for it.
         if ino == 1 {
+            return;
+        }
+        // Decrement the per-ino kernel lookup count.
+        // Three outcomes:
+        //   * count > nlookup → just decrement, keep
+        //     all state (other lookups still live).
+        //   * count <= nlookup → kernel released its
+        //     last ref; remove the counter entry AND
+        //     drop the inodes / path_to_ino / attr_cache
+        //     / handle state below.
+        //   * counter missing → never bumped (e.g. ino
+        //     was created out-of-band via alloc_ino
+        //     from a code path that didn't go through a
+        //     reply.entry to the kernel). Defensive
+        //     drop matches pre-Bug-33 behaviour.
+        let drop_state = match self.lookup_count.entry(ino) {
+            dashmap::mapref::entry::Entry::Occupied(mut e) => {
+                let cur = *e.get();
+                if cur > _nlookup {
+                    *e.get_mut() = cur - _nlookup;
+                    false
+                } else {
+                    e.remove();
+                    true
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(_) => true,
+        };
+        if !drop_state {
             return;
         }
         if let Some(InodeEntry { path, .. }) = self.resolve(ino) {
@@ -4020,6 +4112,7 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         op: Arc::new(op),
         inodes: Default::default(),
         path_to_ino: Default::default(),
+        lookup_count: Default::default(),
         dir_cache: Default::default(),
         cache_dir,
         handles: Default::default(),

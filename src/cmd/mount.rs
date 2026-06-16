@@ -630,6 +630,7 @@ pub fn mount(
         op: Arc::new(op),
         inodes: dashmap::DashMap::new(),
         path_to_ino: dashmap::DashMap::new(),
+        lookup_count: dashmap::DashMap::new(),
         dir_cache: dashmap::DashMap::new(),
         cache_dir: cache_dir_path,
         handles: dashmap::DashMap::new(),
