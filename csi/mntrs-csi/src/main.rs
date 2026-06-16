@@ -349,20 +349,85 @@ impl node_server::Node for NodeService {
             let vol_cache = format!("{}/{}", cache_base, encode_volume_id(&storage_url));
             opts.insert("cache-dir".to_string(), vol_cache);
         }
-        // FUSE mount blocks in session.run() — spawn on a dedicated OS thread
+        // FUSE mount blocks in session.run() — spawn on a dedicated OS thread.
+        //
+        // Bug 13: pre-fix this thread was fully detached
+        // (just `std::thread::spawn(move || { if let
+        // Err(e) = mount_internal(...) { error!(); } })`).
+        // If mount setup failed (auth, bad endpoint, perm
+        // denied) the error landed only in the daemon's
+        // tracing log; the gRPC caller waited the full
+        // `wait_for_mount` timeout and saw
+        // `DeadlineExceeded`, with no hint at the real
+        // cause. CSI's standard error semantics expect a
+        // mount setup failure to come back as
+        // `Status::internal(message)` so kubelet can
+        // record + retry meaningfully.
+        //
+        // Fix: send the mount thread's Err through a
+        // one-shot channel and race the wait loop
+        // against it. If the thread errors before the
+        // mountpoint comes up, surface that error
+        // verbatim; otherwise the timeout still fires.
+        // We also detect thread panic (channel
+        // disconnected without a send) — same idea.
+        let (mount_err_tx, mount_err_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         {
             let su = storage_url.clone();
             let sp = staging_path.clone();
             let ro = read_only;
-            std::thread::spawn(move || {
-                if let Err(e) = mount_internal(&su, &sp, &opts, ro) {
+            std::thread::spawn(move || match mount_internal(&su, &sp, &opts, ro) {
+                Ok(()) => {
+                    // mount_internal only returns Ok on a
+                    // clean unmount (session.run() exit).
+                    // For stage purposes, treat as success
+                    // signal so the channel disconnect
+                    // below isn't read as a panic.
+                    let _ = mount_err_tx.send(Ok(()));
+                }
+                Err(e) => {
                     tracing::error!(error=%e, "stage FUSE mount thread failed");
+                    let _ = mount_err_tx.send(Err(format!("{e}")));
                 }
             });
         }
 
-        // Wait for mount to be ready
-        wait_for_mount(&staging_path, std::time::Duration::from_secs(60))?;
+        // Wait for either:
+        //   - the mountpoint to appear (success path)
+        //   - the mount thread to send an error (fast-fail)
+        //   - the channel to disconnect without an
+        //     error (thread panicked — treat as failed)
+        //   - timeout (preserve the pre-fix DeadlineExceeded
+        //     behaviour for genuinely-slow mounts)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            match mount_err_rx.try_recv() {
+                Ok(Err(e)) => {
+                    return Err(Status::internal(format!("mount setup failed: {e}")));
+                }
+                Ok(Ok(())) => {
+                    // mount_internal returned Ok mid-stage —
+                    // shouldn't happen (it runs the FUSE
+                    // session loop), but be defensive.
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(Status::internal(
+                        "mount thread exited unexpectedly (panic?)",
+                    ));
+                }
+            }
+            if is_mountpoint(&staging_path) {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(Status::deadline_exceeded(format!(
+                    "mountpoint {} not ready after 60s",
+                    staging_path
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
 
         Ok(Response::new(NodeStageVolumeResponse::default()))
     }
