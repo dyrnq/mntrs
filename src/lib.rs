@@ -847,7 +847,26 @@ fn read_block_cached(cpath: &Path) -> Option<bytes::Bytes> {
     if size == CACHE_BLOCK_SIZE as usize + BLOCK_CRC_TRAILER {
         // Legacy / protected full block: verify CRC32C.
         let (content, trailer) = data.split_at(CACHE_BLOCK_SIZE as usize);
-        let want = u32::from_le_bytes(trailer.try_into().unwrap_or([0u8; 4]));
+        // Bug 4 fix: trailer.try_into() should always
+        // succeed here (split_at gives exactly
+        // BLOCK_CRC_TRAILER bytes when size matches the
+        // outer check), but defending against a future
+        // refactor that breaks that invariant — a silent
+        // unwrap_or([0u8; 4]) would let a torn write whose
+        // computed CRC happens to be 0 (e.g. empty content)
+        // pass as valid. Treat as corrupt instead.
+        let want = match <[u8; BLOCK_CRC_TRAILER]>::try_from(trailer) {
+            Ok(b) => u32::from_le_bytes(b),
+            Err(_) => {
+                let _ = std::fs::remove_file(cpath);
+                tracing::warn!(
+                    ?cpath,
+                    trailer_len = trailer.len(),
+                    "legacy block CRC trailer wrong size; unlinking"
+                );
+                return None;
+            }
+        };
         let got = crc32c_checksum(content);
         if want != got {
             let _ = std::fs::remove_file(cpath);
@@ -915,7 +934,24 @@ fn read_new_format(cpath: &Path, data: &[u8]) -> Option<bytes::Bytes> {
     }
     let content_end = after_header.len() - BLOCK_CRC_TRAILER;
     let content = &after_header[..content_end];
-    let stored_crc = u32::from_le_bytes(after_header[content_end..].try_into().unwrap_or([0u8; 4]));
+    // Bug 4 fix: the size check above guarantees
+    // `after_header[content_end..]` is exactly
+    // BLOCK_CRC_TRAILER bytes, so try_into succeeds, but
+    // unwrap_or([0u8; 4]) would silently let a torn write
+    // whose computed CRC happens to be 0 pass as valid.
+    // Treat the conversion failure as corrupt instead.
+    let stored_crc = match <[u8; BLOCK_CRC_TRAILER]>::try_from(&after_header[content_end..]) {
+        Ok(b) => u32::from_le_bytes(b),
+        Err(_) => {
+            let _ = std::fs::remove_file(cpath);
+            tracing::warn!(
+                ?cpath,
+                trailer_len = after_header.len() - content_end,
+                "new-format block CRC trailer wrong size; unlinking"
+            );
+            return None;
+        }
+    };
     // CRC covers magic + version + content (the entire
     // file minus the trailing 4 CRC bytes).
     let computed_crc = crc32c_checksum(&data[..data.len() - BLOCK_CRC_TRAILER]);
@@ -938,7 +974,31 @@ fn read_new_format(cpath: &Path, data: &[u8]) -> Option<bytes::Bytes> {
     // understand. The CRC has already been verified
     // above, so reaching this point with a known version
     // means the payload is intact.
-    let version = u32::from_le_bytes(data[4..8].try_into().unwrap_or([0u8; 4]));
+    // Bug 4 fix: data is guaranteed `>= BLOCK_HEADER_SIZE`
+    // (= 8) by the caller — the `is_new_format` check at the
+    // top of `read_block_cached` verifies the magic at
+    // offset 0..4 and only enters this function when
+    // `data.len() >= BLOCK_HEADER_SIZE`. So `data[4..8]`
+    // is always 4 bytes. But the explicit fallback to
+    // [0u8; 4] would map to `version == 0`, which doesn't
+    // match LEGACY_V1 (1) or BLOCK_FORMAT_VERSION (2), so
+    // it would still hit the "unsupported version" arm and
+    // unlink — coincidentally safe. Replace with an
+    // explicit corrupt-file return so future refactors that
+    // add a version 0 (unlikely but legal) don't silently
+    // accept a length-truncated header.
+    let version_bytes: [u8; 4] = match data[4..8].try_into() {
+        Ok(b) => b,
+        Err(_) => {
+            let _ = std::fs::remove_file(cpath);
+            tracing::warn!(
+                ?cpath,
+                "new-format block too short for version field; unlinking"
+            );
+            return None;
+        }
+    };
+    let version = u32::from_le_bytes(version_bytes);
     match version {
         LEGACY_BLOCK_FORMAT_VERSION_V1 => {
             // Uncompressed: content is the payload as-is.

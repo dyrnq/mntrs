@@ -83,7 +83,21 @@ pub fn spawn(
                 // Upload in a separate task so DelayQueue keeps ticking.
                 static UPLOAD_SEM: std::sync::LazyLock<Semaphore> =
                     std::sync::LazyLock::new(|| Semaphore::new(4));
-                let permit = UPLOAD_SEM.acquire().await.unwrap();
+                // SAFETY: `UPLOAD_SEM` is a process-static
+                // `LazyLock<Semaphore>` that is never `.close()`d
+                // anywhere in this crate. `acquire().await` only
+                // returns `Err(AcquireError::Closed)` after an
+                // explicit close, so this `.expect` is unreachable
+                // under the current design. The explicit panic
+                // message (vs a bare `.unwrap()`) is so that a
+                // future refactor that introduces close() logic
+                // fails loudly with a pointer to this contract,
+                // rather than silently passing on a torn-permit
+                // path. Audit: 2026-06-16.
+                let permit = UPLOAD_SEM
+                    .acquire()
+                    .await
+                    .expect("BUG: UPLOAD_SEM is never closed; see writeback.rs SAFETY comment");
                 let inodes2 = inodes.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
