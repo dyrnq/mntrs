@@ -1081,28 +1081,39 @@ fn read_new_format(cpath: &Path, data: &[u8], expected_path: &str) -> Option<byt
         );
         return None;
     }
-    // Version gate. v1 = uncompressed (legacy: old cache
-    // files written by builds before #4 lz4); v2 =
-    // lz4-compressed payload with 4-byte size prefix.
+    // Version gate. Three known versions today:
+    //   * v1 (LEGACY_BLOCK_FORMAT_VERSION_V1 = 1) —
+    //     uncompressed, no embedded path. Pre-#4 cache
+    //     files; read for back-compat, no collision
+    //     check.
+    //   * v2 (LEGACY_BLOCK_FORMAT_VERSION_V2 = 2) —
+    //     lz4-compressed with size prefix, no embedded
+    //     path. Post-#4, pre-v3 (path-collision audit).
+    //     Read for back-compat, no collision check.
+    //   * v3 (BLOCK_FORMAT_VERSION = 3, current) — lz4
+    //     + embedded path for path_hash collision
+    //     detection. Written by both writers
+    //     (write_block_cached + do_block_cache_write).
     // Unknown versions are conservatively treated as
     // corrupt — better to lose one cache entry than to
     // silently misread a format the code doesn't
     // understand. The CRC has already been verified
     // above, so reaching this point with a known version
     // means the payload is intact.
+    //
     // Bug 4 fix: data is guaranteed `>= BLOCK_HEADER_SIZE`
-    // (= 8) by the caller — the `is_new_format` check at the
-    // top of `read_block_cached` verifies the magic at
-    // offset 0..4 and only enters this function when
+    // (= 8) by the caller — the `is_new_format` check at
+    // the top of `read_block_cached` verifies the magic
+    // at offset 0..4 and only enters this function when
     // `data.len() >= BLOCK_HEADER_SIZE`. So `data[4..8]`
     // is always 4 bytes. But the explicit fallback to
-    // [0u8; 4] would map to `version == 0`, which doesn't
-    // match LEGACY_V1 (1) or BLOCK_FORMAT_VERSION (2), so
-    // it would still hit the "unsupported version" arm and
-    // unlink — coincidentally safe. Replace with an
-    // explicit corrupt-file return so future refactors that
-    // add a version 0 (unlikely but legal) don't silently
-    // accept a length-truncated header.
+    // [0u8; 4] would map to `version == 0`, which
+    // doesn't match any of v1/v2/v3 today; it would
+    // still hit the "unsupported version" arm and
+    // unlink — coincidentally safe. We replace with an
+    // explicit corrupt-file return so a future refactor
+    // that adds a version 0 (unlikely but legal) doesn't
+    // silently accept a length-truncated header.
     let version_bytes: [u8; 4] = match data[4..8].try_into() {
         Ok(b) => b,
         Err(_) => {
@@ -4819,8 +4830,9 @@ mod disk_cache_crc_tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(BLOCK_MAGIC);
         // Version 99 — a future build might know how to
-        // read this; this build (BLOCK_FORMAT_VERSION=1)
-        // does not.
+        // read this; this build (current BLOCK_FORMAT_VERSION
+        // = 3, with LEGACY_BLOCK_FORMAT_VERSION_V1/V2 also
+        // accepted on read) does not.
         buf.extend_from_slice(&99u32.to_le_bytes());
         buf.extend_from_slice(&content);
         let crc = crc32c_checksum_concat(&buf, &[]);
