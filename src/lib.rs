@@ -789,6 +789,23 @@ const BLOCK_OVERHEAD: usize = BLOCK_HEADER_SIZE + BLOCK_CRC_TRAILER;
 /// data like JPEGs or zstd files.
 const MAX_PAYLOAD_OVERHEAD: usize = 65_536;
 
+/// Hard cap on entries `list_op` will accumulate for a
+/// single readdir, to bound memory on pathological backend
+/// directories. 1M entries × ~100 B per tuple
+/// (String name + EntryMode + u64 size + SystemTime) =
+/// ~100 MiB worst case in `out`. An S3 bucket prefix with
+/// 10M+ keys is rare but does happen (data lakes with
+/// flat layouts); hitting that should produce a truncated
+/// listing + a `warn!` log, not an OOM that kills the
+/// FUSE worker.
+///
+/// 1M is generous enough that no real `ls`/`find`
+/// workload trips it in practice — FUSE itself paginates
+/// readdir replies to the kernel in 4 KiB chunks, so
+/// even a 1M-entry readdir would page-fault the user-
+/// space `ls` long before the cap.
+const MAX_LIST_ENTRIES: usize = 1_000_000;
+
 /// Read a block cache file with optional CRC32C
 /// verification. Detects the on-disk format by inspecting
 /// the first 4 bytes; see `BLOCK_MAGIC` for the
@@ -1581,7 +1598,32 @@ impl MntrsFs {
                 Err(e) => return Err(e),
             };
             let mut out = vec![];
+            // Bug 6 (list_op OOM): hard cap on entries
+            // accumulated per readdir. Pre-fix the lister
+            // loop ran to exhaustion — an S3 bucket with
+            // 10 M+ keys under one prefix would allocate
+            // ~1 GiB into `out` before returning, blowing
+            // memory on the FUSE worker. The cap is set
+            // generously enough to fit normal "large"
+            // dirs (millions of files in a single dir
+            // are an anti-pattern; FUSE itself paginates
+            // readdir below the kernel layer).
+            //
+            // On hit: stop iteration, log at warn (a
+            // truncated readdir is a real correctness
+            // signal — `ls` will silently lose the tail
+            // entries), and return what we have. The
+            // dir_cache stores the truncated result with
+            // the same TTL as a complete listing; if the
+            // user reduces depth/glob filters and retries,
+            // the TTL will expire and a fresh listing
+            // runs.
+            let mut hit_cap = false;
             while let Some(item) = lister.next().await {
+                if out.len() >= MAX_LIST_ENTRIES {
+                    hit_cap = true;
+                    break;
+                }
                 let entry = item?;
                 let name = entry.name().trim_end_matches('/').to_string();
                 let mode = entry.metadata().mode();
@@ -1633,6 +1675,15 @@ impl MntrsFs {
                     .map(opendal_timestamp_to_system_time)
                     .unwrap_or(SystemTime::UNIX_EPOCH);
                 out.push((name, mode, size, mtime));
+            }
+            if hit_cap {
+                tracing::warn!(
+                    path = %p,
+                    cap = MAX_LIST_ENTRIES,
+                    entries = out.len(),
+                    "list_op truncated at MAX_LIST_ENTRIES cap — directory is larger than \
+                     the per-readdir budget; ls/find on this path will be incomplete"
+                );
             }
             Ok::<_, opendal::Error>(out)
         })?;
