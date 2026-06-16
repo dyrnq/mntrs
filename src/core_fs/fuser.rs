@@ -259,7 +259,10 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         //     (S3 NextContinuationToken, HDFS startAfter,
         //     fs:// ReadDir cursor, etc.).
         // That's a meaningful refactor; for now the cap
-        // is the documented limit.
+        // is the documented limit. The proposed design is
+        // captured in DESIGN_READDIR_STREAMING.md (see
+        // also issue #23) — half-day to one-day focused
+        // work, ~300 LoC across 4 files.
         //
         // The slice-indexing micro-fix below replaces a
         // pre-fix `entries.iter().enumerate().skip(start)`
