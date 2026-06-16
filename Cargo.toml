@@ -37,6 +37,17 @@ crc32c = "0.6"
 # route FUSE-worker `write()` calls to the IO thread pool
 # without the per-write `std::thread::spawn` cost (~10 µs).
 crossbeam-channel = "0.5"
+# LZ4 frame-less block compression for disk-cache files
+# (#4 in DESIGN_VULNS / cache audit). Used by the new
+# block-cache format v2 — full 8 MiB blocks compress at
+# ~1 GiB/s/core with typical 2-3× ratio on JSON/text/log/
+# parquet, ~1× on already-compressed media. CPU cost is
+# 5-10 % on hot writes/reads; disk savings (and disk-I/O
+# bandwidth savings on disk-bound workloads) are the win.
+# `lz4_flex` (vs the `lz4` C-binding crate) is pure Rust,
+# no system lz4.so dep, and has comparable perf for our
+# block sizes.
+lz4_flex = "0.11"
 
 
 

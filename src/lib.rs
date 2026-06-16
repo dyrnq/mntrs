@@ -716,7 +716,28 @@ const BLOCK_MAGIC: &[u8; 4] = b"MNCR";
 /// forcing a remote re-fetch. Bump this when changing
 /// the layout, and add a branch in `read_block_cached` to
 /// handle the new version.
-const BLOCK_FORMAT_VERSION: u32 = 1;
+///
+/// Version history:
+///   * `1` — uncompressed: `MNCR || version=1 || content
+///     || crc32c(magic||version||content)`.
+///   * `2` — lz4-compressed (current): `MNCR ||
+///     version=2 || lz4_flex::compress_prepend_size(content)
+///     || crc32c(magic||version||compressed_payload)`.
+///     The lz4 payload starts with a 4-byte little-endian
+///     uncompressed-size prefix (lz4_flex's
+///     `compress_prepend_size` format), so the read path
+///     can decompress without knowing the original length
+///     out-of-band. CRC covers the on-disk compressed
+///     bytes so corruption is caught before decompression.
+const BLOCK_FORMAT_VERSION: u32 = 2;
+
+/// First-generation new-format version (uncompressed).
+/// Kept as a read-side constant so the read path can
+/// transparently consume cache files written by older
+/// builds without forcing a refetch. Old files get
+/// rewritten with version 2 on the next write through
+/// `write_block_cached` / `do_block_cache_write`.
+const LEGACY_BLOCK_FORMAT_VERSION_V1: u32 = 1;
 
 /// Size of the magic + version header at the start of a
 /// new-format block file. = 4 (magic) + 4 (version).
@@ -728,6 +749,25 @@ const BLOCK_HEADER_SIZE: usize = 8;
 /// BLOCK_OVERHEAD` bytes; a partial new-format block is
 /// `< 8 MiB + BLOCK_OVERHEAD` bytes.
 const BLOCK_OVERHEAD: usize = BLOCK_HEADER_SIZE + BLOCK_CRC_TRAILER;
+
+/// Upper bound on the on-disk payload (post-header,
+/// pre-trailer) of any block file. Set to leave room
+/// for the v2 lz4-compressed format's worst-case
+/// expansion on uncompressible input.
+///
+/// LZ4 frame-less block worst case ≈
+/// `input_len + (input_len / 255) + 16` per the spec.
+/// For an 8 MiB block: ~32 928 bytes of expansion.
+/// Plus the 4-byte uncompressed-size prefix that
+/// `lz4_flex::compress_prepend_size` prepends.
+///
+/// `MAX_PAYLOAD_OVERHEAD = 65_536` gives ~2× safety
+/// margin over the theoretical worst case — keeps the
+/// sanity check tight enough to catch garbage in the
+/// cache dir while not unlinking legitimate lz4
+/// expansions on incompressible (already-compressed)
+/// data like JPEGs or zstd files.
+const MAX_PAYLOAD_OVERHEAD: usize = 65_536;
 
 /// Read a block cache file with optional CRC32C
 /// verification. Detects the on-disk format by inspecting
@@ -760,9 +800,14 @@ const BLOCK_OVERHEAD: usize = BLOCK_HEADER_SIZE + BLOCK_CRC_TRAILER;
 fn read_block_cached(cpath: &Path) -> Option<bytes::Bytes> {
     let metadata = std::fs::metadata(cpath).ok()?;
     let size = metadata.len() as usize;
-    if size > CACHE_BLOCK_SIZE as usize + BLOCK_OVERHEAD {
+    if size > CACHE_BLOCK_SIZE as usize + BLOCK_OVERHEAD + MAX_PAYLOAD_OVERHEAD {
         // Writer overran or someone dropped garbage in
-        // the cache dir. Treat as corrupt.
+        // the cache dir. Treat as corrupt. The added
+        // MAX_PAYLOAD_OVERHEAD slack accommodates the v2
+        // lz4-compressed format's worst-case expansion
+        // when content is uncompressible (already-zipped
+        // media, encrypted data) — lz4 may emit slightly
+        // more than input.
         let _ = std::fs::remove_file(cpath);
         tracing::warn!(
             ?cpath,
@@ -864,22 +909,65 @@ fn read_new_format(cpath: &Path, data: &[u8]) -> Option<bytes::Bytes> {
         );
         return None;
     }
-    // Version gate. Unknown versions are conservatively
-    // treated as corrupt — better to lose one cache
-    // entry than to silently misread a format the code
-    // doesn't understand.
+    // Version gate. v1 = uncompressed (legacy: old cache
+    // files written by builds before #4 lz4); v2 =
+    // lz4-compressed payload with 4-byte size prefix.
+    // Unknown versions are conservatively treated as
+    // corrupt — better to lose one cache entry than to
+    // silently misread a format the code doesn't
+    // understand. The CRC has already been verified
+    // above, so reaching this point with a known version
+    // means the payload is intact.
     let version = u32::from_le_bytes(data[4..8].try_into().unwrap_or([0u8; 4]));
-    if version != BLOCK_FORMAT_VERSION {
-        let _ = std::fs::remove_file(cpath);
-        tracing::warn!(
-            ?cpath,
-            version,
-            supported = BLOCK_FORMAT_VERSION,
-            "new-format block has unsupported version; unlinking and refetching"
-        );
-        return None;
+    match version {
+        LEGACY_BLOCK_FORMAT_VERSION_V1 => {
+            // Uncompressed: content is the payload as-is.
+            Some(bytes::Bytes::copy_from_slice(content))
+        }
+        BLOCK_FORMAT_VERSION => {
+            // lz4-compressed with leading 4-byte
+            // uncompressed-size prefix. The cap check
+            // (decompressed > CACHE_BLOCK_SIZE) protects
+            // against a malicious / corrupt size prefix
+            // that would otherwise allocate a huge
+            // buffer; we know our writer never produces
+            // anything larger than CACHE_BLOCK_SIZE.
+            match lz4_flex::decompress_size_prepended(content) {
+                Ok(decompressed) if decompressed.len() <= CACHE_BLOCK_SIZE as usize => {
+                    Some(bytes::Bytes::from(decompressed))
+                }
+                Ok(decompressed) => {
+                    let _ = std::fs::remove_file(cpath);
+                    tracing::warn!(
+                        ?cpath,
+                        decompressed_size = decompressed.len(),
+                        cap = CACHE_BLOCK_SIZE,
+                        "v2 lz4 block decompressed to more than CACHE_BLOCK_SIZE; unlinking"
+                    );
+                    None
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(cpath);
+                    tracing::warn!(
+                        ?cpath,
+                        error = %e,
+                        "v2 lz4 block decompress failed; unlinking and refetching"
+                    );
+                    None
+                }
+            }
+        }
+        _ => {
+            let _ = std::fs::remove_file(cpath);
+            tracing::warn!(
+                ?cpath,
+                version,
+                supported = BLOCK_FORMAT_VERSION,
+                "new-format block has unsupported version; unlinking and refetching"
+            );
+            None
+        }
     }
-    Some(bytes::Bytes::copy_from_slice(content))
 }
 
 /// Remove block-level cache entries for a path. O(K) where K is
@@ -1088,19 +1176,31 @@ impl MntrsFs {
         if let Some(parent) = blk_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        // New on-disk format: `MNCR || version(LE u32) ||
-        // content || crc32c(MNCR || version || content)`.
-        // The CRC covers magic + version + content (the
-        // entire file up to the trailing 4 bytes), so a
-        // write-side bug that corrupts the header bytes is
-        // caught at read time and the file is unlinked.
+        // New on-disk format (v2, #4): `MNCR ||
+        // version=2 || lz4_compress_prepend_size(content)
+        // || crc32c(MNCR || version || compressed)`.
+        // CRC covers the on-disk compressed payload, so
+        // corruption (torn write, bit flip) is caught
+        // before lz4 decompression — saving a noisy
+        // lz4 error on a clearly-broken file.
         //
-        // Applies to both full blocks (8 MiB) and partial
-        // blocks (< 8 MiB, last block of a file). Partial
-        // blocks previously had no CRC trailer; the new
-        // format adds one (over the partial content) for
-        // the same corruption-detection reason.
-        let written_size: u64 = (slice.len() + BLOCK_OVERHEAD) as u64;
+        // lz4_flex::compress_prepend_size prepends a
+        // 4-byte LE u32 of the uncompressed size; the
+        // read side uses decompress_size_prepended.
+        // Saves us from carrying an out-of-band length
+        // (the block's size on the file system isn't
+        // the uncompressed size anymore).
+        //
+        // Compression is unconditional, even on
+        // uncompressible content (already-zipped
+        // media): worst-case lz4 expansion is bounded
+        // (input + ~0.4 % + 16 B) and the
+        // MAX_PAYLOAD_OVERHEAD sanity slack at the read
+        // side accommodates it. The CPU cost (5-10 %
+        // on hot paths) is amortized by the disk-I/O
+        // savings on compressible data.
+        let compressed = lz4_flex::compress_prepend_size(slice);
+        let written_size: u64 = (compressed.len() + BLOCK_OVERHEAD) as u64;
         // Build the header bytes once.
         let mut header = [0u8; BLOCK_HEADER_SIZE];
         header[0..4].copy_from_slice(BLOCK_MAGIC);
@@ -1112,22 +1212,28 @@ impl MntrsFs {
             .open(&blk_path)
         {
             use std::io::Write;
-            // Write header, then content, then CRC over
-            // everything except the trailing 4 bytes.
+            // Write header, then compressed payload,
+            // then CRC over (header || compressed) — the
+            // whole file minus the trailing 4 CRC bytes.
             let mut ok = f.write_all(&header).is_ok();
             if ok {
-                ok = f.write_all(slice).is_ok();
+                ok = f.write_all(&compressed).is_ok();
             }
             if ok {
                 let mut crc_buf = [0u8; BLOCK_CRC_TRAILER];
-                // We need the CRC over (header || content),
-                // which is the whole file minus the trailing
-                // 4 bytes. The file layout in memory is
-                // exactly that, so the read-back path
-                // (read_new_format) computes the same CRC
-                // from the same bytes.
-                crc_buf.copy_from_slice(&crc32c_checksum_concat(&header, slice).to_le_bytes());
+                crc_buf
+                    .copy_from_slice(&crc32c_checksum_concat(&header, &compressed).to_le_bytes());
                 ok = f.write_all(&crc_buf).is_ok();
+            }
+            // v2 may leave the file longer than a v1
+            // overwrite of the same block (incompressible
+            // payload expanded slightly). Set the
+            // file size to exactly what we wrote so the
+            // read side doesn't see a stale tail from a
+            // previous v1 write to the same block path.
+            if ok {
+                let total_len = BLOCK_HEADER_SIZE + compressed.len() + BLOCK_CRC_TRAILER;
+                let _ = f.set_len(total_len as u64);
             }
             if !ok {
                 tracing::debug!(?blk_path, "block cache write failed");
@@ -3487,6 +3593,12 @@ impl DiskWriteJob {
         if let Some(parent) = blk_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        // v2 format (#4 lz4) — same layout as
+        // `MntrsFs::write_block_cached` so a future
+        // change to one path forces a parallel update.
+        // See that function's doc comment for the
+        // format rationale.
+        let compressed = lz4_flex::compress_prepend_size(data);
         let mut f = match std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -3502,12 +3614,19 @@ impl DiskWriteJob {
         header[4..8].copy_from_slice(&BLOCK_FORMAT_VERSION.to_le_bytes());
         let mut ok = f.write_all(&header).is_ok();
         if ok {
-            ok = f.write_all(data).is_ok();
+            ok = f.write_all(&compressed).is_ok();
         }
         if ok {
             let mut crc_buf = [0u8; BLOCK_CRC_TRAILER];
-            crc_buf.copy_from_slice(&crc32c_checksum_concat(&header, data).to_le_bytes());
+            crc_buf.copy_from_slice(&crc32c_checksum_concat(&header, &compressed).to_le_bytes());
             ok = f.write_all(&crc_buf).is_ok();
+        }
+        // Truncate so any stale tail from a v1
+        // overwrite is not visible to readers (see
+        // write_block_cached for the same rationale).
+        if ok {
+            let total_len = BLOCK_HEADER_SIZE + compressed.len() + BLOCK_CRC_TRAILER;
+            let _ = f.set_len(total_len as u64);
         }
         if !ok {
             tracing::debug!(?blk_path, "block cache write (pool) failed");
@@ -3785,8 +3904,8 @@ pub(crate) fn submit_block_cache_write(
 #[cfg(test)]
 mod disk_cache_crc_tests {
     use super::{
-        BLOCK_FORMAT_VERSION, BLOCK_MAGIC, BLOCK_OVERHEAD, CACHE_BLOCK_SIZE, crc32c_checksum,
-        crc32c_checksum_concat, read_block_cached,
+        BLOCK_FORMAT_VERSION, BLOCK_MAGIC, BLOCK_OVERHEAD, CACHE_BLOCK_SIZE,
+        LEGACY_BLOCK_FORMAT_VERSION_V1, crc32c_checksum, crc32c_checksum_concat, read_block_cached,
     };
     use std::path::PathBuf;
 
@@ -3799,30 +3918,43 @@ mod disk_cache_crc_tests {
         p
     }
 
+    /// Build a v2 (lz4-compressed) on-disk block file
+    /// matching what `write_block_cached` produces.
+    /// Used by the round-trip and corruption tests so
+    /// they exercise the current writer format.
+    fn build_v2_block(content: &[u8]) -> Vec<u8> {
+        let compressed = lz4_flex::compress_prepend_size(content);
+        let mut buf = Vec::with_capacity(BLOCK_OVERHEAD + compressed.len());
+        buf.extend_from_slice(BLOCK_MAGIC);
+        buf.extend_from_slice(&BLOCK_FORMAT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&compressed);
+        let crc = crc32c_checksum_concat(
+            &{
+                let mut h = Vec::with_capacity(8);
+                h.extend_from_slice(BLOCK_MAGIC);
+                h.extend_from_slice(&BLOCK_FORMAT_VERSION.to_le_bytes());
+                h
+            },
+            &compressed,
+        );
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
     #[test]
     fn crc_round_trip_full_block() {
-        // A full block (8 MiB) written in the new format
-        // (`MNCR || version || content || crc32c(...)`)
-        // should be returned with the header and trailer
-        // stripped (size == 8 MiB, not 8 MiB +
-        // BLOCK_OVERHEAD).
+        // A full block (8 MiB) written in the v2 format
+        // (`MNCR || version=2 || lz4(content) ||
+        // crc32c(...)`) should round-trip cleanly through
+        // `read_block_cached`: decompressed content
+        // matches the input, size == 8 MiB (the original
+        // uncompressed length), not the on-disk size.
         let dir = scratch("full");
         let p = dir.join("block.bin");
         let content: Vec<u8> = (0..CACHE_BLOCK_SIZE as u32)
             .map(|i| (i & 0xff) as u8)
             .collect();
-        // Build the new-format file by hand.
-        let mut buf = Vec::new();
-        buf.extend_from_slice(BLOCK_MAGIC);
-        buf.extend_from_slice(&BLOCK_FORMAT_VERSION.to_le_bytes());
-        buf.extend_from_slice(&content);
-        let crc = crc32c_checksum_concat(BLOCK_MAGIC, &{
-            let mut t = BLOCK_FORMAT_VERSION.to_le_bytes().to_vec();
-            t.extend_from_slice(&content);
-            t
-        });
-        buf.extend_from_slice(&crc.to_le_bytes());
-        std::fs::write(&p, &buf).unwrap();
+        std::fs::write(&p, build_v2_block(&content)).unwrap();
         let out = read_block_cached(&p).expect("clean full block should be Some");
         assert_eq!(out.len(), CACHE_BLOCK_SIZE as usize);
         assert_eq!(out.as_ref(), content.as_slice());
@@ -3831,31 +3963,61 @@ mod disk_cache_crc_tests {
 
     #[test]
     fn crc_corruption_triggers_unlink_and_returns_none() {
-        // A new-format full block whose CRC doesn't match
-        // (i.e. someone flipped a byte in the content)
-        // should be unlinked, and the function should
-        // return None so the caller falls through to a
-        // remote re-fetch. Pre-fix, this exact scenario
-        // would have returned the corrupted bytes
-        // (silent data corruption).
+        // A v2 full block whose CRC doesn't match (someone
+        // flipped a byte in the compressed payload) should
+        // be unlinked, and the function should return None
+        // so the caller falls through to a remote re-fetch.
+        // Pre-CRC, this exact scenario would have returned
+        // either the corrupted bytes or a noisy lz4 decode
+        // failure (silent data corruption).
         let dir = scratch("corrupt");
         let p = dir.join("block.bin");
         let content: Vec<u8> = (0..CACHE_BLOCK_SIZE as u32)
             .map(|i| (i & 0xff) as u8)
             .collect();
-        // Build the file but with a wrong CRC.
-        let mut buf = Vec::new();
-        buf.extend_from_slice(BLOCK_MAGIC);
-        buf.extend_from_slice(&BLOCK_FORMAT_VERSION.to_le_bytes());
-        buf.extend_from_slice(&content);
-        let mut bad_crc = crc32c_checksum_concat(&buf, &[]).to_le_bytes();
-        bad_crc[0] ^= 0x01;
-        buf.extend_from_slice(&bad_crc);
+        let mut buf = build_v2_block(&content);
+        // Flip a bit in the CRC trailer (last 4 bytes).
+        let len = buf.len();
+        buf[len - 1] ^= 0x01;
         std::fs::write(&p, &buf).unwrap();
 
         let out = read_block_cached(&p);
         assert!(out.is_none(), "corrupt CRC should return None");
         assert!(!p.exists(), "corrupt file should be unlinked");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v1_uncompressed_block_round_trip() {
+        // Backward-compat: a cache file written by a
+        // pre-#4 build (version=1 = uncompressed payload)
+        // must still read cleanly. Important because users
+        // upgrading don't get their cache wiped — old v1
+        // files coexist with new v2 writes until the LRU
+        // sweeps them out or they're overwritten on
+        // re-read.
+        let dir = scratch("legacy_v1");
+        let p = dir.join("block.bin");
+        let content: Vec<u8> = (0..1024_u32).map(|i| (i & 0xff) as u8).collect();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(BLOCK_MAGIC);
+        buf.extend_from_slice(&LEGACY_BLOCK_FORMAT_VERSION_V1.to_le_bytes());
+        buf.extend_from_slice(&content);
+        // CRC over (header || content), same recipe as
+        // the v1 writer used before #4 landed.
+        let crc = crc32c_checksum_concat(
+            &{
+                let mut h = Vec::with_capacity(8);
+                h.extend_from_slice(BLOCK_MAGIC);
+                h.extend_from_slice(&LEGACY_BLOCK_FORMAT_VERSION_V1.to_le_bytes());
+                h
+            },
+            &content,
+        );
+        buf.extend_from_slice(&crc.to_le_bytes());
+        std::fs::write(&p, &buf).unwrap();
+        let out = read_block_cached(&p).expect("v1 block should read cleanly");
+        assert_eq!(out.as_ref(), content.as_slice());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3910,13 +4072,9 @@ mod disk_cache_crc_tests {
         let dir = scratch("partial");
         let p = dir.join("block.bin");
         let content: Vec<u8> = (0..4096u32).map(|i| (i & 0xff) as u8).collect();
-        let mut buf = Vec::new();
-        buf.extend_from_slice(BLOCK_MAGIC);
-        buf.extend_from_slice(&BLOCK_FORMAT_VERSION.to_le_bytes());
-        buf.extend_from_slice(&content);
-        let crc = crc32c_checksum_concat(&buf, &[]);
-        buf.extend_from_slice(&crc.to_le_bytes());
-        std::fs::write(&p, &buf).unwrap();
+        // v2 format: lz4-compressed payload with size
+        // prefix, then CRC over (header || compressed).
+        std::fs::write(&p, build_v2_block(&content)).unwrap();
         let out = read_block_cached(&p).expect("partial block should be Some");
         assert_eq!(out.len(), content.len());
         assert_eq!(out.as_ref(), content.as_slice());
@@ -4034,13 +4192,22 @@ mod disk_cache_crc_tests {
         h.finish()
     }
 
-    /// Full block (== CACHE_BLOCK_SIZE) gets the new format:
-    /// `MNCR || version || content || crc32c(...)`. The
-    /// on-disk file is 8 MiB + BLOCK_OVERHEAD (12), the
-    /// index has the entry with the on-disk size, and the
-    /// CRC-aware reader round-trips the original content.
+    /// Full block (== CACHE_BLOCK_SIZE) gets the v2
+    /// format: `MNCR || version=2 || lz4(content) ||
+    /// crc32c(...)`. Because the content is lz4-
+    /// compressed, the on-disk file size is now
+    /// `BLOCK_OVERHEAD + compressed_payload_size`, not
+    /// `BLOCK_OVERHEAD + content.len()`. The test
+    /// uses a pattern (`(i & 0xff)` cycling) that
+    /// compresses well; we don't assert an exact
+    /// size, just that it's bounded by the format's
+    /// max (BLOCK_OVERHEAD + content + MAX_PAYLOAD_OVERHEAD).
+    /// The index has the on-disk size, and the
+    /// CRC-aware reader round-trips the original
+    /// uncompressed content.
     #[test]
     fn write_block_full_round_trip() {
+        use super::MAX_PAYLOAD_OVERHEAD;
         let fs = make_fs();
         let content: Vec<u8> = (0..CACHE_BLOCK_SIZE as u32)
             .map(|i| (i & 0xff) as u8)
@@ -4048,9 +4215,16 @@ mod disk_cache_crc_tests {
         assert!(fs.write_block_cached("full.bin", 0, &content));
         let blk_path = cache_block_path(&fs.cache_dir, "full.bin", 0);
         let meta = std::fs::metadata(&blk_path).unwrap();
-        assert_eq!(
-            meta.len() as usize,
-            CACHE_BLOCK_SIZE as usize + BLOCK_OVERHEAD
+        assert!(
+            (meta.len() as usize) >= BLOCK_OVERHEAD + 4,
+            "on-disk file should at least hold header + 4-byte size prefix + CRC; got {}",
+            meta.len()
+        );
+        assert!(
+            (meta.len() as usize)
+                <= CACHE_BLOCK_SIZE as usize + BLOCK_OVERHEAD + MAX_PAYLOAD_OVERHEAD,
+            "on-disk file should fit the v2 worst-case bound; got {}",
+            meta.len()
         );
         // First 4 bytes are the magic.
         let head = std::fs::read(&blk_path).unwrap();
@@ -4064,33 +4238,36 @@ mod disk_cache_crc_tests {
             .get(&(String::from("full.bin"), Some(0)))
             .expect("disk_cache_index should contain the entry");
         assert_eq!(entry.value().0 as usize, meta.len() as usize);
-        // Round-trip through the new-format reader.
+        // Round-trip through the new-format reader:
+        // expect uncompressed content back.
         let bytes = read_block_cached(&blk_path).expect("clean full block");
         assert_eq!(bytes.len(), CACHE_BLOCK_SIZE as usize);
         assert_eq!(bytes.as_ref(), content.as_slice());
     }
 
-    /// Partial block (< CACHE_BLOCK_SIZE) now uses the new
-    /// format too: N + BLOCK_OVERHEAD bytes on disk (N
-    /// content + 8 header + 4 CRC). Previously partial
-    /// blocks had no trailer; the new format gives them
-    /// corruption detection for free.
+    /// Partial block (< CACHE_BLOCK_SIZE) goes through
+    /// the same v2 lz4 path as full blocks — the
+    /// writer compresses uniformly. On-disk size is
+    /// `BLOCK_OVERHEAD + lz4_compressed_payload`,
+    /// bounded above by the per-block max-overhead
+    /// slack.
     #[test]
     fn write_block_partial_new_format() {
+        use super::MAX_PAYLOAD_OVERHEAD;
         let fs = make_fs();
         let content: Vec<u8> = (0..4096u32).map(|i| (i & 0xff) as u8).collect();
         assert!(fs.write_block_cached("tail.bin", 7, &content));
         let blk_path = cache_block_path(&fs.cache_dir, "tail.bin", 7);
         let meta = std::fs::metadata(&blk_path).unwrap();
-        assert_eq!(
-            meta.len() as usize,
-            4096 + BLOCK_OVERHEAD,
-            "partial block uses new format: content + header + CRC"
+        assert!(
+            (meta.len() as usize) <= content.len() + BLOCK_OVERHEAD + MAX_PAYLOAD_OVERHEAD,
+            "partial block on-disk size should fit v2 worst-case bound; got {}",
+            meta.len()
         );
         // Verify header.
         let head = std::fs::read(&blk_path).unwrap();
         assert_eq!(&head[0..4], BLOCK_MAGIC);
-        // Round-trip.
+        // Round-trip: uncompressed content comes back.
         let bytes = read_block_cached(&blk_path).expect("partial block should round-trip");
         assert_eq!(bytes.len(), content.len());
         assert_eq!(bytes.as_ref(), content.as_slice());
