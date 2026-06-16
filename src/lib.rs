@@ -2362,7 +2362,14 @@ impl CoreFilesystem for MntrsFs {
         let job = match &cache_fd {
             Some(fd) => DiskWriteJob {
                 cache_fd: Some(fd.clone()),
-                cache_path: None,
+                // #8 (durability): populate cache_path
+                // even when cache_fd is Some, so the
+                // pool worker can register the path for
+                // periodic fsync. cache_fd remains the
+                // preferred handle for the write itself
+                // (avoids the open syscall on the hot
+                // path); cache_path is read-only here.
+                cache_path: Some(crate::cache_path(&self.cache_dir, &path)),
                 remote_path: path.clone(),
                 offset: _offset,
                 data: _data.to_vec(),
@@ -3436,6 +3443,18 @@ impl DiskWriteJob {
                 Self::do_write(&mut f, &self.remote_path, self.offset, &self.data);
             }
         }
+        // #8 (durability): register the cache file for
+        // periodic fsync. The write above only landed in
+        // the OS page cache; without a periodic sync, a
+        // power loss or kernel panic can truncate the
+        // file to 0 bytes (the cache_fd open created the
+        // inode metadata before the data was written).
+        // The fsync thread batches sync_data() calls
+        // every 5 s, amortizing the cost across all
+        // dirty paths.
+        if let Some(p) = &self.cache_path {
+            register_dirty_cache_path(p);
+        }
     }
 
     /// Write a single block-cache file in the new
@@ -3482,7 +3501,17 @@ impl DiskWriteJob {
         }
         if !ok {
             tracing::debug!(?blk_path, "block cache write (pool) failed");
+            return;
         }
+        // #8 (durability): the file is in the OS page
+        // cache but not necessarily on disk. Register
+        // the path with the periodic-fsync thread, which
+        // batches `sync_data()` calls every 5 s. Without
+        // this, a power loss between the write and the
+        // kernel's lazy writeback leaves a 0-byte (or
+        // truncated) .block file that the next read sees
+        // as corrupt (CRC mismatch → unlink → re-fetch).
+        register_dirty_cache_path(blk_path);
     }
 
     fn do_write(f: &mut std::fs::File, remote_path: &str, offset: u64, data: &[u8]) {
@@ -3564,12 +3593,128 @@ pub fn init_disk_write_pool(num_threads: Option<usize>) {
     // enough to drain the queue.
     drop(rx);
     let _ = DISK_WRITE_POOL.set(tx);
+    // #8 (durability): spawn the periodic fsync thread
+    // alongside the IO worker pool. This follows the
+    // same all-or-nothing init pattern as the worker
+    // loop above (which spawns N threads even if
+    // OnceCell.set later fails): a duplicate
+    // init_disk_write_pool call would leak both the
+    // workers and an extra fsync thread, but in
+    // practice init is called once from main()/tests
+    // and the leaked threads sit in sleep / blocked
+    // recv with zero CPU cost.
+    spawn_fsync_thread();
 }
 
 fn disk_io_worker_loop(rx: crossbeam_channel::Receiver<DiskWriteJob>) {
     while let Ok(job) = rx.recv() {
         job.execute();
     }
+}
+
+/// #8 (durability): periodic-fsync interval. Every
+/// `FSYNC_INTERVAL_SECS` seconds, the background
+/// fsync thread walks `DIRTY_CACHE_PATHS` and calls
+/// `File::sync_data()` on each. 5 s is a balance
+/// between durability (smaller window = less data
+/// lost on power loss) and efficiency (larger window
+/// = fewer syscalls, more page-cache amortization).
+const FSYNC_INTERVAL_SECS: u64 = 5;
+
+/// Cache file paths that have been written but may
+/// not yet be on disk. Inserted by the disk-IO pool
+/// workers after every successful write; drained by
+/// the periodic fsync thread.
+///
+/// Set semantics (idempotent insert): a hot-write
+/// path stays a single entry no matter how many
+/// writes hit it between fsync ticks. The fsync
+/// thread removes a path on successful sync, and
+/// also on `NotFound` (cache evicted between the
+/// last write and this tick).
+///
+/// Memory bound: O(number of distinct cache files
+/// written in the last fsync interval). Each entry
+/// is a `PathBuf` (~200 B). With ~10 k unique cache
+/// files in a busy mount, this is ~2 MiB — negligible
+/// next to the cache itself.
+static DIRTY_CACHE_PATHS: once_cell::sync::Lazy<dashmap::DashSet<std::path::PathBuf>> =
+    once_cell::sync::Lazy::new(dashmap::DashSet::new);
+
+/// Register a cache file path as dirty. Called by
+/// the disk-IO pool worker after a successful write
+/// to the local cache. The periodic fsync thread
+/// picks this up on the next tick.
+///
+/// Insert is idempotent (DashSet); repeated writes
+/// to the same path collapse to one entry. The
+/// fsync thread removes the entry after a
+/// successful sync, so a steady-state hot file
+/// oscillates between "in set" and "not in set" at
+/// the tick frequency.
+pub(crate) fn register_dirty_cache_path(path: &std::path::Path) {
+    DIRTY_CACHE_PATHS.insert(path.to_path_buf());
+}
+
+/// Spawn the background fsync thread. Called once
+/// from `init_disk_write_pool` (which itself is
+/// init-once via OnceCell on `DISK_WRITE_POOL`),
+/// so this also runs at most once per process.
+///
+/// The thread loops forever (lifetime = process):
+///   1. sleep `FSYNC_INTERVAL_SECS`
+///   2. snapshot the set into a Vec (avoid holding
+///      the dashmap iterator while issuing syscalls)
+///   3. for each path: open read-only, `sync_data()`,
+///      remove from set on success or `NotFound`
+///
+/// `sync_data` (vs `sync_all`) skips metadata sync,
+/// which is what we actually care about — the cache
+/// file's data is the durability target; mtime/atime
+/// updates can be lost.
+///
+/// A failed sync (e.g. transient I/O error) leaves
+/// the path in the set; next tick retries.
+fn spawn_fsync_thread() {
+    std::thread::Builder::new()
+        .name("mntrs-fsync".to_string())
+        .spawn(|| {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(FSYNC_INTERVAL_SECS));
+                // Snapshot to avoid holding the dashmap
+                // iterator across syscalls (other
+                // threads keep writing into the set).
+                let paths: Vec<std::path::PathBuf> =
+                    DIRTY_CACHE_PATHS.iter().map(|r| r.clone()).collect();
+                for path in paths {
+                    match std::fs::File::open(&path) {
+                        Ok(f) => {
+                            if f.sync_data().is_ok() {
+                                DIRTY_CACHE_PATHS.remove(&path);
+                            }
+                            // Sync failed: keep in set,
+                            // retry next tick. Don't
+                            // log here — a transient
+                            // ENOSPC or EIO during one
+                            // tick will spam the log
+                            // every 5 s otherwise.
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            // File was evicted between
+                            // write and sync. Drop the
+                            // tracking entry.
+                            DIRTY_CACHE_PATHS.remove(&path);
+                        }
+                        Err(_) => {
+                            // Transient open failure
+                            // (EACCES, ENOMEM, …):
+                            // keep, retry next tick.
+                        }
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn fsync thread");
 }
 
 /// Submit a write job to the IO thread pool. Called
