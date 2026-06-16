@@ -687,6 +687,51 @@ pub fn fnmatch(pattern: &str, name: &str, ignore_case: bool) -> bool {
     pi == pl
 }
 
+/// Bug 34: canonical form for any path used as a
+/// `dir_cache` key OR passed to opendal's `lister`.
+///
+/// Why one form: pre-fix, `list_op` stored entries
+/// under `"foo/"` (with trailing slash, formatted by
+/// the caller), while `cache_add_entry` (called from
+/// create/mkdir) stored entries under `"foo"` (no
+/// trailing slash). A subsequent `list_op("foo/")`
+/// would miss the just-added entry because the keys
+/// disagreed. The fix centralizes path normalization
+/// in this helper so every dir_cache touch agrees on
+/// the canonical shape.
+///
+/// Rules (idempotent):
+///   * Strip leading slashes (opendal S3/GCS/etc.
+///     reject leading `/`).
+///   * Collapse interior `//` runs to a single `/`
+///     (defensive vs caller-side string concatenation
+///     that may leave double slashes).
+///   * Non-empty paths always end with a single `/`.
+///     (opendal listers signal "list contents of dir
+///     X" via the trailing `/`; without it, some
+///     backends return the entry for X itself
+///     instead.)
+///   * Empty input → empty output (the root of the
+///     bucket / mount).
+///
+/// Examples:
+///   * `""`           → `""`
+///   * `"/"`          → `""`
+///   * `"foo"`        → `"foo/"`
+///   * `"foo/"`       → `"foo/"`
+///   * `"/foo/"`      → `"foo/"`
+///   * `"//foo//bar//"` → `"foo/bar/"`
+pub(crate) fn canonicalize_list_path(raw: &str) -> String {
+    let segments: Vec<&str> = raw.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.is_empty() {
+        String::new()
+    } else {
+        let mut out = segments.join("/");
+        out.push('/');
+        out
+    }
+}
+
 pub fn cache_path(cache_dir: &Path, path: &str) -> PathBuf {
     cache_path_block(cache_dir, path, 0)
 }
@@ -1845,6 +1890,18 @@ impl MntrsFs {
         &self,
         path: &str,
     ) -> Result<Vec<(String, EntryMode, u64, SystemTime)>, opendal::Error> {
+        // Bug 34: canonicalize the path once at entry —
+        // dir_cache key and the opendal lister arg both
+        // use the same canonical form. Pre-fix the
+        // caller passed `format!("{}/", path)` and
+        // list_op stored under that key, but
+        // cache_add_entry stored under `path` (no
+        // trailing slash) for the same dir — meaning a
+        // create()+ls()'s entry-then-cache-hit could
+        // miss the just-added entry. See
+        // canonicalize_list_path for the rule set.
+        let path = canonicalize_list_path(path);
+        let path = path.as_str();
         {
             if let Some(entry) = self.dir_cache.get(path) {
                 let (t, entries) = entry.value();
@@ -2111,6 +2168,16 @@ impl MntrsFs {
         size: u64,
         mtime: SystemTime,
     ) {
+        // Bug 34: canonicalize so the key agrees with
+        // list_op (which also canonicalizes). Without
+        // this, list_op stored under "foo/" and a
+        // subsequent create() that called cache_add_entry
+        // with parent_path="foo" stored under "foo" —
+        // two keys for the same dir, and the dir_cache
+        // hit-on-cache_add was a miss for any subsequent
+        // list_op read.
+        let parent_path = canonicalize_list_path(parent_path);
+        let parent_path = parent_path.as_str();
         if let Some(entry) = self.dir_cache.get(parent_path) {
             let (_, entries) = entry.value();
             entries.insert(name.to_string(), (mode, size, mtime));
@@ -2137,13 +2204,23 @@ impl MntrsFs {
     /// Full invalidation: remove directory cache and all sub-paths.
     /// Used for rename (both src and dst sides) where we can't cheaply update.
     fn invalidate_dir_cache(&self, path: &str) {
-        self.dir_cache.remove(path);
-        let prefix = format!("{}/", path);
+        // Bug 34: canonicalize for dir_cache key parity.
+        // Pre-fix this used raw `path` which could
+        // disagree with the canonical key list_op used.
+        let canon = canonicalize_list_path(path);
+        self.dir_cache.remove(canon.as_str());
+        let prefix = canon.clone(); // "foo/" — already trailing-/
         self.dir_cache.retain(|k, _| !k.starts_with(&prefix));
-        if let Some(slash) = path.rfind('/') {
-            let parent = &path[..slash];
-            if !parent.is_empty() {
-                self.dir_cache.remove(parent);
+        // Walk up one level — parent's listing of `path`
+        // becomes stale on rename, so drop the parent's
+        // cache too. Strip the trailing slash off the
+        // canonical form to find the parent path.
+        let without_slash = canon.trim_end_matches('/');
+        if let Some(slash) = without_slash.rfind('/') {
+            let parent_raw = &without_slash[..slash];
+            if !parent_raw.is_empty() {
+                let parent_canon = canonicalize_list_path(parent_raw);
+                self.dir_cache.remove(parent_canon.as_str());
             }
         }
     }
@@ -2226,11 +2303,7 @@ impl CoreFilesystem for MntrsFs {
             // — purely-default attrs would be a worse answer than
             // ENOENT, because the caller (FUSE) would then treat
             // something nonexistent as existent.
-            let parent_cache_key = if parent_path.is_empty() {
-                String::new()
-            } else {
-                format!("{}/", parent_path)
-            };
+            let parent_cache_key = canonicalize_list_path(&parent_path);
             let implicit = self.dir_cache.get(&parent_cache_key).and_then(|entry| {
                 let (_t, entries) = entry.value();
                 entries
@@ -2494,16 +2567,15 @@ impl CoreFilesystem for MntrsFs {
 
     fn readdir(&self, ino: u64) -> std::io::Result<Vec<CoreDirEntry>> {
         let path = self.resolve(ino).map(|e| e.path).unwrap_or_default();
-        let list_path = if path.is_empty() {
-            String::new()
-        } else {
-            format!("{}/", path)
-        };
-        // Per SESSION_PITFALLS §2.6: propagate list_op errors to FUSE.
-        // A swallowed backend error used to surface as an empty
-        // directory (CI looked green, root cause was invisible).
-        let listed = self.list_op(&list_path).map_err(|e| {
-            tracing::warn!(path = %list_path, error = %e,
+        // Bug 34: pass the raw inode path; list_op
+        // canonicalizes internally. Pre-fix this
+        // computed `list_path = format!("{}/", path)`
+        // and used the formatted form as both the
+        // list_op arg AND the queried_last derivation
+        // base — duplicating the trailing-slash policy
+        // that list_op now owns.
+        let listed = self.list_op(&path).map_err(|e| {
+            tracing::warn!(path = %path, error = %e,
                     "CoreFilesystem::readdir: list_op failed");
             std::io::Error::other(e)
         })?;
@@ -2538,7 +2610,7 @@ impl CoreFilesystem for MntrsFs {
         // matches the parent dir's basename. ls -R then descends into it
         // and gets EIO on stat, plus the root listing can show an empty
         // name (kernel EIO on readdir). Per SESSION_PITFALLS §2.4.
-        let queried_last = std::path::Path::new(&list_path)
+        let queried_last = std::path::Path::new(&path)
             .components()
             .next_back()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
