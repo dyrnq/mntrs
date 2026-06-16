@@ -2408,6 +2408,21 @@ impl CoreFilesystem for MntrsFs {
                         .open(&cpath)
                         .map(|f| f.set_len(s));
                 }
+                // Bug 29: invalidate mem_cache after the
+                // truncate. Pre-fix the write path called
+                // `mem_cache.invalidate_ino(ino)` on
+                // every write but setattr did not — so a
+                // file whose blocks were already in
+                // mem_cache (e.g. a complete cat right
+                // before the truncate) would still serve
+                // those pre-truncate blocks to subsequent
+                // reads, returning stale bytes from the
+                // truncated region instead of EOF. The
+                // read path's `b[start..end].min(b.len())`
+                // hides the bug from a quick `cat` but
+                // surfaces clearly on `dd skip=10`
+                // (reads past the new EOF).
+                self.mem_cache.invalidate_ino(ino);
             }
             Ok(to_core_attr(&self.make_attr(
                 ino,
@@ -3842,9 +3857,27 @@ fn to_core_attr(a: &FileAttr) -> CoreFileAttr {
         mtime: a.mtime,
         ctime: a.ctime,
         crtime: a.crtime,
+        // Bug 28: map every FileType variant explicitly.
+        // Pre-fix the catch-all `_ => RegularFile`
+        // collapsed Symlink / NamedPipe / BlockDevice /
+        // CharDevice / Socket into regular files. Today
+        // `make_attr` only produces Directory and
+        // RegularFile so the collapse was a no-op, but
+        // Bug 17 added the readlink/symlink trait surface
+        // — a future fs-backend override that returns a
+        // Symlink attr through this helper would have
+        // lost its `kind` and presented to the kernel as
+        // a regular file (broken `ls -la`, broken
+        // readlink). Exhaustive match here so the
+        // compiler enforces future additions.
         kind: match a.kind {
             FileType::Directory => CoreFileType::Directory,
-            _ => CoreFileType::RegularFile,
+            FileType::RegularFile => CoreFileType::RegularFile,
+            FileType::Symlink => CoreFileType::Symlink,
+            FileType::NamedPipe => CoreFileType::NamedPipe,
+            FileType::BlockDevice => CoreFileType::BlockDevice,
+            FileType::CharDevice => CoreFileType::CharDevice,
+            FileType::Socket => CoreFileType::Socket,
         },
         perm: a.perm,
         nlink: a.nlink,
