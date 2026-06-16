@@ -134,14 +134,44 @@ fn record_mount(storage: &str, mountpoint: &str, read_only: bool) {
 
 fn remove_mount(mountpoint: &str) {
     let path = mounts_db();
-    if let Ok(content) = fs::read_to_string(&path) {
-        let filtered: Vec<&str> = content
-            .lines()
-            .filter(|l| l.split('\0').nth(1) != Some(mountpoint))
-            .collect();
-        if let Err(e) = fs::write(&path, filtered.join("\n")) {
-            tracing::debug!(error=%e, "mounts db cleanup failed");
+    // Bug 31: mirror record_mount's tmp + rename pattern
+    // so the rewrite is atomic. Pre-fix this used
+    // read_to_string + filter + write — two non-atomic
+    // syscalls. If a concurrent record_mount rename
+    // landed between our read and write, our write
+    // would overwrite the freshly-recorded entry and
+    // it would silently disappear from the list.
+    //
+    // Race window: record_mount runs in mount setup,
+    // remove_mount in unmount/cleanup. Different
+    // lifecycle phases, low real-world probability —
+    // but two mounts started concurrently (e.g. an
+    // automation script kicking off N mounts in
+    // parallel) where one finishes + unmounts while
+    // another is starting can hit it. Atomic rename
+    // closes the window for free.
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let filtered: Vec<&str> = content
+        .lines()
+        .filter(|l| l.split('\0').nth(1) != Some(mountpoint))
+        .collect();
+    let new_body = filtered.join("\n");
+    let tmp = format!("{}.tmp.{}", path, std::process::id());
+    if std::fs::write(&tmp, &new_body).is_ok() {
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            tracing::debug!(error=%e, "mounts db rename failed");
+            // Rename failed — clean the tmp so it
+            // doesn't accumulate. Ignore the unlink
+            // result; worst case is a leftover
+            // {path}.tmp.{pid} which the next
+            // remove_mount will overwrite.
+            let _ = std::fs::remove_file(&tmp);
         }
+    } else {
+        tracing::debug!("mounts db tmp write failed");
     }
 }
 
