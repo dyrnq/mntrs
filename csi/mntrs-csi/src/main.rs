@@ -653,15 +653,34 @@ impl node_server::Node for NodeService {
         &self,
         _request: Request<NodeGetCapabilitiesRequest>,
     ) -> Result<Response<NodeGetCapabilitiesResponse>, Status> {
+        // node_get_volume_stats is implemented below
+        // (via rustix::statvfs on the FUSE mountpoint, which
+        // hits MntrsFs::statfs). CSI requires that any
+        // advertised capability corresponds to a working
+        // RPC, and conversely that any implemented RPC be
+        // declared — kubelet uses the capability list to
+        // decide whether to call NodeGetVolumeStats for
+        // VolumeStatsAggregation. Without GET_VOLUME_STATS
+        // the kubelet skips the call, capacity monitoring
+        // shows stale data, and CSI sidecars log
+        // "GetVolumeStats not supported" warnings.
         Ok(Response::new(NodeGetCapabilitiesResponse {
-            capabilities: vec![NodeServiceCapability {
-                r#type: Some(node_service_capability::Type::Rpc(
-                    node_service_capability::Rpc {
-                        r#type: node_service_capability::rpc::Type::StageUnstageVolume as i32,
-                        // MULTI_NODE_MULTI_WRITER: not in CSI v1 spec
-                    },
-                )),
-            }],
+            capabilities: vec![
+                NodeServiceCapability {
+                    r#type: Some(node_service_capability::Type::Rpc(
+                        node_service_capability::Rpc {
+                            r#type: node_service_capability::rpc::Type::StageUnstageVolume as i32,
+                        },
+                    )),
+                },
+                NodeServiceCapability {
+                    r#type: Some(node_service_capability::Type::Rpc(
+                        node_service_capability::Rpc {
+                            r#type: node_service_capability::rpc::Type::GetVolumeStats as i32,
+                        },
+                    )),
+                },
+            ],
         }))
     }
 
