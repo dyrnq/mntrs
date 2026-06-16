@@ -11,7 +11,36 @@ pub mod writeback;
 
 /// Shared inode table type for writeback callback.
 pub const CACHE_BLOCK_SIZE: u64 = 8 * 1024 * 1024;
-pub type Inodes = Arc<dashmap::DashMap<u64, (String, FileType, u64, Option<SystemTime>)>>;
+
+/// A single entry in the inodes map.
+///
+/// Replaces a `(String, FileType, u64, Option<SystemTime>)`
+/// tuple used everywhere via `v.0` / `v.1` / `v.2` / `v.3`.
+/// The named-field form is the same size (Rust elides
+/// the wrapper), but eliminates the "which positional
+/// field is mtime again" footgun on every and_modify /
+/// destructuring site (Bug 8).
+///
+/// Fields:
+///   * `path`  — backend path (no leading slash)
+///   * `kind`  — file kind (regular / directory)
+///   * `size`  — logical size in bytes. The write path
+///     bumps this on every successful write; reads consult
+///     it (max'd against the cache-file size) for getattr.
+///   * `mtime` — last modification time. `None` for an
+///     entry populated by `lookup` / `readdir` on a file
+///     we've only ever read remotely (no local writes
+///     yet); `Some` after the first write or after a
+///     create / mkdir.
+#[derive(Clone, Debug)]
+pub struct InodeEntry {
+    pub path: String,
+    pub kind: FileType,
+    pub size: u64,
+    pub mtime: Option<SystemTime>,
+}
+
+pub type Inodes = Arc<dashmap::DashMap<u64, InodeEntry>>;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -166,7 +195,7 @@ pub struct MntrsFs {
     /// ino is self-consistent with the cache-file state (Bug F fix
     /// — `CoreFilesystem::lookup` / `getattr` now consider the
     /// local cache file's size, not just the backend).
-    pub inodes: dashmap::DashMap<u64, (String, FileType, u64, Option<std::time::SystemTime>)>,
+    pub inodes: dashmap::DashMap<u64, InodeEntry>,
     /// Reverse map of `path → ino` for the inodes table.
     ///
     /// Why: `find_ino_by_path` is on the hot lookup path
@@ -481,7 +510,7 @@ impl MntrsFs {
         ino: u64,
         path: &str,
     ) -> Option<std::sync::Arc<prefetcher::HandlePrefetcher>> {
-        let file_size = self.resolve(ino).map(|(_, _, s, _)| s).unwrap_or(0);
+        let file_size = self.resolve(ino).map(|e| e.size).unwrap_or(0);
         if self.prefetch_threshold == 0 || file_size < self.prefetch_threshold {
             return None;
         }
@@ -1122,7 +1151,7 @@ pub fn load_cache_index(cache_dir: &Path) -> Vec<(String, u64, u64, std::time::S
 }
 
 impl MntrsFs {
-    fn resolve(&self, ino: u64) -> Option<(String, FileType, u64, Option<std::time::SystemTime>)> {
+    fn resolve(&self, ino: u64) -> Option<InodeEntry> {
         self.inodes.get(&ino).map(|r| r.clone())
     }
 
@@ -1192,8 +1221,13 @@ impl MntrsFs {
         let ino = NEXT_INO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inodes
             .entry(ino)
-            .and_modify(|v| v.2 = size)
-            .or_insert((path.to_string(), kind, size, None));
+            .and_modify(|v| v.size = size)
+            .or_insert(InodeEntry {
+                path: path.to_string(),
+                kind,
+                size,
+                mtime: None,
+            });
         // Maintain the path→ino reverse map (stat phase 2
         // — `find_ino_by_path` is on the hot stat path).
         // Last writer wins on collision: a second
@@ -1224,8 +1258,13 @@ impl MntrsFs {
         let ino = NEXT_INO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inodes
             .entry(ino)
-            .and_modify(|v| v.2 = size)
-            .or_insert((path.to_string(), kind, size, Some(mtime)));
+            .and_modify(|v| v.size = size)
+            .or_insert(InodeEntry {
+                path: path.to_string(),
+                kind,
+                size,
+                mtime: Some(mtime),
+            });
         // Same reverse-map maintenance as `alloc_ino`.
         self.path_to_ino.insert(path.to_string(), ino);
         ino
@@ -1263,7 +1302,7 @@ impl MntrsFs {
         // or since-removed) file.
         if let Some(ino) = self.path_to_ino.get(path).map(|r| *r.value())
             && let Some(entry) = self.inodes.get(&ino)
-            && entry.value().0 == path
+            && entry.value().path == path
         {
             return Some(ino);
         }
@@ -1272,7 +1311,7 @@ impl MntrsFs {
         // (e.g. a code path that bypassed `alloc_ino*`).
         // Repair so the next call hits the fast path.
         for entry in self.inodes.iter() {
-            if entry.value().0 == path {
+            if entry.value().path == path {
                 let ino = *entry.key();
                 self.path_to_ino.insert(path.to_string(), ino);
                 return Some(ino);
@@ -1815,10 +1854,7 @@ impl CoreFilesystem for MntrsFs {
                 SystemTime::UNIX_EPOCH,
             )));
         }
-        let parent_path = self
-            .resolve(parent)
-            .map(|(p, _, _, _)| p)
-            .unwrap_or_default();
+        let parent_path = self.resolve(parent).map(|e| e.path).unwrap_or_default();
         let full_path = if parent_path.is_empty() {
             name.to_string()
         } else {
@@ -1958,7 +1994,13 @@ impl CoreFilesystem for MntrsFs {
                 SystemTime::UNIX_EPOCH,
             )));
         }
-        if let Some((path, kind, inodes_size, inodes_mtime)) = self.resolve(ino) {
+        if let Some(InodeEntry {
+            path,
+            kind,
+            size: inodes_size,
+            mtime: inodes_mtime,
+        }) = self.resolve(ino)
+        {
             // #28 (stat optimization): skip the S3 stat_op
             // round-trip when the inodes entry is fresh
             // enough. The entry is populated by:
@@ -2022,7 +2064,7 @@ impl CoreFilesystem for MntrsFs {
         _atime: Option<SystemTime>,
         _mtime: Option<SystemTime>,
     ) -> std::io::Result<CoreFileAttr> {
-        if let Some((_p, kind, _, _)) = self.resolve(ino) {
+        if let Some(InodeEntry { path: _p, kind, .. }) = self.resolve(ino) {
             if let Some(s) = size {
                 // Truncate the inodes size to the new value.
                 //
@@ -2040,7 +2082,7 @@ impl CoreFilesystem for MntrsFs {
                 // (setattr's mtime is handled by the `make_attr` call
                 // below with `SystemTime::now()`).
                 self.inodes.entry(ino).and_modify(|v| {
-                    v.2 = s;
+                    v.size = s;
                 });
                 // Truncate the on-disk cache file too, so subsequent
                 // reads at offset ≥ s return EOF instead of leftover
@@ -2082,7 +2124,7 @@ impl CoreFilesystem for MntrsFs {
     }
 
     fn readdir(&self, ino: u64) -> std::io::Result<Vec<CoreDirEntry>> {
-        let path = self.resolve(ino).map(|(p, _, _, _)| p).unwrap_or_default();
+        let path = self.resolve(ino).map(|e| e.path).unwrap_or_default();
         let list_path = if path.is_empty() {
             String::new()
         } else {
@@ -2165,7 +2207,7 @@ impl CoreFilesystem for MntrsFs {
     }
 
     fn open(&self, ino: u64, _flags: u32) -> std::io::Result<u64> {
-        let path = self.resolve(ino).map(|(p, _, _, _)| p).unwrap_or_default();
+        let path = self.resolve(ino).map(|e| e.path).unwrap_or_default();
         let fh = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // Check if flags contain write access (O_WRONLY=1, O_RDWR=2)
@@ -2217,7 +2259,7 @@ impl CoreFilesystem for MntrsFs {
     fn read(&self, ino: u64, fh: u64, offset: u64, size: u32) -> std::io::Result<Vec<u8>> {
         let (path, file_size) = self
             .resolve(ino)
-            .map(|(p, _, s, _)| (p, s))
+            .map(|e| (e.path, e.size))
             .ok_or(std::io::ErrorKind::NotFound)?;
         // Defensive size reconciliation (see CoreFilesystem::read history
         // for the full explanation). inodes is the FUSE-protocol
@@ -2732,12 +2774,17 @@ impl CoreFilesystem for MntrsFs {
         self.inodes
             .entry(_ino)
             .and_modify(|v| {
-                if end > v.2 {
-                    v.2 = end;
+                if end > v.size {
+                    v.size = end;
                 }
-                v.3 = Some(write_mtime);
+                v.mtime = Some(write_mtime);
             })
-            .or_insert_with(|| (path.clone(), FileType::RegularFile, end, Some(write_mtime)));
+            .or_insert_with(|| InodeEntry {
+                path: path.clone(),
+                kind: FileType::RegularFile,
+                size: end,
+                mtime: Some(write_mtime),
+            });
 
         // Invalidate mem_cache for this ino.
         //
@@ -2911,10 +2958,7 @@ impl CoreFilesystem for MntrsFs {
     }
 
     fn create(&self, _parent: u64, name: &str, _mode: u32) -> std::io::Result<CoreFileAttr> {
-        let parent_path = self
-            .resolve(_parent)
-            .map(|(p, _, _, _)| p)
-            .unwrap_or_default();
+        let parent_path = self.resolve(_parent).map(|e| e.path).unwrap_or_default();
         let full_path = if parent_path.is_empty() {
             name.to_string()
         } else {
@@ -2984,10 +3028,7 @@ impl CoreFilesystem for MntrsFs {
     }
 
     fn mkdir(&self, _parent: u64, name: &str) -> std::io::Result<CoreFileAttr> {
-        let parent_path = self
-            .resolve(_parent)
-            .map(|(p, _, _, _)| p)
-            .unwrap_or_default();
+        let parent_path = self.resolve(_parent).map(|e| e.path).unwrap_or_default();
         let full_path = if parent_path.is_empty() {
             name.to_string()
         } else {
@@ -3019,10 +3060,7 @@ impl CoreFilesystem for MntrsFs {
     }
 
     fn unlink(&self, _parent: u64, name: &str) -> std::io::Result<()> {
-        let parent_path = self
-            .resolve(_parent)
-            .map(|(p, _, _, _)| p)
-            .unwrap_or_default();
+        let parent_path = self.resolve(_parent).map(|e| e.path).unwrap_or_default();
         let full_path = if parent_path.is_empty() {
             name.to_string()
         } else {
@@ -3051,8 +3089,12 @@ impl CoreFilesystem for MntrsFs {
             .inodes
             .iter()
             .find_map(|entry| {
-                let (p, _kind, sz, _mtime) = entry.value();
-                if p == &full_path { Some(*sz) } else { None }
+                let v = entry.value();
+                if v.path == full_path {
+                    Some(v.size)
+                } else {
+                    None
+                }
             })
             .unwrap_or(0);
         if file_size > 0 {
@@ -3093,10 +3135,7 @@ impl CoreFilesystem for MntrsFs {
     }
 
     fn rmdir(&self, _parent: u64, name: &str) -> std::io::Result<()> {
-        let parent_path = self
-            .resolve(_parent)
-            .map(|(p, _, _, _)| p)
-            .unwrap_or_default();
+        let parent_path = self.resolve(_parent).map(|e| e.path).unwrap_or_default();
         let full_path = if parent_path.is_empty() {
             name.to_string()
         } else {
@@ -3130,14 +3169,8 @@ impl CoreFilesystem for MntrsFs {
         _newparent: u64,
         newname: &str,
     ) -> std::io::Result<()> {
-        let parent_path = self
-            .resolve(_parent)
-            .map(|(p, _, _, _)| p)
-            .unwrap_or_default();
-        let newparent_path = self
-            .resolve(_newparent)
-            .map(|(p, _, _, _)| p)
-            .unwrap_or_default();
+        let parent_path = self.resolve(_parent).map(|e| e.path).unwrap_or_default();
+        let newparent_path = self.resolve(_newparent).map(|e| e.path).unwrap_or_default();
         let src = if parent_path.is_empty() {
             name.to_string()
         } else {
@@ -3326,7 +3359,7 @@ impl CoreFilesystem for MntrsFs {
         if let Some(src_ino) = src_ino {
             // In-place path update. Size/mtime/ino are unchanged.
             self.inodes.entry(src_ino).and_modify(|v| {
-                v.0 = dst.clone();
+                v.path = dst.clone();
             });
             // Reverse map: drop the old path entry,
             // insert the new one pointing at the same
@@ -3398,7 +3431,7 @@ impl CoreFilesystem for MntrsFs {
     }
 
     fn getxattr(&self, ino: u64, name: &str) -> std::io::Result<Vec<u8>> {
-        if let Some((p, _, _, _)) = self.resolve(ino) {
+        if let Some(InodeEntry { path: p, .. }) = self.resolve(ino) {
             let op = self.op.clone();
             let p2 = p.clone();
             match rt().block_on(async move { op.stat(&p2).await }) {
@@ -3430,7 +3463,7 @@ impl CoreFilesystem for MntrsFs {
     }
 
     fn listxattr(&self, ino: u64) -> std::io::Result<Vec<Vec<u8>>> {
-        if let Some((_, kind, _, _)) = self.resolve(ino) {
+        if let Some(InodeEntry { kind, .. }) = self.resolve(ino) {
             if kind == FileType::Directory {
                 return Ok(vec![]);
             }
@@ -3451,7 +3484,7 @@ impl CoreFilesystem for MntrsFs {
         if ino == 1 {
             return;
         }
-        if let Some((path, _, _, _)) = self.resolve(ino) {
+        if let Some(InodeEntry { path, .. }) = self.resolve(ino) {
             self.inodes.remove(&ino);
             // Stat phase 2: drop the reverse map entry,
             // but ONLY if it still points to the ino

@@ -112,7 +112,7 @@ pub fn spawn(
                                 // logical size due to set_len sparse extension, so
                                 // using cache metadata length would corrupt reads.
                                 inodes2.entry(ino).and_modify(|v| {
-                                    v.3 = Some(std::time::SystemTime::now());
+                                    v.mtime = Some(std::time::SystemTime::now());
                                 });
                                 // Keep cache file on disk as a read cache.
                                 // Only remove the .dirty sidecar to mark upload complete.
@@ -230,8 +230,8 @@ pub fn worker(
         if upload_ok {
             let new_size = full_data.len() as u64;
             inodes.entry(tasks[0].0).and_modify(|v| {
-                v.2 = new_size;
-                v.3 = Some(std::time::SystemTime::now());
+                v.size = new_size;
+                v.mtime = Some(std::time::SystemTime::now());
             });
             for (_, _, cache_path) in &tasks {
                 let _ = std::fs::remove_file(cache_path);
