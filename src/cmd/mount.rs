@@ -60,6 +60,23 @@ pub fn read_mounts() -> Vec<MountInfo> {
             if parts.len() < 6 {
                 return None;
             }
+            // Bug 23: filter rows with empty critical
+            // fields. A malformed line (e.g. a partial
+            // write from a crashed `record_mount`) can
+            // have all 6 \0 separators but an empty
+            // storage/mountpoint/pid string, which would
+            // surface in `list` as a blank table row.
+            // pid is the most useful diagnostic — empty
+            // pid means the writer crashed before
+            // capturing std::process::id(), and the row
+            // can't be acted on by the user (no kill /
+            // unmount). Drop the row, log at debug
+            // since this is an opportunistic recovery
+            // path not a hot loop.
+            if parts[2].is_empty() || parts[0].is_empty() || parts[1].is_empty() {
+                tracing::debug!(line=%l, "read_mounts: skipping malformed entry (empty critical field)");
+                return None;
+            }
             Some(MountInfo {
                 storage: parts[0].to_string(),
                 mountpoint: parts[1].to_string(),

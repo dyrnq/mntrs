@@ -856,7 +856,7 @@ const BLOCK_OVERHEAD: usize = BLOCK_HEADER_SIZE + BLOCK_CRC_TRAILER;
 
 /// Upper bound on the on-disk payload (post-header,
 /// pre-trailer) of any block file. Set to leave room
-/// for the v2 lz4-compressed format's worst-case
+/// for the v2/v3 lz4-compressed formats' worst-case
 /// expansion on uncompressible input.
 ///
 /// LZ4 frame-less block worst case ≈
@@ -1357,7 +1357,28 @@ impl MntrsFs {
                             // makes the contract grep-able + the
                             // next stat() from user space refreshes
                             // mtime from the remote anyway.
-                            tx.send((INO_RECOVERY_SENTINEL, remote, cache_path)).ok();
+                            // Bug 22: send().ok() previously
+                            // swallowed an Err silently. send
+                            // on an UnboundedSender returns
+                            // Err only when the receiver is
+                            // dropped — which here means the
+                            // writeback worker thread died.
+                            // The .dirty sidecar is still on
+                            // disk, so the next mount's
+                            // recovery scan will try again,
+                            // but an operator watching this
+                            // mount needs to know the worker
+                            // is gone NOW. Log at warn.
+                            if let Err(e) =
+                                tx.send((INO_RECOVERY_SENTINEL, remote, cache_path.clone()))
+                            {
+                                tracing::warn!(
+                                    cache_path=?cache_path,
+                                    error=%e,
+                                    "writeback recovery send failed (worker dropped?); \
+                                     .dirty sidecar kept for next-mount retry"
+                                );
+                            }
                         }
                     }
                 }
@@ -3112,7 +3133,20 @@ impl CoreFilesystem for MntrsFs {
                     tracing::warn!(error=%e, path=?sidecar, "sidecar write failed");
                 }
                 if let Some(tx) = self.writeback_sender.get() {
-                    tx.send((_ino, path.clone(), cpath)).ok();
+                    // Bug 22: surface a send() failure (writeback
+                    // worker dropped) instead of silently
+                    // discarding the queue request. The
+                    // .dirty sidecar written just above stays
+                    // on disk and will be picked up on next-
+                    // mount recovery.
+                    if let Err(e) = tx.send((_ino, path.clone(), cpath)) {
+                        tracing::warn!(
+                            path=%path,
+                            error=%e,
+                            "flush writeback send failed (worker dropped?); \
+                             .dirty sidecar kept for next-mount retry"
+                        );
+                    }
                 }
                 tracing::debug!(path=%path, "flush queued writeback");
             }
@@ -3151,7 +3185,17 @@ impl CoreFilesystem for MntrsFs {
                 let sidecar = cpath.with_extension("dirty");
                 let _ = std::fs::write(&sidecar, path.as_bytes());
                 if let Some(tx) = self.writeback_sender.get() {
-                    tx.send((_ino, path.clone(), cpath)).ok();
+                    // Bug 22 (release-side mirror of the flush
+                    // fix above). Same rationale + same
+                    // recovery shape.
+                    if let Err(e) = tx.send((_ino, path.clone(), cpath)) {
+                        tracing::warn!(
+                            path=%path,
+                            error=%e,
+                            "release writeback send failed (worker dropped?); \
+                             .dirty sidecar kept for next-mount retry"
+                        );
+                    }
                 }
                 tracing::debug!(path=%path, "release queued writeback");
             }
@@ -4603,12 +4647,13 @@ mod disk_cache_crc_tests {
 
     #[test]
     fn crc_round_trip_full_block() {
-        // A full block (8 MiB) written in the v2 format
-        // (`MNCR || version=2 || lz4(content) ||
-        // crc32c(...)`) should round-trip cleanly through
-        // `read_block_cached`: decompressed content
-        // matches the input, size == 8 MiB (the original
-        // uncompressed length), not the on-disk size.
+        // A full block (8 MiB) written in the v3 format
+        // (`MNCR || version=3 || path_len || path ||
+        // lz4(content) || crc32c(...)`) should round-trip
+        // cleanly through `read_block_cached`: decompressed
+        // content matches the input, size == 8 MiB (the
+        // original uncompressed length), not the on-disk
+        // size.
         let dir = scratch("full");
         let p = dir.join("block.bin");
         let content: Vec<u8> = (0..CACHE_BLOCK_SIZE as u32)
@@ -4791,8 +4836,9 @@ mod disk_cache_crc_tests {
         let dir = scratch("partial");
         let p = dir.join("block.bin");
         let content: Vec<u8> = (0..4096u32).map(|i| (i & 0xff) as u8).collect();
-        // v2 format: lz4-compressed payload with size
-        // prefix, then CRC over (header || compressed).
+        // v3 format: lz4-compressed payload with size
+        // prefix + embedded path, then CRC over (header
+        // || path_block || compressed).
         std::fs::write(&p, build_v3_block("test/block.bin", &content)).unwrap();
         let out = read_block_cached(&p, "test/block.bin").expect("partial block should be Some");
         assert_eq!(out.len(), content.len());
@@ -4966,9 +5012,9 @@ mod disk_cache_crc_tests {
     }
 
     /// Partial block (< CACHE_BLOCK_SIZE) goes through
-    /// the same v2 lz4 path as full blocks — the
+    /// the same v3 lz4 path as full blocks — the
     /// writer compresses uniformly. On-disk size is
-    /// `BLOCK_OVERHEAD + lz4_compressed_payload`,
+    /// `BLOCK_OVERHEAD + 2 + path_len + lz4_compressed`,
     /// bounded above by the per-block max-overhead
     /// slack.
     #[test]
