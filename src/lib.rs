@@ -2471,11 +2471,27 @@ impl CoreFilesystem for MntrsFs {
 
     fn write(&self, _ino: u64, _fh: u64, _offset: u64, _data: &[u8]) -> std::io::Result<u32> {
         let fh_val = _fh;
-        let path = self
-            .handles
-            .get(&fh_val)
-            .map(|r| r.value().path().to_string())
-            .ok_or(std::io::ErrorKind::NotFound)?;
+        // #17 (small-write hot-path): single handles.get
+        // call extracts path AND cache_fd in one shard
+        // lock. Pre-fix did two separate gets (one for
+        // path, one for cache_fd) — each acquired a
+        // DashMap shard lock + cloned an Arc<Mutex<File>>.
+        // For 4 KiB writes (FUSE block size) this was a
+        // measurable fraction of the per-write cost vs
+        // the single-RTT rclone path.
+        let (path, cache_fd) = match self.handles.get(&fh_val) {
+            Some(entry) => match entry.value() {
+                crate::FileHandleState::Write { path, cache_fd, .. } => {
+                    (path.to_string(), cache_fd.clone())
+                }
+                // Non-Write handle: keep the old behavior
+                // of consulting only `path()` (the
+                // pre-fix code did this implicitly via
+                // the .path() helper).
+                other => (other.path().to_string(), None),
+            },
+            None => return Err(std::io::ErrorKind::NotFound.into()),
+        };
 
         if self.direct_io {
             let op = self.op.clone();
@@ -2485,18 +2501,6 @@ impl CoreFilesystem for MntrsFs {
                 .map_err(|_| std::io::Error::other("write failed"))?;
             return Ok(_data.len() as u32);
         }
-
-        // Write via single cache fd (like rclone RWFileHandle)
-        let cache_fd = self.handles.get(&fh_val).and_then(|e| {
-            if let crate::FileHandleState::Write {
-                cache_fd: Some(fd), ..
-            } = e.value()
-            {
-                Some(fd.clone())
-            } else {
-                None
-            }
-        });
 
         // #24 (async write): the actual disk I/O
         // (set_len + seek + write_all) is moved to a
@@ -2650,15 +2654,36 @@ impl CoreFilesystem for MntrsFs {
         // retain only locks the affected shard(s).
         self.mem_cache.invalidate_ino(_ino);
 
-        self.handles.insert(
-            fh_val,
-            crate::FileHandleState::Write {
+        // #17 (small-write hot-path): pre-fix did a
+        // full `handles.insert(fh, Write { path: ...,
+        // cache_fd, dirty: true, dirty_since: now })`
+        // every single write — that rewrote the
+        // FileHandleState variant from scratch (path
+        // clone, Arc clone, fresh struct alloc) even
+        // when only `dirty_since` actually changed.
+        // and_modify avoids the rewrite: we update
+        // just the two fields that matter. The
+        // or_insert_with branch is a safety net for
+        // the (extremely unlikely) case that another
+        // thread evicted the handle entry between the
+        // initial get above and here.
+        self.handles
+            .entry(fh_val)
+            .and_modify(|h| {
+                if let crate::FileHandleState::Write {
+                    dirty, dirty_since, ..
+                } = h
+                {
+                    *dirty = true;
+                    *dirty_since = Some(std::time::Instant::now());
+                }
+            })
+            .or_insert_with(|| crate::FileHandleState::Write {
                 path: path.clone(),
-                cache_fd,
+                cache_fd: cache_fd.clone(),
                 dirty: true,
                 dirty_since: Some(std::time::Instant::now()),
-            },
-        );
+            });
         Ok(written)
     }
     fn flush(&self, _ino: u64, _fh: u64) -> std::io::Result<()> {
