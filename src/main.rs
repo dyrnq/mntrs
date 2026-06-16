@@ -271,14 +271,6 @@ enum Commands {
     Unmount { target: String },
     /// List active mounts
     List,
-    /// Serve storage as read-only HTTP server
-    Serve {
-        storage: String,
-        #[arg(long, default_value = "8080")]
-        port: u16,
-        #[arg(long = "opt", value_name = "KEY=VAL", num_args = 0..)]
-        opt: Vec<String>,
-    },
     /// Install systemd service
     Install {
         #[command(subcommand)]
@@ -473,14 +465,6 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::List => {
             mntrs::cmd::list::list()?;
-        }
-        Commands::Serve { storage, port, opt } => {
-            let opts: HashMap<String, String> = opt
-                .iter()
-                .filter_map(|kv| kv.split_once("="))
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-            mntrs::cmd::serve::serve(&storage, &opts, port)?;
         }
         Commands::Install { action } => match action {
             Some(InstallAction::Systemd) | None => {
