@@ -91,7 +91,19 @@ pub fn read_mounts() -> Vec<MountInfo> {
 
 fn record_mount(storage: &str, mountpoint: &str, read_only: bool) {
     let path = mounts_db();
-    let dir = std::path::Path::new(&path).parent().unwrap();
+    // Bug 26: bare .unwrap() replaced with .expect() so a
+    // contract-breaking panic carries an actionable
+    // message. mounts_db() returns
+    // "{HOME}/.local/share/mntrs/mounts.txt" — the path
+    // always contains at least one '/' separator, so
+    // parent() can only return None if a future
+    // refactor changes mounts_db() to a single-segment
+    // relative path. The expect catches that case
+    // loudly instead of crashing with "called unwrap on
+    // None".
+    let dir = std::path::Path::new(&path)
+        .parent()
+        .expect("BUG: mounts_db() path must have a parent directory");
     let _ = std::fs::create_dir_all(dir);
     // Atomically rewrite: tmp + rename (POSIX atomic)
     let tmp = format!("{}.tmp.{}", path, std::process::id());

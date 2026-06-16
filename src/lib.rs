@@ -750,8 +750,21 @@ fn opendal_sync_op() -> opendal::Operator {
                 "opendal_sync_op accessed before initialization; \
                  this is a bug in the write path's prefix fetch"
             );
+            // Bug 27: SAFETY — Memory::default() +
+            // Operator::new(...).finish() is infallible
+            // for the in-memory backend (no FS, no
+            // network, no auth — just a HashMap behind
+            // an Arc). The `expect` message preserves
+            // the actionable signal if a future opendal
+            // upgrade changes that contract; bare
+            // .unwrap() would produce a context-free
+            // panic on the same condition. This fallback
+            // is itself only reached on a pre-init
+            // access (logged above) and is a defensive
+            // backstop — production code always
+            // initializes the cell first.
             opendal::Operator::new(opendal::services::Memory::default())
-                .unwrap()
+                .expect("BUG: opendal Memory backend Operator::new is infallible")
                 .finish()
         })
         .clone()
@@ -2343,6 +2356,34 @@ impl CoreFilesystem for MntrsFs {
                 self.inodes.entry(ino).and_modify(|v| {
                     v.size = s;
                 });
+                // Bug 25 (truncate-vs-async-write race):
+                // there's no lock between the inodes
+                // size update above and the cache file
+                // set_len below, vs an in-flight
+                // DiskWriteJob still draining the IO
+                // pool. Worst case: setattr says "truncate
+                // to 10", a queued write of 4 KiB at
+                // offset 0 lands AFTER set_len, the cache
+                // file is back to 4 KiB but inodes.size is
+                // 10. The write path's own
+                // `entry().and_modify(|v| if end > v.size
+                // { v.size = end })` would also bump
+                // inodes.size to 4096, so the two
+                // operations clobber each other and the
+                // result depends on scheduling.
+                //
+                // Why we accept this: POSIX leaves
+                // concurrent truncate+write across
+                // different fds undefined. FUSE serializes
+                // operations on the same fd (so a single
+                // process's `ftruncate` + `write` sequence
+                // is fine), and a write through a
+                // separate fd racing with truncate is
+                // already an application-level bug under
+                // any filesystem. Adding a per-ino lock
+                // here would slow the hot write path for
+                // every workload, to guard a case POSIX
+                // doesn't promise correctness for.
                 // Truncate the on-disk cache file too, so subsequent
                 // reads at offset ≥ s return EOF instead of leftover
                 // bytes from the previous content. Without this, a
