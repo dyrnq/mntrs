@@ -1004,6 +1004,38 @@ fn apply_operator_with_tls(
     let insecure = opts.contains_key("insecure");
     let has_tls = insecure || opts.contains_key("cacert") || opts.contains_key("cert");
     let op = if has_tls {
+        // Bug 15: assert we're being built from inside
+        // crate::rt() before we construct the
+        // reqwest::Client. The non-TLS branch below
+        // gets this guarantee for free from
+        // `crate::http_client::shared()`'s init assertion;
+        // the TLS branch builds a per-mount client
+        // directly, so it needs the same check.
+        //
+        // Why: reqwest::Client's hyper connector binds
+        // to whichever tokio runtime drives the FIRST
+        // .await on a request — not at .build() time.
+        // Today every apply_operator_with_tls caller
+        // runs inside rt_block_on (= crate::rt()), so
+        // the first .await is on the right runtime by
+        // construction. The assertion catches a future
+        // refactor that ever calls apply_operator_with_tls
+        // from a different (or no) tokio runtime, which
+        // would silently bind the hyper connector to
+        // the wrong reactor and produce hard-to-debug
+        // deadlocks in writeback. See src/http_client.rs
+        // for the full root cause writeup (the same
+        // bug pattern caused csi-e2e run 27407577059 to
+        // hang at pending=3).
+        let init_handle = tokio::runtime::Handle::current();
+        let expected = crate::rt().handle();
+        debug_assert!(
+            init_handle.id() == expected.id(),
+            "apply_operator_with_tls TLS branch must be reached from inside crate::rt(); \
+             got a different (or no) tokio runtime — reqwest::Client built here would bind \
+             its hyper connector to that other runtime on first .await and deadlock when \
+             writeback (which runs in crate::rt()) tries to drive it."
+        );
         let mut rb = reqwest::Client::builder();
         if insecure {
             rb = rb.danger_accept_invalid_certs(true);
