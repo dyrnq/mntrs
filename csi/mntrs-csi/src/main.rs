@@ -662,6 +662,13 @@ impl node_server::Node for NodeService {
 
 /// Check if `path` appears as an exact mount target in the given mounts content.
 /// Extracted from `is_mountpoint` so it can be unit-tested with synthetic data.
+///
+/// `#[cfg(test)]` since Bug 16: production `is_mountpoint` now delegates to
+/// `mntrs::cmd::mount::is_mount_point`, which canonicalizes the path before
+/// matching `/proc/mounts`. This pure helper stays gated to test builds so
+/// the regression suite below can still exercise the exact-match logic with
+/// synthetic mount-content strings (no `/proc/mounts` dependency).
+#[cfg(test)]
 fn is_mountpoint_in(path: &str, mounts_content: &str) -> bool {
     for line in mounts_content.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -672,15 +679,25 @@ fn is_mountpoint_in(path: &str, mounts_content: &str) -> bool {
     false
 }
 
-/// Check if a path is a mountpoint — exact match on the mount target field.
-/// Previous `contains(path)` was a substring match that could return true
-/// when a different volume's path was a prefix of the queried path.
+/// Check if a path is a mountpoint.
+///
+/// Bug 16: pre-fix this read `/proc/mounts` and compared `parts[1] == path`
+/// directly — no canonicalization. If the input path contained a symlink
+/// component (common in Kubernetes: kubelet may stage a PVC at
+/// `/var/lib/kubelet/...` while `/var/lib` itself is a symlink to
+/// `/data/k8s/var-lib` on some host setups), the raw-path comparison missed
+/// the mount entirely. Every `is_mountpoint(staging_path)` short-circuit in
+/// node_stage_volume / node_publish_volume / unstage / unpublish then took
+/// the wrong branch — re-mounting an already-mounted volume, or skipping
+/// the unmount of a mounted one, depending on the call site.
+///
+/// Fix: delegate to `mntrs::cmd::mount::is_mount_point`, which has always
+/// canonicalized the path first (resolving symlinks via
+/// `std::fs::canonicalize`) before matching `/proc/mounts`. Same source of
+/// truth as the mntrs CLI / mount_internal, so behaviour now agrees across
+/// CSI and the standalone binary.
 fn is_mountpoint(path: &str) -> bool {
-    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
-        is_mountpoint_in(path, &mounts)
-    } else {
-        false
-    }
+    mntrs::cmd::mount::is_mount_point(path)
 }
 
 // Bug 14 follow-up: removed `fn wait_for_mount` —
