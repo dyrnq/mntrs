@@ -386,8 +386,25 @@ pub fn unmount_internal(mountpoint: &str) -> anyhow::Result<()> {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
                 let cache_dir = cache_dir_for_mount(mountpoint);
-                if let Err(e) = std::fs::remove_dir_all(&cache_dir) {
-                    tracing::warn!(cache_dir, error=%e, "cache cleanup failed");
+                // Bug 30: ENOENT here is the common case
+                // when the mount used a non-default
+                // cache-dir (notably CSI, which sets
+                // cache-dir to {MNTRS_CACHE_DIR}/{volume_id}
+                // and cleans that path itself in
+                // node_unstage_volume). The cache_dir
+                // helper derives a /tmp/mntrs-csi-cache/
+                // <slug> path from the mountpoint that
+                // CSI never used; the remove_dir_all here
+                // then fails with NotFound on every CSI
+                // unmount. Suppress that case so the warn
+                // log only fires for real cleanup
+                // problems (permissions, EIO).
+                match std::fs::remove_dir_all(&cache_dir) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        tracing::warn!(cache_dir, error=%e, "cache cleanup failed");
+                    }
                 }
                 return Ok(());
             }
@@ -425,8 +442,15 @@ pub fn unmount_internal(mountpoint: &str) -> anyhow::Result<()> {
     }
     // Phase 5: clean up isolated cache directory
     let cache_dir = cache_dir_for_mount(mountpoint);
-    if let Err(e) = std::fs::remove_dir_all(&cache_dir) {
-        tracing::warn!(cache_dir, error=%e, "cache cleanup failed");
+    // Bug 30 (mirror of Phase 2 above): silence ENOENT
+    // when CSI/custom cache-dir overrides put the
+    // actual files elsewhere.
+    match std::fs::remove_dir_all(&cache_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(cache_dir, error=%e, "cache cleanup failed");
+        }
     }
     Ok(())
 }

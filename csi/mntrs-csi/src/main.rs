@@ -438,6 +438,7 @@ impl node_server::Node for NodeService {
     ) -> Result<Response<NodeUnstageVolumeResponse>, Status> {
         let req = request.into_inner();
         let staging_path = req.staging_target_path;
+        let volume_id = req.volume_id;
 
         if staging_path.is_empty() {
             return Err(Status::invalid_argument(
@@ -452,6 +453,36 @@ impl node_server::Node for NodeService {
         }
 
         let _ = std::fs::remove_dir(&staging_path);
+
+        // Bug 30: clean the actual cache dir that
+        // node_stage_volume created at
+        // `{MNTRS_CACHE_DIR}/{volume_id}`. Pre-fix CSI
+        // relied on mntrs's unmount_internal auto-
+        // cleanup, but that uses cache_dir_for_mount()
+        // (which derives a /tmp/mntrs-csi-cache/<slug>
+        // path from the mountpoint) — a different path
+        // than the one stage actually used. Result: the
+        // mntrs cleanup tried to remove a non-existent
+        // dir (warn-logged + no-op) while the real cache
+        // files leaked under MNTRS_CACHE_DIR.
+        //
+        // CSI knows both MNTRS_CACHE_DIR and the
+        // volume_id, so it can reconstruct the exact
+        // path stage used and clean it directly.
+        // Failures are debug-logged: missing dir is
+        // normal (mount may have never been staged
+        // here, or already cleaned by a prior crash).
+        if let Some(cache_base) = std::env::var("MNTRS_CACHE_DIR").ok() {
+            let vol_cache = format!("{}/{}", cache_base, volume_id);
+            match std::fs::remove_dir_all(&vol_cache) {
+                Ok(()) => tracing::debug!(cache=%vol_cache, "csi unstage cache cleanup"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(cache=%vol_cache, error=%e, "csi unstage cache cleanup failed");
+                }
+            }
+        }
+
         Ok(Response::new(NodeUnstageVolumeResponse::default()))
     }
 
