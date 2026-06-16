@@ -101,11 +101,57 @@ fn io_err_to_status(e: std::io::Error) -> winfsp::FspError {
 }
 
 /// A per-handle context for WinFSP.
-/// WinFSP 的 FileContextMode::Minimal 下 handle 就是 ino。
+///
+/// Bug 11: pre-fix this only carried `ino` and was
+/// used as BOTH ino AND fh in every read/write/flush/
+/// close call. That collapsed all concurrent opens of
+/// the same file onto one synthetic fh, so each open's
+/// state (cache_fd, prefetcher, dirty flags in
+/// FileHandleState) clobbered the others'. Adding a
+/// distinct `fh` minted by `CoreFilesystem::open`
+/// restores per-handle isolation and is what the Linux
+/// (fuser) adapter has always done.
 #[derive(Clone)]
 pub struct WinFspHandle {
     pub ino: u64,
+    /// File handle returned by `CoreFilesystem::open`.
+    /// Equal to `ino` for directories (we don't call
+    /// `open`/`release` on dirs in this adapter — WinFSP
+    /// has no opendir/releasedir distinct from open).
+    pub fh: u64,
     pub is_dir: bool,
+}
+
+/// Translate WinFSP's GRANTED_ACCESS bitmask to the
+/// POSIX-style flag word that `CoreFilesystem::open`
+/// expects (low 2 bits: 0=O_RDONLY, 1=O_WRONLY, 2=O_RDWR).
+///
+/// WinFSP grants access bits per the Windows ACL
+/// model. Any write-style right (FILE_WRITE_DATA,
+/// FILE_APPEND_DATA, GENERIC_WRITE, GENERIC_ALL,
+/// MAXIMUM_ALLOWED) maps to O_RDWR rather than
+/// O_WRONLY — the cache_fd path opens the local cache
+/// file read+write (for prefix-fetch on offset writes),
+/// and a write-only POSIX flag would forbid that.
+///
+/// Read-only access maps to O_RDONLY; the open() handler
+/// then takes the FileHandleState::Read branch (no
+/// cache_fd) and the read path uses the on-disk block
+/// cache + remote fetch.
+fn winfsp_access_to_open_flags(granted_access: winfsp_sys::FILE_ACCESS_RIGHTS) -> u32 {
+    // Windows access mask constants. Match
+    // `windows::Win32::Storage::FileSystem` and
+    // winfsp-sys conventions.
+    const FILE_WRITE_DATA: u32 = 0x0000_0002;
+    const FILE_APPEND_DATA: u32 = 0x0000_0004;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+    let rights = granted_access as u32;
+    let writes_granted = (rights
+        & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE | GENERIC_ALL | MAXIMUM_ALLOWED))
+        != 0;
+    if writes_granted { 2 } else { 0 } // O_RDWR : O_RDONLY
 }
 
 /// WinFSP adapter that wraps a `CoreFilesystem`.
@@ -151,12 +197,38 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         let attr = self.inner.lookup(1, &path).map_err(io_err_to_status)?;
         let is_dir = attr.kind == CoreFileType::Directory;
         let ino = attr.ino;
+        // Bug 11: actually call CoreFilesystem::open so
+        // the per-handle FileHandleState (cache_fd for
+        // writes, prefetcher for reads) gets populated.
+        // Pre-fix the WinFspHandle was just { ino,
+        // is_dir } with no fh and no inner.open() — so
+        // every Windows write hit a missing handle and
+        // failed at handles.get(fh). Directories don't
+        // need a separate fh (this adapter has no
+        // distinct opendir/closedir path), so we reuse
+        // ino as the dir "fh" — only files take the
+        // open() round-trip.
+        let fh = if is_dir {
+            ino
+        } else {
+            let flags = winfsp_access_to_open_flags(_granted_access);
+            self.inner.open(ino, flags).map_err(io_err_to_status)?
+        };
         // WinFSP open() sets FileInfo via OpenFileInfo; kernel auto-fills from response
-        Ok(WinFspHandle { ino, is_dir })
+        Ok(WinFspHandle { ino, fh, is_dir })
     }
 
     fn close(&self, _context: Self::FileContext) {
-        let _ = self.inner.release(_context.ino, _context.ino);
+        // Bug 11: use the real fh, not ino. Pre-fix
+        // close() called release(ino, ino) which would
+        // try to release the ino as if it were a fh
+        // and skip the real handle. With the real fh
+        // here, FileHandleState entries are actually
+        // removed and cache_fds (Arc<Mutex<File>>)
+        // get their last strong ref dropped.
+        if !_context.is_dir {
+            let _ = self.inner.release(_context.ino, _context.fh);
+        }
     }
 
     fn get_file_info(&self, context: &Self::FileContext, file_info: &mut FileInfo) -> Result<()> {
@@ -169,7 +241,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         let size = buffer.len() as u32;
         let data = self
             .inner
-            .read(context.ino, context.ino, offset, size)
+            .read(context.ino, context.fh, offset, size)
             .map_err(io_err_to_status)?;
         let n = data.len().min(buffer.len());
         buffer[..n].copy_from_slice(&data[..n]);
@@ -186,7 +258,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         _file_info: &mut FileInfo,
     ) -> Result<u32> {
         self.inner
-            .write(context.ino, context.ino, offset, buffer)
+            .write(context.ino, context.fh, offset, buffer)
             .map_err(io_err_to_status)
     }
 
@@ -258,8 +330,10 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
 
     fn flush(&self, context: Option<&Self::FileContext>, _file_info: &mut FileInfo) -> Result<()> {
         if let Some(ctx) = context {
+            // Bug 11: use the real fh, not ino. Same
+            // rationale as `close`/`read`/`write`.
             self.inner
-                .flush(ctx.ino, ctx.ino)
+                .flush(ctx.ino, ctx.fh)
                 .map_err(io_err_to_status)?;
         }
         Ok(())

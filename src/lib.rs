@@ -2210,12 +2210,19 @@ impl CoreFilesystem for MntrsFs {
         let path = self.resolve(ino).map(|e| e.path).unwrap_or_default();
         let fh = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // Check if flags contain write access (O_WRONLY=1, O_RDWR=2)
-        let is_write = if cfg!(unix) {
-            (_flags & 0x3) != 0
-        } else {
-            false
-        };
+        // Bug 11: the pre-fix `is_write` check was gated
+        // on `cfg!(unix)`, which silently coerced every
+        // Windows open() to a Read handle — every write
+        // afterwards failed because `handles.get(fh)`
+        // saw `FileHandleState::Read` and `write()`'s
+        // cache_fd extraction returned None. The flag
+        // mask (O_RDONLY=0, O_WRONLY=1, O_RDWR=2) is a
+        // platform-independent POSIX convention; the
+        // platform adapter is responsible for passing
+        // it in this format (Windows: the winfsp
+        // adapter maps GRANTED_ACCESS bits to POSIX
+        // flags before calling open()).
+        let is_write = (_flags & 0x3) != 0;
         if is_write {
             let cpath = crate::cache_path(&self.cache_dir, &path);
             if let Some(parent) = cpath.parent() {
