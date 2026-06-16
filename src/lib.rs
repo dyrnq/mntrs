@@ -167,6 +167,26 @@ pub struct MntrsFs {
     /// — `CoreFilesystem::lookup` / `getattr` now consider the
     /// local cache file's size, not just the backend).
     pub inodes: dashmap::DashMap<u64, (String, FileType, u64, Option<std::time::SystemTime>)>,
+    /// Reverse map of `path → ino` for the inodes table.
+    ///
+    /// Why: `find_ino_by_path` is on the hot lookup path
+    /// (every FUSE `lookup(parent, name)` reaches it),
+    /// and the pre-fix implementation linear-scanned all
+    /// inodes entries — O(N) where N grows with every
+    /// readdir over a large directory (e.g. 500-file
+    /// `many/` dir → N=500+). The bench's `stat 1K.bin`
+    /// after listing such a dir was dominated by this
+    /// scan, ~3-4 ms per stat for 500 entries.
+    ///
+    /// The reverse map turns the lookup into O(1) (one
+    /// DashMap get). Maintenance: every `alloc_ino*`
+    /// inserts, every `inodes.remove` removes, and
+    /// `rename` removes old + inserts new. The defensive
+    /// fallback in `find_ino_by_path` rebuilds an entry
+    /// from a linear scan if it's missing — so a
+    /// forgotten maintenance site self-heals rather than
+    /// losing the ino entirely.
+    path_to_ino: dashmap::DashMap<String, u64>,
     dir_cache: dashmap::DashMap<
         String,
         (
@@ -1097,6 +1117,16 @@ impl MntrsFs {
             .entry(ino)
             .and_modify(|v| v.2 = size)
             .or_insert((path.to_string(), kind, size, None));
+        // Maintain the path→ino reverse map (stat phase 2
+        // — `find_ino_by_path` is on the hot stat path).
+        // Last writer wins on collision: a second
+        // alloc_ino for the same path overwrites the
+        // older ino entry, matching the inodes map's
+        // and_modify behavior above. The leftover inodes
+        // entry for the older ino is eventually swept by
+        // FUSE `forget` or never read (the FUSE kernel
+        // uses our latest reply).
+        self.path_to_ino.insert(path.to_string(), ino);
         ino
     }
 
@@ -1119,29 +1149,61 @@ impl MntrsFs {
             .entry(ino)
             .and_modify(|v| v.2 = size)
             .or_insert((path.to_string(), kind, size, Some(mtime)));
+        // Same reverse-map maintenance as `alloc_ino`.
+        self.path_to_ino.insert(path.to_string(), ino);
         ino
     }
 
-    /// Look up the ino currently registered for `path` (linear scan — the
-    /// inodes map is small, typically O(open-files) plus cached lookups).
+    /// Look up the ino currently registered for `path`.
     ///
-    /// Needed because `inodes` is keyed by the `NEXT_INO` counter that
-    /// `alloc_ino` mints, *not* by `path_hash`. Operations that receive a
-    /// full path (mkdir/rmdir/unlink) and need to remove the ino entry
-    /// must look up the counter by path before calling `inodes.remove`.
-    /// Using `path_hash(&path)` here — as the rename pre-fix code did —
-    /// is a silent no-op: the FUSE kernel then keeps using the stale
-    /// ino for subsequent operations on the same path, and a recreate
-    /// at the same path collides with the lingering entry.
+    /// Needed because `inodes` is keyed by the `NEXT_INO` counter
+    /// that `alloc_ino` mints, *not* by `path_hash`. Operations
+    /// that receive a full path (mkdir/rmdir/unlink) and need to
+    /// remove the ino entry must look up the counter by path
+    /// before calling `inodes.remove`. Using `path_hash(&path)`
+    /// here — as the rename pre-fix code did — is a silent no-op:
+    /// the FUSE kernel then keeps using the stale ino for
+    /// subsequent operations on the same path, and a recreate at
+    /// the same path collides with the lingering entry.
+    ///
+    /// Stat phase 2 (#16): backed by the `path_to_ino` reverse
+    /// map. Pre-fix this function linear-scanned `inodes` — O(N)
+    /// per call — and was the dominant cost of `stat` after a
+    /// `readdir` populated `inodes` with 500+ entries (bench's
+    /// `many/` dir). The hot lookup path now does a single
+    /// DashMap get; on miss/stale-entry it falls back to the
+    /// scan and repairs the reverse map (so a maintenance site
+    /// we forgot to update doesn't permanently lose the ino —
+    /// it just pays the scan once before self-healing).
     ///
     /// `pub(crate)` so integration tests in `tests/` can verify the
     /// rename/rmdir/unlink leak fix.
     pub(crate) fn find_ino_by_path(&self, path: &str) -> Option<u64> {
+        // Fast path: reverse map hit. Confirm the
+        // inodes entry still points at this path —
+        // a stale reverse entry would otherwise hand
+        // back an ino for a different (since-renamed
+        // or since-removed) file.
+        if let Some(ino) = self.path_to_ino.get(path).map(|r| *r.value())
+            && let Some(entry) = self.inodes.get(&ino)
+            && entry.value().0 == path
+        {
+            return Some(ino);
+        }
+        // Fallback: scan + repair. Hit means the reverse
+        // map was stale or never populated for this path
+        // (e.g. a code path that bypassed `alloc_ino*`).
+        // Repair so the next call hits the fast path.
         for entry in self.inodes.iter() {
             if entry.value().0 == path {
-                return Some(*entry.key());
+                let ino = *entry.key();
+                self.path_to_ino.insert(path.to_string(), ino);
+                return Some(ino);
             }
         }
+        // Truly absent — also clear any stale reverse
+        // entry so the next caller doesn't re-scan.
+        self.path_to_ino.remove(path);
         None
     }
 
@@ -2883,6 +2945,12 @@ impl CoreFilesystem for MntrsFs {
         if let Some(ino) = self.find_ino_by_path(&full_path) {
             self.inodes.remove(&ino);
         }
+        // Stat phase 2: drop the reverse map entry too,
+        // so a recreate at the same path doesn't see a
+        // stale ino. find_ino_by_path above already
+        // self-heals on miss, but the explicit remove
+        // avoids a one-shot scan after unlink.
+        self.path_to_ino.remove(&full_path);
         self.attr_cache.remove(&full_path);
         self.cache_remove_entry(&parent_path, name);
         Ok(())
@@ -2912,6 +2980,7 @@ impl CoreFilesystem for MntrsFs {
         if let Some(ino) = self.find_ino_by_path(&full_path) {
             self.inodes.remove(&ino);
         }
+        self.path_to_ino.remove(&full_path);
         self.attr_cache.remove(&full_path);
         self.cache_remove_entry(&parent_path, name);
         self.invalidate_dir_cache(&full_path);
@@ -3113,16 +3182,24 @@ impl CoreFilesystem for MntrsFs {
         // implementation's mistake of inserting at path_hash
         // (which is a different number from the counter) and
         // leaving the FUSE kernel with a stale ino->path map.
-        let src_ino = self
-            .inodes
-            .iter()
-            .find(|e| e.value().0 == src)
-            .map(|e| *e.key());
+        // Stat phase 2: switch from the linear iter-find
+        // to the reverse-map fast path. `find_ino_by_path`
+        // returns the canonical NEXT_INO-minted ino so
+        // the in-place inodes update below is safe.
+        let src_ino = self.find_ino_by_path(&src);
         if let Some(src_ino) = src_ino {
             // In-place path update. Size/mtime/ino are unchanged.
             self.inodes.entry(src_ino).and_modify(|v| {
                 v.0 = dst.clone();
             });
+            // Reverse map: drop the old path entry,
+            // insert the new one pointing at the same
+            // ino. Both ops are independent DashMap
+            // calls — between them, a concurrent
+            // find_ino_by_path("dst") might briefly
+            // miss; the fallback scan there self-heals.
+            self.path_to_ino.remove(&src);
+            self.path_to_ino.insert(dst.to_string(), src_ino);
         }
 
         if let Some(entry) = self.attr_cache.get(&src).map(|e| *e.value()) {
@@ -3240,6 +3317,16 @@ impl CoreFilesystem for MntrsFs {
         }
         if let Some((path, _, _, _)) = self.resolve(ino) {
             self.inodes.remove(&ino);
+            // Stat phase 2: drop the reverse map entry,
+            // but ONLY if it still points to the ino
+            // we're forgetting. A concurrent
+            // alloc_ino*(path) after a recreate at the
+            // same path may have already overwritten
+            // the entry with a fresh ino — in that
+            // case the entry is still live and we must
+            // not remove it.
+            self.path_to_ino
+                .remove_if(&path, |_, current_ino| *current_ino == ino);
             self.attr_cache.remove(&path);
             // Clean up any open file handles for this inode
             self.handles.retain(|k, v| k != &ino && v.path() != path);
@@ -3400,6 +3487,7 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
     MntrsFs {
         op: Arc::new(op),
         inodes: Default::default(),
+        path_to_ino: Default::default(),
         dir_cache: Default::default(),
         cache_dir,
         handles: Default::default(),

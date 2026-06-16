@@ -546,6 +546,7 @@ pub fn mount(
     let fs = MntrsFs {
         op: Arc::new(op),
         inodes: dashmap::DashMap::new(),
+        path_to_ino: dashmap::DashMap::new(),
         dir_cache: dashmap::DashMap::new(),
         cache_dir: cache_dir_path,
         handles: dashmap::DashMap::new(),
