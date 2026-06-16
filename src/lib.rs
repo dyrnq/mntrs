@@ -801,24 +801,47 @@ const BLOCK_MAGIC: &[u8; 4] = b"MNCR";
 /// Version history:
 ///   * `1` — uncompressed: `MNCR || version=1 || content
 ///     || crc32c(magic||version||content)`.
-///   * `2` — lz4-compressed (current): `MNCR ||
-///     version=2 || lz4_flex::compress_prepend_size(content)
-///     || crc32c(magic||version||compressed_payload)`.
-///     The lz4 payload starts with a 4-byte little-endian
-///     uncompressed-size prefix (lz4_flex's
-///     `compress_prepend_size` format), so the read path
-///     can decompress without knowing the original length
-///     out-of-band. CRC covers the on-disk compressed
-///     bytes so corruption is caught before decompression.
-const BLOCK_FORMAT_VERSION: u32 = 2;
+///   * `2` — lz4-compressed: `MNCR || version=2 ||
+///     lz4_flex::compress_prepend_size(content) ||
+///     crc32c(magic||version||compressed_payload)`.
+///   * `3` (current) — lz4 + path verification:
+///     `MNCR || version=3 || path_len(2 LE u16) ||
+///     path(path_len bytes UTF-8) ||
+///     lz4_flex::compress_prepend_size(content) ||
+///     crc32c(magic||version||path_len||path||payload)`.
+///     The embedded path lets the reader detect a
+///     `path_hash` collision (DESIGN_VULNS High #4):
+///     the cache file at `{path_hash(P)}_{idx}.block`
+///     is opened, parsed, and the embedded path is
+///     compared against the expected path P. Mismatch
+///     → unlink + return None → remote re-fetch +
+///     re-write with the correct path embedded. Without
+///     this, two different paths whose 64-bit FNV-1a
+///     hashes collide (probability ~5e-8 at 1M entries
+///     with the per-process salt, but climbing to ~50%
+///     near 2^32) would silently swap content.
+const BLOCK_FORMAT_VERSION: u32 = 3;
 
 /// First-generation new-format version (uncompressed).
 /// Kept as a read-side constant so the read path can
 /// transparently consume cache files written by older
 /// builds without forcing a refetch. Old files get
-/// rewritten with version 2 on the next write through
-/// `write_block_cached` / `do_block_cache_write`.
+/// rewritten with the current `BLOCK_FORMAT_VERSION`
+/// on the next write through `write_block_cached` /
+/// `do_block_cache_write`.
 const LEGACY_BLOCK_FORMAT_VERSION_V1: u32 = 1;
+
+/// Second-generation format (lz4-compressed, no path
+/// verification). Same back-compat policy as V1: read
+/// only, get rewritten as v3 on next write to the same
+/// block. Note that v2 reads return content WITHOUT
+/// the v3 collision check, so a v2 file could in
+/// principle deliver wrong content if two paths hashed
+/// to the same name — but the per-process random salt
+/// in `path_hash` makes that vanishingly unlikely for
+/// realistic cache sizes, and a v2-to-v3 rewrite
+/// closes the window for any subsequent read.
+const LEGACY_BLOCK_FORMAT_VERSION_V2: u32 = 2;
 
 /// Size of the magic + version header at the start of a
 /// new-format block file. = 4 (magic) + 4 (version).
@@ -849,6 +872,20 @@ const BLOCK_OVERHEAD: usize = BLOCK_HEADER_SIZE + BLOCK_CRC_TRAILER;
 /// expansions on incompressible (already-compressed)
 /// data like JPEGs or zstd files.
 const MAX_PAYLOAD_OVERHEAD: usize = 65_536;
+
+/// Max embedded-path length the v3 block format
+/// supports. Stored as a 2-byte LE u16 (so the
+/// hard limit is 65535), capped at MAX_PATH_LEN
+/// for sanity. PATH_MAX on Linux is 4096; we round
+/// up to the next power of 2 to leave room for
+/// backends that allow longer keys (S3 keys can be
+/// up to 1024 bytes, GCS up to 1024, but some
+/// HDFS/abstract paths can be longer with namespace
+/// prefixes). The check is a defensive cap, not a
+/// supported configuration — writes of paths above
+/// this limit fall through to direct remote on the
+/// next read.
+const MAX_PATH_LEN: usize = 8192;
 
 /// Hard cap on entries `list_op` will accumulate for a
 /// single readdir, to bound memory on pathological backend
@@ -895,17 +932,18 @@ const MAX_LIST_ENTRIES: usize = 1_000_000;
 /// Returns `Some(Bytes)` on a clean read and `None` on a
 /// corrupt or unrecognized file (after unlinking it). The
 /// caller should treat `None` as a cache miss.
-fn read_block_cached(cpath: &Path) -> Option<bytes::Bytes> {
+fn read_block_cached(cpath: &Path, expected_path: &str) -> Option<bytes::Bytes> {
     let metadata = std::fs::metadata(cpath).ok()?;
     let size = metadata.len() as usize;
-    if size > CACHE_BLOCK_SIZE as usize + BLOCK_OVERHEAD + MAX_PAYLOAD_OVERHEAD {
+    if size > CACHE_BLOCK_SIZE as usize + BLOCK_OVERHEAD + MAX_PAYLOAD_OVERHEAD + MAX_PATH_LEN + 2 {
         // Writer overran or someone dropped garbage in
         // the cache dir. Treat as corrupt. The added
         // MAX_PAYLOAD_OVERHEAD slack accommodates the v2
         // lz4-compressed format's worst-case expansion
         // when content is uncompressible (already-zipped
         // media, encrypted data) — lz4 may emit slightly
-        // more than input.
+        // more than input. MAX_PATH_LEN + 2 additionally
+        // covers the v3 embedded-path field.
         let _ = std::fs::remove_file(cpath);
         tracing::warn!(
             ?cpath,
@@ -919,7 +957,7 @@ fn read_block_cached(cpath: &Path) -> Option<bytes::Bytes> {
     // magic at offset 0. Anything else is legacy.
     let is_new_format = data.len() >= BLOCK_HEADER_SIZE && &data[0..4] == BLOCK_MAGIC;
     if is_new_format {
-        return read_new_format(cpath, &data);
+        return read_new_format(cpath, &data, expected_path);
     }
     // Legacy parsers — the three pre-CRC variants:
     if size == CACHE_BLOCK_SIZE as usize + BLOCK_CRC_TRAILER {
@@ -999,7 +1037,7 @@ fn read_block_cached(cpath: &Path) -> Option<bytes::Bytes> {
 /// "version field at offset 4": the magic and version
 /// are themselves CRC-protected, so they can't be
 /// silently tampered with.
-fn read_new_format(cpath: &Path, data: &[u8]) -> Option<bytes::Bytes> {
+fn read_new_format(cpath: &Path, data: &[u8], expected_path: &str) -> Option<bytes::Bytes> {
     // Strip the 8-byte header.
     let after_header = &data[BLOCK_HEADER_SIZE..];
     // The last 4 bytes are the CRC; everything before is
@@ -1080,37 +1118,64 @@ fn read_new_format(cpath: &Path, data: &[u8]) -> Option<bytes::Bytes> {
     match version {
         LEGACY_BLOCK_FORMAT_VERSION_V1 => {
             // Uncompressed: content is the payload as-is.
+            // No path verification (v1 predates the
+            // embedded-path field); collision risk
+            // remains for v1 files until they're rewritten
+            // as v3 on next write to the same block.
             Some(bytes::Bytes::copy_from_slice(content))
         }
+        LEGACY_BLOCK_FORMAT_VERSION_V2 => {
+            // v2 lz4 (no embedded path). Same
+            // collision-risk caveat as v1.
+            decode_lz4_payload(cpath, content)
+        }
         BLOCK_FORMAT_VERSION => {
-            // lz4-compressed with leading 4-byte
-            // uncompressed-size prefix. The cap check
-            // (decompressed > CACHE_BLOCK_SIZE) protects
-            // against a malicious / corrupt size prefix
-            // that would otherwise allocate a huge
-            // buffer; we know our writer never produces
-            // anything larger than CACHE_BLOCK_SIZE.
-            match lz4_flex::decompress_size_prepended(content) {
-                Ok(decompressed) if decompressed.len() <= CACHE_BLOCK_SIZE as usize => {
-                    Some(bytes::Bytes::from(decompressed))
+            // v3: `path_len(2 LE u16) || path(path_len) ||
+            // lz4_payload`. Extract the path, verify it
+            // matches what the caller expected (rejects
+            // path_hash collisions per DESIGN_VULNS High
+            // #4), then decompress the rest.
+            if content.len() < 2 {
+                let _ = std::fs::remove_file(cpath);
+                tracing::warn!(?cpath, "v3 block too short for path_len field; unlinking");
+                return None;
+            }
+            let path_len = u16::from_le_bytes([content[0], content[1]]) as usize;
+            if path_len > MAX_PATH_LEN || 2 + path_len > content.len() {
+                let _ = std::fs::remove_file(cpath);
+                tracing::warn!(
+                    ?cpath,
+                    path_len,
+                    max = MAX_PATH_LEN,
+                    "v3 block path_len out of bounds; unlinking"
+                );
+                return None;
+            }
+            let path_bytes = &content[2..2 + path_len];
+            match std::str::from_utf8(path_bytes) {
+                Ok(p) if p == expected_path => {
+                    // Path matches — safe to decompress.
+                    decode_lz4_payload(cpath, &content[2 + path_len..])
                 }
-                Ok(decompressed) => {
+                Ok(p) => {
+                    // Path mismatch — `path_hash` collision.
+                    // Unlink so the next write owns the
+                    // file; return None so the caller
+                    // re-fetches from remote and writes a
+                    // v3 with the right path embedded.
+                    // The DESIGN_VULNS High #4 fix.
                     let _ = std::fs::remove_file(cpath);
                     tracing::warn!(
                         ?cpath,
-                        decompressed_size = decompressed.len(),
-                        cap = CACHE_BLOCK_SIZE,
-                        "v2 lz4 block decompressed to more than CACHE_BLOCK_SIZE; unlinking"
+                        expected = expected_path,
+                        stored = p,
+                        "v3 block path_hash collision detected; unlinking and refetching"
                     );
                     None
                 }
-                Err(e) => {
+                Err(_) => {
                     let _ = std::fs::remove_file(cpath);
-                    tracing::warn!(
-                        ?cpath,
-                        error = %e,
-                        "v2 lz4 block decompress failed; unlinking and refetching"
-                    );
+                    tracing::warn!(?cpath, "v3 block path bytes not valid UTF-8; unlinking");
                     None
                 }
             }
@@ -1122,6 +1187,37 @@ fn read_new_format(cpath: &Path, data: &[u8]) -> Option<bytes::Bytes> {
                 version,
                 supported = BLOCK_FORMAT_VERSION,
                 "new-format block has unsupported version; unlinking and refetching"
+            );
+            None
+        }
+    }
+}
+
+/// Decompress a v2/v3 lz4 payload (after any leading
+/// header bytes have been stripped). Shared by both
+/// formats so the bounds + error handling stay
+/// consistent.
+fn decode_lz4_payload(cpath: &Path, content: &[u8]) -> Option<bytes::Bytes> {
+    match lz4_flex::decompress_size_prepended(content) {
+        Ok(decompressed) if decompressed.len() <= CACHE_BLOCK_SIZE as usize => {
+            Some(bytes::Bytes::from(decompressed))
+        }
+        Ok(decompressed) => {
+            let _ = std::fs::remove_file(cpath);
+            tracing::warn!(
+                ?cpath,
+                decompressed_size = decompressed.len(),
+                cap = CACHE_BLOCK_SIZE,
+                "lz4 block decompressed to more than CACHE_BLOCK_SIZE; unlinking"
+            );
+            None
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(cpath);
+            tracing::warn!(
+                ?cpath,
+                error = %e,
+                "lz4 block decompress failed; unlinking and refetching"
             );
             None
         }
@@ -1395,35 +1491,57 @@ impl MntrsFs {
         if let Some(parent) = blk_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        // New on-disk format (v2, #4): `MNCR ||
-        // version=2 || lz4_compress_prepend_size(content)
-        // || crc32c(MNCR || version || compressed)`.
-        // CRC covers the on-disk compressed payload, so
-        // corruption (torn write, bit flip) is caught
-        // before lz4 decompression — saving a noisy
-        // lz4 error on a clearly-broken file.
+        // On-disk format v3 (DESIGN_VULNS High #4):
+        //   `MNCR || version=3 || path_len(LE u16) ||
+        //    path(UTF-8) || lz4_payload || CRC32C(over all
+        //    of above)`.
         //
-        // lz4_flex::compress_prepend_size prepends a
-        // 4-byte LE u32 of the uncompressed size; the
-        // read side uses decompress_size_prepended.
-        // Saves us from carrying an out-of-band length
-        // (the block's size on the file system isn't
-        // the uncompressed size anymore).
+        // The embedded path is what makes path_hash
+        // collisions self-correcting: when read_block_cached
+        // opens this file at a colliding hash slot, it
+        // extracts the stored path and compares against the
+        // caller's expected path; a mismatch unlinks the
+        // file and forces a remote re-fetch (and the next
+        // write of the colliding twin then owns the slot).
+        // Without v3, two different paths whose 64-bit
+        // FNV-1a hashes coincide would silently swap
+        // content.
         //
-        // Compression is unconditional, even on
-        // uncompressible content (already-zipped
-        // media): worst-case lz4 expansion is bounded
-        // (input + ~0.4 % + 16 B) and the
-        // MAX_PAYLOAD_OVERHEAD sanity slack at the read
-        // side accommodates it. The CPU cost (5-10 %
-        // on hot paths) is amortized by the disk-I/O
-        // savings on compressible data.
+        // v3 also keeps the v2 features intact: the
+        // lz4_flex::compress_prepend_size payload
+        // (4-byte LE u32 uncompressed size + lz4 bytes)
+        // and the CRC32C trailer over (header || path_len
+        // || path || payload) so a torn write is caught
+        // before the lz4 decoder gets confused.
+        //
+        // Paths above MAX_PATH_LEN bypass the cache (we
+        // refuse to write a block whose embedded path
+        // wouldn't fit). They're rare (PATH_MAX = 4096
+        // on Linux; MAX_PATH_LEN = 8192 leaves headroom)
+        // and gracefully degrade to direct-from-remote.
+        let path_bytes = path.as_bytes();
+        if path_bytes.len() > MAX_PATH_LEN {
+            tracing::debug!(
+                path,
+                len = path_bytes.len(),
+                max = MAX_PATH_LEN,
+                "block cache write: path too long for v3 embed; skipping cache"
+            );
+            return false;
+        }
         let compressed = lz4_flex::compress_prepend_size(slice);
-        let written_size: u64 = (compressed.len() + BLOCK_OVERHEAD) as u64;
+        let payload_with_path_header_len = 2 + path_bytes.len() + compressed.len();
+        let written_size: u64 = (payload_with_path_header_len + BLOCK_OVERHEAD) as u64;
         // Build the header bytes once.
         let mut header = [0u8; BLOCK_HEADER_SIZE];
         header[0..4].copy_from_slice(BLOCK_MAGIC);
         header[4..8].copy_from_slice(&BLOCK_FORMAT_VERSION.to_le_bytes());
+        // Build the v3 path-prefix block (path_len ||
+        // path) so we can checksum + write it as a
+        // contiguous slice.
+        let mut path_block = Vec::with_capacity(2 + path_bytes.len());
+        path_block.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+        path_block.extend_from_slice(path_bytes);
         let wrote = if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -1431,27 +1549,39 @@ impl MntrsFs {
             .open(&blk_path)
         {
             use std::io::Write;
-            // Write header, then compressed payload,
-            // then CRC over (header || compressed) — the
+            // Write header, then path_block, then
+            // compressed payload, then CRC over
+            // (header || path_block || compressed) — the
             // whole file minus the trailing 4 CRC bytes.
             let mut ok = f.write_all(&header).is_ok();
+            if ok {
+                ok = f.write_all(&path_block).is_ok();
+            }
             if ok {
                 ok = f.write_all(&compressed).is_ok();
             }
             if ok {
+                // CRC covers magic+version+path_block+
+                // compressed. crc32c_checksum_concat takes
+                // two slices; concat the two trailing
+                // segments into one allocation. The
+                // shared `crc32c_checksum` (single-slice)
+                // would need a third allocation —
+                // keeping it as concat-of-(header, rest)
+                // matches the v2 pattern.
+                let mut tail = Vec::with_capacity(path_block.len() + compressed.len());
+                tail.extend_from_slice(&path_block);
+                tail.extend_from_slice(&compressed);
                 let mut crc_buf = [0u8; BLOCK_CRC_TRAILER];
-                crc_buf
-                    .copy_from_slice(&crc32c_checksum_concat(&header, &compressed).to_le_bytes());
+                crc_buf.copy_from_slice(&crc32c_checksum_concat(&header, &tail).to_le_bytes());
                 ok = f.write_all(&crc_buf).is_ok();
             }
-            // v2 may leave the file longer than a v1
-            // overwrite of the same block (incompressible
-            // payload expanded slightly). Set the
-            // file size to exactly what we wrote so the
-            // read side doesn't see a stale tail from a
-            // previous v1 write to the same block path.
+            // Truncate so any stale tail from a v1/v2
+            // overwrite of the same block isn't visible
+            // to readers.
             if ok {
-                let total_len = BLOCK_HEADER_SIZE + compressed.len() + BLOCK_CRC_TRAILER;
+                let total_len =
+                    BLOCK_HEADER_SIZE + payload_with_path_header_len + BLOCK_CRC_TRAILER;
                 let _ = f.set_len(total_len as u64);
             }
             if !ok {
@@ -2461,7 +2591,7 @@ impl CoreFilesystem for MntrsFs {
                 // (possibly truncated) `data` to the caller
                 // and *populated `mem_cache` with it* — silent
                 // data corruption.
-                && let Some(b) = read_block_cached(&cpath)
+                && let Some(b) = read_block_cached(&cpath, &path)
             {
                 // Bug B fix (block-level): same LRU sort key
                 // bump as for the file-level hit. With block
@@ -3832,7 +3962,7 @@ impl DiskWriteJob {
         // a remote S3 fetch to populate the block-level
         // disk cache.
         if let Some(path) = &self.block_cache {
-            Self::do_block_cache_write(path, &self.data);
+            Self::do_block_cache_write(path, &self.remote_path, &self.data);
             return;
         }
         match self.cache_fd {
@@ -3893,16 +4023,27 @@ impl DiskWriteJob {
     /// before submit, since the pool worker has no
     /// `&self` reference. See `submit_block_cache_write`
     /// callers.
-    fn do_block_cache_write(blk_path: &std::path::Path, data: &[u8]) {
+    fn do_block_cache_write(blk_path: &std::path::Path, remote_path: &str, data: &[u8]) {
         use std::io::Write;
         if let Some(parent) = blk_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        // v2 format (#4 lz4) — same layout as
-        // `MntrsFs::write_block_cached` so a future
+        // v3 format (DESIGN_VULNS High #4) — same layout
+        // as `MntrsFs::write_block_cached` so a future
         // change to one path forces a parallel update.
-        // See that function's doc comment for the
-        // format rationale.
+        // See that function's doc for the format
+        // rationale (path embedded for path_hash
+        // collision detection).
+        let path_bytes = remote_path.as_bytes();
+        if path_bytes.len() > MAX_PATH_LEN {
+            tracing::debug!(
+                remote_path,
+                len = path_bytes.len(),
+                max = MAX_PATH_LEN,
+                "block cache write (pool): path too long for v3 embed; skipping"
+            );
+            return;
+        }
         let compressed = lz4_flex::compress_prepend_size(data);
         let mut f = match std::fs::OpenOptions::new()
             .create(true)
@@ -3913,24 +4054,32 @@ impl DiskWriteJob {
             Ok(f) => f,
             Err(_) => return,
         };
-        // Build the 8-byte header.
         let mut header = [0u8; BLOCK_HEADER_SIZE];
         header[0..4].copy_from_slice(BLOCK_MAGIC);
         header[4..8].copy_from_slice(&BLOCK_FORMAT_VERSION.to_le_bytes());
+        let mut path_block = Vec::with_capacity(2 + path_bytes.len());
+        path_block.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+        path_block.extend_from_slice(path_bytes);
         let mut ok = f.write_all(&header).is_ok();
+        if ok {
+            ok = f.write_all(&path_block).is_ok();
+        }
         if ok {
             ok = f.write_all(&compressed).is_ok();
         }
         if ok {
+            let mut tail = Vec::with_capacity(path_block.len() + compressed.len());
+            tail.extend_from_slice(&path_block);
+            tail.extend_from_slice(&compressed);
             let mut crc_buf = [0u8; BLOCK_CRC_TRAILER];
-            crc_buf.copy_from_slice(&crc32c_checksum_concat(&header, &compressed).to_le_bytes());
+            crc_buf.copy_from_slice(&crc32c_checksum_concat(&header, &tail).to_le_bytes());
             ok = f.write_all(&crc_buf).is_ok();
         }
-        // Truncate so any stale tail from a v1
-        // overwrite is not visible to readers (see
-        // write_block_cached for the same rationale).
+        // Truncate so any stale tail from a v1/v2
+        // overwrite is not visible to readers.
         if ok {
-            let total_len = BLOCK_HEADER_SIZE + compressed.len() + BLOCK_CRC_TRAILER;
+            let total_len =
+                BLOCK_HEADER_SIZE + path_block.len() + compressed.len() + BLOCK_CRC_TRAILER;
             let _ = f.set_len(total_len as u64);
         }
         if !ok {
@@ -4311,7 +4460,8 @@ pub(crate) fn submit_block_cache_write(
 mod disk_cache_crc_tests {
     use super::{
         BLOCK_FORMAT_VERSION, BLOCK_MAGIC, BLOCK_OVERHEAD, CACHE_BLOCK_SIZE,
-        LEGACY_BLOCK_FORMAT_VERSION_V1, crc32c_checksum, crc32c_checksum_concat, read_block_cached,
+        LEGACY_BLOCK_FORMAT_VERSION_V1, LEGACY_BLOCK_FORMAT_VERSION_V2, crc32c_checksum,
+        crc32c_checksum_concat, read_block_cached,
     };
     use std::path::PathBuf;
 
@@ -4328,17 +4478,54 @@ mod disk_cache_crc_tests {
     /// matching what `write_block_cached` produces.
     /// Used by the round-trip and corruption tests so
     /// they exercise the current writer format.
-    fn build_v2_block(content: &[u8]) -> Vec<u8> {
+    /// Build a v3 (lz4 + embedded path) on-disk block
+    /// file matching what `write_block_cached` produces.
+    /// Used by the round-trip and corruption tests so
+    /// they exercise the current writer format.
+    fn build_v3_block(path: &str, content: &[u8]) -> Vec<u8> {
         let compressed = lz4_flex::compress_prepend_size(content);
-        let mut buf = Vec::with_capacity(BLOCK_OVERHEAD + compressed.len());
+        let path_bytes = path.as_bytes();
+        let mut buf = Vec::with_capacity(BLOCK_OVERHEAD + 2 + path_bytes.len() + compressed.len());
         buf.extend_from_slice(BLOCK_MAGIC);
         buf.extend_from_slice(&BLOCK_FORMAT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(path_bytes);
         buf.extend_from_slice(&compressed);
         let crc = crc32c_checksum_concat(
             &{
                 let mut h = Vec::with_capacity(8);
                 h.extend_from_slice(BLOCK_MAGIC);
                 h.extend_from_slice(&BLOCK_FORMAT_VERSION.to_le_bytes());
+                h
+            },
+            &{
+                let mut t = Vec::with_capacity(2 + path_bytes.len() + compressed.len());
+                t.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+                t.extend_from_slice(path_bytes);
+                t.extend_from_slice(&compressed);
+                t
+            },
+        );
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    /// Build a v2 (lz4, no path) on-disk block file for
+    /// the back-compat regression test. Hardcodes
+    /// version=2 (LEGACY_BLOCK_FORMAT_VERSION_V2) so the
+    /// reader takes the v2 branch and decodes without
+    /// path verification.
+    fn build_v2_legacy_block(content: &[u8]) -> Vec<u8> {
+        let compressed = lz4_flex::compress_prepend_size(content);
+        let mut buf = Vec::with_capacity(BLOCK_OVERHEAD + compressed.len());
+        buf.extend_from_slice(BLOCK_MAGIC);
+        buf.extend_from_slice(&LEGACY_BLOCK_FORMAT_VERSION_V2.to_le_bytes());
+        buf.extend_from_slice(&compressed);
+        let crc = crc32c_checksum_concat(
+            &{
+                let mut h = Vec::with_capacity(8);
+                h.extend_from_slice(BLOCK_MAGIC);
+                h.extend_from_slice(&LEGACY_BLOCK_FORMAT_VERSION_V2.to_le_bytes());
                 h
             },
             &compressed,
@@ -4360,8 +4547,8 @@ mod disk_cache_crc_tests {
         let content: Vec<u8> = (0..CACHE_BLOCK_SIZE as u32)
             .map(|i| (i & 0xff) as u8)
             .collect();
-        std::fs::write(&p, build_v2_block(&content)).unwrap();
-        let out = read_block_cached(&p).expect("clean full block should be Some");
+        std::fs::write(&p, build_v3_block("test/block.bin", &content)).unwrap();
+        let out = read_block_cached(&p, "test/block.bin").expect("clean full block should be Some");
         assert_eq!(out.len(), CACHE_BLOCK_SIZE as usize);
         assert_eq!(out.as_ref(), content.as_slice());
         std::fs::remove_dir_all(&dir).ok();
@@ -4381,13 +4568,13 @@ mod disk_cache_crc_tests {
         let content: Vec<u8> = (0..CACHE_BLOCK_SIZE as u32)
             .map(|i| (i & 0xff) as u8)
             .collect();
-        let mut buf = build_v2_block(&content);
+        let mut buf = build_v3_block("test/block.bin", &content);
         // Flip a bit in the CRC trailer (last 4 bytes).
         let len = buf.len();
         buf[len - 1] ^= 0x01;
         std::fs::write(&p, &buf).unwrap();
 
-        let out = read_block_cached(&p);
+        let out = read_block_cached(&p, "test/block.bin");
         assert!(out.is_none(), "corrupt CRC should return None");
         assert!(!p.exists(), "corrupt file should be unlinked");
         std::fs::remove_dir_all(&dir).ok();
@@ -4399,7 +4586,7 @@ mod disk_cache_crc_tests {
         // pre-#4 build (version=1 = uncompressed payload)
         // must still read cleanly. Important because users
         // upgrading don't get their cache wiped — old v1
-        // files coexist with new v2 writes until the LRU
+        // files coexist with new v3 writes until the LRU
         // sweeps them out or they're overwritten on
         // re-read.
         let dir = scratch("legacy_v1");
@@ -4422,8 +4609,65 @@ mod disk_cache_crc_tests {
         );
         buf.extend_from_slice(&crc.to_le_bytes());
         std::fs::write(&p, &buf).unwrap();
-        let out = read_block_cached(&p).expect("v1 block should read cleanly");
+        let out = read_block_cached(&p, "test/block.bin").expect("v1 block should read cleanly");
         assert_eq!(out.as_ref(), content.as_slice());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v2_lz4_block_round_trip_back_compat() {
+        // Backward-compat for the #4-era v2 format
+        // (lz4-compressed, no embedded path). Same
+        // rationale as the v1 test above: a user who
+        // upgrades from an #4-era build to the v3-era
+        // build must still be able to read their existing
+        // v2 cache files. v3 supersedes v2 for new writes;
+        // v2 files get rewritten as v3 on next overwrite.
+        //
+        // Note: v2 reads bypass the path-verification step
+        // (no embedded path to compare). The expected_path
+        // arg is therefore ignored on the v2 branch. The
+        // residual collision risk on v2 files is what the
+        // DESIGN_VULNS High #4 audit flagged — accepted
+        // here because the alternative (auto-purge every
+        // v2 file on read) would wipe legitimate caches
+        // across the upgrade.
+        let dir = scratch("legacy_v2");
+        let p = dir.join("block.bin");
+        let content: Vec<u8> = (0..1024_u32).map(|i| (i & 0xff) as u8).collect();
+        std::fs::write(&p, build_v2_legacy_block(&content)).unwrap();
+        let out = read_block_cached(&p, "test/block.bin")
+            .expect("v2 block should read cleanly via back-compat branch");
+        assert_eq!(out.as_ref(), content.as_slice());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v3_path_collision_detected_and_unlinked() {
+        // DESIGN_VULNS High #4 regression test: when the
+        // on-disk block has v3's embedded path, but the
+        // caller expects a DIFFERENT path (i.e. a
+        // path_hash collision in production), the reader
+        // must unlink the file and return None so the
+        // caller refetches from remote. Pre-v3 the reader
+        // returned the (wrong) cached content silently.
+        let dir = scratch("path_collision");
+        let p = dir.join("block.bin");
+        let content: Vec<u8> = (0..1024_u32).map(|i| (i & 0xff) as u8).collect();
+        // Write a v3 block embedding "owner/file_A".
+        std::fs::write(&p, build_v3_block("owner/file_A", &content)).unwrap();
+        // Read with a different expected path — simulates
+        // a hash collision: same on-disk file, two
+        // logical paths.
+        let out = read_block_cached(&p, "owner/file_B");
+        assert!(
+            out.is_none(),
+            "v3 path mismatch should return None (collision detected)"
+        );
+        assert!(
+            !p.exists(),
+            "v3 path mismatch should unlink so the next write of the colliding twin owns the slot"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4440,7 +4684,8 @@ mod disk_cache_crc_tests {
             .map(|i| (i & 0xff) as u8)
             .collect();
         std::fs::write(&p, &content).unwrap();
-        let out = read_block_cached(&p).expect("legacy unprotected block should be Some");
+        let out = read_block_cached(&p, "test/block.bin")
+            .expect("legacy unprotected block should be Some");
         assert_eq!(out.len(), CACHE_BLOCK_SIZE as usize);
         assert_eq!(out.as_ref(), content.as_slice());
         std::fs::remove_dir_all(&dir).ok();
@@ -4463,7 +4708,8 @@ mod disk_cache_crc_tests {
         let mut buf = content.clone();
         buf.extend_from_slice(&crc.to_le_bytes());
         std::fs::write(&p, &buf).unwrap();
-        let out = read_block_cached(&p).expect("legacy protected block should be Some");
+        let out =
+            read_block_cached(&p, "test/block.bin").expect("legacy protected block should be Some");
         assert_eq!(out.len(), CACHE_BLOCK_SIZE as usize);
         assert_eq!(out.as_ref(), content.as_slice());
         std::fs::remove_dir_all(&dir).ok();
@@ -4480,8 +4726,8 @@ mod disk_cache_crc_tests {
         let content: Vec<u8> = (0..4096u32).map(|i| (i & 0xff) as u8).collect();
         // v2 format: lz4-compressed payload with size
         // prefix, then CRC over (header || compressed).
-        std::fs::write(&p, build_v2_block(&content)).unwrap();
-        let out = read_block_cached(&p).expect("partial block should be Some");
+        std::fs::write(&p, build_v3_block("test/block.bin", &content)).unwrap();
+        let out = read_block_cached(&p, "test/block.bin").expect("partial block should be Some");
         assert_eq!(out.len(), content.len());
         assert_eq!(out.as_ref(), content.as_slice());
         std::fs::remove_dir_all(&dir).ok();
@@ -4498,7 +4744,7 @@ mod disk_cache_crc_tests {
         let content: Vec<u8> = vec![0xab; CACHE_BLOCK_SIZE as usize + BLOCK_OVERHEAD + 1];
         std::fs::write(&p, &content).unwrap();
 
-        let out = read_block_cached(&p);
+        let out = read_block_cached(&p, "test/block.bin");
         assert!(out.is_none(), "oversized file should return None");
         assert!(!p.exists(), "oversized file should be unlinked");
         std::fs::remove_dir_all(&dir).ok();
@@ -4525,7 +4771,7 @@ mod disk_cache_crc_tests {
         buf.extend_from_slice(&crc.to_le_bytes());
         std::fs::write(&p, &buf).unwrap();
 
-        let out = read_block_cached(&p);
+        let out = read_block_cached(&p, "test/block.bin");
         assert!(out.is_none(), "unsupported version should return None");
         assert!(!p.exists(), "unsupported-version file should be unlinked");
         std::fs::remove_dir_all(&dir).ok();
@@ -4547,7 +4793,7 @@ mod disk_cache_crc_tests {
         // be detected as corrupt and unlinked.
         let content: Vec<u8> = vec![0xab; 4096];
         std::fs::write(&p, &content).unwrap();
-        let out = read_block_cached(&p);
+        let out = read_block_cached(&p, "test/block.bin");
         // This file is < 8 MiB, so it reads as a
         // legacy partial block. To actually trigger
         // the magic mismatch path, we'd need a file
@@ -4646,7 +4892,7 @@ mod disk_cache_crc_tests {
         assert_eq!(entry.value().0 as usize, meta.len() as usize);
         // Round-trip through the new-format reader:
         // expect uncompressed content back.
-        let bytes = read_block_cached(&blk_path).expect("clean full block");
+        let bytes = read_block_cached(&blk_path, "full.bin").expect("clean full block");
         assert_eq!(bytes.len(), CACHE_BLOCK_SIZE as usize);
         assert_eq!(bytes.as_ref(), content.as_slice());
     }
@@ -4674,7 +4920,8 @@ mod disk_cache_crc_tests {
         let head = std::fs::read(&blk_path).unwrap();
         assert_eq!(&head[0..4], BLOCK_MAGIC);
         // Round-trip: uncompressed content comes back.
-        let bytes = read_block_cached(&blk_path).expect("partial block should round-trip");
+        let bytes =
+            read_block_cached(&blk_path, "tail.bin").expect("partial block should round-trip");
         assert_eq!(bytes.len(), content.len());
         assert_eq!(bytes.as_ref(), content.as_slice());
     }
@@ -4700,7 +4947,7 @@ mod disk_cache_crc_tests {
                 "block {blk} must be in disk_cache_index"
             );
             let p = cache_block_path(&fs.cache_dir, "prefetched.bin", blk);
-            let bytes = read_block_cached(&p).expect("round-trip read");
+            let bytes = read_block_cached(&p, "prefetched.bin").expect("round-trip read");
             assert_eq!(bytes.len(), CACHE_BLOCK_SIZE as usize);
             assert_eq!(bytes.as_ref(), full.as_slice());
         }
