@@ -380,7 +380,6 @@ pub struct MntrsFs {
     /// defaults.
     #[allow(clippy::type_complexity)]
     disk_cache_index: dashmap::DashMap<CacheKey, (u64, std::time::Instant)>,
-    out_of_space: std::sync::atomic::AtomicBool,
     pub(crate) storage_class: Option<String>,
 }
 
@@ -426,21 +425,22 @@ impl MntrsFs {
     /// configured limit, or until the cache disk has the
     /// requested free space, whichever is the tighter constraint.
     ///
+    /// The index tracks both whole-file cache (`cache_path`,
+    /// keyed by `(path, None)`) and per-block cache
+    /// (`cache_block_path`, keyed by `(path, Some(block_idx))`).
+    /// Either kind is evicted under the same LRU order — a v1
+    /// index (no block entries) just has fewer children to
+    /// consider; a freshly-read large file accumulates block
+    /// entries as the read path populates them. The index
+    /// cleanup on unlink/rmdir (commit 8f4244c) removes
+    /// orphaned entries of either kind.
+    ///
     /// Cost: O(N) over `disk_cache_index` per call, where N is
-    /// the number of cached files (NOT blocks — the index only
-    /// tracks the file-level whole-file cache, not the 8 MiB block
-    /// cache that I added in commit e279810). For a busy CSI node
+    /// the number of cached files + blocks. For a busy CSI node
     /// with 10k cached files this is well under a millisecond.
     /// A BinaryHeap (min-heap by atime) gives O(N log K) where K
     /// is the number of files to evict; on a 10k-file cache
     /// evicting 100 files is ~50k heap ops, also sub-ms.
-    ///
-    /// Block-level cache files (`{hash}_{block:010x}.block`) are
-    /// NOT tracked by this index and therefore NOT evicted. They
-    /// accumulate unbounded for now; a future commit can extend
-    /// the index to also track block files. The index cleanup on
-    /// unlink/rmdir (commit 8f4244c) removes orphaned whole-file
-    /// cache entries but not block files.
     ///
     /// Runs inline on the FUSE write worker. Synchronous is
     /// intentional: a background eviction thread introduces a
@@ -503,12 +503,8 @@ impl MntrsFs {
         // We need to free at least the larger of the two deltas.
         let to_free = size_limit.max(need_free.unwrap_or(0));
         if to_free == 0 {
-            self.out_of_space
-                .store(false, std::sync::atomic::Ordering::Relaxed);
             return;
         }
-        self.out_of_space
-            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Pop oldest entries until enough space freed. Each pop
         // removes the corresponding cache file (file-level
@@ -535,9 +531,18 @@ impl MntrsFs {
             remaining = remaining.saturating_sub(size);
         }
 
-        if freed >= to_free {
-            self.out_of_space
-                .store(false, std::sync::atomic::Ordering::Relaxed);
+        if freed < to_free {
+            // Cache under-filled even after draining every
+            // tracked entry. The next write that hits this
+            // path will see the same numbers and likely fail
+            // for the same reason — surface it in the log
+            // rather than papering over with a now-removed
+            // `out_of_space` gate that nothing read.
+            tracing::warn!(
+                freed,
+                to_free,
+                "mntrs evict_lru_if_needed: cache under target after draining index"
+            );
         }
     }
 
@@ -4238,7 +4243,6 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         mem_cache: std::sync::Arc::new(crate::cache::DashMapMemCache::new(0)),
         attr_cache: Default::default(),
         disk_cache_index: Default::default(),
-        out_of_space: std::sync::atomic::AtomicBool::new(false),
         storage_class: None,
     }
 }

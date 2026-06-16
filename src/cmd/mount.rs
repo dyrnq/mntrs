@@ -700,7 +700,6 @@ pub fn mount(
         mem_cache,
         attr_cache: dashmap::DashMap::new(),
         disk_cache_index: dashmap::DashMap::new(),
-        out_of_space: std::sync::atomic::AtomicBool::new(false),
         storage_class: storage_class.map(|s| s.to_string()),
     };
 
