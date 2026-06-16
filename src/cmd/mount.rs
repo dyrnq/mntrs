@@ -10,9 +10,9 @@ use opendal::services::{
 };
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 #[cfg(not(windows))]
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -1197,68 +1197,24 @@ async fn build_webhdfs(url: &url::Url, opts: &HashMap<String, String>) -> Result
     apply_operator_with_tls(builder, opts)
 }
 
-#[cfg(not(windows))]
-static DAEMON_PIPE_WR: OnceLock<i32> = OnceLock::new();
-
-#[cfg(not(windows))]
-#[allow(dead_code)]
-fn daemonize(mountpoint: &str, wait_pipe: Option<i32>) -> Result<()> {
-    // fork/setsid require unsafe — rustix intentionally doesn't wrap them
-    match unsafe { libc::fork() } {
-        -1 => return Err(anyhow!("fork failed")),
-        0 => {}
-        _ => std::process::exit(0),
-    }
-    if unsafe { libc::setsid() } < 0 {
-        return Err(anyhow!("setsid failed"));
-    }
-    match unsafe { libc::fork() } {
-        -1 => return Err(anyhow!("second fork failed")),
-        0 => {}
-        _ => std::process::exit(0),
-    }
-    if let Some(fd) = wait_pipe {
-        DAEMON_PIPE_WR.set(fd).ok();
-    }
-    if let Err(e) = std::env::set_current_dir("/") {
-        tracing::debug!(error=%e, "daemon chdir failed");
-    }
-    // Use rustix for safe fd operations
-    let devnull = rustix::fs::open(
-        "/dev/null",
-        rustix::fs::OFlags::RDWR,
-        rustix::fs::Mode::empty(),
-    )
-    .unwrap_or_else(|_| {
-        // Safety: fd 0 is always valid (stdin)
-        #[cfg(not(windows))]
-        unsafe {
-            rustix::fd::OwnedFd::from_raw_fd(std::os::fd::RawFd::from(0))
-        }
-    });
-    if rustix::stdio::dup2_stdin(&devnull).is_err() {
-        tracing::debug!("daemon dup2 stdin failed");
-    }
-    if rustix::stdio::dup2_stdout(&devnull).is_err() {
-        tracing::debug!("daemon dup2 stdout failed");
-    }
-    if rustix::stdio::dup2_stderr(&devnull).is_err() {
-        tracing::debug!("daemon dup2 stderr failed");
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let pid_dir = format!("{}/.local/share/mntrs", home);
-    if let Err(e) = fs::create_dir_all(&pid_dir) {
-        tracing::debug!(error=%e, "pid dir create failed");
-    }
-    let pid = std::process::id();
-    let pid_path = format!("{}/{}.pid", pid_dir, mountpoint.replace('/', "_"));
-    if let Ok(mut f) = File::create(&pid_path)
-        && writeln!(f, "{}", pid).is_err()
-    {
-        tracing::debug!("pid file write failed");
-    }
-    Ok(())
-}
+// Bug 7 / dead-code cleanup: a stale `fn daemonize`
+// (double-fork + setsid + stdio redirect) sat here
+// behind `#[allow(dead_code)]`. It was never called —
+// the actual daemon model is re-exec (see line ~633:
+// the parent spawns the child via `Command::new(exe)
+// .env("MNTRS_INTERNAL_DAEMON", "1")` rather than
+// fork+setsid). The audit caught that the dead
+// function had a bug too: setsid() failure returned
+// `Err` from the child, but the parent had already
+// `exit(0)`'d — so the shell saw success and the
+// daemon silently died. Rather than fix dead code
+// that no one calls, the whole function and its
+// supporting `DAEMON_PIPE_WR` static are removed.
+// If a fork-based daemon path ever comes back, build
+// it fresh against the current pipe/wait_pipe
+// machinery in `mount_internal` (which DOES correctly
+// surface child startup errors back through the
+// status pipe).
 
 async fn build_oss(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
     let bucket = url.host_str().ok_or_else(|| anyhow!("missing bucket"))?;
