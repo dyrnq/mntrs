@@ -1829,12 +1829,56 @@ impl MntrsFs {
             // the TTL will expire and a fresh listing
             // runs.
             let mut hit_cap = false;
+            // DESIGN_VULNS #5 (readdirplus error isolation):
+            // count per-entry lister errors but don't
+            // propagate. Pre-fix `let entry = item?;` would
+            // bail on the first mid-stream lister error
+            // (e.g. one S3 page timed out, one HDFS NameNode
+            // RPC failed, one entry blocked by ACL), dropping
+            // every entry accumulated so far and surfacing as
+            // EIO on `ls`. The audit's concern: a single
+            // unreadable file shouldn't make the whole
+            // directory unlistable.
+            //
+            // New behaviour: log + count + continue. The
+            // function still returns Ok with whatever entries
+            // we managed to read. A non-zero skip count is
+            // logged at warn so the operator can see partial
+            // results in the daemon log.
+            let mut skipped_errors = 0u64;
             while let Some(item) = lister.next().await {
                 if out.len() >= MAX_LIST_ENTRIES {
                     hit_cap = true;
                     break;
                 }
-                let entry = item?;
+                let entry = match item {
+                    Ok(e) => e,
+                    Err(e) => {
+                        skipped_errors += 1;
+                        // Sample the first error at warn so
+                        // the operator sees the actual error
+                        // shape, then drop to debug for the
+                        // rest of this listing (a
+                        // hundreds-of-skipped-entries listing
+                        // would otherwise spam the daemon
+                        // log).
+                        if skipped_errors == 1 {
+                            tracing::warn!(
+                                path = %p,
+                                error = %e,
+                                "list_op: per-entry lister error; skipping (further errors at debug)"
+                            );
+                        } else {
+                            tracing::debug!(
+                                path = %p,
+                                skipped = skipped_errors,
+                                error = %e,
+                                "list_op: per-entry lister error; skipping"
+                            );
+                        }
+                        continue;
+                    }
+                };
                 let name = entry.name().trim_end_matches('/').to_string();
                 let mode = entry.metadata().mode();
                 let content_length = entry.metadata().content_length();
@@ -1893,6 +1937,18 @@ impl MntrsFs {
                     entries = out.len(),
                     "list_op truncated at MAX_LIST_ENTRIES cap — directory is larger than \
                      the per-readdir budget; ls/find on this path will be incomplete"
+                );
+            }
+            if skipped_errors > 0 {
+                // DESIGN_VULNS #5: aggregate summary so a
+                // partial listing shows up in the daemon log
+                // as a single warn line per readdir (rather
+                // than the per-entry warns above).
+                tracing::warn!(
+                    path = %p,
+                    returned = out.len(),
+                    skipped = skipped_errors,
+                    "list_op completed with per-entry errors — returning partial listing"
                 );
             }
             Ok::<_, opendal::Error>(out)
