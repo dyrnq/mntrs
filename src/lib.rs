@@ -7,6 +7,7 @@ pub mod core_fs;
 pub mod error_log;
 pub mod fuse_error;
 pub mod http_client;
+pub mod metrics;
 pub mod path;
 pub mod prefetcher;
 pub mod writeback;
