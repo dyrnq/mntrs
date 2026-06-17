@@ -3196,16 +3196,31 @@ impl CoreFilesystem for MntrsFs {
             (path.clone(), None),
             (_data.len() as u64, std::time::Instant::now()),
         );
-        // Trigger LRU eviction if cache limits are configured. Runs
-        // inline (synchronous, on the FUSE write worker) because
-        // (a) the index is small in practice (entries == cached
-        // files, not blocks) and (b) deferring to a background
-        // thread introduces a race where a subsequent write sees
-        // out-of-space before the eviction completes. The current
-        // write is allowed to push the total briefly over the
-        // limit; the next write that observes the breach evicts
-        // down to the target. See `evict_lru_if_needed` for the
-        // exact size math.
+        // Issue #39: evict BEFORE the pool worker tries to
+        // write the cache file. The pre-fix order submitted
+        // the job first and evicted after, which raced with
+        // the pool worker: on a full disk the pool worker
+        // could hit ENOSPC before the eviction freed
+        // anything, leaving the FUSE reply Ok but the cache
+        // file silently truncated. Eager eviction before
+        // submit means the pool worker usually sees
+        // post-eviction free space; the in-pool retry on
+        // ENOSPC in `execute()` is the safety net for the
+        // rare case where eviction didn't free enough (e.g.
+        // the cache is so full that even an empty index
+        // doesn't meet the min-free-space target).
+        //
+        // Runs inline (synchronous, on the FUSE write
+        // worker) because (a) the index is small in
+        // practice (entries == cached files, not blocks)
+        // and (b) deferring to a background thread
+        // introduces a race where a subsequent write sees
+        // out-of-space before the eviction completes. The
+        // current write is allowed to push the total
+        // briefly over the limit; the next write that
+        // observes the breach evicts down to the target.
+        // See `evict_lru_if_needed` for the exact size
+        // math.
         self.evict_lru_if_needed();
         let written = _data.len() as u32;
 
@@ -4408,7 +4423,45 @@ impl DiskWriteJob {
                     Ok(f) => f,
                     Err(_) => return,
                 };
-                Self::do_write(&mut f, &self.remote_path, self.offset, &self.data);
+                // Issue #39: retry once on ENOSPC. The
+                // FUSE write() path runs
+                // `evict_lru_if_needed()` synchronously
+                // before submitting the job (see
+                // `fn write` in this file), so the
+                // common case is the first attempt
+                // succeeds after eviction. The retry
+                // here is a safety net for the rare
+                // case where the disk is so full that
+                // even an empty cache index doesn't
+                // meet the min-free-space target —
+                // the FUSE reply was already Ok before
+                // we got here, so the best we can do
+                // is try one more time and log a warn
+                // if it still fails.
+                if let Err(e) = Self::do_write(&mut f, &self.remote_path, self.offset, &self.data) {
+                    if e.kind() == std::io::ErrorKind::StorageFull {
+                        tracing::warn!(
+                            path = %self.remote_path,
+                            "disk cache write hit ENOSPC; retrying once (issue #39)"
+                        );
+                        if let Err(e2) =
+                            Self::do_write(&mut f, &self.remote_path, self.offset, &self.data)
+                        {
+                            tracing::error!(
+                                path = %self.remote_path,
+                                error = %e2,
+                                "disk cache write still failed after ENOSPC retry; \
+                                 FUSE reply was Ok but cache file may be truncated"
+                            );
+                        }
+                    } else {
+                        tracing::debug!(
+                            path = %self.remote_path,
+                            error = %e,
+                            "disk cache write (cache_fd) failed"
+                        );
+                    }
+                }
             }
             None => {
                 let cpath = match &self.cache_path {
@@ -4428,7 +4481,36 @@ impl DiskWriteJob {
                     Ok(f) => f,
                     Err(_) => return,
                 };
-                Self::do_write(&mut f, &self.remote_path, self.offset, &self.data);
+                // Same retry-after-ENOSPC pattern as the
+                // cache_fd branch (issue #39). The
+                // fall-back open path doesn't have a
+                // long-lived fd to keep across the
+                // retry, but the FUSE-side eviction
+                // still helps future writes.
+                if let Err(e) = Self::do_write(&mut f, &self.remote_path, self.offset, &self.data) {
+                    if e.kind() == std::io::ErrorKind::StorageFull {
+                        tracing::warn!(
+                            path = %self.remote_path,
+                            "disk cache write (no-fd) hit ENOSPC; retrying once (issue #39)"
+                        );
+                        if let Err(e2) =
+                            Self::do_write(&mut f, &self.remote_path, self.offset, &self.data)
+                        {
+                            tracing::error!(
+                                path = %self.remote_path,
+                                error = %e2,
+                                "disk cache write still failed after ENOSPC retry; \
+                                 cache file may be truncated"
+                            );
+                        }
+                    } else {
+                        tracing::debug!(
+                            path = %self.remote_path,
+                            error = %e,
+                            "disk cache write (no-fd) failed"
+                        );
+                    }
+                }
             }
         }
         // #8 (durability): register the cache file for
@@ -4534,13 +4616,15 @@ impl DiskWriteJob {
         register_dirty_cache_path(blk_path);
     }
 
-    fn do_write(f: &mut std::fs::File, remote_path: &str, offset: u64, data: &[u8]) {
+    fn do_write(
+        f: &mut std::fs::File,
+        remote_path: &str,
+        offset: u64,
+        data: &[u8],
+    ) -> std::io::Result<()> {
         use std::io::{Seek, Write};
         let end = offset + data.len() as u64;
-        let current_len = match f.metadata() {
-            Ok(m) => m.len(),
-            Err(_) => return,
-        };
+        let current_len = f.metadata()?.len();
         // Prefix fetch: when writing at an offset past
         // current length, backfill the missing prefix
         // from the remote backend (so the cache file
@@ -4553,22 +4637,27 @@ impl DiskWriteJob {
             && let Ok(remote) = opendal_sync_read(remote_path)
             && !remote.is_empty()
         {
-            let _ = f.write_all(&remote);
+            f.write_all(&remote)?;
         }
-        let current_len = match f.metadata() {
-            Ok(m) => m.len(),
-            Err(_) => return,
-        };
+        let current_len = f.metadata()?.len();
         if end > current_len {
-            let _ = f.set_len(end);
+            // Issue #39: surface ENOSPC up to the caller so
+            // `execute()` can retry-after-evict. Pre-fix
+            // this used `let _ = f.set_len(end)` which
+            // swallowed the StorageFull error — the FUSE
+            // reply was Ok, but the cache file silently
+            // failed to grow, leading to truncated reads
+            // on the next access.
+            f.set_len(end)?;
         }
-        let _ = f.seek(std::io::SeekFrom::Start(offset));
-        let _ = f.write_all(data);
+        f.seek(std::io::SeekFrom::Start(offset))?;
+        f.write_all(data)?;
         // #6: no `f.flush()`. The OS page cache holds
         // the data and flushes in the background. The
         // writeback worker's `std::fs::read` of this
         // file goes through the same page cache and
         // sees the freshly-written data.
+        Ok(())
     }
 }
 
