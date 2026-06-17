@@ -5249,9 +5249,7 @@ impl DiskWriteJob {
         offset: u64,
         data: &[u8],
     ) -> std::io::Result<()> {
-        use std::io::Write;
-        #[cfg(unix)]
-        use std::os::unix::fs::FileExt;
+        use std::io::{Seek, Write};
         let end = offset + data.len() as u64;
         let current_len = f.metadata()?.len();
         // Prefix fetch: when writing at an offset past
@@ -5279,16 +5277,28 @@ impl DiskWriteJob {
             // on the next access.
             f.set_len(end)?;
         }
-        // Issue #12: combine seek + write_all into a
-        // single `write_at` syscall. Pre-fix the
-        // separate `seek` + `write_all` did a
-        // redundant lseek; write_at lets the kernel
-        // position + write in one syscall. The bench's
-        // 6x gap vs rclone is dominated by the local
-        // disk write itself (rclone streams to S3
-        // without buffering the whole file locally),
-        // not the syscall — but write_at is free.
-        f.write_at(data, offset)?;
+        // Issue #60: revert #12's `write_at` change to
+        // `seek + write_all`. The original change aimed
+        // for one fewer syscall (lseek + pwrite vs
+        // lseek + pwrite) but had two regressions:
+        //   * `std::os::unix::fs::FileExt` is Unix-only,
+        //     so the Windows CI clippy job failed with
+        //     `no method named write_at` (issue #59).
+        //   * `write_at` (pwrite) does NOT update the
+        //     kernel-side fd offset, but the same fd is
+        //     shared with the flush/release/fsync paths
+        //     which do read+seek. A subsequent read
+        //     would see a wrong offset, leading to the
+        //     "read pre-existing FAIL: got ''" pattern
+        //     in hdfs-kerberos + CSI e2e.
+        //
+        // The bench's 6x gap vs rclone is dominated by
+        // the local disk write itself, not the syscall.
+        // Reverting to seek + write_all costs ~30 µs of
+        // redundant lseek per 10 MiB write — well
+        // below the noise floor of the disk write.
+        f.seek(std::io::SeekFrom::Start(offset))?;
+        f.write_all(data)?;
         // #6: no `f.flush()`. The OS page cache holds
         // the data and flushes in the background. The
         // writeback worker's `std::fs::read` of this
