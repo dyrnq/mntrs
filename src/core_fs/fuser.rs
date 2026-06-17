@@ -481,6 +481,59 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         }
     }
 
+    /// Issue #35: forward fsync to the trait. Pre-fix this
+    /// handler didn't exist on the FuserAdapter, so every
+    /// `fsync(2)` from user-space (e.g. SQLite's
+    /// `xSync` callback after every transaction commit)
+    /// returned `ENOSYS`. The fuser 0.17 default body
+    /// matches that behaviour, but the in-memory
+    /// `register_dirty_cache_path` fsync thread + the
+    /// `cache_fd::sync_all` on close path are not
+    /// triggered by FUSE's fsync — they only fire from
+    /// the kernel's own dirty-page writeback. A database
+    /// workload depends on this hook to know "the bytes
+    /// you wrote are now durable on the local cache
+    /// disk" before it acks the commit. With this in
+    /// place, the kernel sees `Ok` and the database
+    /// proceeds; the cache file is `fdatasync`'d by
+    /// `MntrsFs::fsync` against the open cache fd.
+    fn fsync(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        match self.inner.fsync(ino.into(), fh.into(), datasync) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(io_err_to_fuse_errno(e)),
+        }
+    }
+
+    /// Issue #35 (mirror of fsync): forward fsyncdir to
+    /// the trait. The fuser default returns `ENOSYS`;
+    /// pre-fix there was no override, so a user-space
+    /// `fsyncdir(2)` (rare, but used by some database
+    /// fsync paths on metadata updates) hit the default
+    /// behaviour. The trait default is `Ok(())` because
+    /// most backends have no directory-data to sync;
+    /// `MntrsFs` keeps the default unless a future
+    /// backend needs explicit dir-fsync.
+    fn fsyncdir(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        match self.inner.fsyncdir(ino.into(), fh.into(), datasync) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(io_err_to_fuse_errno(e)),
+        }
+    }
+
     fn release(
         &self,
         _req: &Request,

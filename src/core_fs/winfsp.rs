@@ -352,6 +352,24 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         if let Some(ctx) = context {
             // Bug 11: use the real fh, not ino. Same
             // rationale as `close`/`read`/`write`.
+            //
+            // Issue #35: WinFSP's `flush` is the
+            // user-space `FlushFileBuffers` semantic
+            // (force-cached-data-to-disk), which is the
+            // FUSE `fsync` equivalent. The pre-fix
+            // adapter forwarded to `CoreFilesystem::flush`
+            // (queue-async-writeback), which is a
+            // different operation entirely. We now call
+            // `fsync` (datasync=true — user data only,
+            // matching FlushFileBuffers semantics) and
+            // keep the existing `flush` call as a
+            // best-effort writeback trigger for backends
+            // where the fsync-on-cache-fd isn't enough
+            // (e.g. cloud storage where "durable" means
+            // uploaded, not just on local disk).
+            self.inner
+                .fsync(ctx.ino, ctx.fh, true)
+                .map_err(io_err_to_status)?;
             self.inner
                 .flush(ctx.ino, ctx.fh)
                 .map_err(io_err_to_status)?;

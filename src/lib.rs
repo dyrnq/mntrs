@@ -3468,6 +3468,59 @@ impl CoreFilesystem for MntrsFs {
         }
         Ok(())
     }
+    fn fsync(&self, ino: u64, fh: u64, datasync: bool) -> std::io::Result<()> {
+        // Issue #35: force the open cache fd's data (and
+        // optionally its metadata) to stable storage.
+        // SQLite / etcd / RocksDB call fsync(2) on every
+        // commit; returning ENOSYS (the fuser default
+        // pre-fix) means those workloads silently lose
+        // commit guarantees. With this override the
+        // kernel sees a real `Ok` once the cache file's
+        // bytes are on local disk.
+        //
+        // We sync the *cache file*, not the remote
+        // object — the cache is the source of truth for
+        // a FUSE mount's read-after-write view, and the
+        // async writeback worker will upload to the
+        // remote backend in the background. If a future
+        // backend is "synchronous-or-bust" (no async
+        // writeback), this method should also block on
+        // the upload completing before returning Ok.
+        let cache_fd = self.handles.get(&fh).and_then(|e| match e.value() {
+            crate::FileHandleState::Write {
+                cache_fd: Some(fd), ..
+            } => Some(fd.clone()),
+            _ => None,
+        });
+        let Some(fd) = cache_fd else {
+            // No open cache fd (e.g. setattr with no fh,
+            // or a read-only handle that never opened a
+            // cache file). Surface NotFound so the
+            // adapter maps to ENOENT; the database
+            // typically retries or fails the transaction
+            // — better than silently Ok'ing.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("fsync({ino:#x}, fh={fh}): no open cache fd"),
+            ));
+        };
+        // Hold the per-fd mutex while syncing so a
+        // concurrent write through the same fd doesn't
+        // race with the kernel's writeback. The write
+        // path takes the same mutex around set_len +
+        // write_all (see DiskWriteJob::do_write), so a
+        // concurrent write is already serialised
+        // through this lock.
+        let f = fd
+            .lock()
+            .map_err(|e| std::io::Error::other(format!("fsync({fh}) mutex poisoned: {e}")))?;
+        if datasync {
+            f.sync_data()?;
+        } else {
+            f.sync_all()?;
+        }
+        Ok(())
+    }
     fn release(&self, _ino: u64, fh: u64) -> std::io::Result<()> {
         // On release, trigger writeback for dirty handles
         let was_dirty = if let Some(entry) = self.handles.get(&fh)

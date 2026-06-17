@@ -122,6 +122,50 @@ pub trait CoreFilesystem: Send + Sync {
     /// Flush buffered data for an open handle.
     fn flush(&self, ino: u64, fh: u64) -> std::io::Result<()>;
 
+    /// Sync file contents to stable storage.
+    ///
+    /// Issue #35: SQLite / etcd / RocksDB / LMDB call
+    /// `fsync(2)` on every transaction commit to guarantee
+    /// journal durability. The fuser default for this
+    /// callback is `ENOSYS`; databases on a FUSE mount
+    /// built on the default adapter silently lose commit
+    /// guarantees. The winfsp default also returns an
+    /// error.
+    ///
+    /// `datasync` mirrors the FUSE flag: when true, only
+    /// user data needs to be flushed (mtime / ctime can
+    /// stay in the page cache); when false, the
+    /// implementation must also persist metadata.
+    ///
+    /// Default returns `Unsupported` (mapped to `ENOSYS`
+    /// by the fuser adapter) so external test fakes
+    /// continue to compile when the trait gains this
+    /// method.
+    fn fsync(&self, ino: u64, fh: u64, datasync: bool) -> std::io::Result<()> {
+        let _ = (ino, fh, datasync);
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+
+    /// Sync directory contents to stable storage.
+    ///
+    /// Same rationale as `fsync` (issue #35): databases
+    /// that `opendir` + `fsyncdir` after a metadata update
+    /// get ENOSYS on the default adapter. Mirrors
+    /// libfuse passthrough_hp's `sfs_fsyncdir`.
+    ///
+    /// `datasync` mirrors the FUSE flag. For most
+    /// backends, fsyncdir on a directory is a no-op (the
+    /// directory's own data blocks are tiny and the
+    /// backend directory listing is usually served from
+    /// a separate metadata service). The default
+    /// implementation returns Ok(()) to preserve the
+    /// pre-existing semantics for backends where
+    /// dir-fsync is meaningless.
+    fn fsyncdir(&self, ino: u64, fh: u64, datasync: bool) -> std::io::Result<()> {
+        let _ = (ino, fh, datasync);
+        Ok(())
+    }
+
     /// Release (close) an open file handle.
     fn release(&self, ino: u64, fh: u64) -> std::io::Result<()>;
 
