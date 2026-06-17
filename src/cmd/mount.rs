@@ -614,6 +614,33 @@ pub fn mount(
     vfs_disk_space_total_size: u64,
 ) -> Result<()> {
     let op = rt_block_on(build_operator(storage_url, opts))?;
+    // Initialize the global op for the write path's
+    // background thread (it can't borrow `&self.op`,
+    // which lives on the FUSE worker). Without this,
+    // the lazy `opendal_sync_op` fallback in `lib.rs`
+    // returns a brand-new empty `Memory::default()`
+    // operator — the FUSE write path's prefix fetch
+    // then reads from that empty backend instead of
+    // the user-configured `memory://`/`s3://`/etc.
+    // backend, so every read returns "" and the
+    // regression test in `memory_stress.sh` fails
+    // (closes the Integration Tests "memory mount
+    // not ready after 60s" failure on commit 977854d).
+    crate::set_opendal_sync_op(op.clone());
+    // Initialize the disk-IO thread pool. Without
+    // it, `submit_disk_write` falls back to running
+    // the I/O job synchronously on the FUSE worker
+    // thread — the same thread that runs
+    // `fuser::session::run()`. A sync disk I/O there
+    // starves the FUSE event loop, the kernel mount
+    // never completes, and `mount | grep` reports
+    // the FUSE mount as not present for the full
+    // 60s readiness probe. `init_disk_write_pool`
+    // is guarded by `DISK_WRITE_POOL.get().is_some()`
+    // so repeat calls (e.g. CSI test that calls
+    // `mount()` again with a different cache dir)
+    // do NOT spawn extra fsync threads (Bug 5).
+    crate::init_disk_write_pool(None);
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let cache_dir_path = if let Some(cd) = cache_dir {
         std::path::PathBuf::from(cd)
