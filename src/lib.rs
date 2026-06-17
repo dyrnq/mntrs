@@ -3312,18 +3312,57 @@ impl CoreFilesystem for MntrsFs {
     fn flush(&self, _ino: u64, _fh: u64) -> std::io::Result<()> {
         // Look up the handle to find the path and dirty state
         let fh_val = _fh;
-        let (path, dirty) = {
+        let (path, dirty, cache_fd) = {
             let entry = self.handles.get(&fh_val).map(|r| r.clone());
             if let Some(crate::FileHandleState::Write {
-                path: p, dirty: d, ..
+                path: p,
+                dirty: d,
+                cache_fd,
+                ..
             }) = entry
             {
-                (p, d)
+                (p, d, cache_fd)
             } else {
                 return Ok(());
             }
         };
         if dirty {
+            // Issue #34: force the cache fd's data to
+            // stable storage before we reply Ok. Pre-fix
+            // this method only queued an async writeback
+            // job, and the FUSE worker returned to the
+            // kernel with the bytes still in the OS page
+            // cache. A user-space close(2) then saw the
+            // FUSE reply and treated the data as durable
+            // -- but a power loss between the reply and
+            // the kernel's lazy writeback would leave the
+            // cache file empty (or truncated), and the
+            // async writeback had no bytes to upload.
+            //
+            // sync_data (not sync_all) matches libfuse
+            // passthrough_hp's dup+close pattern: we
+            // only need the user data flushed, mtime/
+            // ctime can wait for the kernel's later
+            // writeback. Holding the per-fd mutex blocks
+            // a concurrent writer through the same fd so
+            // we don't sync mid-write.
+            //
+            // Errors are surfaced: if the disk is so
+            // broken that fdatasync fails, the user
+            // process deserves to see it (typically as
+            // EIO from close()) rather than discovering
+            // the corruption on the next read.
+            if let Some(fd) = &cache_fd
+                && let Ok(f) = fd.lock()
+                && let Err(e) = f.sync_data()
+            {
+                tracing::warn!(
+                    path = %path,
+                    error = %e,
+                    "flush fdatasync failed; data may not be durable on local disk"
+                );
+                return Err(e);
+            }
             // Push single cache file to writeback queue
             let cpath = crate::cache_path(&self.cache_dir, &path);
             if cpath.exists() {
@@ -3376,9 +3415,41 @@ impl CoreFilesystem for MntrsFs {
         // On release, trigger writeback for dirty handles
         let was_dirty = if let Some(entry) = self.handles.get(&fh)
             && let crate::FileHandleState::Write {
-                path, dirty: true, ..
+                path,
+                dirty: true,
+                cache_fd: Some(fd),
+                ..
             } = entry.value()
         {
+            // Issue #34 (release counterpart to flush):
+            // fdatasync the cache fd before queueing the
+            // async writeback. close(2) returns to the
+            // user once FUSE replies Ok, and the user
+            // treats that as "data is on local disk and
+            // safe from this process crashing". Without
+            // the explicit sync, only the OS page cache
+            // holds the bytes; a power loss between
+            // close() returning and the kernel's lazy
+            // writeback would zero the cache file and
+            // the async writeback would have nothing to
+            // upload.
+            //
+            // sync_data (not sync_all) is intentional:
+            // we only need the user data flushed, the
+            // mtime update from the last write can stay
+            // in the page cache and ride out on the
+            // kernel's normal writeback. This matches
+            // libfuse passthrough_hp's dup+close pattern.
+            if let Ok(f) = fd.lock()
+                && let Err(e) = f.sync_data()
+            {
+                tracing::warn!(
+                    path = %path,
+                    error = %e,
+                    "release fdatasync failed; data may not be durable on local disk"
+                );
+                return Err(e);
+            }
             let cpath = crate::cache_path(&self.cache_dir, path);
             if cpath.exists() {
                 let sidecar = cpath.with_extension("dirty");
