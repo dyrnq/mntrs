@@ -283,6 +283,29 @@ pub struct MntrsFs {
     /// regression test that simulates a pending writeback).
     pub cache_dir: PathBuf,
     handles: dashmap::DashMap<u64, FileHandleState>,
+    /// Per-fh readdir state (issue #23 / DESIGN_READDIR_STREAMING).
+    /// `opendir(ino)` materialises the full entry list, stores
+    /// it here keyed by the dir-lister fh it returns, and
+    /// subsequent `readdir(ino, fh, offset)` calls slice the
+    /// cached Vec by `offset` (FUSE cookie) without re-hitting
+    /// `list_op` / `dir_cache`. `releasedir(ino, fh)` drops
+    /// the entry.
+    ///
+    /// The whole point of the per-fh state is stability: a
+    /// concurrent `create`/`unlink` that invalidates the
+    /// shared `dir_cache` after the kernel's first readdir
+    /// page no longer changes what the second page returns,
+    /// because the second page is served from this private
+    /// snapshot. Pre-fix the FUSE adapter called
+    /// `inner.readdir(ino)` on every page, and the second
+    /// call could see a different list at the same
+    /// `start` offset (issue #23, Bug 32 comment).
+    ///
+    /// Stored on `MntrsFs` (not a process-wide static)
+    /// because the tests construct multiple `MntrsFs`
+    /// instances; a static would leak list state across
+    /// mount lifetimes.
+    dir_listers: dashmap::DashMap<u64, Vec<CoreDirEntry>>,
     pub(crate) dir_cache_ttl: Duration,
     pub(crate) attr_ttl: Duration,
     pub(crate) stat_cache_ttl: Duration,
@@ -1378,6 +1401,98 @@ pub fn load_cache_index(cache_dir: &Path) -> Vec<(String, u64, u64, std::time::S
 impl MntrsFs {
     fn resolve(&self, ino: u64) -> Option<InodeEntry> {
         self.inodes.get(&ino).map(|r| r.clone())
+    }
+
+    /// Re-materialise the full directory entry list.
+    /// Issue #23: shared by `opendir` (per-fh path) and
+    /// any fallback `readdir(ino, 0, _)` call (the
+    /// pre-#23 re-materialize-on-every-page behaviour,
+    /// which the default trait impl exercises when a
+    /// test fake hasn't overridden the new methods).
+    /// Lives as an inherent method (not on the
+    /// `CoreFilesystem` trait) because it captures
+    /// backend-specific listing state (`dir_cache`,
+    /// `list_op`) that external test fakes wouldn't have.
+    fn readdir_materialise(&self, ino: u64) -> std::io::Result<Vec<CoreDirEntry>> {
+        let path = self.resolve(ino).map(|e| e.path).unwrap_or_default();
+        // Bug 34: pass the raw inode path; list_op
+        // canonicalizes internally. Pre-fix this
+        // computed `list_path = format!("{}/", path)`
+        // and used the formatted form as both the
+        // list_op arg AND the queried_last derivation
+        // base — duplicating the trailing-slash policy
+        // that list_op now owns.
+        let listed = self.list_op(&path).map_err(|e| {
+            tracing::warn!(path = %path, error = %e,
+                    "CoreFilesystem::readdir: list_op failed");
+            std::io::Error::other(e)
+        })?;
+        let mut entries = vec![
+            CoreDirEntry {
+                ino,
+                kind: CoreFileType::Directory,
+                name: ".".to_string(),
+            },
+            CoreDirEntry {
+                ino: 1,
+                kind: CoreFileType::Directory,
+                name: "..".to_string(),
+            },
+        ];
+        // hdfs-native quirk: the first entry of op.lister(p) is the queried
+        // path itself. After trim_end_matches('/') inside list_op:
+        //   lister("/")      → entries[0].name = ""       ← was caught
+        //   lister("/test/") → entries[0].name = "/test"
+        //   lister("/test")  → entries[0].name = "test"
+        // Without filtering all three, the FUSE reply contains a phantom
+        // entry that matches the parent dir name. ls -R then descends into
+        // it and gets EIO on stat, plus the root listing can show an empty
+        // name (kernel EIO on readdir).
+        // hdfs-native quirk: the first entry of op.lister(p) is a phantom
+        // whose name is the LAST path component of p (with any trailing
+        // slash already trimmed by list_op). Confirmed by direct probe:
+        //   lister("/")         → [0].name = ""        (root, no component)
+        //   lister("/test/")    → [0].name = "test"
+        //   lister("/test/sub/")→ [0].name = "sub"
+        // Without filtering, the FUSE reply contains a phantom that
+        // matches the parent dir's basename. ls -R then descends into it
+        // and gets EIO on stat, plus the root listing can show an empty
+        // name (kernel EIO on readdir). Per SESSION_PITFALLS §2.4.
+        let queried_last = std::path::Path::new(&path)
+            .components()
+            .next_back()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for (name, mode, size, _mtime) in listed {
+            if name.is_empty() || name == "/" || (name == queried_last && !queried_last.is_empty())
+            {
+                continue;
+            }
+            let kind = match mode {
+                EntryMode::DIR => CoreFileType::Directory,
+                _ => CoreFileType::RegularFile,
+            };
+            // name from list_op already includes path prefix (e.g., "many/file_0001.txt")
+            // Extract just the filename for display, use full path for inode allocation
+            let display_name = name
+                .rsplit_once('/')
+                .map(|(_, n)| n.to_string())
+                .unwrap_or_else(|| name.clone());
+            let ino = self.alloc_ino(
+                &name,
+                match kind {
+                    CoreFileType::Directory => FileType::Directory,
+                    _ => FileType::RegularFile,
+                },
+                size,
+            );
+            entries.push(CoreDirEntry {
+                ino,
+                kind,
+                name: display_name,
+            });
+        }
+        Ok(entries)
     }
 
     /// Background thread that periodically clears stale directory cache entries.
@@ -2612,86 +2727,63 @@ impl CoreFilesystem for MntrsFs {
         }
     }
 
-    fn readdir(&self, ino: u64) -> std::io::Result<Vec<CoreDirEntry>> {
-        let path = self.resolve(ino).map(|e| e.path).unwrap_or_default();
-        // Bug 34: pass the raw inode path; list_op
-        // canonicalizes internally. Pre-fix this
-        // computed `list_path = format!("{}/", path)`
-        // and used the formatted form as both the
-        // list_op arg AND the queried_last derivation
-        // base — duplicating the trailing-slash policy
-        // that list_op now owns.
-        let listed = self.list_op(&path).map_err(|e| {
-            tracing::warn!(path = %path, error = %e,
-                    "CoreFilesystem::readdir: list_op failed");
-            std::io::Error::other(e)
+    fn opendir(&self, ino: u64) -> std::io::Result<u64> {
+        // Issue #23: materialise the full directory entry
+        // list once and stash it under a per-fh handle.
+        // The FUSE adapter passes the returned fh to
+        // subsequent `readdir(ino, fh, offset)` calls;
+        // we slice the cached Vec by `offset` instead of
+        // re-hitting `list_op` on every page.
+        //
+        // Why a fresh fh (not the kernel's `fh` from
+        // opendir's FUSE argument): the FUSE protocol
+        // treats the `fh` as opaque — we mint one via
+        // NEXT_HANDLE and store the snapshot under it.
+        // The same fh is fed back to us on readdir and
+        // releasedir. This keeps the dir-lister lifetime
+        // independent of the inode's open-file handles
+        // (which serve regular files via `open`/`release`).
+        let entries = self.readdir_materialise(ino)?;
+        let fh = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.dir_listers.insert(fh, entries);
+        Ok(fh)
+    }
+
+    fn readdir(
+        &self,
+        ino: u64,
+        fh: u64,
+        offset: u64,
+        _max: usize,
+    ) -> std::io::Result<Vec<CoreDirEntry>> {
+        // Issue #23: serve from the per-fh snapshot.
+        // The FUSE cookie is "index of the last entry
+        // delivered + 1", so `start = offset as usize -
+        // 1` would also work, but the fuser adapter
+        // passes the raw `(i + 1) as u64` it would have
+        // used pre-fix, and we slice from
+        // `entries[start..]` — same semantics as
+        // pre-fix slice-indexing (Bug 32 fix in
+        // ece4391).
+        let start = offset as usize;
+        let entries = self.dir_listers.get(&fh).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("readdir(ino={ino}, fh={fh}): unknown dir-lister handle"),
+            )
         })?;
-        let mut entries = vec![
-            CoreDirEntry {
-                ino,
-                kind: CoreFileType::Directory,
-                name: ".".to_string(),
-            },
-            CoreDirEntry {
-                ino: 1,
-                kind: CoreFileType::Directory,
-                name: "..".to_string(),
-            },
-        ];
-        // hdfs-native quirk: the first entry of op.lister(p) is the queried
-        // path itself. After trim_end_matches('/') inside list_op:
-        //   lister("/")      → entries[0].name = ""       ← was caught
-        //   lister("/test/") → entries[0].name = "/test"
-        //   lister("/test")  → entries[0].name = "test"
-        // Without filtering all three, the FUSE reply contains a phantom
-        // entry that matches the parent dir name. ls -R then descends into
-        // it and gets EIO on stat, plus the root listing can show an empty
-        // name (kernel EIO on readdir).
-        // hdfs-native quirk: the first entry of op.lister(p) is a phantom
-        // whose name is the LAST path component of p (with any trailing
-        // slash already trimmed by list_op). Confirmed by direct probe:
-        //   lister("/")         → [0].name = ""        (root, no component)
-        //   lister("/test/")    → [0].name = "test"
-        //   lister("/test/sub/")→ [0].name = "sub"
-        // Without filtering, the FUSE reply contains a phantom that
-        // matches the parent dir's basename. ls -R then descends into it
-        // and gets EIO on stat, plus the root listing can show an empty
-        // name (kernel EIO on readdir). Per SESSION_PITFALLS §2.4.
-        let queried_last = std::path::Path::new(&path)
-            .components()
-            .next_back()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .unwrap_or_default();
-        for (name, mode, size, _mtime) in listed {
-            if name.is_empty() || name == "/" || (name == queried_last && !queried_last.is_empty())
-            {
-                continue;
-            }
-            let kind = match mode {
-                EntryMode::DIR => CoreFileType::Directory,
-                _ => CoreFileType::RegularFile,
-            };
-            // name from list_op already includes path prefix (e.g., "many/file_0001.txt")
-            // Extract just the filename for display, use full path for inode allocation
-            let display_name = name
-                .rsplit_once('/')
-                .map(|(_, n)| n.to_string())
-                .unwrap_or_else(|| name.clone());
-            let ino = self.alloc_ino(
-                &name,
-                match kind {
-                    CoreFileType::Directory => FileType::Directory,
-                    _ => FileType::RegularFile,
-                },
-                size,
-            );
-            entries.push(CoreDirEntry {
-                ino,
-                kind,
-                name: display_name,
-            });
+        if start >= entries.len() {
+            return Ok(Vec::new());
         }
-        Ok(entries)
+        Ok(entries[start..].to_vec())
+    }
+
+    fn releasedir(&self, _ino: u64, fh: u64) -> std::io::Result<()> {
+        // Drop the per-fh snapshot. Idempotent: a
+        // double-releasedir (kernel bug? retry?) is a
+        // no-op rather than an error.
+        self.dir_listers.remove(&fh);
+        Ok(())
     }
 
     fn open(&self, ino: u64, _flags: u32) -> std::io::Result<u64> {
@@ -4098,13 +4190,6 @@ impl CoreFilesystem for MntrsFs {
         })
     }
 
-    fn opendir(&self, _ino: u64) -> std::io::Result<u64> {
-        Ok(0)
-    }
-    fn releasedir(&self, _ino: u64, _fh: u64) -> std::io::Result<()> {
-        Ok(())
-    }
-
     fn getxattr(&self, ino: u64, name: &str) -> std::io::Result<Vec<u8>> {
         if let Some(InodeEntry { path: p, .. }) = self.resolve(ino) {
             let op = self.op.clone();
@@ -4386,6 +4471,9 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         dir_cache: Default::default(),
         cache_dir,
         handles: Default::default(),
+        // Issue #23: per-fh readdir snapshots. Empty
+        // until opendir() populates an entry.
+        dir_listers: Default::default(),
         dir_cache_ttl: std::time::Duration::from_secs(10),
         attr_ttl: std::time::Duration::from_secs(1),
         stat_cache_ttl: std::time::Duration::from_secs(10),

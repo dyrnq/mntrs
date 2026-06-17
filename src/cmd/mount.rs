@@ -646,6 +646,9 @@ pub fn mount(
         dir_cache: dashmap::DashMap::new(),
         cache_dir: cache_dir_path,
         handles: dashmap::DashMap::new(),
+        // Issue #23: per-fh readdir snapshots. Empty
+        // until opendir() populates an entry.
+        dir_listers: dashmap::DashMap::new(),
         dir_cache_ttl: std::time::Duration::from_secs(dir_cache_time),
         attr_ttl: std::time::Duration::from_secs(attr_timeout),
         stat_cache_ttl: std::time::Duration::from_secs(stat_cache_ttl),

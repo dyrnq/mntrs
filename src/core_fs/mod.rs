@@ -105,10 +105,63 @@ pub trait CoreFilesystem: Send + Sync {
         size: Option<u64>,
         _atime: Option<SystemTime>,
         _mtime: Option<SystemTime>,
+        fh: Option<u64>,
     ) -> std::io::Result<CoreFileAttr>;
 
     /// Read directory entries.
-    fn readdir(&self, ino: u64) -> std::io::Result<Vec<CoreDirEntry>>;
+    ///
+    /// Issue #23 / DESIGN_READDIR_STREAMING: the FUSE
+    /// protocol paginates readdir by cookie. The
+    /// pre-fix `readdir(ino) -> Vec<CoreDirEntry>` API
+    /// re-materialized the list on every page (via
+    /// `dir_cache` + `list_op`). If a concurrent mutation
+    /// (create/unlink) invalidated the dir cache between
+    /// the first and second page, the second `readdir`
+    /// could produce a different list at the same
+    /// `start` offset — leading to skipped or duplicate
+    /// entries delivered to user-space.
+    ///
+    /// The fix is a 3-call API:
+    ///   * `opendir(ino)` materializes the list once
+    ///     and returns a per-fh handle. The default
+    ///     returns a sentinel fh of 0 (no per-fh state,
+    ///     falls back to the pre-#23 re-materialize path).
+    ///   * `readdir(ino, fh, offset)` slices into the
+    ///     per-fh state for non-zero fh, or re-materialises
+    ///     on every call for fh=0 (the pre-#23 fallback).
+    ///   * `releasedir(ino, fh)` drops the per-fh state.
+    fn opendir(&self, ino: u64) -> std::io::Result<u64> {
+        let _ = ino;
+        Ok(0)
+    }
+
+    /// Read the next page of directory entries.
+    /// `offset` is the FUSE cookie (= 1 + index of the
+    /// last entry the kernel consumed). `max` is a hint;
+    /// the implementation may return fewer (or up to all
+    /// remaining) entries.
+    ///
+    /// Required method: implementations that use
+    /// per-fh state (issue #23) implement this directly;
+    /// test fakes can fall back to the pre-#23 behaviour
+    /// by re-materialising on every call. There is no
+    /// default body because the only public impl
+    /// (`MntrsFs`) always has per-fh state available
+    /// and slicing is the right primitive.
+    fn readdir(
+        &self,
+        ino: u64,
+        fh: u64,
+        offset: u64,
+        _max: usize,
+    ) -> std::io::Result<Vec<CoreDirEntry>>;
+
+    /// Release the per-fh readdir state. The default is
+    /// a no-op (no per-fh state to release under the
+    /// re-materialize path).
+    fn releasedir(&self, _ino: u64, _fh: u64) -> std::io::Result<()> {
+        Ok(())
+    }
 
     /// Open a file (return a handle id).
     fn open(&self, ino: u64, _flags: u32) -> std::io::Result<u64>;
@@ -231,17 +284,6 @@ pub trait CoreFilesystem: Send + Sync {
 
     /// Get volume statistics.
     fn statfs(&self, ino: u64) -> std::io::Result<CoreVolumeStat>;
-
-    /// Open a directory (return a handle id).
-    fn opendir(&self, ino: u64) -> std::io::Result<u64> {
-        let _ = ino;
-        Ok(0)
-    }
-
-    /// Release an open directory handle.
-    fn releasedir(&self, _ino: u64, _fh: u64) -> std::io::Result<()> {
-        Ok(())
-    }
 
     /// Get extended attribute value.
     fn getxattr(&self, ino: u64, name: &str) -> std::io::Result<Vec<u8>>;

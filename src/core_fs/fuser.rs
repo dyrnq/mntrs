@@ -234,51 +234,26 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        // Bug 32 (readdir pagination):
+        // Issue #23: pull a single page from the per-fh
+        // dir-lister snapshot. The materialisation
+        // happened once in opendir (called the first
+        // time the kernel opened this directory); the
+        // fh we receive here is the same fh opendir
+        // returned. The cookie is the kernel's
+        // "1 + index of last entry delivered" —
+        // slicing from `offset as usize` matches the
+        // pre-#23 (Bug 32 fix in ece4391) semantics.
         //
-        // What this code does today: `inner.readdir(ino)`
-        // returns the WHOLE directory entry list (capped
-        // at MAX_LIST_ENTRIES = 1M in list_op). The kernel
-        // calls readdir(offset=0), we fill the 4 KiB
-        // reply buffer with as many entries as fit, the
-        // kernel re-calls readdir(offset=N), we slice into
-        // the same materialized list and continue. The
-        // dir_cache TTL (300 s by default) keeps the
-        // materialized list around so subsequent pages
-        // don't re-hit list_op.
-        //
-        // What it doesn't do: true kernel pagination via
-        // backend continuation tokens. Beyond
-        // MAX_LIST_ENTRIES the listing is silently
-        // truncated (list_op logs a warn — see Bug 6).
-        // True streaming would need:
-        //   * per-fh lister state on the FileHandleState
-        //     enum (a Read variant that holds the opendal
-        //     Lister mid-iteration);
-        //   * a fh-aware CoreFilesystem::readdir that
-        //     pulls only the next page from the lister,
-        //     using offset as a continuation key;
-        //   * cross-backend continuation semantics
-        //     (S3 NextContinuationToken, HDFS startAfter,
-        //     fs:// ReadDir cursor, etc.).
-        // That's a meaningful refactor; for now the cap
-        // is the documented limit. The proposed design is
-        // captured in DESIGN_READDIR_STREAMING.md (see
-        // also issue #23) — half-day to one-day focused
-        // work, ~300 LoC across 4 files.
-        //
-        // The slice-indexing micro-fix below replaces a
-        // pre-fix `entries.iter().enumerate().skip(start)`
-        // which advanced the iterator one step at a time
-        // (O(offset) per page). For a 1M-entry dir paged
-        // in 4 KiB chunks, the original cost was
-        // 250 × O(500k) ≈ 125M iterations to fill 1M
-        // output. Slice indexing is O(1) per page.
-        match self.inner.readdir(ino.into()) {
+        // For the pre-#23 fallback (fh=0, the trait
+        // default), the implementation re-materialises
+        // on every call, so pagination is still correct
+        // — just slower and subject to the same
+        // "list changed between pages" risk as before.
+        match self.inner.readdir(ino.into(), fh.into(), offset, 0) {
             Ok(entries) => {
                 let start = offset as usize;
                 if start >= entries.len() {
@@ -306,20 +281,18 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectoryPlus,
     ) {
-        // Bug 32: same slice-indexing fix as readdir
-        // above — see that function's comment for the
-        // full pagination story (cap, kernel page reuse
-        // via dir_cache, future-work true-streaming
-        // gap). readdirplus's extra cost is the per-
-        // entry lookup() which dominates anyway; the
-        // skip→slice change still matters because
-        // pre-fix the skip walked the iterator one
-        // entry at a time before the lookup ran.
-        match self.inner.readdir(ino.into()) {
+        // Issue #23: same per-fh slice path as readdir
+        // above. The per-fh snapshot also pins inode
+        // allocation (alloc_ino) for each entry, so the
+        // lookups below resolve to the same ino the
+        // entry was emitted with — vs the pre-#23
+        // path which could allocate a different ino
+        // for the same name across pages.
+        match self.inner.readdir(ino.into(), fh.into(), offset, 0) {
             Ok(entries) => {
                 let start = offset as usize;
                 if start >= entries.len() {
@@ -368,6 +341,12 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        // Issue #23: forward to the trait's opendir
+        // which materialises the dir entries and returns
+        // a per-fh handle. Pre-fix this used the trait
+        // default that returns Ok(0) — a sentinel that
+        // skips the per-fh state and falls back to the
+        // re-materialise-on-every-page path.
         match self.inner.opendir(ino.into()) {
             Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
             Err(e) => reply.error(io_err_to_fuse_errno(e)),
@@ -378,11 +357,13 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         _flags: OpenFlags,
         reply: ReplyEmpty,
     ) {
-        match self.inner.releasedir(ino.into(), _fh.into()) {
+        // Issue #23: drop the per-fh snapshot. Idempotent
+        // — see MntrsFs::releasedir.
+        match self.inner.releasedir(ino.into(), fh.into()) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(io_err_to_fuse_errno(e)),
         }

@@ -118,15 +118,21 @@ fn bug_b_readdir_lists_new_dir_on_cold_parent_cache() {
     let b = CoreFilesystem::mkdir(&*fs, a.ino, "beta").unwrap();
     assert!(matches!(b.kind, mntrs::core_fs::CoreFileType::Directory));
     // First readdir on the root — should see "alpha" even though
-    // we never listed the root before.
-    let root_entries = CoreFilesystem::readdir(&*fs, 1).unwrap();
+    // we never listed the root before. Issue #23: use the
+    // opendir/readdir pair so the per-fh snapshot path is
+    // exercised.
+    let root_fh = CoreFilesystem::opendir(&*fs, 1).unwrap();
+    let root_entries = CoreFilesystem::readdir(&*fs, 1, root_fh, 0, 0).unwrap();
+    CoreFilesystem::releasedir(&*fs, 1, root_fh).unwrap();
     let root_names: Vec<&str> = root_entries.iter().map(|e| e.name.as_str()).collect();
     assert!(
         root_names.contains(&"alpha"),
         "root readdir should list alpha (cold-cache fix), got {root_names:?}"
     );
     // First readdir on a — should see "beta".
-    let a_entries = CoreFilesystem::readdir(&*fs, a.ino).unwrap();
+    let a_fh = CoreFilesystem::opendir(&*fs, a.ino).unwrap();
+    let a_entries = CoreFilesystem::readdir(&*fs, a.ino, a_fh, 0, 0).unwrap();
+    CoreFilesystem::releasedir(&*fs, a.ino, a_fh).unwrap();
     let a_names: Vec<&str> = a_entries.iter().map(|e| e.name.as_str()).collect();
     assert!(
         a_names.contains(&"beta"),
@@ -143,7 +149,9 @@ fn bug_b_readdir_lists_new_dir_on_cold_parent_cache() {
 fn bug_b_readdir_on_empty_dir_succeeds() {
     let fs = Arc::new(make_memory_fs());
     let a = CoreFilesystem::mkdir(&*fs, 1, "alpha").unwrap();
-    let entries = CoreFilesystem::readdir(&*fs, a.ino).unwrap();
+    let entries_fh = CoreFilesystem::opendir(&*fs, a.ino).unwrap();
+    let entries = CoreFilesystem::readdir(&*fs, a.ino, entries_fh, 0, 0).unwrap();
+    CoreFilesystem::releasedir(&*fs, a.ino, entries_fh).unwrap();
     // Just ".", "..", and nothing else.
     let user_visible: Vec<&str> = entries
         .iter()
@@ -451,4 +459,94 @@ fn bug_g_rename_falls_back_when_op_copy_unsupported() {
         String::from_utf8_lossy(&dst_data)
     );
     let _ = first.ino;
+}
+
+// ============================================================
+// Issue #23 — readdir per-fh stability
+// ============================================================
+//
+// Pre-fix the FUSE adapter called
+// `CoreFilesystem::readdir(ino)` on every page, which
+// re-materialised the list via `list_op` + `dir_cache`.
+// A concurrent create/unlink that invalidated the cache
+// between the kernel's first and second readdir page
+// could return a different list at the same `start`
+// offset, producing skipped or duplicate entries
+// delivered to user-space.
+//
+// The fix: opendir materialises once and stashes a
+// per-fh snapshot. Subsequent readdir calls slice the
+// snapshot, immune to dir_cache invalidation between
+// pages. This test simulates the exact race:
+//
+//   1. opendir(root) — snapshots {".", "..", "a"}
+//   2. mkdir(root, "b")  ← concurrent mutation
+//   3. readdir(root, fh, offset=0) — should still return
+//      the {".", "..", "a"} snapshot, NOT the new "b"
+//
+// Pre-fix the post-mkdir readdir would see "b" because
+// it re-materialised; post-fix the per-fh snapshot
+// keeps the original list stable.
+#[test]
+fn bug_issue23_readdir_per_fh_snapshot_stable_under_concurrent_mkdir() {
+    use mntrs::core_fs::CoreFilesystem;
+
+    let fs = std::sync::Arc::new(make_memory_fs());
+    // Pre-create "a" so the first readdir has a known
+    // baseline.
+    CoreFilesystem::mkdir(&*fs, 1, "a").unwrap();
+
+    // 1. opendir — materialise the snapshot.
+    let fh = CoreFilesystem::opendir(&*fs, 1).unwrap();
+    let page1 = CoreFilesystem::readdir(&*fs, 1, fh, 0, 0).unwrap();
+    let page1_names: Vec<&str> = page1.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        page1_names.contains(&"a"),
+        "first page should list pre-existing 'a' (got {page1_names:?})"
+    );
+    assert!(
+        !page1_names.contains(&"b"),
+        "first page should NOT yet list 'b' (got {page1_names:?})"
+    );
+
+    // 2. concurrent mutation — create a new entry
+    //    AFTER the snapshot was taken.
+    CoreFilesystem::mkdir(&*fs, 1, "b").unwrap();
+
+    // 3. Second page read — the kernel paginates by
+    //    re-calling readdir(offset=N). The per-fh
+    //    snapshot must NOT include the post-snapshot
+    //    "b", otherwise the kernel would see a
+    //    duplicate / mid-list mutation.
+    let start = page1_names.len() as u64;
+    let page2 = CoreFilesystem::readdir(&*fs, 1, fh, start, 0).unwrap();
+    let page2_names: Vec<&str> = page2.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        page2_names.is_empty(),
+        "second page from stable snapshot should be empty \
+         (page1_names={page1_names:?}, page2_names={page2_names:?})"
+    );
+    assert!(
+        !page1_names.contains(&"b"),
+        "first page must remain stable: 'b' was created \
+         AFTER opendir, must not appear in the per-fh snapshot \
+         (page1_names={page1_names:?})"
+    );
+
+    // Releasedir drops the snapshot.
+    CoreFilesystem::releasedir(&*fs, 1, fh).unwrap();
+    // A fresh opendir after the mutation SHOULD see "b"
+    // — the per-fh stability is scoped to one fh, not
+    // a global freeze. This confirms the fix is
+    // targeted (only the in-flight readdir is pinned,
+    // new reads see fresh state).
+    let fh2 = CoreFilesystem::opendir(&*fs, 1).unwrap();
+    let fresh = CoreFilesystem::readdir(&*fs, 1, fh2, 0, 0).unwrap();
+    let fresh_names: Vec<&str> = fresh.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        fresh_names.contains(&"a") && fresh_names.contains(&"b"),
+        "fresh opendir after mkdir should see both 'a' and 'b' \
+         (got {fresh_names:?})"
+    );
+    CoreFilesystem::releasedir(&*fs, 1, fh2).unwrap();
 }
