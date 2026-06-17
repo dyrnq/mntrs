@@ -305,6 +305,37 @@ impl controller_server::Controller for ControllerService {
 /// `volume_id` pointing at a fresh path.
 struct MountState {
     mountpoint: String,
+    /// `true` if the bind mount was remounted read-only at
+    /// publish time (issue #36). Tracked for ops visibility
+    /// / unpublish logging; the kernel's mount table is the
+    /// source of truth for the actual ro/rw state.
+    read_only: bool,
+}
+
+/// CSI `VolumeCapability::AccessMode::Mode` values that
+/// map to a read-only bind mount at the node. Pulled from
+/// csi.proto (see proto/csi.proto:484). Encoded as raw
+/// i32 because the generated enum is only visible after
+/// the build script has run; the constants are stable in
+/// the CSI spec and have not changed since v1.0.
+mod access_mode {
+    pub const SINGLE_NODE_READER_ONLY: i32 = 2;
+    pub const MULTI_NODE_READER_ONLY: i32 = 3;
+    /// MULTI_NODE_SINGLE_WRITER (4) is read-only on every
+    /// node except the elected writer. K8s asks each node
+    /// to publish with the per-node mode that matches its
+    /// actual read/write capability, so seeing 4 here means
+    /// "publish ro here".
+    pub const MULTI_NODE_SINGLE_WRITER: i32 = 4;
+}
+
+fn access_mode_is_read_only(mode: i32) -> bool {
+    matches!(
+        mode,
+        access_mode::SINGLE_NODE_READER_ONLY
+            | access_mode::MULTI_NODE_READER_ONLY
+            | access_mode::MULTI_NODE_SINGLE_WRITER
+    )
 }
 
 pub struct NodeService {
@@ -524,11 +555,17 @@ impl node_server::Node for NodeService {
             tracing::info!(volume_id, target=%target_path, "already mounted (bind)");
             // Reflect this in our internal map so a later
             // unpublish for the same volume_id works
-            // through the normal remove path.
+            // through the normal remove path. We don't
+            // know the original read_only intent here
+            // (the kernel just says "is a mountpoint");
+            // default to false — unpublish behaviour is
+            // the same either way (umount), and the log
+            // line is cosmetic.
             self.mounts.lock().unwrap().insert(
                 volume_id.clone(),
                 MountState {
                     mountpoint: target_path.clone(),
+                    read_only: false,
                 },
             );
             return Ok(Response::new(NodePublishVolumeResponse::default()));
@@ -577,14 +614,63 @@ impl node_server::Node for NodeService {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(Status::internal(format!("mount --bind: {stderr}")));
         }
+
+        // Issue #36: honour the access_mode declared by the
+        // pod's storage class. Without this remount, a PVC
+        // that asked for readOnly access would still see
+        // `rw` in /proc/mounts (bind mounts inherit the
+        // source's flags), and write syscalls would slip
+        // past the kernel VFS to FUSE — wasting a FUSE
+        // round-trip before the FUSE layer rejected with
+        // EROFS. A `remount,bind,ro` on the same path
+        // flips the kernel's per-mount read-only flag so
+        // the write is rejected at VFS lookup (EIO or
+        // EROFS) before any FUSE traffic.
+        //
+        // We do the remount unconditionally *after* the
+        // bind (the only legal order on Linux — see
+        // mount(8): "You must change mount options of a
+        // mount that already exists"). If the remount
+        // fails we tear down the bind mount and surface
+        // the error, so the caller doesn't end up with a
+        // half-configured ro state and our `mounts` map
+        // staying consistent with reality.
+        let read_only = req
+            .volume_capability
+            .as_ref()
+            .and_then(|vc| vc.access_mode.as_ref())
+            .map(|am| access_mode_is_read_only(am.mode))
+            .unwrap_or(false);
+        if read_only {
+            tracing::info!(volume_id, target=%target_path, "remounting bind ro (issue #36)");
+            let output = std::process::Command::new("mount")
+                .args(["-o", "remount,bind,ro", &target_path])
+                .output()
+                .map_err(|e| Status::internal(format!("mount -o remount,bind,ro failed: {e}")))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // Tear down the bind we just created so we
+                // don't leak an rw mount that the storage
+                // class asked to be ro.
+                let _ = std::process::Command::new("umount")
+                    .arg(&target_path)
+                    .output();
+                let _ = std::fs::remove_dir_all(&target_path);
+                return Err(Status::internal(format!(
+                    "mount -o remount,bind,ro {target_path}: {stderr}"
+                )));
+            }
+        }
+
         let mut mounts = self.mounts.lock().unwrap();
         mounts.insert(
             volume_id.clone(),
             MountState {
                 mountpoint: target_path.clone(),
+                read_only,
             },
         );
-        tracing::info!(volume_id, staging=%staging_target_path, target=%target_path, "volume published");
+        tracing::info!(volume_id, staging=%staging_target_path, target=%target_path, read_only, "volume published");
         Ok(Response::new(NodePublishVolumeResponse::default()))
     }
 
@@ -621,10 +707,20 @@ impl node_server::Node for NodeService {
         }
         std::fs::remove_dir_all(&target_path).ok();
 
-        let mut mounts = self.mounts.lock().unwrap();
-        mounts.remove(&volume_id);
+        // The map entry is removed whether or not the prior
+        // umount succeeded; tracking the ro state at publish
+        // time gives ops a hint about what was actually mounted,
+        // but the kernel's mount table is the source of truth
+        // for what umount just operated on.
+        let read_only = self
+            .mounts
+            .lock()
+            .unwrap()
+            .remove(&volume_id)
+            .map(|m| m.read_only)
+            .unwrap_or(false);
 
-        tracing::info!(target=%target_path, vol=%volume_id, "volume unmounted");
+        tracing::info!(target=%target_path, vol=%volume_id, read_only, "volume unmounted");
         Ok(Response::new(NodeUnpublishVolumeResponse::default()))
     }
 
@@ -937,6 +1033,34 @@ mod tests {
         ctx2.insert("readOnly".to_string(), "false".to_string());
         let ro2 = ctx2.get("readOnly").map(|v| v == "true").unwrap_or(false);
         assert!(!ro2);
+    }
+
+    // ============================================================
+    // access_mode_is_read_only — issue #36 readOnly remount
+    // ============================================================
+
+    #[test]
+    fn access_mode_ro_classification() {
+        use super::access_mode_is_read_only;
+        // CSI spec v1 (csi.proto:484) enum values. UNKNOWN
+        // and the SINGLE/MULTI NODE_WRITER modes must NOT
+        // remount ro, otherwise write PVCs would silently
+        // become read-only.
+        assert!(access_mode_is_read_only(
+            super::access_mode::SINGLE_NODE_READER_ONLY
+        ));
+        assert!(access_mode_is_read_only(
+            super::access_mode::MULTI_NODE_READER_ONLY
+        ));
+        assert!(access_mode_is_read_only(
+            super::access_mode::MULTI_NODE_SINGLE_WRITER
+        ));
+        // Everything else is rw (UNKNOWN defaults to rw for
+        // forward compat with future CSI spec extensions).
+        assert!(!access_mode_is_read_only(0)); // UNKNOWN
+        assert!(!access_mode_is_read_only(1)); // SINGLE_NODE_WRITER
+        assert!(!access_mode_is_read_only(5)); // MULTI_NODE_MULTI_WRITER
+        assert!(!access_mode_is_read_only(99)); // unknown future mode → rw
     }
 
     // ============================================================
