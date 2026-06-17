@@ -3738,6 +3738,20 @@ impl CoreFilesystem for MntrsFs {
         } else {
             format!("{}/{}", parent_path, name)
         };
+        // Issue #57: ensure the parent directory exists
+        // on hierarchical backends (HDFS, local fs,
+        // WebHDFS) before issuing the write. Flat-
+        // namespace backends (S3, GCS, OSS, COS, OBS)
+        // auto-create the prefix on write, so the
+        // mkdir_chain's `Unsupported` / `AlreadyExists`
+        // arms make this a no-op for them — same cost
+        // as a single op.create_dir round-trip.
+        //
+        // Pre-fix this skipped the parent check
+        // entirely, so a `create("a/b/c.txt")` on
+        // HDFS would surface `NotFound` from
+        // op.write("a/b/c.txt") with no retry path.
+        self.mkdir_chain(&full_path)?;
         let op = self.op.clone();
         let p = full_path.clone();
         rt().block_on(async move { op.write(&p, Vec::<u8>::new()).await })
