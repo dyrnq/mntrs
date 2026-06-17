@@ -5,6 +5,7 @@ pub mod cache;
 pub mod cmd;
 pub mod core_fs;
 pub mod error_log;
+pub mod fuse_error;
 pub mod http_client;
 pub mod path;
 pub mod prefetcher;
