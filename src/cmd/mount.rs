@@ -359,24 +359,33 @@ pub fn mount_internal(
         false,                    // mount_case_insensitive
         131072,                   // max_read_ahead
         0,                        // vfs_read_chunk_size_limit
-        0,                        // vfs_read_chunk_streams (serial)
-        16777216,                 // vfs_prefetch_threshold (16 MiB)
-        64,                       // vfs_prefetch_queue_mb
-        false,                    // vfs_fast_fingerprint
-        false,                    // async_read
-        false,                    // vfs_refresh
-        false,                    // vfs_case_insensitive
-        false,                    // no_implicit_dir
-        false,                    // vfs_block_norm_dupes
-        false,                    // vfs_links
-        false,                    // vfs_used_is_size
-        None,                     // vfs_metadata_extension
-        None,                     // storage_class
-        1,                        // vfs_write_wait (1s)
-        1,                        // vfs_read_wait (1s)
-        60,                       // vfs_cache_poll_interval
-        0,                        // vfs_handle_caching
-        0,                        // vfs_disk_space_total_size (off)
+        // Issue #31: bump default chunk_streams from 0
+        // (serial) to 4. rclone's default
+        // --vfs-read-chunk-streams is 4; the bench
+        // showed cold-start of 100M files at
+        // 1.3x slower with serial streams. 4 is
+        // enough to keep the network busy without
+        // saturating memory or concurrent-upload
+        // pools. Operators who want serial can pass
+        // `--vfs-read-chunk-streams=0` on the CLI.
+        4,        // vfs_read_chunk_streams (parallel)
+        16777216, // vfs_prefetch_threshold (16 MiB)
+        64,       // vfs_prefetch_queue_mb
+        false,    // vfs_fast_fingerprint
+        false,    // async_read
+        false,    // vfs_refresh
+        false,    // vfs_case_insensitive
+        false,    // no_implicit_dir
+        false,    // vfs_block_norm_dupes
+        false,    // vfs_links
+        false,    // vfs_used_is_size
+        None,     // vfs_metadata_extension
+        None,     // storage_class
+        1,        // vfs_write_wait (1s)
+        1,        // vfs_read_wait (1s)
+        60,       // vfs_cache_poll_interval
+        0,        // vfs_handle_caching
+        0,        // vfs_disk_space_total_size (off)
     )
 }
 
