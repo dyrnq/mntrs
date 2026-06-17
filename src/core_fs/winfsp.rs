@@ -167,6 +167,35 @@ impl<F: CoreFilesystem + 'static> WinFspAdapter<F> {
     pub fn new(inner: Arc<F>) -> Self {
         Self { inner }
     }
+
+    /// Issue #56: resolve a full parent path (e.g.
+    /// "/subdir") to an inode by walking the
+    /// intermediate directories via the trait's
+    /// `lookup`. Returns None if any intermediate
+    /// lookup fails — the caller falls back to
+    /// parent=1 (root), which is the only safe
+    /// default when we can't prove the parent.
+    fn parent_ino_for(&self, full_path: &str) -> Option<u64> {
+        // Strip leading/trailing slashes; split
+        // into components.
+        let trimmed = full_path.trim_matches('/');
+        if trimmed.is_empty() {
+            // "/" → root inode (= 1, per mntrs's
+            // lookup_count convention)
+            return Some(1);
+        }
+        let mut current_parent = 1u64;
+        for component in trimmed.split('/') {
+            if component.is_empty() {
+                continue;
+            }
+            match self.inner.lookup(current_parent, component) {
+                Ok(attr) => current_parent = attr.ino,
+                Err(_) => return None,
+            }
+        }
+        Some(current_parent)
+    }
 }
 
 impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
@@ -273,10 +302,45 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         new_file_name: &U16CStr,
         _replace_if_exists: bool,
     ) -> Result<()> {
-        let src = file_name.to_string_lossy().replace('\\', "/");
-        let dst = new_file_name.to_string_lossy().replace('\\', "/");
+        // Issue #56: WinFSP passes full paths (e.g.
+        // "/subdir/file.txt") as `file_name`. The
+        // pre-fix code hardcoded `parent = 1` and
+        // relied on the path concatenation
+        // `format!("{}/{}", root_path, src)` to
+        // accidentally produce the correct full
+        // path. That works only because the root
+        // path is empty AND src starts with "/". For
+        // non-root mounts (e.g. --root subdir/) or
+        // relative src paths, the result is wrong
+        // and the rename lands at the wrong place
+        // (or fails with NotFound).
+        //
+        // Fix: extract the parent directory from the
+        // full src path, look up its ino, and pass
+        // (parent_ino, basename, newparent_ino,
+        // newname) to the trait's rename.
+        let src_full = file_name.to_string_lossy().replace('\\', "/");
+        let dst_full = new_file_name.to_string_lossy().replace('\\', "/");
+        let (src_parent_path, src_name) = match src_full.rsplit_once('/') {
+            Some((parent, name)) if !name.is_empty() => (parent.to_string(), name.to_string()),
+            // No slash or empty basename — treat as
+            // root-level rename (parent=1).
+            _ => ("/".to_string(), src_full.clone()),
+        };
+        let (dst_parent_path, dst_name) = match dst_full.rsplit_once('/') {
+            Some((parent, name)) if !name.is_empty() => (parent.to_string(), name.to_string()),
+            _ => ("/".to_string(), dst_full.clone()),
+        };
+        // Resolve the parent paths to inodes via
+        // lookup. WinFSP's pre-fix hardcoded 1
+        // because the path concatenation masked the
+        // bug; the trait's rename(parent_ino, name,
+        // newparent_ino, newname) signature requires
+        // a real parent ino.
+        let src_parent_ino = self.parent_ino_for(&src_parent_path).unwrap_or(1);
+        let dst_parent_ino = self.parent_ino_for(&dst_parent_path).unwrap_or(1);
         self.inner
-            .rename(1, &src, 1, &dst)
+            .rename(src_parent_ino, &src_name, dst_parent_ino, &dst_name)
             .map_err(io_err_to_status)
     }
 
