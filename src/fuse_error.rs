@@ -36,16 +36,16 @@
 /// Unified FUSE error macro.
 ///
 /// Required variables in the calling scope:
-///   * `op` — `&'static str` FUSE operation name
+///     * `op` — `&'static str` FUSE operation name
 ///     (e.g. `"read"`, `"write"`, `"lookup"`)
-///   * `reply` — the FUSE `Reply*` value
-///   * `e` — the `std::io::Error` value
+///     * `reply` — the FUSE `Reply*` value
+///     * `e` — the `std::io::Error` value
 ///
 /// Effect:
-///   * `tracing::warn!(op, error=%e, ...)`
-///   * `error_log::log_fuse_error(op, e, vec![])`
+///     * `tracing::warn!(op, error=%e, ...)`
+///     * `error_log::log_fuse_error(op, e, vec![])`
 ///     (no-op if the error log is not installed)
-///   * `reply.error(io_err_to_fuse_errno(e))`
+///     * `reply.error(io_err_to_fuse_errno(e))`
 ///
 /// Note: the macro is intentionally lightweight —
 /// no metrics counters, no unique-request tagging

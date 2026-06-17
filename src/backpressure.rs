@@ -6,27 +6,27 @@
 //! `prefetch/backpressure_controller.rs`.
 //!
 //! Algorithm (kept simple for v1):
-//!   * `record_part_consumed(consumed_bytes,
+//!     * `record_part_consumed(consumed_bytes,
 //!     elapsed)` — FUSE read consumed a part
 //!     in `elapsed` time. The consumer rate
 //!     (bytes/sec) is computed.
-//!   * `record_part_fetched(fetched_bytes,
+//!     * `record_part_fetched(fetched_bytes,
 //!     elapsed)` — the prefetch pool fetched
 //!     a part. The producer rate is computed.
-//!   * `current_window()` returns the next
+//!     * `current_window()` returns the next
 //!     chunk_size the prefetcher should use.
-//!   * If consume rate > fetch rate, the
+//!     * If consume rate > fetch rate, the
 //!     consumer is faster than the producer
 //!     (queue is draining); the window grows
 //!     toward `max_window` so the prefetcher
 //!     can keep up.
-//!   * If fetch rate > consume rate, the
+//!     * If fetch rate > consume rate, the
 //!     producer is faster (queue is filling);
 //!     the window shrinks toward `min_window`
 //!     so the prefetcher doesn't waste memory
 //!     on parts the FUSE read isn't going to
 //!     touch.
-//!   * If the memory limiter is at > 80% of
+//!     * If the memory limiter is at > 80% of
 //!     the cap, the window shrinks to
 //!     `min_window` immediately (memory
 //!     pressure).

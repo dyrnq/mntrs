@@ -17,15 +17,15 @@
 //! OpenTelemetry collector can scrape them.
 //!
 //! Metric names follow Prometheus conventions:
-//!   * \`fuse_request_total{op,errno}\` (counter)
-//!   * \`fuse_request_duration_microseconds{op}\` (histogram, exponential buckets)
-//!   * \`cache_lookups_total{kind,result}\` (counter)
-//!   * \`writeback_pending\` (gauge)
-//!   * \`process_memory_bytes\` (gauge, set on snapshot)
+//!     * \`fuse_request_total{op,errno}\` (counter)
+//!     * \`fuse_request_duration_microseconds{op}\` (histogram, exponential buckets)
+//!     * \`cache_lookups_total{kind,result}\` (counter)
+//!     * \`writeback_pending\` (gauge)
+//!     * \`process_memory_bytes\` (gauge, set on snapshot)
 //!
 //! The user-facing API is two functions:
-//!   * \`record_fuse_op(op, duration, errno_name)\`
-//!   * \`snapshot() -> String\` (Prometheus text format)
+//!     * \`record_fuse_op(op, duration, errno_name)\`
+//!     * \`snapshot() -> String\` (Prometheus text format)
 //!
 //! A future \`--metrics-addr <ip:port>\` CLI flag
 //! would start a tiny axum-based HTTP server on

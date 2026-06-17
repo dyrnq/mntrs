@@ -7,29 +7,29 @@
 //! mountpoint-s3's `mem_limiter.rs`.
 //!
 //! API:
-//!   * `MemoryLimiter::new(cap_bytes)` — process-wide
+//!     * `MemoryLimiter::new(cap_bytes)` — process-wide
 //!     budget. Wired from the CLI's
 //!     `--mem-limit <bytes>` (existing flag,
 //!     see commit 5127da3).
-//!   * `try_reserve(label, n)` — atomic reserve
+//!     * `try_reserve(label, n)` — atomic reserve
 //!     + commit. Returns Ok(()) if `n` bytes fit
 //!     in the remaining budget, Err(()) if not.
 //!     `label` is for diagnostics (\"mem_cache\",
 //!     \"prefetch\", \"upload\") — the limiter tracks
 //!     usage by label for the snapshot.
-//!   * `release(label, n)` — release previously
+//!     * `release(label, n)` — release previously
 //!     reserved bytes (e.g. on mem_cache eviction
 //!     or prefetch completion).
-//!   * `snapshot() -> String` — JSON-formatted
+//!     * `snapshot() -> String` — JSON-formatted
 //!     usage by label, for the structured error
 //!     log (issue #50) or the metrics endpoint
 //!     (issue #47).
 //!
 //! The limiter is intentionally lightweight:
-//!   * Single `AtomicU64` for the global counter
-//!   * `DashMap<String, AtomicU64>` for per-label
+//!     * Single `AtomicU64` for the global counter
+//!     * `DashMap<String, AtomicU64>` for per-label
 //!     tracking
-//!   * No per-thread accounting (the per-label
+//!     * No per-thread accounting (the per-label
 //!     view is enough for ops visibility)
 //!
 //! Pre-fix mntrs had a single `--mem-limit`
