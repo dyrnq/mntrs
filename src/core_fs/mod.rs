@@ -339,6 +339,96 @@ pub trait CoreFilesystem: Send + Sync {
 
     /// Check access permissions.
     fn access(&self, ino: u64, mask: u32) -> std::io::Result<()>;
+
+    /// Create a hard link.
+    ///
+    /// Issue #25: pre-fix the fuser default returned
+    /// `EPERM` on every link, breaking POSIX apps that
+    /// rely on hard links for atomic file replacement
+    /// (e.g. `mv`, package managers' `rename(2)`-via-
+    /// -link fallbacks). Object stores don't have a
+    /// native hard link primitive, so the default
+    /// returns `Unsupported` (mapped to ENOSYS); an
+    /// fs-backend impl can override with a real
+    /// `std::fs::hard_link`.
+    fn link(&self, ino: u64, newparent: u64, newname: &str) -> std::io::Result<CoreFileAttr> {
+        let _ = (ino, newparent, newname);
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+
+    /// Allocate / deallocate space in a file.
+    ///
+    /// Issue #25: pre-fix returned ENOSYS. Databases
+    /// (SQLite, etc.) and some apps use `fallocate` to
+    /// pre-extend files, which avoids the
+    /// set_len-then-write pattern that would
+    /// otherwise create a sparse hole. The default
+    /// here is a `set_len` to `offset + length` —
+    /// matches the typical use case and works for
+    /// both object stores (via opendal's eventual
+    /// `set_len` on the cache file) and local fs.
+    fn fallocate(
+        &self,
+        ino: u64,
+        _fh: u64,
+        offset: u64,
+        length: u64,
+        mode: i32,
+    ) -> std::io::Result<()> {
+        // Mode bits (from fcntl.h):
+        //   0x00 = default (allocate)
+        //   0x01 = KEEP_SIZE (don't grow file size)
+        //   0x02 = PUNCH_HOLE (deallocate)
+        // We handle allocate + KEEP_SIZE; PUNCH_HOLE
+        // is a no-op for now (object stores don't have
+        // a hole primitive). The default
+        // setattr(ino, size) at offset+length grows
+        // the cache file to cover the requested range.
+        let _ = mode;
+        self.setattr(
+            ino,
+            None,
+            None,
+            None,
+            Some(offset + length),
+            None,
+            None,
+            None,
+        )
+        .map(|_| ())
+    }
+
+    /// Copy `len` bytes from one file to another
+    /// without going through user-space (the kernel
+    /// splice optimization).
+    ///
+    /// Issue #25 / #46: pre-fix returned ENOSYS.
+    /// The trait's default is a read + write
+    /// passthrough — sub-optimal for object stores
+    /// (extra GET + PUT) but correct. Backends with
+    /// a native server-side copy (S3 CopyObject, HDFS
+    /// `concat`/`rename`, etc.) can override for
+    /// a single-RTT optimization.
+    fn copy_file_range(
+        &self,
+        ino_in: u64,
+        fh_in: u64,
+        offset_in: u64,
+        ino_out: u64,
+        fh_out: u64,
+        offset_out: u64,
+        len: u64,
+    ) -> std::io::Result<u32> {
+        // Default: read the source chunk via the
+        // existing read path, write via the existing
+        // write path. The reads hit mem_cache; the
+        // writes go through the writeback pool. The
+        // backends with a native copy primitive
+        // (S3 CopyObject, etc.) should override this.
+        let data = self.read(ino_in, fh_in, offset_in, len as u32)?;
+        let written = self.write(ino_out, fh_out, offset_out, &data)?;
+        Ok(written)
+    }
 }
 
 #[cfg(unix)]

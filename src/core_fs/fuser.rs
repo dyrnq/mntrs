@@ -702,4 +702,85 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
     fn forget(&self, _req: &Request, _ino: INodeNo, _nlookup: u64) {
         self.inner.forget(_ino.into(), _nlookup);
     }
+
+    /// Issue #25: forward `link` to the trait. The
+    /// trait default returns Unsupported (object
+    /// stores have no native hard-link primitive);
+    /// an fs-backend override can serve a real
+    /// `std::fs::hard_link`. Pre-fix the fuser
+    /// default returned EPERM on every link().
+    fn link(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        newparent: INodeNo,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        let name = newname.to_string_lossy();
+        match self.inner.link(ino.into(), newparent.into(), &name) {
+            Ok(attr) => {
+                let fattr = from_core_attr(&attr);
+                reply.entry(&self.attr_ttl, &fattr, Generation(0));
+            }
+            Err(e) => reply.error(io_err_to_fuse_errno(e)),
+        }
+    }
+
+    /// Issue #25: forward `fallocate` to the trait.
+    /// The default impl is `setattr(ino, size =
+    /// offset + length)`, which grows the cache
+    /// file to cover the requested range. Pre-fix
+    /// the fuser default returned ENOSYS.
+    fn fallocate(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        length: u64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        match self
+            .inner
+            .fallocate(ino.into(), fh.into(), offset, length, mode)
+        {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(io_err_to_fuse_errno(e)),
+        }
+    }
+
+    /// Issue #25 / #46: forward `copy_file_range` to
+    /// the trait. The default impl is read + write
+    /// passthrough (correct but extra RTTs on object
+    /// stores). Backends with a native server-side
+    /// copy primitive (S3 CopyObject, HDFS concat)
+    /// can override for a single-RTT optimization.
+    fn copy_file_range(
+        &self,
+        _req: &Request,
+        ino_in: INodeNo,
+        fh_in: FileHandle,
+        offset_in: u64,
+        ino_out: INodeNo,
+        fh_out: FileHandle,
+        offset_out: u64,
+        len: u64,
+        _flags: fuser::CopyFileRangeFlags,
+        reply: ReplyWrite,
+    ) {
+        match self.inner.copy_file_range(
+            ino_in.into(),
+            fh_in.into(),
+            offset_in,
+            ino_out.into(),
+            fh_out.into(),
+            offset_out,
+            len,
+        ) {
+            Ok(written) => reply.written(written),
+            Err(e) => reply.error(io_err_to_fuse_errno(e)),
+        }
+    }
 }
