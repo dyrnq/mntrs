@@ -70,11 +70,25 @@ pub fn shared() -> &'static reqwest::Client {
             // gap between CSI-mount reads. Matches rclone's VFS-mount
             // default.
             .pool_idle_timeout(Some(Duration::from_secs(300)))
-            // 16 idle keep-alive connections per host. The
-            // `ConcurrentLimitLayer` in `apply_operator_with_tls`
-            // further caps in-flight requests at 16; idle-pool sizing
-            // is independent.
-            .pool_max_idle_per_host(16)
+            // 4 idle keep-alive connections per host
+            // (issue #19). Pre-fix the pool was sized
+            // at 16 per host — over a 30-iter mount/
+            // unmount lifecycle stress that hits
+            // multiple hosts (MinIO + HDFS WebHDFS +
+            // auth endpoints), the keep-alive
+            // connection pool accumulates FDs that
+            // are not released on unmount (reqwest
+            // owns the pool, not the mount). 4 is
+            // enough for `ConcurrentLimitLayer`'s
+            // 16 in-flight cap (4 idle warm slots is
+            // plenty for the next burst) and bounds
+            // the worst-case FD usage to a small
+            // multiple of (hosts × 4). The mount/
+            // unmount cycle doesn't tear down the
+            // process, so the pool must be small
+            // enough that the unmount-time FD count
+            // is at-or-below the test threshold.
+            .pool_max_idle_per_host(4)
             // Build a fresh client per process. `reqwest::Client` is
             // `Clone` (Arc internally), so callers below just clone the
             // `&'static` and pass it into opendal's `HttpClient::with`.
