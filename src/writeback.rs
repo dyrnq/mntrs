@@ -224,8 +224,42 @@ pub fn spawn(
                     let _permit = permit;
                     let mut last_err = None;
                     for attempt in 0..5 {
-                        let write_fut = op.write(&remote, data.clone());
-                        match tokio::time::timeout(Duration::from_secs(120), write_fut).await {
+                        // Issue #46: route large files
+                        // through opendal's multipart
+                        // writer (which auto-handles
+                        // chunking + retry for S3-style
+                        // backends). The threshold is
+                        // 5 MiB — below it, multipart
+                        // overhead exceeds the per-part
+                        // RTT saving. The fallback
+                        // (`op.write`) handles backends
+                        // without multipart support.
+                        // Both branches return
+                        // Result<Result<(), opendal::Error>, Elapsed>
+                        // so the match arms have a
+                        // uniform shape. The Metadata
+                        // return from op.write is
+                        // discarded via .map(|_| ()).
+                        let op_for_multipart = op.clone();
+                        let write_result: Result<
+                            Result<(), opendal::Error>,
+                            tokio::time::error::Elapsed,
+                        > = if data.len() > 5 * 1024 * 1024 {
+                            let path = remote.clone();
+                            let data_clone = data.clone();
+                            tokio::time::timeout(Duration::from_secs(120), async move {
+                                let mut w = op_for_multipart.writer(&path).await?;
+                                w.write(data_clone).await?;
+                                w.close().await.map(|_| ())
+                            })
+                            .await
+                        } else {
+                            let write_fut = op.write(&remote, data.clone());
+                            tokio::time::timeout(Duration::from_secs(120), write_fut)
+                                .await
+                                .map(|res| res.map(|_meta| ()))
+                        };
+                        match write_result {
                             Ok(Ok(_)) => {
                                 // Only update mtime — do NOT update file size (v.2).
                                 // The write function tracks the correct logical size
