@@ -702,7 +702,7 @@ pub fn mount(
 
         mem_cache,
         attr_cache: dashmap::DashMap::new(),
-        disk_cache_index: dashmap::DashMap::new(),
+        disk_cache_index: std::sync::Arc::new(dashmap::DashMap::new()),
         storage_class: storage_class.map(|s| s.to_string()),
     };
 

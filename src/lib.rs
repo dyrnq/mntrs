@@ -402,7 +402,14 @@ pub struct MntrsFs {
     /// on-disk atime is unreliable on `relatime` mount
     /// defaults.
     #[allow(clippy::type_complexity)]
-    disk_cache_index: dashmap::DashMap<CacheKey, (u64, std::time::Instant)>,
+    /// Issue #55: the disk cache LRU index. `pub(crate)` so
+    /// `writeback::spawn` can drop block-level entries
+    /// after a successful upload (see the writeback
+    /// upload completion path). Wrapped in `Arc` so
+    /// the writeback worker can hold its own clone
+    /// (the inner DashMap is already cheap to clone
+    /// at the `Arc` level).
+    pub(crate) disk_cache_index: Arc<dashmap::DashMap<CacheKey, (u64, std::time::Instant)>>,
     pub(crate) storage_class: Option<String>,
 }
 
@@ -1376,6 +1383,32 @@ pub(crate) fn remove_block_cache_files(cache_dir: &Path, full_path: &str, size: 
     }
 }
 
+/// Issue #55: drop every block-level disk cache
+/// entry for `path` (both the in-memory index and
+/// the on-disk `.block` files). Called by the
+/// writeback worker after a successful upload so
+/// subsequent reads can't return pre-upload data
+/// via the stale block cache. `pub(crate)` so
+/// `writeback::spawn` can call it.
+pub(crate) fn drop_block_cache_for_path(
+    cache_dir: &Path,
+    disk_cache_index: &Arc<dashmap::DashMap<CacheKey, (u64, std::time::Instant)>>,
+    path: &str,
+) {
+    let to_remove: Vec<CacheKey> = disk_cache_index
+        .iter()
+        .filter(|e| e.key().0 == path && e.key().1.is_some())
+        .map(|e| e.key().clone())
+        .collect();
+    for key in to_remove {
+        if let Some(idx) = key.1 {
+            let bpath = cache_block_path(cache_dir, &key.0, idx);
+            let _ = std::fs::remove_file(&bpath);
+        }
+        disk_cache_index.remove(&key);
+    }
+}
+
 /// Scan cache dir for block files and rebuild disk_cache_index.
 /// Loaded at startup so cache is warm across restarts.
 pub fn load_cache_index(cache_dir: &Path) -> Vec<(String, u64, u64, std::time::SystemTime)> {
@@ -1522,7 +1555,13 @@ impl MntrsFs {
         let op = self.op.clone();
         let delay = self.write_back_delay;
         let inodes = Arc::new(self.inodes.clone());
-        let (tx, _handle) = crate::writeback::spawn(op, inodes, delay);
+        let (tx, _handle) = crate::writeback::spawn(
+            op,
+            inodes,
+            self.disk_cache_index.clone(),
+            self.cache_dir.clone(),
+            delay,
+        );
         self.writeback_sender.set(tx).ok();
 
         // Recover writeback queue from dirty sidecars.
@@ -4618,7 +4657,7 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         // overwrite this in cmd/mount.rs after the size is known.
         mem_cache: std::sync::Arc::new(crate::cache::DashMapMemCache::new(0)),
         attr_cache: Default::default(),
-        disk_cache_index: Default::default(),
+        disk_cache_index: Arc::new(dashmap::DashMap::new()),
         storage_class: None,
     }
 }

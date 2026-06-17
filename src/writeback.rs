@@ -23,6 +23,14 @@ use tokio_util::time::delay_queue::DelayQueue;
 
 use crate::Inodes;
 
+/// Type alias for the disk cache LRU index shared with
+/// `MntrsFs` (issue #55). Inlined here rather than
+/// exported as `pub type` in `lib.rs` because
+/// `CacheKey` is defined later in `lib.rs` and a
+/// forward reference would need a `pub(crate)` to
+/// keep the crate's surface minimal.
+type DiskCacheIndex = std::sync::Arc<dashmap::DashMap<crate::CacheKey, (u64, std::time::Instant)>>;
+
 /// Type of task sent by FUSE threads to the writeback worker.
 ///
 /// The 4th element is the retry-cycle count: 0 for a fresh
@@ -79,9 +87,19 @@ const REENQUEUE_COOLDOWN: Duration = Duration::from_secs(60);
 /// Spawn the writeback worker inside the global tokio runtime.
 ///
 /// Returns a `Sender` that is `Clone + Send`, usable from any FUSE thread.
+///
+/// Issue #55: `cache_dir` and `disk_cache_index` are
+/// passed in so the worker can drop the block-level
+/// cache entries for a path after a successful upload.
+/// Without this, the read path could still return
+/// pre-upload data via the block-level cache even
+/// though the file-level cache (the writeback's
+/// source of truth) is up to date.
 pub fn spawn(
     op: Arc<Operator>,
     inodes: Inodes,
+    disk_cache_index: DiskCacheIndex,
+    cache_dir: std::path::PathBuf,
     delay: Duration,
 ) -> (Sender, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Task>();
@@ -182,6 +200,15 @@ pub fn spawn(
                 // the task — leaving the .dirty sidecar to
                 // sit forever in daemon mode.
                 let tx_clone = tx_for_worker.clone();
+                // Issue #55: clone cache_dir +
+                // disk_cache_index for the post-upload
+                // block-cache drop spawn. The outer
+                // tokio::spawn moves them into the
+                // closure, so the inner spawn_blocking
+                // can't take ownership — the clones
+                // keep them available here.
+                let cache_dir_for_upload = cache_dir.clone();
+                let disk_cache_index_for_upload = disk_cache_index.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     let mut last_err = None;
@@ -210,6 +237,28 @@ pub fn spawn(
                                 // The cache eviction logic handles disk space separately.
                                 PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
                                 let _ = std::fs::remove_file(cache_path.with_extension("dirty"));
+                                // Issue #55: drop the
+                                // block-level cache for
+                                // this path. The
+                                // file-level cache is
+                                // now in sync with the
+                                // backend; any stale
+                                // .block files from a
+                                // prior cold read would
+                                // otherwise serve
+                                // pre-upload data on
+                                // the next read.
+                                let remote_for_block_drop = remote.clone();
+                                let cache_dir_for_block_drop = cache_dir_for_upload.clone();
+                                let disk_cache_index_for_block_drop =
+                                    disk_cache_index_for_upload.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    crate::drop_block_cache_for_path(
+                                        &cache_dir_for_block_drop,
+                                        &disk_cache_index_for_block_drop,
+                                        &remote_for_block_drop,
+                                    );
+                                });
                                 return;
                             }
                             Ok(Err(e)) if attempt < 4 => {
