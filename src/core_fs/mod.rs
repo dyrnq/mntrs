@@ -73,6 +73,32 @@ pub trait CoreFilesystem: Send + Sync {
     /// Look up a directory entry by name and return its inode + attributes.
     fn lookup(&self, parent: u64, name: &str) -> std::io::Result<CoreFileAttr>;
 
+    /// Batch lookup multiple entries in a parent directory.
+    ///
+    /// Issue #29: readdirplus issues one lookup per
+    /// entry, each of which is a remote RTT in the
+    /// worst case. Implementations that already have
+    /// the attrs in memory (e.g. `MntrsFs` after a
+    /// recent `list_op`) can serve the whole batch
+    /// from the existing snapshot, turning N RTTs
+    /// into 0.
+    ///
+    /// The default implementation falls back to N
+    /// individual `lookup` calls — preserves the
+    /// pre-fix behaviour for any external test
+    /// fakes.
+    fn lookup_many(
+        &self,
+        parent: u64,
+        names: &[&str],
+    ) -> std::io::Result<Vec<std::io::Result<CoreFileAttr>>> {
+        let mut out = Vec::with_capacity(names.len());
+        for n in names {
+            out.push(self.lookup(parent, n));
+        }
+        Ok(out)
+    }
+
     /// Forget about an inode (decrement reference count).
     fn forget(&self, _ino: u64, _nlookup: u64) {}
 

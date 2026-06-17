@@ -299,11 +299,35 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
                     reply.ok();
                     return;
                 }
-                for (offset_i, entry) in entries[start..].iter().enumerate() {
+                let page = &entries[start..];
+                // Issue #29: batch the per-entry lookups
+                // so the implementation can serve the
+                // whole page from its dir_cache
+                // snapshot in one call (0 RTTs on a
+                // warm cache) instead of N individual
+                // trait lookups (N RTTs in the worst
+                // case). For `ls -la` on a 500-file
+                // directory this drops 500 stat RTTs
+                // to 0; for `find maxdepth1` it
+                // eliminates the per-entry stat
+                // completely.
+                let names: Vec<&str> = page.iter().map(|e| e.name.as_str()).collect();
+                let attr_results =
+                    self.inner
+                        .lookup_many(ino.into(), &names)
+                        .unwrap_or_else(|_| {
+                            names
+                                .iter()
+                                .map(|_| Err(std::io::ErrorKind::Other.into()))
+                                .collect()
+                        });
+                for (offset_i, (entry, attr_res)) in
+                    page.iter().zip(attr_results.iter()).enumerate()
+                {
                     let i = start + offset_i;
                     // For each directory entry, do a lookup to get full attr
-                    let attr = self.inner.lookup(ino.into(), &entry.name).ok();
-                    let fattr = attr.as_ref().map(from_core_attr).unwrap_or_else(|| {
+                    let attr = attr_res.as_ref().ok();
+                    let fattr = attr.map(from_core_attr).unwrap_or_else(|| {
                         let a = CoreFileAttr {
                             ino: entry.ino,
                             size: 0,

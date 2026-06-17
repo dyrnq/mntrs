@@ -2444,6 +2444,97 @@ impl MntrsFs {
         }
     }
 
+    /// Issue #29: batch lookup helper for readdirplus.
+    /// Reads the parent's dir_cache snapshot (already
+    /// populated by the recent list_op) and returns
+    /// one attr per name. Falls back to the per-name
+    /// trait `lookup` for names not in the snapshot
+    /// (e.g. a write that landed after the snapshot
+    /// was taken).
+    ///
+    /// Performance: the snapshot path is O(N) over
+    /// the requested names with no remote RTT.
+    /// Pre-fix the FUSE adapter called
+    /// `inner.lookup(parent, name)` per entry, each
+    /// of which is potentially a stat RTT to the
+    /// backend (4-10 ms for S3/HDFS). On a 500-file
+    /// directory this dominates the
+    /// `ls -la` benchmark at 1.6x slower than
+    /// rclone; on `find maxdepth1` (no readdirplus
+    /// helper, but each entry's getattr also hits
+    /// the same path) it's 32x slower.
+    fn batch_lookup_from_dir_cache(
+        &self,
+        parent: u64,
+        names: &[&str],
+    ) -> Vec<std::io::Result<CoreFileAttr>> {
+        let parent_path = self.resolve(parent).map(|e| e.path).unwrap_or_default();
+        // canonicalize_list_path is what list_op
+        // uses to key the dir_cache. Aligning the
+        // read here means a recent opendir+readdir
+        // already warmed the slot the readdirplus
+        // lookup will hit.
+        let cache_key = canonicalize_list_path(&parent_path);
+        let cache_key = cache_key.as_str();
+        let cached: Option<dashmap::DashMap<String, (EntryMode, u64, SystemTime)>> =
+            self.dir_cache.get(cache_key).map(|e| e.value().1.clone());
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            // "." / ".." are special: not in
+            // dir_cache (they're synthesized by
+            // the FUSE adapter), but cheap to
+            // construct.
+            if *name == "." || *name == ".." {
+                let p = if *name == "." { parent } else { 1 };
+                out.push(Ok(to_core_attr(&self.make_attr(
+                    p,
+                    4096,
+                    FileType::Directory,
+                    SystemTime::UNIX_EPOCH,
+                ))));
+                continue;
+            }
+            // Try the snapshot first.
+            let snapshot_hit = cached
+                .as_ref()
+                .and_then(|entries| entries.get(*name).map(|e| *e.value()));
+            match snapshot_hit {
+                Some((mode, size, mtime)) => {
+                    let kind = match mode {
+                        EntryMode::DIR => FileType::Directory,
+                        _ => FileType::RegularFile,
+                    };
+                    // alloc_ino with the cached
+                    // mtime so subsequent stat
+                    // calls return the same
+                    // data without a remote
+                    // round-trip.
+                    let ino = self.alloc_ino_with_mtime(
+                        &format!("{}/{}", parent_path, name),
+                        kind,
+                        size,
+                        mtime,
+                    );
+                    out.push(Ok(to_core_attr(&self.make_attr(ino, size, kind, mtime))));
+                }
+                None => {
+                    // Snapshot miss — fall
+                    // through to the per-name
+                    // trait lookup. The common
+                    // case for this is a file
+                    // written after the
+                    // snapshot was taken
+                    // (write doesn't update
+                    // dir_cache; only
+                    // cache_add_entry on
+                    // create/mkdir does).
+                    out.push(self.lookup(parent, name));
+                }
+            }
+        }
+        out
+    }
+
     /// Full invalidation: remove directory cache and all sub-paths.
     /// Used for rename (both src and dst sides) where we can't cheaply update.
     fn invalidate_dir_cache(&self, path: &str) {
@@ -2475,6 +2566,16 @@ impl CoreFilesystem for MntrsFs {
     fn init(&self) -> std::io::Result<()> {
         self.common_init_wb();
         Ok(())
+    }
+
+    /// Issue #29 override: serve the batch from the
+    /// dir_cache snapshot when possible.
+    fn lookup_many(
+        &self,
+        parent: u64,
+        names: &[&str],
+    ) -> std::io::Result<Vec<std::io::Result<CoreFileAttr>>> {
+        Ok(self.batch_lookup_from_dir_cache(parent, names))
     }
 
     fn access(&self, _ino: u64, _mask: u32) -> std::io::Result<()> {
