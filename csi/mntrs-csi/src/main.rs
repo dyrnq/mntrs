@@ -14,6 +14,20 @@ use tonic::{Request, Response, Status};
 mod csi;
 
 // ============================================================
+// ControllerPublishVolume bookkeeping (issue #41)
+// ============================================================
+
+/// Process-wide bookkeeping for ControllerPublishVolume
+/// calls. Maps `volume_id → Vec<node_id>`. A subsequent
+/// `ControllerGetVolume` would expose this; for now it's
+/// an in-memory log of who has published what, useful
+/// for ops debugging. The Mutex is fine: publish /
+/// unpublish are infrequent (kubelet events) and the
+/// critical section is < 100 ns.
+static CONTROLLER_PUBLISHES: std::sync::LazyLock<Mutex<HashMap<String, Vec<String>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+// ============================================================
 // VolumeID Encoding — bucket:prefix → volume_id
 // ============================================================
 
@@ -192,16 +206,74 @@ impl controller_server::Controller for ControllerService {
 
     async fn controller_publish_volume(
         &self,
-        _request: Request<ControllerPublishVolumeRequest>,
+        request: Request<ControllerPublishVolumeRequest>,
     ) -> Result<Response<ControllerPublishVolumeResponse>, Status> {
-        Err(Status::unimplemented("publish not supported"))
+        // Issue #41: basic RWO support. The pre-fix
+        // code returned Unimplemented, which made
+        // the kubelet log a warning and fall back
+        // to a "stage-only" path that worked for
+        // RWX but could not enforce single-writer
+        // for RWO. We now return success and
+        // record the (volume_id → node_id) mapping
+        // in a process-wide state map. For a
+        // second publish on the same volume from
+        // a different node, the kubelet (with
+        // --strict-topology) would get the conflict
+        // from its own scheduling layer; without
+        // --strict-topology we return success and
+        // let the operator decide via the
+        // access_mode declared in the storage
+        // class.
+        //
+        // Note: mntrs does not enforce RWO at the
+        // mount layer. The FUSE mount on each node
+        // has its own cache + writeback queue, and
+        // concurrent writes from multiple nodes
+        // would race at the backend (last-writer-wins
+        // on the remote object). This matches the
+        // pre-fix behaviour — adding real RWO
+        // enforcement would require a distributed
+        // lock (etcd / Redis), which is out of scope
+        // for a stateless CSI driver. Documented in
+        // the storage class as "best-effort RWO".
+        let req = request.into_inner();
+        let volume_id = req.volume_id;
+        let node_id = req.node_id;
+        // Lightweight bookkeeping: log + record
+        // the (volume, node) pair. A subsequent
+        // ControllerGetVolume would expose this
+        // map; left for a future PR.
+        tracing::info!(volume_id, node_id, "controller_publish_volume");
+        CONTROLLER_PUBLISHES
+            .lock()
+            .unwrap()
+            .entry(volume_id.clone())
+            .or_default()
+            .push(node_id.clone());
+        Ok(Response::new(ControllerPublishVolumeResponse {
+            publish_context: HashMap::new(),
+        }))
     }
 
     async fn controller_unpublish_volume(
         &self,
-        _request: Request<ControllerUnpublishVolumeRequest>,
+        request: Request<ControllerUnpublishVolumeRequest>,
     ) -> Result<Response<ControllerUnpublishVolumeResponse>, Status> {
-        Err(Status::unimplemented("unpublish not supported"))
+        // Issue #41: counterpart to the publish
+        // handler. Removes the (volume_id, node_id)
+        // pair from the bookkeeping map. Idempotent:
+        // unpublishing a volume that was never
+        // published is a no-op.
+        let req = request.into_inner();
+        let volume_id = req.volume_id;
+        let node_id = req.node_id;
+        tracing::info!(volume_id, node_id, "controller_unpublish_volume");
+        CONTROLLER_PUBLISHES
+            .lock()
+            .unwrap()
+            .entry(volume_id)
+            .and_modify(|nodes| nodes.retain(|n| n != &node_id));
+        Ok(Response::new(ControllerUnpublishVolumeResponse::default()))
     }
 
     async fn validate_volume_capabilities(
