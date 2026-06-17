@@ -1665,6 +1665,46 @@ impl MntrsFs {
         ino
     }
 
+    /// Drop every block-level disk cache entry for `path`
+    /// (issue #52). Used by setattr truncate and the
+    /// write path after the file-level cache is updated.
+    ///
+    /// Walks the `disk_cache_index` and removes every
+    /// entry whose path matches, then unlinks the
+    /// corresponding `.block` file on disk. The
+    /// block-level cache's mem_cache is dropped
+    /// separately via `mem_cache.invalidate_ino` by
+    /// the caller — this helper only handles the
+    /// disk side.
+    ///
+    /// Without this, a file that was cold-read into
+    /// the block cache, then truncated + written,
+    /// could still serve pre-truncate bytes from the
+    /// block cache after the file-level cache is
+    /// LRU-evicted (issue #52's exact repro).
+    fn invalidate_block_cache_for_path(&self, path: &str) {
+        // Collect matching keys, then remove. DashMap's
+        // `retain` is per-shard, but we want path-based
+        // filtering across all shards, so the two-step
+        // collect-then-remove is clearer than nesting
+        // an .iter().filter() in a `remove_if` lambda.
+        let to_remove: Vec<(String, Option<u64>)> = self
+            .disk_cache_index
+            .iter()
+            .filter(|entry| entry.key().0 == path)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in to_remove {
+            let (p, block_idx) = (&key.0, key.1);
+            let blk_path = match block_idx {
+                Some(idx) => crate::cache_block_path(&self.cache_dir, p, idx),
+                None => crate::cache_path(&self.cache_dir, p),
+            };
+            let _ = std::fs::remove_file(&blk_path);
+            self.disk_cache_index.remove(&key);
+        }
+    }
+
     /// Look up the ino currently registered for `path`.
     ///
     /// Needed because `inodes` is keyed by the `NEXT_INO` counter
@@ -2715,6 +2755,19 @@ impl CoreFilesystem for MntrsFs {
                 // surfaces clearly on `dd skip=10`
                 // (reads past the new EOF).
                 self.mem_cache.invalidate_ino(ino);
+                // Issue #52: also invalidate the
+                // block-level disk cache. Pre-fix this
+                // path only touched mem_cache + the
+                // file-level cache — any .block files
+                // already on disk (populated by a prior
+                // cold read) would still serve
+                // pre-truncate bytes to subsequent
+                // reads if the file-level cache was
+                // LRU-evicted. The block cache's
+                // mem_cache is dropped above; the
+                // disk index + on-disk .block files
+                // need an explicit sweep.
+                self.invalidate_block_cache_for_path(&_p);
             }
             Ok(to_core_attr(&self.make_attr(
                 ino,
@@ -3428,6 +3481,15 @@ impl CoreFilesystem for MntrsFs {
         // mem_cache uses DashMap so shards are independent and the
         // retain only locks the affected shard(s).
         self.mem_cache.invalidate_ino(_ino);
+        // Issue #52: also sweep the block-level disk
+        // cache for this path. The write above
+        // changes the file's content, so any .block
+        // files populated by a prior cold read would
+        // now be stale. Without this, a read after
+        // the file-level cache is LRU-evicted would
+        // hit the block cache and return pre-write
+        // bytes.
+        self.invalidate_block_cache_for_path(&path);
 
         // #17 (small-write hot-path): pre-fix did a
         // full `handles.insert(fh, Write { path: ...,

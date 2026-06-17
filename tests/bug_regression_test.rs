@@ -576,7 +576,6 @@ fn bug_issue23_readdir_per_fh_snapshot_stable_under_concurrent_mkdir() {
 // cannot equal the ino of a sibling entry.
 #[test]
 fn bug_issue51_create_fh_does_not_collide_with_open_fh() {
-    use mntrs::core_fs::CoreFileAttr;
     use mntrs::core_fs::CoreFilesystem;
 
     let fs = std::sync::Arc::new(make_memory_fs());
@@ -654,7 +653,7 @@ fn bug_issue57_create_ensures_parent_chain() {
 
     // Follow-up write through the new handle must
     // succeed (sanity that the file is reachable).
-    let parent_path = format!("a/b");
+    let parent_path = "a/b".to_string();
     let _ = parent_path; // keep variable used
     let _ = CoreFileType::RegularFile; // keep import used
 }
