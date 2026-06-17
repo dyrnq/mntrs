@@ -5171,7 +5171,9 @@ impl DiskWriteJob {
         offset: u64,
         data: &[u8],
     ) -> std::io::Result<()> {
-        use std::io::{Seek, Write};
+        use std::io::Write;
+        #[cfg(unix)]
+        use std::os::unix::fs::FileExt;
         let end = offset + data.len() as u64;
         let current_len = f.metadata()?.len();
         // Prefix fetch: when writing at an offset past
@@ -5199,8 +5201,16 @@ impl DiskWriteJob {
             // on the next access.
             f.set_len(end)?;
         }
-        f.seek(std::io::SeekFrom::Start(offset))?;
-        f.write_all(data)?;
+        // Issue #12: combine seek + write_all into a
+        // single `write_at` syscall. Pre-fix the
+        // separate `seek` + `write_all` did a
+        // redundant lseek; write_at lets the kernel
+        // position + write in one syscall. The bench's
+        // 6x gap vs rclone is dominated by the local
+        // disk write itself (rclone streams to S3
+        // without buffering the whole file locally),
+        // not the syscall — but write_at is free.
+        f.write_at(data, offset)?;
         // #6: no `f.flush()`. The OS page cache holds
         // the data and flushes in the background. The
         // writeback worker's `std::fs::read` of this
