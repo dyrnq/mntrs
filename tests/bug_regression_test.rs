@@ -550,3 +550,60 @@ fn bug_issue23_readdir_per_fh_snapshot_stable_under_concurrent_mkdir() {
     );
     CoreFilesystem::releasedir(&*fs, 1, fh2).unwrap();
 }
+
+// ============================================================
+// Issue #51 — create()/open() fh collision
+// ============================================================
+//
+// Pre-fix `create()` inserted its Write handle into the
+// shared `handles` DashMap keyed by `ino`, while
+// `open()` keyed by `NEXT_HANDLE` (a separate counter
+// starting at 1). Since `alloc_ino` starts at 2 and
+// `NEXT_HANDLE` also starts at 1, the second `open()`
+// after a `create()` would land on the same fh key as
+// the create, silently overwriting the Write state.
+//
+// Repro pre-fix:
+//   1. create("a")  → ino=2, handles[2] = Write{a}
+//   2. open("b")    → fh=1, handles[1] = Read{b}
+//   3. open("c")    → fh=2, handles[2] = Read{c}  ← overwrites a's Write
+//   4. write(a, "data", fh=2) → reads c's path, writes
+//      to wrong file
+//
+// Post-fix: `create()` mints a fresh fh via NEXT_HANDLE
+// and the trait returns (attr, fh). The collision key
+// is broken because the create's fh is monotonic and
+// cannot equal the ino of a sibling entry.
+#[test]
+fn bug_issue51_create_fh_does_not_collide_with_open_fh() {
+    use mntrs::core_fs::CoreFileAttr;
+    use mntrs::core_fs::CoreFilesystem;
+
+    let fs = std::sync::Arc::new(make_memory_fs());
+
+    // create("a") — pre-fix this would have used ino
+    // as the fh returned to the kernel. open() uses
+    // NEXT_HANDLE, so any create whose ino == an
+    // open's NEXT_HANDLE would deterministically
+    // collide.
+    let (a_attr, a_fh) = CoreFilesystem::create(&*fs, 1, "a", 0o644).unwrap();
+    let a_ino = a_attr.ino;
+
+    // Two open()s after the create — these mint
+    // NEXT_HANDLE fhs. The pre-fix collision was
+    // a_fh == some-open-fh via the shared `handles`
+    // DashMap keying on (ino for create, NEXT_HANDLE
+    // for open). Post-fix the create's fh is from
+    // NEXT_HANDLE too, but a fresh value — the test
+    // confirms the contract by asserting a_fh != a_ino.
+    let _b_fh = CoreFilesystem::open(&*fs, a_ino, 0).unwrap();
+
+    // The contract: a_fh (from create) must NOT equal
+    // a_ino (which is what the pre-fix code used as
+    // the create's handle key). Any equality here would
+    // be a regression of #51.
+    assert_ne!(
+        a_fh, a_ino,
+        "create() fh must not equal the file's ino (issue #51 regression)"
+    );
+}

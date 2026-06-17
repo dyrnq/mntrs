@@ -381,21 +381,25 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
     ) {
         let name = name.to_string_lossy();
         match self.inner.create(parent.into(), &name, mode) {
-            Ok(attr) => {
-                let ino = attr.ino;
+            Ok((attr, fh)) => {
+                // Issue #51: forward the implementation-
+                // minted `fh` (from NEXT_HANDLE) instead
+                // of using `attr.ino`. Pre-fix the
+                // adapter used `attr.ino` as the
+                // FileHandle returned to the kernel,
+                // which collided with `open()`'s
+                // NEXT_HANDLE counter and silently
+                // overwrote the create's Write state on
+                // the second open() (deterministic data
+                // corruption — see issue text for the
+                // 3-step repro).
                 let fattr = from_core_attr(&attr);
                 let flags = if self.direct_io {
                     FopenFlags::FOPEN_DIRECT_IO
                 } else {
                     FopenFlags::empty()
                 };
-                reply.created(
-                    &self.attr_ttl,
-                    &fattr,
-                    Generation(0),
-                    FileHandle(ino),
-                    flags,
-                );
+                reply.created(&self.attr_ttl, &fattr, Generation(0), FileHandle(fh), flags);
             }
             Err(e) => reply.error(io_err_to_fuse_errno(e)),
         }

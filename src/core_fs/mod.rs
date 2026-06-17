@@ -223,7 +223,27 @@ pub trait CoreFilesystem: Send + Sync {
     fn release(&self, ino: u64, fh: u64) -> std::io::Result<()>;
 
     /// Create a file in a directory.
-    fn create(&self, parent: u64, name: &str, mode: u32) -> std::io::Result<CoreFileAttr>;
+    ///
+    /// Returns `(attr, fh)` — `attr` carries the new
+    /// inode's metadata, `fh` is a fresh open file
+    /// handle minted by the implementation (typically
+    /// via `NEXT_HANDLE.fetch_add(1)`).
+    ///
+    /// Issue #51: pre-fix the fuser adapter used
+    /// `attr.ino` as the `FileHandle` returned to the
+    /// kernel. The `handles` DashMap is shared between
+    /// `create()` and `open()`, but `open()` uses
+    /// `NEXT_HANDLE` (a separate counter) for its key.
+    /// When `attr.ino` collided with an `open()`'s
+    /// `NEXT_HANDLE` value, the second `open()`
+    /// silently overwrote the first `create()`'s
+    /// Write state — a deterministic data-corruption
+    /// bug ("create a.txt, open b.txt, open c.txt;
+    /// read(b.txt) returns c.txt's data").
+    ///
+    /// The trait now exposes a separate `fh` so the
+    /// adapter can return a non-colliding handle.
+    fn create(&self, parent: u64, name: &str, mode: u32) -> std::io::Result<(CoreFileAttr, u64)>;
 
     /// Create a directory.
     fn mkdir(&self, parent: u64, name: &str) -> std::io::Result<CoreFileAttr>;

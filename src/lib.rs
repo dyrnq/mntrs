@@ -3731,7 +3731,7 @@ impl CoreFilesystem for MntrsFs {
         Ok(())
     }
 
-    fn create(&self, _parent: u64, name: &str, _mode: u32) -> std::io::Result<CoreFileAttr> {
+    fn create(&self, _parent: u64, name: &str, _mode: u32) -> std::io::Result<(CoreFileAttr, u64)> {
         let parent_path = self.resolve(_parent).map(|e| e.path).unwrap_or_default();
         let full_path = if parent_path.is_empty() {
             name.to_string()
@@ -3759,6 +3759,14 @@ impl CoreFilesystem for MntrsFs {
         // someone refactors mtime back to Option.
         let now = SystemTime::now();
         let ino = self.alloc_ino_with_mtime(&full_path, kind, size, mtime.unwrap_or(now));
+        // Issue #51: mint a fresh fh from NEXT_HANDLE
+        // instead of using `ino` as the key into the
+        // shared `handles` DashMap. `open()` uses
+        // NEXT_HANDLE, so a `create()` returning `ino`
+        // collides deterministically with the second
+        // `open()` after the create — see the issue
+        // text for the exact 3-step repro.
+        let fh = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Insert Write handle so follow-up write() can find the path
         // Create cache file for write handle
         let cpath = crate::cache_path(&self.cache_dir, &full_path);
@@ -3774,7 +3782,7 @@ impl CoreFilesystem for MntrsFs {
             .ok()
             .map(|f| Arc::new(std::sync::Mutex::new(f)));
         self.handles.insert(
-            ino,
+            fh,
             FileHandleState::Write {
                 path: full_path,
                 cache_fd,
@@ -3796,12 +3804,10 @@ impl CoreFilesystem for MntrsFs {
         // Bug 33: create reply.entry bumps kernel
         // dentry count; mirror it.
         self.bump_lookup_count(ino);
-        Ok(to_core_attr(&self.make_attr(
-            ino,
-            size,
-            kind,
-            mtime.unwrap_or(SystemTime::UNIX_EPOCH),
-        )))
+        Ok((
+            to_core_attr(&self.make_attr(ino, size, kind, mtime.unwrap_or(SystemTime::UNIX_EPOCH))),
+            fh,
+        ))
     }
 
     fn mkdir(&self, _parent: u64, name: &str) -> std::io::Result<CoreFileAttr> {
