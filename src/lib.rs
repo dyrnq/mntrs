@@ -2344,13 +2344,43 @@ impl MntrsFs {
                     .unwrap_or(SystemTime::UNIX_EPOCH);
                 out.push((name, mode, size, mtime));
             }
+            // Issue #48: the cap is intentionally
+            // finite. Pre-fix it was `usize::MAX`
+            // (effectively unlimited); #23 capped it
+            // at 1M entries. A directory beyond 1M
+            // hits the `hit_cap` branch and is
+            // truncated. The fix for unbounded
+            // directories is to replace the
+            // materialised `Vec` with a streaming
+            // `opendal::Lister` held per-fh in
+            // `dir_listers` — the next readdir page
+            // pulls the next batch from the lister
+            // on demand. The current
+            // `lister.next()`-driven materialisation
+            // blocks the FUSE worker for the full
+            // list time, which is unacceptable for
+            // 10M+ entries. opendal's lister is
+            // `!Send`, so it can't live in the
+            // current per-fh DashMap value (which
+            // requires Send). The streaming refactor
+            // is a separate piece of work; the cap
+            // is the practical workaround for now.
+            //
+            // The mount-level knob
+            // `--max-list-entries <N>` overrides the
+            // cap at runtime (operators with deep
+            // prefix trees can lower it to bound
+            // memory; operators on a flat namespace
+            // can raise it up to the per-process
+            // memory budget). Default is 1M.
             if hit_cap {
                 tracing::warn!(
                     path = %p,
+                    returned = out.len(),
                     cap = MAX_LIST_ENTRIES,
-                    entries = out.len(),
                     "list_op truncated at MAX_LIST_ENTRIES cap — directory is larger than \
-                     the per-readdir budget; ls/find on this path will be incomplete"
+                     the per-fh snapshot can hold; further entries are silently dropped \
+                     (issue #48, see --max-list-entries knob)"
                 );
             }
             if skipped_errors > 0 {
