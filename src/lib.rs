@@ -113,8 +113,33 @@ pub(crate) fn rt() -> &'static tokio::runtime::Runtime {
     static RT: once_cell::sync::OnceCell<tokio::runtime::Runtime> =
         once_cell::sync::OnceCell::new();
     RT.get_or_init(|| {
+        // Issue #30: a single worker thread is the
+        // sweet spot for FUSE callbacks. The
+        // block_on path (mkdir / unlink / rename /
+        // create / read) parks the FUSE worker on
+        // a future and dispatches it to the runtime;
+        // with 4 worker threads, each block_on
+        // costs a cross-thread hand-off + wake-up
+        // (~10 µs), which adds up to the 3-6x
+        // regression vs rclone on metadata ops.
+        //
+        // Background work (disk_write_pool, writeback
+        // worker, writeback fsync thread) still gets
+        // full parallelism via `tokio::task::spawn`
+        // — the runtime multiplexes the spawn tasks
+        // onto the single worker, and a long-running
+        // upload doesn't block a metadata op
+        // because spawn returns immediately. The
+        // net is: 1 FUSE-blocking call at a time
+        // (per the FUSE kernel's per-fd serialization)
+        // but N concurrent background uploads.
+        //
+        // The FUSE kernel itself serializes ops on
+        // the same fd, so 1 worker thread is the
+        // natural fit — more workers would just
+        // queue up behind the first.
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
+            .worker_threads(1)
             .enable_all()
             .build()
             .expect("tokio rt")
