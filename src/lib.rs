@@ -3082,22 +3082,71 @@ impl CoreFilesystem for MntrsFs {
                 && let Ok(data) = std::fs::read(&fcpath)
             {
                 let b = bytes::Bytes::from(data);
-                // Bug B fix: bump the in-memory LRU sort key
-                // on every cache hit. The on-disk atime is
-                // unreliable on `relatime` mount defaults, so
-                // the LRU sweeper consults the in-memory
-                // `Instant` recorded here (see `bump_in_memory_atime`
-                // and the field doc on `disk_cache_index`).
-                bump_in_memory_atime(&self.disk_cache_index, &(path.clone(), None));
-                let start = offset as usize;
-                let end = (start + size as usize).min(b.len());
-                let result = if start < b.len() {
-                    b[start..end].to_vec()
+                // Issue #43: if the on-disk file is
+                // SHORTER than the inodes-reported size,
+                // treat the file-level cache as a
+                // partial hit. Returning an empty read
+                // at `offset >= b.len()` while inodes
+                // claims the file is larger produces
+                // kernel-visible EOF in the middle of
+                // the file (the read above reports
+                // b.len() bytes successfully, then a
+                // 0-byte read at the next page — FUSE
+                // then thinks the file is b.len()
+                // bytes, contradicting the getattr
+                // reply). This was the source of the
+                // "100M write but read returns 24M then
+                // hangs" symptom in s3-lifecycle-stress:
+                // a previous mount's writeback didn't
+                // complete, leaving a partial cache
+                // file with inodes.size = 100M.
+                //
+                // The fix: if `b.len() < actual_size`
+                // (the cache is partial), fall through
+                // to the block cache + remote fetch to
+                // backfill. mem_cache is still warmed
+                // with the partial bytes for the next
+                // read in the same region.
+                let cache_is_complete = (b.len() as u64) >= actual_size;
+                if cache_is_complete {
+                    // Bug B fix: bump the in-memory
+                    // LRU sort key on every cache hit.
+                    // The on-disk atime is unreliable
+                    // on `relatime` mount defaults, so
+                    // the LRU sweeper consults the
+                    // in-memory `Instant` recorded
+                    // here (see `bump_in_memory_atime`
+                    // and the field doc on
+                    // `disk_cache_index`).
+                    bump_in_memory_atime(&self.disk_cache_index, &(path.clone(), None));
+                    let start = offset as usize;
+                    let end = (start + size as usize).min(b.len());
+                    let result = if start < b.len() {
+                        b[start..end].to_vec()
+                    } else {
+                        vec![]
+                    };
+                    self.mem_cache.put(ino, offset / CACHE_BLOCK_SIZE, b);
+                    return Ok(result);
                 } else {
-                    vec![]
-                };
-                self.mem_cache.put(ino, offset / CACHE_BLOCK_SIZE, b);
-                return Ok(result);
+                    // Partial cache — warm mem_cache
+                    // for the next read but fall
+                    // through. The mem_cache put is
+                    // best-effort: the block cache +
+                    // remote fetch below will satisfy
+                    // the current request. Clone `b`
+                    // because `b` may be needed for
+                    // the partial-data path below
+                    // (when offset > b.len()).
+                    self.mem_cache
+                        .put(ino, offset / CACHE_BLOCK_SIZE, b.clone());
+                    tracing::debug!(
+                        path = %path,
+                        cache_bytes = b.len(),
+                        inodes_bytes = actual_size,
+                        "file-level cache is partial; falling through to block cache + remote (issue #43)"
+                    );
+                }
             }
             // 5. Block-level disk cache
             let cpath = crate::cache_block_path(&self.cache_dir, &path, block_idx);
