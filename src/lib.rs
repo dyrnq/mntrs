@@ -1570,9 +1570,12 @@ impl MntrsFs {
                             // but an operator watching this
                             // mount needs to know the worker
                             // is gone NOW. Log at warn.
-                            if let Err(e) =
-                                tx.send((INO_RECOVERY_SENTINEL, remote, cache_path.clone()))
-                            {
+                            if let Err(e) = tx.send((
+                                INO_RECOVERY_SENTINEL,
+                                remote,
+                                cache_path.clone(),
+                                0, // fresh enqueue (cycle 0)
+                            )) {
                                 tracing::warn!(
                                     cache_path=?cache_path,
                                     error=%e,
@@ -3526,7 +3529,15 @@ impl CoreFilesystem for MntrsFs {
                     // .dirty sidecar written just above stays
                     // on disk and will be picked up on next-
                     // mount recovery.
-                    if let Err(e) = tx.send((_ino, path.clone(), cpath)) {
+                    //
+                    // Issue #53: 4th tuple element is the
+                    // retry-cycle count — 0 for a fresh
+                    // enqueue from flush. The writeback
+                    // worker re-enqueues with cycle+1 when
+                    // the in-process 5-attempt retry loop
+                    // exhausts, applying a 60 s cooldown
+                    // between cycles.
+                    if let Err(e) = tx.send((_ino, path.clone(), cpath, 0)) {
                         tracing::warn!(
                             path=%path,
                             error=%e,
@@ -3659,8 +3670,10 @@ impl CoreFilesystem for MntrsFs {
                 if let Some(tx) = self.writeback_sender.get() {
                     // Bug 22 (release-side mirror of the flush
                     // fix above). Same rationale + same
-                    // recovery shape.
-                    if let Err(e) = tx.send((_ino, path.clone(), cpath)) {
+                    // recovery shape. Issue #53: 4th tuple
+                    // element is the retry-cycle count —
+                    // 0 for a fresh enqueue.
+                    if let Err(e) = tx.send((_ino, path.clone(), cpath, 0)) {
                         tracing::warn!(
                             path=%path,
                             error=%e,

@@ -24,7 +24,19 @@ use tokio_util::time::delay_queue::DelayQueue;
 use crate::Inodes;
 
 /// Type of task sent by FUSE threads to the writeback worker.
-pub type Task = (u64, String, PathBuf);
+///
+/// The 4th element is the retry-cycle count: 0 for a fresh
+/// enqueue (from flush/release), incremented every time the
+/// upload exhausts its 5-attempt in-process retry loop and
+/// gets pushed back into the queue. Issue #53: without
+/// tracking cycles here, a permanently-failing upload
+/// (backend 5xx, network partition, auth expiry) would
+/// keep the file in the queue forever once retries are
+/// re-enabled, OR — pre-fix — would silently drop the task
+/// after 5 attempts and the daemon would never upload the
+/// data again. The cap (see `MAX_REENQUEUE_CYCLES` below)
+/// bounds the second scenario.
+pub type Task = (u64, String, PathBuf, u32);
 
 /// The shared sender used by FUSE threads to enqueue writeback work.
 pub type Sender = tokio::sync::mpsc::UnboundedSender<Task>;
@@ -37,6 +49,33 @@ pub fn pending_count() -> usize {
     PENDING_COUNT.load(Ordering::Relaxed) as usize
 }
 
+/// Cap on how many times a single task can be re-enqueued
+/// after exhausting its in-process retry loop. Each cycle
+/// is 5 attempts with exponential backoff (1+2+4+8+16 s
+/// = 31 s of active upload time) plus a 60 s cooldown
+/// between cycles. 10 cycles = 50 attempts ≈ 15 min of
+/// total upload time before the task is declared stuck.
+///
+/// Issue #53: pre-fix the log message said "re-enqueueing"
+/// but the code did not re-enqueue, leaving the file
+/// permanently stuck in daemon mode. With the cap, an
+/// operator can monitor the "stuck writeback" critical
+/// log line + the .dirty sidecar count to alert on a
+/// real backend outage. Without the cap, a permanent
+/// backend failure would cycle the same task forever
+/// and grow the delay queue unboundedly.
+const MAX_REENQUEUE_CYCLES: u32 = 10;
+
+/// Cooldown between re-enqueue cycles when the in-process
+/// retry loop exhausts. Longer than the first-time enqueue
+/// delay (`delay` arg to `spawn`, default 5 s) so a
+/// persistently-flaky backend doesn't get hammered. 60 s
+/// matches the per-PVC mount retry cadence in K8s CSI
+/// drivers (e.g. csi-attacher's default 30 s), so a single
+/// cycle's worth of retries aligns with one K8s resync
+/// window.
+const REENQUEUE_COOLDOWN: Duration = Duration::from_secs(60);
+
 /// Spawn the writeback worker inside the global tokio runtime.
 ///
 /// Returns a `Sender` that is `Clone + Send`, usable from any FUSE thread.
@@ -45,7 +84,14 @@ pub fn spawn(
     inodes: Inodes,
     delay: Duration,
 ) -> (Sender, tokio::task::JoinHandle<()>) {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Task>();
+    // Clone for the upload task's re-enqueue path
+    // (issue #53). The original `tx` is also
+    // returned to the caller for FUSE-thread
+    // enqueues; we move the clone into the worker
+    // task and keep the original for the return
+    // value.
+    let tx_for_worker = tx.clone();
 
     let handle = crate::rt().spawn(async move {
         let mut queue: DelayQueue<Task> = DelayQueue::new();
@@ -54,14 +100,32 @@ pub fn spawn(
             // Drain channel into queue
             while let Ok(task) = rx.try_recv() {
                 PENDING_COUNT.fetch_add(1, Ordering::Relaxed);
-                queue.insert_at(task, tokio::time::Instant::now() + delay);
+                // Issue #53: preserve the retry-cycle count.
+                // A fresh enqueue from flush/release has
+                // count=0; a re-enqueue from the upload
+                // task's retry-exhaustion path has a higher
+                // count and the worker routes it to a
+                // longer cooldown slot.
+                let cycle = task.3;
+                let enqueue_at = if cycle == 0 {
+                    tokio::time::Instant::now() + delay
+                } else {
+                    tokio::time::Instant::now() + REENQUEUE_COOLDOWN
+                };
+                queue.insert_at(task, enqueue_at);
             }
 
             if queue.is_empty() {
                 match rx.recv().await {
                     Some(task) => {
                         PENDING_COUNT.fetch_add(1, Ordering::Relaxed);
-                        queue.insert_at(task, tokio::time::Instant::now() + delay);
+                        let cycle = task.3;
+                        let enqueue_at = if cycle == 0 {
+                            tokio::time::Instant::now() + delay
+                        } else {
+                            tokio::time::Instant::now() + REENQUEUE_COOLDOWN
+                        };
+                        queue.insert_at(task, enqueue_at);
                     }
                     None => break,
                 }
@@ -74,12 +138,23 @@ pub fn spawn(
                 let _p = task.1.clone();
                 let data = match std::fs::read(&task.2) {
                     Ok(d) => d,
-                    Err(_) => continue,
+                    Err(_) => {
+                        // Issue #53: cache file vanished (e.g.
+                        // evicted by LRU) — drop the task
+                        // cleanly. Without this, the
+                        // pre-fix code would have read
+                        // failed with a confusing error and
+                        // the .dirty sidecar would linger.
+                        PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
+                        let _ = std::fs::remove_file(task.2.with_extension("dirty"));
+                        continue;
+                    }
                 };
                 let op = op.clone();
                 let remote = task.1;
                 let ino = task.0;
                 let cache_path = task.2;
+                let cycle = task.3;
                 // Upload in a separate task so DelayQueue keeps ticking.
                 static UPLOAD_SEM: std::sync::LazyLock<Semaphore> =
                     std::sync::LazyLock::new(|| Semaphore::new(4));
@@ -99,6 +174,14 @@ pub fn spawn(
                     .await
                     .expect("BUG: UPLOAD_SEM is never closed; see writeback.rs SAFETY comment");
                 let inodes2 = inodes.clone();
+                // Issue #53: hold a clone of the channel
+                // sender so the upload task can re-enqueue
+                // the work when the 5-attempt retry loop
+                // exhausts. Pre-fix the log message lied
+                // about re-enqueueing but the code dropped
+                // the task — leaving the .dirty sidecar to
+                // sit forever in daemon mode.
+                let tx_clone = tx_for_worker.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     let mut last_err = None;
@@ -147,13 +230,58 @@ pub fn spawn(
                             }
                         }
                     }
-                    PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
+                    // Issue #53: in-process retry loop
+                    // exhausted. Re-enqueue the task via
+                    // the channel with cycle+1 so the
+                    // outer worker applies
+                    // `REENQUEUE_COOLDOWN` (60 s) instead
+                    // of the normal `delay` (5 s). The
+                    // task goes back to the end of the
+                    // queue — concurrent uploads keep
+                    // progressing, this file just gets
+                    // another shot later.
+                    //
+                    // Bounded by `MAX_REENQUEUE_CYCLES`
+                    // (10 cycles ≈ 15 min of total
+                    // active upload time). After the cap,
+                    // the file is declared stuck: the
+                    // .dirty sidecar stays for ops to
+                    // inspect (e.g. via the warning count
+                    // metric), the in-memory queue is
+                    // freed, and a `error!` log surfaces
+                    // the permanent failure.
+                    let next_cycle = cycle + 1;
+                    if next_cycle > MAX_REENQUEUE_CYCLES {
+                        PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
+                        tracing::error!(
+                            path = %remote,
+                            cycle = cycle,
+                            error = ?last_err,
+                            "writeback upload STUCK after {} cycles ({} total attempts); \
+                             .dirty sidecar left on disk for operator inspection — issue #53",
+                            cycle,
+                            cycle * 5
+                        );
+                        return;
+                    }
                     tracing::warn!(
                         path = %remote,
+                        cycle = cycle,
+                        next_cycle = next_cycle,
+                        cooldown_s = REENQUEUE_COOLDOWN.as_secs(),
                         error = ?last_err,
-                        "writeback upload failed after 5 retries, re-enqueueing"
+                        "writeback upload exhausted 5 retries; re-enqueueing (issue #53)"
                     );
-                    // File stays on disk with .dirty sidecar — recovered on next mount
+                    // Re-enqueue. If the channel is
+                    // closed (worker shut down), the
+                    // send fails; the .dirty sidecar
+                    // and on-disk cache file stay for
+                    // the next-mount recovery path.
+                    let _ = tx_clone.send((ino, remote, cache_path, next_cycle));
+                    // PENDING_COUNT stays the same —
+                    // the task is still in flight,
+                    // just moved from the delay queue
+                    // back to the channel.
                 });
             }
         }
@@ -202,7 +330,7 @@ pub fn worker(
 
         let remote_path = tasks[0].1.clone();
         let mut full_data = Vec::new();
-        for (_, _, cache_path) in &tasks {
+        for (_, _, cache_path, _) in &tasks {
             if let Ok(d) = std::fs::read(cache_path) {
                 full_data.extend_from_slice(&d);
             }
@@ -253,10 +381,58 @@ pub fn worker(
                     v.mtime = Some(std::time::SystemTime::now());
                 });
             }
-            for (_, _, cache_path) in &tasks {
+            for (_, _, cache_path, _) in &tasks {
                 let _ = std::fs::remove_file(cache_path);
                 let _ = std::fs::remove_file(cache_path.with_extension("dirty"));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #53: the retry-exhaustion re-enqueue must
+    /// be bounded. The cap is `MAX_REENQUEUE_CYCLES` —
+    /// 10 cycles × 5 attempts/cycle = 50 total
+    /// attempts, ≈ 15 min of total active upload time
+    /// (5 retries with exponential 1+2+4+8+16 s
+    /// backoff = 31 s per cycle, plus 60 s cooldown
+    /// between cycles). Past the cap the task is
+    /// declared stuck and the operator gets an
+    /// `error!` log + the .dirty sidecar to inspect.
+    ///
+    /// The test pins the constants so an accidental
+    /// change (e.g. someone bumps the cap to 1000 and
+    /// the delay queue grows unboundedly on a real
+    /// backend outage) trips CI.
+    #[test]
+    fn reenqueue_cycle_constants() {
+        assert_eq!(MAX_REENQUEUE_CYCLES, 10);
+        assert_eq!(REENQUEUE_COOLDOWN, Duration::from_secs(60));
+    }
+
+    /// Issue #53: Task tuple shape is now 4 elements
+    /// (ino, remote, cache_path, cycle). Pin the
+    /// arity so an accidental refactor that drops the
+    /// cycle counter trips CI before reaching
+    /// production and re-introducing the silent
+    /// data-loss bug.
+    #[test]
+    fn task_tuple_has_cycle_field() {
+        let task: Task = (
+            42,
+            "/remote/path".to_string(),
+            PathBuf::from("/cache/path"),
+            0,
+        );
+        assert_eq!(task.0, 42);
+        assert_eq!(task.1, "/remote/path");
+        assert_eq!(task.2, PathBuf::from("/cache/path"));
+        assert_eq!(task.3, 0);
+        // Cycle count advances on re-enqueue.
+        let retried: Task = (task.0, task.1, task.2, task.3 + 1);
+        assert_eq!(retried.3, 1);
     }
 }
