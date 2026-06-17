@@ -100,6 +100,16 @@ pub fn spawn(
     inodes: Inodes,
     disk_cache_index: DiskCacheIndex,
     cache_dir: std::path::PathBuf,
+    // Issue #38: set of paths that currently have a
+    // writeback task in flight. The worker removes
+    // the path on completion (success or final
+    // retry-exhaustion) so the next flush/release
+    // with new content enqueues a fresh task. The
+    // flush/release enqueue sites insert into the
+    // set first; if the insert returns false, the
+    // task is already in flight and the enqueue is
+    // skipped.
+    writeback_pending: Arc<dashmap::DashSet<String>>,
     delay: Duration,
 ) -> (Sender, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Task>();
@@ -209,6 +219,7 @@ pub fn spawn(
                 // keep them available here.
                 let cache_dir_for_upload = cache_dir.clone();
                 let disk_cache_index_for_upload = disk_cache_index.clone();
+                let writeback_pending_for_upload = writeback_pending.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     let mut last_err = None;
@@ -237,6 +248,13 @@ pub fn spawn(
                                 // The cache eviction logic handles disk space separately.
                                 PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
                                 let _ = std::fs::remove_file(cache_path.with_extension("dirty"));
+                                // Issue #38: clear the
+                                // pending entry so the
+                                // next flush/release
+                                // with new content can
+                                // enqueue a fresh
+                                // task.
+                                writeback_pending_for_upload.remove(remote.as_str());
                                 // Issue #55: drop the
                                 // block-level cache for
                                 // this path. The
@@ -302,6 +320,16 @@ pub fn spawn(
                     let next_cycle = cycle + 1;
                     if next_cycle > MAX_REENQUEUE_CYCLES {
                         PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
+                        // Issue #38: clear the
+                        // pending entry so a future
+                        // flush/release with new
+                        // content can enqueue
+                        // fresh. (Without this the
+                        // path stays pending forever
+                        // and no writebacks for new
+                        // content would ever
+                        // start.)
+                        writeback_pending_for_upload.remove(&remote);
                         tracing::error!(
                             path = %remote,
                             cycle = cycle,

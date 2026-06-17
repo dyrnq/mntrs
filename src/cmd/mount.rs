@@ -649,6 +649,9 @@ pub fn mount(
         // Issue #23: per-fh readdir snapshots. Empty
         // until opendir() populates an entry.
         dir_listers: dashmap::DashMap::new(),
+        // Issue #38: empty pending set; populated on
+        // first flush/release.
+        writeback_pending: std::sync::Arc::new(dashmap::DashSet::new()),
         dir_cache_ttl: std::time::Duration::from_secs(dir_cache_time),
         attr_ttl: std::time::Duration::from_secs(attr_timeout),
         stat_cache_ttl: std::time::Duration::from_secs(stat_cache_ttl),

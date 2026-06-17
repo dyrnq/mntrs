@@ -369,6 +369,21 @@ pub struct MntrsFs {
     pub(crate) disk_total_size: u64,
     writeback_sender: std::sync::OnceLock<writeback::Sender>,
 
+    /// Issue #38: set of paths that currently have a
+    /// writeback task in flight (queued or uploading).
+    /// Used by flush() and release() to avoid queueing
+    /// duplicate tasks for the same file. The
+    /// writeback worker removes a path from this set
+    /// when the upload completes (success or final
+    /// retry-exhaustion). Without this, a flush →
+    /// write → close sequence could queue two
+    /// writeback tasks for the same file with no
+    /// ordering guarantee between them, and the older
+    /// task could land at the backend after the
+    /// newer one (out-of-order writes from the
+    /// user's perspective).
+    writeback_pending: std::sync::Arc<dashmap::DashSet<String>>,
+
     /// Per-(inode, block) in-memory read cache. Held as a
     /// `dyn MemCache` trait object so the underlying
     /// implementation can be swapped (DashMap today, moka
@@ -1560,6 +1575,7 @@ impl MntrsFs {
             inodes,
             self.disk_cache_index.clone(),
             self.cache_dir.clone(),
+            self.writeback_pending.clone(),
             delay,
         );
         self.writeback_sender.set(tx).ok();
@@ -3638,12 +3654,35 @@ impl CoreFilesystem for MntrsFs {
                     // the in-process 5-attempt retry loop
                     // exhausts, applying a 60 s cooldown
                     // between cycles.
-                    if let Err(e) = tx.send((_ino, path.clone(), cpath, 0)) {
-                        tracing::warn!(
+                    //
+                    // Issue #38: skip the enqueue if a
+                    // writeback for this path is already in
+                    // flight. The pending entry is removed
+                    // by the writeback completion path
+                    // (success + retry-exhaustion) so a
+                    // future flush/release with new content
+                    // will enqueue a fresh task. The .dirty
+                    // sidecar stays on disk through the
+                    // upload, so a stale "in flight" entry
+                    // is also protected by the next-mount
+                    // recovery path.
+                    if self.writeback_pending.insert(path.as_str().to_string()) {
+                        if let Err(e) = tx.send((_ino, path.clone(), cpath, 0)) {
+                            // Send failed — back out the
+                            // pending insert so the next
+                            // flush can retry.
+                            self.writeback_pending.remove(path.as_str());
+                            tracing::warn!(
+                                path=%path,
+                                error=%e,
+                                "flush writeback send failed (worker dropped?); \
+                                 .dirty sidecar kept for next-mount retry"
+                            );
+                        }
+                    } else {
+                        tracing::trace!(
                             path=%path,
-                            error=%e,
-                            "flush writeback send failed (worker dropped?); \
-                             .dirty sidecar kept for next-mount retry"
+                            "flush: writeback already in flight for path; skipping duplicate enqueue (issue #38)"
                         );
                     }
                 }
@@ -3774,12 +3813,29 @@ impl CoreFilesystem for MntrsFs {
                     // recovery shape. Issue #53: 4th tuple
                     // element is the retry-cycle count —
                     // 0 for a fresh enqueue.
-                    if let Err(e) = tx.send((_ino, path.clone(), cpath, 0)) {
-                        tracing::warn!(
+                    //
+                    // Issue #38: skip the enqueue if a
+                    // writeback for this path is already
+                    // in flight. This is the second
+                    // enqueue site of the bug (flush +
+                    // release both fire for the same
+                    // file when there's a write between
+                    // them); the pending-set check is
+                    // identical to the flush handler.
+                    if self.writeback_pending.insert(path.as_str().to_string()) {
+                        if let Err(e) = tx.send((_ino, path.clone(), cpath, 0)) {
+                            self.writeback_pending.remove(path.as_str());
+                            tracing::warn!(
+                                path=%path,
+                                error=%e,
+                                "release writeback send failed (worker dropped?); \
+                                 .dirty sidecar kept for next-mount retry"
+                            );
+                        }
+                    } else {
+                        tracing::trace!(
                             path=%path,
-                            error=%e,
-                            "release writeback send failed (worker dropped?); \
-                             .dirty sidecar kept for next-mount retry"
+                            "release: writeback already in flight; skipping duplicate (issue #38)"
                         );
                     }
                 }
@@ -4653,6 +4709,7 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         handle_caching: std::time::Duration::from_secs(0),
         disk_total_size: 0,
         writeback_sender: std::sync::OnceLock::new(),
+        writeback_pending: Arc::new(dashmap::DashSet::new()),
         // Unbounded mem_cache for unit tests. Production mounts
         // overwrite this in cmd/mount.rs after the size is known.
         mem_cache: std::sync::Arc::new(crate::cache::DashMapMemCache::new(0)),
