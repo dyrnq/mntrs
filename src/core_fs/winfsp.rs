@@ -302,9 +302,25 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         _set_allocation_size: bool,
         _file_info: &mut FileInfo,
     ) -> Result<()> {
-        // CoreFilesystem::setattr with size=Some(new_size)
+        // CoreFilesystem::setattr with size=Some(new_size).
+        // Issue #42: pass the open fh so the impl can
+        // ftruncate the cache fd directly. context.fh is
+        // the per-handle value WinFspAdapter minted in
+        // `open` (see the WinFspHandle struct comment);
+        // for a directory handle (where WinFSP didn't
+        // call open) fh equals ino, which the impl falls
+        // back from gracefully.
         self.inner
-            .setattr(context.ino, None, None, None, Some(new_size), None, None)
+            .setattr(
+                context.ino,
+                None,
+                None,
+                None,
+                Some(new_size),
+                None,
+                None,
+                Some(context.fh),
+            )
             .map_err(io_err_to_status)?;
         Ok(())
     }

@@ -80,6 +80,22 @@ pub trait CoreFilesystem: Send + Sync {
     fn getattr(&self, ino: u64) -> std::io::Result<CoreFileAttr>;
 
     /// Set file attributes.
+    ///
+    /// `fh` is the open file handle when the kernel has one
+    /// (e.g. FUSE `setattr` was issued through an open fd;
+    /// `truncate(2)` on an open fd goes through this path).
+    /// Adapters that don't carry a per-fh context can pass
+    /// `None`, in which case the implementation falls back
+    /// to a path-based attribute update.
+    ///
+    /// Issue #42: when `fh.is_some()` and `size.is_some()`,
+    /// the implementation should call `ftruncate(fh, size)`
+    /// against the open cache fd rather than re-opening
+    /// the cache file by path. The fd path avoids a path
+    /// → fd lookup, is more correct on a writer that's
+    /// currently mutating the file (no race with the
+    /// writer's open file description), and matches
+    /// libfuse passthrough_hp.
     fn setattr(
         &self,
         ino: u64,

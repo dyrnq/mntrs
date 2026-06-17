@@ -2467,6 +2467,7 @@ impl CoreFilesystem for MntrsFs {
         size: Option<u64>,
         _atime: Option<SystemTime>,
         _mtime: Option<SystemTime>,
+        fh: Option<u64>,
     ) -> std::io::Result<CoreFileAttr> {
         if let Some(InodeEntry { path: _p, kind, .. }) = self.resolve(ino) {
             if let Some(s) = size {
@@ -2516,29 +2517,70 @@ impl CoreFilesystem for MntrsFs {
                 // here would slow the hot write path for
                 // every workload, to guard a case POSIX
                 // doesn't promise correctness for.
-                // Truncate the on-disk cache file too, so subsequent
-                // reads at offset ≥ s return EOF instead of leftover
-                // bytes from the previous content. Without this, a
-                // cat after truncate could read 18 bytes of stale
-                // content even though our inodes says 10.
-                let cpath = crate::cache_path(&self.cache_dir, &_p);
-                if cpath.exists() {
-                    // Open with write access so the resulting File
-                    // holds a writable handle; the set_len() call below
-                    // is the actual side effect — we don't write any
-                    // bytes here, only shrink/grow the file size to
-                    // match the truncate request. The `let _ =`
-                    // discards any IO error (file vanished between
-                    // exists() and open(), permissions, etc.) —
-                    // truncation is best-effort: a partial truncation
-                    // would leave the cache file slightly larger than
-                    // logical size, which the read path already
-                    // tolerates by using the smaller of cache and
-                    // inodes size.
-                    let _ = std::fs::OpenOptions::new()
-                        .write(true)
-                        .open(&cpath)
-                        .map(|f| f.set_len(s));
+                //
+                // Issue #42: prefer `ftruncate(fh, s)` on the
+                // open cache fd when the kernel gave us an
+                // fh. This avoids:
+                //   * the path → fd re-open syscall,
+                //   * a race where the file disappears
+                //     (e.g. unlink from another fd) between
+                //     cpath.exists() and cpath.open(),
+                //   * the ftruncate semantics mismatch where
+                //     the path-based File::set_len sees a
+                //     different open file description than
+                //     the writer that's currently mutating
+                //     the file (POSIX leaves the result
+                //     undefined; the fd-based form at least
+                //     serializes through the kernel's
+                //     per-fd lock).
+                // If the fh is stale (the handle map no
+                // longer has the entry) or doesn't carry a
+                // cache_fd (e.g. a read-only handle that
+                // happened to get a setattr), we silently
+                // fall through to the path-based branch
+                // below — same final on-disk state, just
+                // via a different syscall.
+                let mut truncated_via_fh = false;
+                if let Some(fh_val) = fh
+                    && let Some(entry) = self.handles.get(&fh_val)
+                    && let crate::FileHandleState::Write {
+                        cache_fd: Some(fd), ..
+                    } = entry.value()
+                    && let Ok(f) = fd.lock()
+                {
+                    // Issue #42: truncate the open cache fd
+                    // directly. The fd-based form is
+                    // preferred because it sees the same
+                    // open file description as the writer
+                    // and serialises with concurrent
+                    // writes on the same fd through the
+                    // kernel's per-fd lock.
+                    if f.set_len(s).is_ok() {
+                        truncated_via_fh = true;
+                    }
+                }
+                if !truncated_via_fh {
+                    // Path-based fallback (Bug 25 comment
+                    // above carries the full rationale).
+                    let cpath = crate::cache_path(&self.cache_dir, &_p);
+                    if cpath.exists() {
+                        // Open with write access so the resulting File
+                        // holds a writable handle; the set_len() call below
+                        // is the actual side effect — we don't write any
+                        // bytes here, only shrink/grow the file size to
+                        // match the truncate request. The `let _ =`
+                        // discards any IO error (file vanished between
+                        // exists() and open(), permissions, etc.) —
+                        // truncation is best-effort: a partial truncation
+                        // would leave the cache file slightly larger than
+                        // logical size, which the read path already
+                        // tolerates by using the smaller of cache and
+                        // inodes size.
+                        let _ = std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&cpath)
+                            .map(|f| f.set_len(s));
+                    }
                 }
                 // Bug 29: invalidate mem_cache after the
                 // truncate. Pre-fix the write path called

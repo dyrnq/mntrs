@@ -196,7 +196,7 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<FileHandle>,
+        fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
@@ -211,9 +211,16 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
             TimeOrNow::SpecificTime(t) => t,
             TimeOrNow::Now => SystemTime::now(),
         });
+        // Issue #42: forward the kernel's optional open fh
+        // so the trait impl can call ftruncate(fh, size)
+        // on the cache fd rather than re-opening the file
+        // by path. The fuser API exposes the fh as
+        // `Option<FileHandle>` (None when setattr came
+        // from a path-based syscall like `truncate(path)`).
+        let fh_u64 = fh.map(|h| h.0);
         match self
             .inner
-            .setattr(ino.into(), mode, uid, gid, size, atime, mtime)
+            .setattr(ino.into(), mode, uid, gid, size, atime, mtime, fh_u64)
         {
             Ok(attr) => {
                 let fattr = from_core_attr(&attr);
