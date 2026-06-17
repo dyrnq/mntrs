@@ -106,7 +106,17 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name = name.to_string_lossy();
-        match self.inner.lookup(parent.into(), &name) {
+        // Issue #47: metrics (lookup)
+        let metrics = crate::metrics::global();
+        let start = std::time::Instant::now();
+        let result = self.inner.lookup(parent.into(), &name);
+        let elapsed = start.elapsed();
+        match &result {
+            Ok(_) => metrics.lookup.record_ok(),
+            Err(_) => metrics.lookup.record_err(),
+        }
+        metrics.lookup_h.observe(elapsed);
+        match result {
             Ok(attr) => {
                 let fattr = from_core_attr(&attr);
                 // Bug 24: TTL = Duration::ZERO is intentional and
@@ -143,7 +153,17 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        match self.inner.getattr(ino.into()) {
+        // Issue #47: metrics (getattr)
+        let metrics = crate::metrics::global();
+        let start = std::time::Instant::now();
+        let result = self.inner.getattr(ino.into());
+        let elapsed = start.elapsed();
+        match &result {
+            Ok(_) => metrics.getattr.record_ok(),
+            Err(_) => metrics.getattr.record_err(),
+        }
+        metrics.getattr_h.observe(elapsed);
+        match result {
             Ok(attr) => {
                 let fattr = from_core_attr(&attr);
                 // Reply with TTL=0 so the FUSE kernel does not cache
@@ -452,7 +472,24 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        match self.inner.read(ino.into(), _fh.into(), offset, size) {
+        // Issue #47: record the read op in the
+        // Prometheus metrics. Wrapped in a
+        // short-lived Arc clone — metrics::global()
+        // is a LazyLock<Arc<...>> so the clone is
+        // a single refcount bump. The start/stop
+        // pair captures the full op duration
+        // including the trait dispatch and the
+        // reply data copy.
+        let metrics = crate::metrics::global();
+        let start = std::time::Instant::now();
+        let result = self.inner.read(ino.into(), _fh.into(), offset, size);
+        let elapsed = start.elapsed();
+        match &result {
+            Ok(_) => metrics.read.record_ok(),
+            Err(_) => metrics.read.record_err(),
+        }
+        metrics.read_h.observe(elapsed);
+        match result {
             Ok(data) => reply.data(&data),
             Err(e) => reply.error(io_err_to_fuse_errno(e)),
         }
@@ -470,7 +507,17 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        match self.inner.write(ino.into(), fh.into(), offset, data) {
+        // Issue #47: metrics. Same pattern as read.
+        let metrics = crate::metrics::global();
+        let start = std::time::Instant::now();
+        let result = self.inner.write(ino.into(), fh.into(), offset, data);
+        let elapsed = start.elapsed();
+        match &result {
+            Ok(_) => metrics.write.record_ok(),
+            Err(_) => metrics.write.record_err(),
+        }
+        metrics.write_h.observe(elapsed);
+        match result {
             Ok(written) => reply.written(written),
             Err(e) => reply.error(io_err_to_fuse_errno(e)),
         }
