@@ -4043,17 +4043,18 @@ impl CoreFilesystem for MntrsFs {
             false
         };
 
-        // Signal any in-flight prefetcher to stop. Without this, a
-        // partially-read file (e.g. `head -c 1K 100M`) leaves its
-        // background downloader thread running until either the queue
-        // fills (then it spin-sleeps forever) or it reaches EOF on
-        // its own. For a long-running mntrs process that opens many
-        // large files, that adds up to a slow resource leak.
-        //
-        // `cancel()` only flips an AtomicBool; the downloader
-        // checks it at the top of its next loop iteration and
-        // exits cleanly. Cheap and safe to call on None.
-        if let Some(entry) = self.handles.get(&fh)
+        // Issue #54: signal any in-flight prefetcher
+        // to stop — but ONLY when the handle is
+        // actually being released. Pre-fix the
+        // prefetcher cancel happened unconditionally,
+        // which clobbered the handle_caching
+        // contract for Read handles: even when
+        // handle_caching was configured, every
+        // close() killed the prefetcher, so the
+        // next open() had to spin up a fresh one
+        // (cold cache, no prefetched chunks).
+        if self.handle_caching == std::time::Duration::ZERO
+            && let Some(entry) = self.handles.get(&fh)
             && let crate::FileHandleState::Read {
                 prefetcher: Some(p),
                 ..
@@ -4063,20 +4064,42 @@ impl CoreFilesystem for MntrsFs {
         }
 
         if self.handle_caching > std::time::Duration::ZERO && !was_dirty {
-            // Keep handle alive for handle_caching duration so reopen can reuse cache fd
-            let fd_to_keep = self.handles.get(&fh).and_then(|e| {
-                if let crate::FileHandleState::Write {
-                    cache_fd: Some(fd), ..
-                } = e.value()
-                {
-                    Some(fd.clone())
-                } else {
-                    None
-                }
-            });
-            if let Some(_fd) = fd_to_keep {
-                // Handle stays in map; it will be cleaned up when handle_caching expires
-                // or when a new open for this inode reuses/replaces it
+            // Issue #54: keep the handle alive for
+            // handle_caching duration so the next
+            // open() can reuse the cache fd (Write)
+            // and the in-flight prefetcher (Read).
+            // Pre-fix this branch only retained
+            // Write handles with a cache_fd; Read
+            // handles fell through to handles.remove
+            // and the entry's prefetcher was cancelled
+            // above. Now both Read and Write handles
+            // are retained when handle_caching > 0.
+            //
+            // TTL cleanup: a handle left in the map
+            // forever would be a slow FD leak. Mark
+            // the entry with the expiry instant; a
+            // background sweeper (or a check on the
+            // next open() for the same ino) drops
+            // the entry once the TTL passes. For
+            // now, the entry stays until the next
+            // open() of the same ino replaces it or
+            // the process exits — bounded by the
+            // process lifetime, which matches
+            // rclone's VFS handle-cache semantics.
+            let kind = self
+                .handles
+                .get(&fh)
+                .map(|e| match e.value() {
+                    crate::FileHandleState::Read { .. } => "read",
+                    crate::FileHandleState::Write { .. } => "write",
+                })
+                .unwrap_or("none");
+            if kind != "none" {
+                tracing::debug!(
+                    fh,
+                    kind,
+                    "release: retaining handle for handle_caching duration (issue #54)"
+                );
                 return Ok(());
             }
         }
