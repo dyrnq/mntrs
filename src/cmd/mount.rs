@@ -613,7 +613,33 @@ pub fn mount(
     vfs_handle_caching: u64,
     vfs_disk_space_total_size: u64,
 ) -> Result<()> {
+    // Issue #62 (debug aid): the CI Integration Tests
+    // show `mount not ready after 60s` with the
+    // mount log capturing only `Mounting` + the
+    // atexit `fusermount3 not found` error, but the
+    // local 2s mount is invisible to the CI test
+    // loop. We don't yet know whether the 60s is
+    // spent in build_operator, in our init calls,
+    // in MntrsFs construction, in mem_cache, or in
+    // fuser::spawn_mount2's kernel mount syscall.
+    // These elapsed_ms checkpoints give us the
+    // timeline on the next push. They use
+    // `tracing::info!` so they go to the same
+    // MOUNT_LOG the integration test already
+    // captures, and the cost is one clock read per
+    // checkpoint (sub-microsecond). Remove this
+    // block once #62 is closed.
+    let _t_mount = std::time::Instant::now();
+    tracing::info!(
+        backend = %storage_url,
+        mountpoint = %mountpoint,
+        "mount: entered, about to build_operator"
+    );
     let op = rt_block_on(build_operator(storage_url, opts))?;
+    tracing::info!(
+        elapsed_ms = _t_mount.elapsed().as_millis() as u64,
+        "mount: after build_operator"
+    );
     // Initialize the global op for the write path's
     // background thread (it can't borrow `&self.op`,
     // which lives on the FUSE worker). Without this,
@@ -641,6 +667,10 @@ pub fn mount(
     // `mount()` again with a different cache dir)
     // do NOT spawn extra fsync threads (Bug 5).
     crate::init_disk_write_pool(None);
+    tracing::info!(
+        elapsed_ms = _t_mount.elapsed().as_millis() as u64,
+        "mount: after init calls (opendal_sync_op + disk_write_pool)"
+    );
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let cache_dir_path = if let Some(cd) = cache_dir {
         std::path::PathBuf::from(cd)
@@ -674,6 +704,10 @@ pub fn mount(
             ));
         }
     };
+    tracing::info!(
+        elapsed_ms = _t_mount.elapsed().as_millis() as u64,
+        "mount: after mem_cache creation"
+    );
     let fs = MntrsFs {
         op: Arc::new(op),
         inodes: dashmap::DashMap::new(),
@@ -744,6 +778,10 @@ pub fn mount(
         disk_cache_index: std::sync::Arc::new(dashmap::DashMap::new()),
         storage_class: storage_class.map(|s| s.to_string()),
     };
+    tracing::info!(
+        elapsed_ms = _t_mount.elapsed().as_millis() as u64,
+        "mount: after MntrsFs construction"
+    );
 
     // Create pipe for daemon_wait parent-child synchronization
     #[cfg(not(windows))]
@@ -1001,7 +1039,15 @@ pub fn mount(
             std::time::Duration::from_secs(attr_timeout),
             direct_io,
         );
+        tracing::info!(
+            elapsed_ms = _t_mount.elapsed().as_millis() as u64,
+            "mount: after FuserAdapter::new, about to call spawn_mount2"
+        );
         let session = fuser::spawn_mount2(adapter, mount_path, &cfg)?;
+        tracing::info!(
+            elapsed_ms = _t_mount.elapsed().as_millis() as u64,
+            "mount: fuser::spawn_mount2 returned (this is where fuser::session prints Mounting)"
+        );
         // Store session so unmount_internal can gracefully shut it down
         // instead of leaking the daemon thread via std::mem::forget.
         // FUSE_SESSION is Unix-only (WinFSP uses a different teardown path).
