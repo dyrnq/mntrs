@@ -3636,30 +3636,61 @@ impl CoreFilesystem for MntrsFs {
         // (which paid ~10 µs of thread-spawn overhead per
         // write) with a shared worker pool that reuses
         // threads.
+        //
+        // Bug #62 (task #3 root cause): the async
+        // submit + worker-pool design above has a
+        // read-after-write race. The FUSE write handler
+        // returns OK to the kernel before the pool worker
+        // runs write_all on the cache fd. A subsequent
+        // read can arrive in the page cache before the
+        // pool worker ran, see the cache file as 0
+        // bytes, fall through to the remote fetch, and
+        // return EIO because the writeback hasn't landed.
+        //
+        // Fix: when cache_fd is Some, write to it
+        // synchronously on the FUSE worker. The cache
+        // file write is a page-cache memcpy (sub-µs),
+        // cheaper than the old async path's pool submit
+        // + thread-wakeup overhead. The async writeback
+        // to the remote (S3/HDFS) is still async — that
+        // is where the real network latency lives, and
+        // it is triggered separately by flush() /
+        // release(), not by this handler.
+        if let Some(fd) = &cache_fd
+            && let Ok(mut f) = fd.lock()
+        {
+            let end = _offset + _data.len() as u64;
+            let _ = f.set_len(end);
+            use std::io::{Seek, Write};
+            let _ = f.seek(std::io::SeekFrom::Start(_offset));
+            f.write_all(_data)?;
+        }
+        // #8 (durability): register the cache file
+        // for the periodic fsync thread (5 s tick,
+        // see spawn_fsync_thread). Without this, a
+        // power loss between the FUSE write and the
+        // kernel's lazy page-cache flushback can zero
+        // the cache file.
+        if cache_fd.is_some() {
+            let cpath = crate::cache_path(&self.cache_dir, &path);
+            register_dirty_cache_path(&cpath);
+        }
+        // #27 (disk-IO thread pool): for the no-fd
+        // fallback (the open() path that couldn't open
+        // the cache file — rare, only when $HOME is
+        // unwritable), still submit to the pool so the
+        // write eventually lands on disk. The pool
+        // worker re-opens the file and writes.
         let job = match &cache_fd {
-            Some(fd) => DiskWriteJob {
-                cache_fd: Some(fd.clone()),
-                // #8 (durability): populate cache_path
-                // even when cache_fd is Some, so the
-                // pool worker can register the path for
-                // periodic fsync. cache_fd remains the
-                // preferred handle for the write itself
-                // (avoids the open syscall on the hot
-                // path); cache_path is read-only here.
-                cache_path: Some(crate::cache_path(&self.cache_dir, &path)),
-                remote_path: path.clone(),
-                offset: _offset,
-                data: _data.to_vec(),
-                block_cache: None,
-            },
-            None => DiskWriteJob {
+            Some(_) => None, // Already wrote synchronously above; no pool work.
+            None => Some(DiskWriteJob {
                 cache_fd: None,
                 cache_path: Some(crate::cache_path(&self.cache_dir, &path)),
                 remote_path: path.clone(),
                 offset: _offset,
                 data: _data.to_vec(),
                 block_cache: None,
-            },
+            }),
         };
         submit_disk_write(job);
 
@@ -5586,7 +5617,8 @@ fn spawn_fsync_thread() {
 /// The fallback preserves correctness in tests that
 /// haven't set up the pool; production mounts
 /// always init it during mount.
-pub(crate) fn submit_disk_write(job: DiskWriteJob) {
+pub(crate) fn submit_disk_write(job: Option<DiskWriteJob>) {
+    let Some(job) = job else { return };
     if let Some(tx) = DISK_WRITE_POOL.get() {
         // `send` returns Err only if there are zero
         // receivers. We hold N receiver clones in the
@@ -5626,7 +5658,7 @@ pub(crate) fn submit_block_cache_write(
         data,
         block_cache: Some(blk_path),
     };
-    submit_disk_write(job);
+    submit_disk_write(Some(job));
 }
 
 // ─── end disk-IO thread pool ────────────────────────────────────
