@@ -1319,6 +1319,16 @@ async fn build_s3(url: &url::Url, opts: &HashMap<String, String>) -> Result<Oper
     if let Some(v) = opts.get("endpoint") {
         builder = builder.endpoint(v);
     }
+    // #72: skip AWS SDK config probing at mount startup.
+    // Without this, S3 builder probes ~/.aws/config, ~/.aws/credentials,
+    // and IMDS in CI/containers that don't have these — adds 100-500ms
+    // of stall per mount. We only do this when both access_key and
+    // secret_key are explicitly provided (otherwise users relying on
+    // env vars / IAM role / IMDS would break).
+    let explicit_creds = opts.get("access-key").is_some() && opts.get("secret-key").is_some();
+    if explicit_creds {
+        builder = builder.disable_config_load();
+    }
     if let Some(v) = opts.get("access-key") {
         builder = builder.access_key_id(v);
     }
@@ -1587,11 +1597,17 @@ extern "C" fn handler(_: i32) {
 }
 
 async fn build_webdav(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
-    let endpoint = format!(
-        "{}://{}",
-        url.scheme(),
-        url.host_str().unwrap_or("localhost")
-    );
+    // Prefer explicit --opt endpoint over URL-derived host.
+    // When no endpoint opt is given, derive from the URL host
+    // but use http:// scheme (opendal's WebDAV service expects
+    // http:// or https://, not webdav://).
+    let endpoint = if let Some(ep) = opts.get("endpoint") {
+        ep.clone()
+    } else {
+        let host = url.host_str().unwrap_or("localhost");
+        let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+        format!("http://{host}{port}")
+    };
     let mut builder = Webdav::default().endpoint(&endpoint);
     let p = url.path();
     if !p.is_empty() && p != "/" {
