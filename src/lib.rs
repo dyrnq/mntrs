@@ -3665,6 +3665,45 @@ impl CoreFilesystem for MntrsFs {
             let _ = f.seek(std::io::SeekFrom::Start(_offset));
             f.write_all(_data)?;
         }
+        // Bug #62 / task #3 (part 2): the cache file is
+        // the local re-read optimization, but a read that
+        // arrives before the async writeback uploads to
+        // the remote will fall through to `op.read_with`
+        // and see a stale 0-byte file in the backend
+        // (the `create` handler only wrote empty bytes).
+        // `opendal::services::Memory::read_with` then
+        // returns `Unexpected { expect: N, actual: 0 }`,
+        // which the FUSE adapter maps to EIO.
+        //
+        // Fix: write to the opendal backend synchronously
+        // so the next read sees the data without waiting
+        // for the writeback worker. For memory this is a
+        // map insert (sub-µs); for S3 / HDFS this is a
+        // network round-trip and is the new cost. The
+        // writeback worker becomes a no-op for the happy
+        // path (the data is already uploaded) and remains
+        // as a recovery path for the create-without-write
+        // edge case (an in-flight create can still leave
+        // a 0-byte file in the backend until the next
+        // writeback tick).
+        {
+            let op = self.op.clone();
+            let p = path.clone();
+            let d = _data.to_vec();
+            let r = rt().block_on(async move { op.write(&p, d).await });
+            if let Err(e) = r {
+                // Don't fail the FUSE write just because
+                // the backend is down — the local cache
+                // file has the data, and the async
+                // writeback worker will retry the upload.
+                tracing::warn!(
+                    path = %path,
+                    error = %e,
+                    kind = ?e.kind(),
+                    "write: sync opendal upload failed (cache file written, writeback will retry)"
+                );
+            }
+        }
         // #8 (durability): register the cache file
         // for the periodic fsync thread (5 s tick,
         // see spawn_fsync_thread). Without this, a
