@@ -398,6 +398,13 @@ pub struct MntrsFs {
     pub(crate) cache_poll_interval: Duration,
     pub(crate) disk_total_size: u64,
     writeback_sender: std::sync::OnceLock<writeback::Sender>,
+    /// #89: FUSE kernel notifier for attr cache invalidation after
+    /// writes. Set once in `set_fuse_notifier()` from the mount
+    /// command path. The write handler calls
+    /// `inval_inode(ino, 0, -1)` after each successful write
+    /// so subsequent O_APPEND opens see the up-to-date file
+    /// size instead of the cached pre-write size.
+    pub(crate) fuse_notifier: std::sync::OnceLock<fuser::Notifier>,
 
     /// Issue #38: set of paths that currently have a
     /// writeback task in flight (queued or uploading).
@@ -942,6 +949,21 @@ fn opendal_sync_op() -> opendal::Operator {
 
 static OPENDAL_SYNC_OP: once_cell::sync::OnceCell<opendal::Operator> =
     once_cell::sync::OnceCell::new();
+
+/// #89: Set the FUSE kernel notifier so the write path can
+/// invalidate the kernel's attr cache after each write. Without
+/// this, the kernel keeps using the pre-write file size it
+/// cached from the last getattr/setattr reply, and the next
+/// O_APPEND open issues a write at the wrong offset (clobbering
+/// prior writes — see the trace in issue #89). Called once
+/// from the mount command path after `spawn_mount2` returns
+/// the BackgroundSession. Safe to call multiple times; only
+/// the first call wins.
+pub fn set_fuse_notifier(notifier: fuser::Notifier) {
+    let _ = FUSE_NOTIFIER.set(notifier);
+}
+
+static FUSE_NOTIFIER: once_cell::sync::OnceCell<fuser::Notifier> = once_cell::sync::OnceCell::new();
 
 /// Set the global op for use by the write path's
 /// background thread. Called once during mount
@@ -3782,6 +3804,18 @@ impl CoreFilesystem for MntrsFs {
                 );
             }
         }
+        // #89 follow-up: invalidate the FUSE kernel's
+        // attr cache for this inode. Without this, the
+        // kernel keeps using the pre-write size it cached
+        // from the last getattr/setattr reply, and the next
+        // O_APPEND open issues a write at the wrong offset
+        // (clobbering prior writes — see the trace in
+        // issue #89). ENOENT is harmless (kernel already
+        // dropped the cache); ignore it like the fuser
+        // `send_inval` helper does.
+        if let Some(notifier) = self.fuse_notifier.get() {
+            let _ = notifier.inval_inode(fuser::INodeNo(_ino), 0, -1);
+        }
         // #8 (durability): register the cache file
         // for the periodic fsync thread (5 s tick,
         // see spawn_fsync_thread). Without this, a
@@ -5119,6 +5153,7 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         handle_caching: std::time::Duration::from_secs(0),
         disk_total_size: 0,
         writeback_sender: std::sync::OnceLock::new(),
+        fuse_notifier: std::sync::OnceLock::new(),
         writeback_pending: Arc::new(dashmap::DashSet::new()),
         // Unbounded mem_cache for unit tests. Production mounts
         // overwrite this in cmd/mount.rs after the size is known.

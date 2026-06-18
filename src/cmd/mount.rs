@@ -764,6 +764,7 @@ pub fn mount(
         handle_caching: std::time::Duration::from_secs(vfs_handle_caching),
         disk_total_size: vfs_disk_space_total_size * 1024 * 1024 * 1024 * 1024, // TB to bytes
         writeback_sender: std::sync::OnceLock::new(),
+        fuse_notifier: std::sync::OnceLock::new(),
 
         mem_cache,
         attr_cache: dashmap::DashMap::new(),
@@ -1045,6 +1046,15 @@ pub fn mount(
         // FUSE_SESSION is Unix-only (WinFSP uses a different teardown path).
         #[cfg(not(windows))]
         if let Ok(mut guard) = FUSE_SESSION.lock() {
+            // #89: stash the kernel notifier so the write handler
+            // can invalidate the kernel's attr cache after each
+            // write — see `set_fuse_notifier` and the write path
+            // tracing for details. ENOENT-class errors here just
+            // mean the mount didn't reach FUSE_INIT yet (impossible
+            // since spawn_mount2 just returned); treat any failure
+            // as a soft no-op since the worst case is the kernel
+            // using stale attrs for one more op.
+            crate::set_fuse_notifier(session.notifier());
             *guard = Some(session);
         }
         record_mount(storage_url, mountpoint, read_only);
