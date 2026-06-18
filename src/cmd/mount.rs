@@ -613,30 +613,22 @@ pub fn mount(
     vfs_handle_caching: u64,
     vfs_disk_space_total_size: u64,
 ) -> Result<()> {
-    // Issue #62 (debug aid): the CI Integration Tests
-    // show `mount not ready after 60s` with the
-    // mount log capturing only `Mounting` + the
-    // atexit `fusermount3 not found` error, but the
-    // local 2s mount is invisible to the CI test
-    // loop. We don't yet know whether the 60s is
-    // spent in build_operator, in our init calls,
-    // in MntrsFs construction, in mem_cache, or in
-    // fuser::spawn_mount2's kernel mount syscall.
-    // These elapsed_ms checkpoints give us the
-    // timeline on the next push. They use
-    // `tracing::info!` so they go to the same
-    // MOUNT_LOG the integration test already
-    // captures, and the cost is one clock read per
-    // checkpoint (sub-microsecond). Remove this
-    // block once #62 is closed.
+    // Issue #62: elapsed_ms checkpoints at every major
+    // mount() step. At `tracing::debug!` so they are
+    // silent under the default INFO filter — turn them
+    // on with `RUST_LOG=mntrs=debug` (or `=trace`).
+    // One Instant::now() read + one tracing event per
+    // checkpoint (~1 µs total). Useful when the next
+    // integration-test failure shows a slow step and
+    // we need to bisect the mount path.
     let _t_mount = std::time::Instant::now();
-    tracing::info!(
+    tracing::debug!(
         backend = %storage_url,
         mountpoint = %mountpoint,
         "mount: entered, about to build_operator"
     );
     let op = rt_block_on(build_operator(storage_url, opts))?;
-    tracing::info!(
+    tracing::debug!(
         elapsed_ms = _t_mount.elapsed().as_millis() as u64,
         "mount: after build_operator"
     );
@@ -667,7 +659,7 @@ pub fn mount(
     // `mount()` again with a different cache dir)
     // do NOT spawn extra fsync threads (Bug 5).
     crate::init_disk_write_pool(None);
-    tracing::info!(
+    tracing::debug!(
         elapsed_ms = _t_mount.elapsed().as_millis() as u64,
         "mount: after init calls (opendal_sync_op + disk_write_pool)"
     );
@@ -704,7 +696,7 @@ pub fn mount(
             ));
         }
     };
-    tracing::info!(
+    tracing::debug!(
         elapsed_ms = _t_mount.elapsed().as_millis() as u64,
         "mount: after mem_cache creation"
     );
@@ -778,7 +770,7 @@ pub fn mount(
         disk_cache_index: std::sync::Arc::new(dashmap::DashMap::new()),
         storage_class: storage_class.map(|s| s.to_string()),
     };
-    tracing::info!(
+    tracing::debug!(
         elapsed_ms = _t_mount.elapsed().as_millis() as u64,
         "mount: after MntrsFs construction"
     );
