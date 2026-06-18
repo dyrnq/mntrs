@@ -2051,8 +2051,18 @@ impl MntrsFs {
     ///   * Anything else — propagate.
     fn mkdir_chain(&self, full_path: &str) -> std::io::Result<()> {
         // Collect every dir level we need to ensure exists, leaf last.
-        // For full_path = "a/b/c" we walk up: ["a/b/c/", "a/b/", "a/"].
-        // Reversed: ["a/", "a/b/", "a/b/c/"].
+        // For full_path = "a/b/c.txt" we walk up: ["a/b/c.txt", "a/b/", "a/"].
+        // After `if leaf path starts with /` filter below, intermediates
+        // are ["a/", "a/b/"] — only the directories above the file.
+        //
+        // Bug fix: previously this function appended `/` to every level
+        // including the leaf, then called `op.create_dir("/a/b/c.txt/")`
+        // on the FILE path. On opendal WebDAV backend this becomes
+        // MKCOL on `/a/b/c.txt/`, which creates a *directory* at that
+        // name (the trailing `/` tells WebDAV this is a collection).
+        // The subsequent `op.write("/a/b/c.txt", ...)` then can't
+        // overwrite the directory. Fix: skip the leaf entirely — only
+        // call `op.create_dir` on intermediate directories.
         let mut chain: Vec<String> = Vec::new();
         let mut cur = full_path.trim_end_matches('/').to_string();
         while !cur.is_empty() {
@@ -2062,6 +2072,10 @@ impl MntrsFs {
                 None => cur.clear(),
             }
         }
+        // The LAST entry of the chain is the leaf (the file itself).
+        // Skip it: op.create_dir on a file path is wrong for any backend,
+        // and op.write (called next) will create the file.
+        chain.pop();
         chain.reverse();
 
         let op = self.op.clone();
