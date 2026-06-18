@@ -2866,118 +2866,168 @@ impl CoreFilesystem for MntrsFs {
         fh: Option<u64>,
     ) -> std::io::Result<CoreFileAttr> {
         if let Some(InodeEntry { path: _p, kind, .. }) = self.resolve(ino) {
+            // Issue #89 / Option B fix: distinguish kernel-driven
+            // setattr from user-initiated `truncate(2)`. The FUSE
+            // kernel sends `FUSE_SETATTR` with `fh=None` for two
+            // distinct cases:
+            //
+            //   1. **User `truncate(2)` syscall** — has an open fd,
+            //      so `fh` is `Some(_)` in the kernel's request.
+            //      This is a real truncation the user wants.
+            //
+            //   2. **Kernel's bookkeeping for `open(O_TRUNC)`** —
+            //      no fd (truncate happens before open), so `fh`
+            //      is `None`. The kernel will then send
+            //      `FUSE_OPEN` which we handle normally. The cache
+            //      file is freshly created by `open()` with the
+            //      truncated size baked into the write handler's
+            //      `set_len(end)`. We must NOT pre-truncate the
+            //      cache file here, because if a previous write
+            //      already populated it (e.g. from a prior session
+            //      or the recovery path), we'd destroy that content
+            //      before the user has even opened the fd.
+            //
+            // Skipping the cache file truncate when `fh` is `None`
+            // fixes the task #3 regression: append writes no longer
+            // see a stale zero-byte cache between the SETATTR and
+            // the OPEN that follows.
+            let user_initiated_truncate = fh.is_some();
+            if user_initiated_truncate {
+                tracing::warn!(
+                    ino = ino,
+                    size = ?size,
+                    "setattr: truncating cache file (user-initiated)"
+                );
+            } else if size.is_some() {
+                tracing::warn!(
+                    ino = ino,
+                    size = ?size,
+                    "setattr: kernel-driven (e.g. O_TRUNC open); skipping cache truncate"
+                );
+            }
             if let Some(s) = size {
-                // Truncate the inodes size to the new value.
-                //
-                // The previous implementation called `alloc_ino(&_p, kind, s)`,
-                // which under the hood is `or_insert` on the inodes map.
-                // `or_insert` only inserts when the entry is vacant — so
-                // a truncate from 18 → 0 on an existing file silently
-                // did nothing, leaving the kernel thinking the file was
-                // still 18 bytes while the cache file had been
-                // (partially) overwritten by a smaller write.
-                //
-                // The fix uses `and_modify` to unconditionally overwrite
-                // the size field, which is what truncation actually
-                // means semantically. We do NOT touch mtime here
-                // (setattr's mtime is handled by the `make_attr` call
-                // below with `SystemTime::now()`).
-                self.inodes.entry(ino).and_modify(|v| {
-                    v.size = s;
-                });
-                // Bug 25 (truncate-vs-async-write race):
-                // there's no lock between the inodes
-                // size update above and the cache file
-                // set_len below, vs an in-flight
-                // DiskWriteJob still draining the IO
-                // pool. Worst case: setattr says "truncate
-                // to 10", a queued write of 4 KiB at
-                // offset 0 lands AFTER set_len, the cache
-                // file is back to 4 KiB but inodes.size is
-                // 10. The write path's own
-                // `entry().and_modify(|v| if end > v.size
-                // { v.size = end })` would also bump
-                // inodes.size to 4096, so the two
-                // operations clobber each other and the
-                // result depends on scheduling.
-                //
-                // Why we accept this: POSIX leaves
-                // concurrent truncate+write across
-                // different fds undefined. FUSE serializes
-                // operations on the same fd (so a single
-                // process's `ftruncate` + `write` sequence
-                // is fine), and a write through a
-                // separate fd racing with truncate is
-                // already an application-level bug under
-                // any filesystem. Adding a per-ino lock
-                // here would slow the hot write path for
-                // every workload, to guard a case POSIX
-                // doesn't promise correctness for.
-                //
-                // Issue #42: prefer `ftruncate(fh, s)` on the
-                // open cache fd when the kernel gave us an
-                // fh. This avoids:
-                //   * the path → fd re-open syscall,
-                //   * a race where the file disappears
-                //     (e.g. unlink from another fd) between
-                //     cpath.exists() and cpath.open(),
-                //   * the ftruncate semantics mismatch where
-                //     the path-based File::set_len sees a
-                //     different open file description than
-                //     the writer that's currently mutating
-                //     the file (POSIX leaves the result
-                //     undefined; the fd-based form at least
-                //     serializes through the kernel's
-                //     per-fd lock).
-                // If the fh is stale (the handle map no
-                // longer has the entry) or doesn't carry a
-                // cache_fd (e.g. a read-only handle that
-                // happened to get a setattr), we silently
-                // fall through to the path-based branch
-                // below — same final on-disk state, just
-                // via a different syscall.
-                let mut truncated_via_fh = false;
-                if let Some(fh_val) = fh
-                    && let Some(entry) = self.handles.get(&fh_val)
-                    && let crate::FileHandleState::Write {
-                        cache_fd: Some(fd), ..
-                    } = entry.value()
-                    && let Ok(f) = fd.lock()
-                {
-                    // Issue #42: truncate the open cache fd
-                    // directly. The fd-based form is
-                    // preferred because it sees the same
-                    // open file description as the writer
-                    // and serialises with concurrent
-                    // writes on the same fd through the
-                    // kernel's per-fd lock.
-                    if f.set_len(s).is_ok() {
-                        truncated_via_fh = true;
+                if user_initiated_truncate {
+                    // Truncate the inodes size to the new value.
+                    //
+                    // The previous implementation called `alloc_ino(&_p, kind, s)`,
+                    // which under the hood is `or_insert` on the inodes map.
+                    // `or_insert` only inserts when the entry is vacant — so
+                    // a truncate from 18 → 0 on an existing file silently
+                    // did nothing, leaving the kernel thinking the file was
+                    // still 18 bytes while the cache file had been
+                    // (partially) overwritten by a smaller write.
+                    //
+                    // The fix uses `and_modify` to unconditionally overwrite
+                    // the size field, which is what truncation actually
+                    // means semantically. We do NOT touch mtime here
+                    // (setattr's mtime is handled by the `make_attr` call
+                    // below with `SystemTime::now()`).
+                    self.inodes.entry(ino).and_modify(|v| {
+                        v.size = s;
+                    });
+                    // Bug 25 (truncate-vs-async-write race):
+                    // there's no lock between the inodes
+                    // size update above and the cache file
+                    // set_len below, vs an in-flight
+                    // DiskWriteJob still draining the IO
+                    // pool. Worst case: setattr says "truncate
+                    // to 10", a queued write of 4 KiB at
+                    // offset 0 lands AFTER set_len, the cache
+                    // file is back to 4 KiB but inodes.size is
+                    // 10. The write path's own
+                    // `entry().and_modify(|v| if end > v.size
+                    // { v.size = end })` would also bump
+                    // inodes.size to 4096, so the two
+                    // operations clobber each other and the
+                    // result depends on scheduling.
+                    //
+                    // Why we accept this: POSIX leaves
+                    // concurrent truncate+write across
+                    // different fds undefined. FUSE serializes
+                    // operations on the same fd (so a single
+                    // process's `ftruncate` + `write` sequence
+                    // is fine), and a write through a
+                    // separate fd racing with truncate is
+                    // already an application-level bug under
+                    // any filesystem. Adding a per-ino lock
+                    // here would slow the hot write path for
+                    // every workload, to guard a case POSIX
+                    // doesn't promise correctness for.
+                    //
+                    // Issue #42: prefer `ftruncate(fh, s)` on the
+                    // open cache fd when the kernel gave us an
+                    // fh. This avoids:
+                    //   * the path → fd re-open syscall,
+                    //   * a race where the file disappears
+                    //     (e.g. unlink from another fd) between
+                    //     cpath.exists() and cpath.open(),
+                    //   * the ftruncate semantics mismatch where
+                    //     the path-based File::set_len sees a
+                    //     different open file description than
+                    //     the writer that's currently mutating
+                    //     the file (POSIX leaves the result
+                    //     undefined; the fd-based form at least
+                    //     serializes through the kernel's
+                    //     per-fd lock).
+                    // If the fh is stale (the handle map no
+                    // longer has the entry) or doesn't carry a
+                    // cache_fd (e.g. a read-only handle that
+                    // happened to get a setattr), we silently
+                    // fall through to the path-based branch
+                    // below — same final on-disk state, just
+                    // via a different syscall.
+                    let mut truncated_via_fh = false;
+                    if let Some(fh_val) = fh
+                        && let Some(entry) = self.handles.get(&fh_val)
+                        && let crate::FileHandleState::Write {
+                            cache_fd: Some(fd), ..
+                        } = entry.value()
+                        && let Ok(f) = fd.lock()
+                    {
+                        // Issue #42: truncate the open cache fd
+                        // directly. The fd-based form is
+                        // preferred because it sees the same
+                        // open file description as the writer
+                        // and serialises with concurrent
+                        // writes on the same fd through the
+                        // kernel's per-fd lock.
+                        if f.set_len(s).is_ok() {
+                            truncated_via_fh = true;
+                        }
                     }
-                }
-                if !truncated_via_fh {
-                    // Path-based fallback (Bug 25 comment
-                    // above carries the full rationale).
-                    let cpath = crate::cache_path(&self.cache_dir, &_p);
-                    if cpath.exists() {
-                        // Open with write access so the resulting File
-                        // holds a writable handle; the set_len() call below
-                        // is the actual side effect — we don't write any
-                        // bytes here, only shrink/grow the file size to
-                        // match the truncate request. The `let _ =`
-                        // discards any IO error (file vanished between
-                        // exists() and open(), permissions, etc.) —
-                        // truncation is best-effort: a partial truncation
-                        // would leave the cache file slightly larger than
-                        // logical size, which the read path already
-                        // tolerates by using the smaller of cache and
-                        // inodes size.
-                        let _ = std::fs::OpenOptions::new()
-                            .write(true)
-                            .open(&cpath)
-                            .map(|f| f.set_len(s));
+                    if !truncated_via_fh && user_initiated_truncate {
+                        // Path-based fallback (Bug 25 comment
+                        // above carries the full rationale).
+                        // SKIPPED when fh is None (kernel-driven
+                        // setattr for `open(O_TRUNC)`): the
+                        // cache file already has whatever the
+                        // previous session / recovery wrote, and
+                        // the subsequent FUSE_OPEN will create a
+                        // fresh fd that respects the user's intent.
+                        // Truncating here would destroy a valid
+                        // cache file before the user even has an
+                        // fd open — see issue #89.
+                        let cpath = crate::cache_path(&self.cache_dir, &_p);
+                        if cpath.exists() {
+                            // Open with write access so the resulting File
+                            // holds a writable handle; the set_len() call below
+                            // is the actual side effect — we don't write any
+                            // bytes here, only shrink/grow the file size to
+                            // match the truncate request. The `let _ =`
+                            // discards any IO error (file vanished between
+                            // exists() and open(), permissions, etc.) —
+                            // truncation is best-effort: a partial truncation
+                            // would leave the cache file slightly larger than
+                            // logical size, which the read path already
+                            // tolerates by using the smaller of cache and
+                            // inodes size.
+                            let _ = std::fs::OpenOptions::new()
+                                .write(true)
+                                .open(&cpath)
+                                .map(|f| f.set_len(s));
+                        }
                     }
-                }
+                } // close if user_initiated_truncate
                 // Bug 29: invalidate mem_cache after the
                 // truncate. Pre-fix the write path called
                 // `mem_cache.invalidate_ino(ino)` on
@@ -3007,9 +3057,37 @@ impl CoreFilesystem for MntrsFs {
                 // need an explicit sweep.
                 self.invalidate_block_cache_for_path(&_p);
             }
+            // Issue #89 Option B follow-up: when setattr is
+            // kernel-driven (fh=None) — e.g. the O_TRUNC open
+            // prelude — the FUSE kernel caches the returned
+            // attrs (including size) and uses them for subsequent
+            // O_APPEND offset calculations. If we report
+            // size=0 here, the kernel thinks the file is 0 bytes
+            // forever and writes go to offset=0, clobbering the
+            // 1st write. So for kernel-driven setattr, return the
+            // current inodes.size (which preserves whatever the
+            // user/app has already accumulated, including the
+            // recovery-time size).
+            //
+            // The kernel will refresh attrs after the subsequent
+            // open + write, so this is just a one-call caching
+            // fix.
+            let reported_size = if let Some(s) = size {
+                if user_initiated_truncate {
+                    s
+                } else {
+                    // Kernel-driven: don't lie about size=0.
+                    // Use the larger of inodes.size and
+                    // current cache file size to avoid
+                    // confusing the kernel.
+                    self.inodes.get(&ino).map(|e| e.size).unwrap_or(s).max(s)
+                }
+            } else {
+                size.unwrap_or(0)
+            };
             Ok(to_core_attr(&self.make_attr(
                 ino,
-                size.unwrap_or(0),
+                reported_size,
                 kind,
                 SystemTime::now(),
             )))
@@ -4348,6 +4426,13 @@ impl CoreFilesystem for MntrsFs {
         } else {
             format!("{}/{}", parent_path, name)
         };
+        // #89 debug: log unlink calls
+        tracing::warn!(
+            parent = %parent_path,
+            name = %name,
+            full_path = %full_path,
+            "FUSE unlink entry"
+        );
         let op = self.op.clone();
         let p = full_path.clone();
         // Bug D fix: preserve the opendal error kind so POSIX callers
