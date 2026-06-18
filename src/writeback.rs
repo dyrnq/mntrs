@@ -493,7 +493,16 @@ pub fn worker(
                 });
             }
             for (_, _, cache_path, _) in &tasks {
-                let _ = std::fs::remove_file(cache_path);
+                // Issue #89 fix: keep cache file on disk as a read cache.
+                // Removing it here races with the next FUSE open() on an
+                // append write: the open finds no file, create(true) makes
+                // a fresh 0-byte file, and the next write's set_len +
+                // write_all produces a file with zero-padded regions
+                // where the previous content used to be. The .dirty
+                // sidecar still marks "upload complete vs pending", and
+                // `evict_lru_if_needed` handles disk pressure separately.
+                // This mirrors the fix at the other writeback completion
+                // site (line ~284) landed in commit 3629b9e.
                 let _ = std::fs::remove_file(cache_path.with_extension("dirty"));
             }
         }
