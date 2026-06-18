@@ -4,7 +4,7 @@ use std::ffi::OsStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    AccessFlags, Errno, FileAttr, FileHandle, FileType, FopenFlags, Generation, INodeNo,
+    AccessFlags, Errno, FileAttr, FileHandle, FileType, FopenFlags, Generation, INodeNo, InitFlags,
     KernelConfig, LockOwner, OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
     Request, TimeOrNow, WriteFlags,
@@ -92,7 +92,27 @@ impl<F: CoreFilesystem + 'static> FuserAdapter<F> {
 }
 
 impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
-    fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> std::io::Result<()> {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        // #79: tune KernelConfig for remote backend latency.
+        // Defaults are libfuse `max_background=12`, `congestion_threshold=8`,
+        // which caps in-flight FUSE requests at 12 — bottleneck for S3/HDFS
+        // where each request has 10-100ms latency. Bump to 64/48 to let
+        // more requests pipeline before kernel throttling.
+        let _ = config.set_max_write(128 * 1024);
+        let _ = config.set_max_readahead(1024 * 1024);
+        let _ = config.set_max_background(64);
+        let _ = config.set_congestion_threshold(48);
+
+        // #80: PARALLEL_DIROPS — kernel allows lookup() and readdir() to
+        // run concurrently for the same directory. Big win for `ls -la`,
+        // `find`, `tree` on large dirs.
+        let _ = config.add_capabilities(InitFlags::FUSE_PARALLEL_DIROPS);
+
+        // #81: WRITEBACK_CACHE — kernel buffers small writes and merges
+        // them before sending to the filesystem. Cuts FUSE write requests
+        // for small-write workloads (`dd bs=4k` etc).
+        let _ = config.add_capabilities(InitFlags::FUSE_WRITEBACK_CACHE);
+
         self.inner.init()
     }
 
