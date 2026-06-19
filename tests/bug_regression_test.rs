@@ -706,10 +706,11 @@ fn bug_issue91_mkdir_chain_drops_leaf_only() {
     // after mkdir_chain. Pre-fix the leaf ended up in the chain
     // and was MKCOL'd as a collection; op.write then failed with
     // 409 Conflict.
-    let (_attr, _fh) = CoreFilesystem::create(&*fs, 1, "a/b/c.txt", 0o644)
-        .expect("create at depth 3 must succeed; pre-fix it failed with EIO \
+    let (_attr, _fh) = CoreFilesystem::create(&*fs, 1, "a/b/c.txt", 0o644).expect(
+        "create at depth 3 must succeed; pre-fix it failed with EIO \
                 because mkdir_chain popped the wrong element and the leaf was \
-                MKCOL'd as a collection, then op.write PUT returned 409");
+                MKCOL'd as a collection, then op.write PUT returned 409",
+    );
 
     // Sanity: the file's inodes entry must be a RegularFile, NOT a
     // Directory. Pre-fix the stat after the failed write would
@@ -808,11 +809,7 @@ fn bug_issue91_build_mkdir_chain_shape_invariants() {
     let chain = build_mkdir_chain("a/b/c/d");
     assert_eq!(
         chain,
-        vec![
-            "a/b/c/".to_string(),
-            "a/b/".to_string(),
-            "a/".to_string()
-        ],
+        vec!["a/b/c/".to_string(), "a/b/".to_string(), "a/".to_string()],
         "depth-4: 3 intermediates top-down"
     );
 }
