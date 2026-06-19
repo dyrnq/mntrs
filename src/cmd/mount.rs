@@ -796,10 +796,29 @@ pub fn mount(
     };
 
     // Re-exec daemon (rclone-style): parent spawns a child process that does
-    // the actual mount. Parent exits immediately; child stays alive holding
-    // the FUSE session. This avoids fork+tokio incompatibility.
+    // the actual mount. Parent exits AFTER the child signals mount-readiness
+    // (POLLHUP on the parent's r_fd, fired when the child closes its copy of
+    // w_fd after the FUSE session is up). Without this wait, the caller
+    // (CI script / shell) races the mount: `mountpoint -q` runs before the
+    // child has called spawn_mount2, and the test sees "Transport endpoint
+    // is not connected" (issue #62).
+    //
+    // The child keeps its w_fd open until just after spawn_mount2 returns
+    // (see the post-mount block below). The parent has already closed its
+    // own w_fd above (so POLLHUP on the parent's r_fd fires iff the child
+    // closes its w_fd).
     #[cfg(not(windows))]
     if daemon && std::env::var_os("MNTRS_INTERNAL_DAEMON").is_none() {
+        // Close our own copy of the write end so POLLHUP on our read end
+        // tracks the child's write-end closure (which the child does right
+        // after a successful mount). Without this, both parent and child
+        // hold the write end open and POLLHUP never fires.
+        if let Some((_r, w)) = wait_pipe {
+            unsafe {
+                rustix::io::close(w);
+            }
+        }
+
         let bin = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("mntrs"));
         let args: Vec<String> = std::env::args()
             .skip(1)
@@ -822,6 +841,40 @@ pub fn mount(
             .stderr(std::process::Stdio::null())
             .spawn()
             .map_err(|e| anyhow!("failed to spawn daemon: {}", e))?;
+
+        // Block in the parent until the child closes its w_fd (POLLHUP
+        // on r_fd) or we hit the daemon-timeout. This is what makes
+        // `--daemon --daemon-wait` actually wait for the mount to be
+        // live before exit(0).
+        if let Some((r, _w)) = wait_pipe {
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(_daemon_timeout);
+            let mut signaled = false;
+            while std::time::Instant::now() < deadline {
+                let mut pfd = libc::pollfd {
+                    fd: r,
+                    events: libc::POLLHUP,
+                    revents: 0,
+                };
+                // 250 ms tick — short enough to react near the deadline
+                // and long enough not to busy-loop.
+                let n = unsafe { libc::poll(&mut pfd, 1, 250) };
+                if n > 0 && (pfd.revents & libc::POLLHUP) != 0 {
+                    signaled = true;
+                    break;
+                }
+            }
+            if !signaled {
+                eprintln!(
+                    "mntrs: daemon did not signal mount readiness within {}s; \
+                     child may have crashed. Check MNTRS_DAEMON_LOG if set.",
+                    _daemon_timeout
+                );
+            }
+            unsafe {
+                rustix::io::close(r);
+            }
+        }
         std::process::exit(0);
     }
 
