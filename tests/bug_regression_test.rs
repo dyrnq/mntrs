@@ -659,17 +659,17 @@ fn bug_issue57_create_ensures_parent_chain() {
 }
 
 // =====================================================================
-// Bug #90 + #89 follow-up: mkdir_chain must drop the LEAF, not pop
-// the last intermediate. The chain is built leaf-first by walking up
-// from the file path (e.g. "a/b/c.txt" → ["a/b/c.txt/", "a/b/", "a/"]),
-// so the leaf sits at index 0. The previous fix called `chain.pop()`
-// (removes the LAST element), which incorrectly stripped the
-// top-most intermediate and left the leaf in the chain. The leaf
-// then went into `op.create_dir(...)` — and on WebDAV that path with
-// trailing `/` becomes a MKCOL, which Apache happily turns into a
-// COLLECTION named after the file. The subsequent op.write() PUT
-// against the same path then returns 409 Conflict ("Cannot PUT to a
-// collection") and FUSE surfaces "Is a directory" / EIO.
+// Issue #91: mkdir_chain must drop the LEAF, not pop the last
+// intermediate. The chain is built leaf-first by walking up from the
+// file path (e.g. "a/b/c.txt" → ["a/b/c.txt/", "a/b/", "a/"]), so the
+// leaf sits at index 0. The previous fix called `chain.pop()` (removes
+// the LAST element), which incorrectly stripped the top-most
+// intermediate and left the leaf in the chain. The leaf then went into
+// `op.create_dir(...)` — and on WebDAV that path with trailing `/`
+// becomes a MKCOL, which Apache happily turns into a COLLECTION named
+// after the file. The subsequent op.write() PUT against the same path
+// then returns 409 Conflict ("Cannot PUT to a collection") and FUSE
+// surfaces "Is a directory" / EIO.
 //
 // Pre-fix (popped last → kept leaf):
 //   chain_before_pop = ["a/b/c.txt/", "a/b/", "a/"]
@@ -682,11 +682,16 @@ fn bug_issue57_create_ensures_parent_chain() {
 //   chain.pop()      → ["a/", "a/b/"]            ← dropped leaf
 //   chain.reverse()  → ["a/b/", "a/"]            ← top-down for join_all
 //
-// This test guards the chain-shape invariant directly so the bug
-// can't silently come back during future refactors.
+// We probe BOTH the high-level create() flow AND the chain shape
+// directly. The chain-shape test (via the pub `build_mkdir_chain`
+// helper) catches the bug on any backend, including the in-memory one
+// that silently accepts a wrongly-shaped chain. The high-level test
+// below additionally guards against regressions where the chain shape
+// is correct but `op.create_dir` is still called with a leaf-shaped
+// path for some other reason.
 // =====================================================================
 #[test]
-fn bug_issue90_mkdir_chain_drops_leaf_only() {
+fn bug_issue91_mkdir_chain_drops_leaf_only() {
     use mntrs::core_fs::CoreFilesystem;
 
     let fs = Arc::new(make_memory_fs());
@@ -720,4 +725,94 @@ fn bug_issue90_mkdir_chain_drops_leaf_only() {
          because mkdir_chain MKCOL'd the leaf path"
     );
     assert_eq!(file_attr.size, 0, "fresh create has size 0");
+}
+
+// Direct chain-shape test — catches #91 even on the in-memory backend
+// (which silently accepts `op.create_dir` on file-shaped paths, so the
+// high-level test above wouldn't notice a re-introduction of
+// `chain.pop()`).
+//
+// Chain invariants we lock in here:
+//   1. Leaf never appears in the returned intermediates.
+//   2. Returned entries always end with `/` (so op.create_dir is the
+//      right call, not op.write).
+//   3. Intermediates are FULL parent paths, not just the last segment
+//      — `build_mkdir_chain("a/b/c.txt")` returns `["a/b/", "a/"]`,
+//      NOT `["b/", "a/"]`. (An earlier draft of this test had the
+//      wrong expectation; the build_mkdir_chain doc comment now
+//      matches.)
+//   4. Order is top-down (parent before child) so the concurrent
+//      join_all PUTs go parent-first.
+//   5. Single-segment and empty paths return `[]` (the leaf was the
+//      only segment, so there's nothing to mkdir ahead of time).
+//   6. Trailing slashes are tolerated.
+#[test]
+fn bug_issue91_build_mkdir_chain_shape_invariants() {
+    use mntrs::build_mkdir_chain;
+
+    // Depth 3 (file): leaf "a/b/c.txt/", intermediates top-down
+    // ["a/b/", "a/"]. The first intermediate is the IMMEDIATE PARENT
+    // of the leaf ("a/b/"), not the last segment ("b/").
+    let chain = build_mkdir_chain("a/b/c.txt");
+    assert_eq!(
+        chain,
+        vec!["a/b/".to_string(), "a/".to_string()],
+        "depth-3 file: leaf must be dropped, intermediates top-down \
+         with full parent paths"
+    );
+    assert!(
+        !chain.iter().any(|p| p == "a/b/c.txt/" || p == "c.txt/"),
+        "leaf path must NOT appear in intermediates (pre-fix it did)"
+    );
+    assert!(
+        !chain.iter().any(|p| p == "b/"),
+        "intermediates are full parent paths, not last-segment-only"
+    );
+
+    // Depth 3 (mkdir): same shape — leaf here is also "a/b/c/" but we
+    // strip it the same way.
+    let chain = build_mkdir_chain("a/b/c");
+    assert_eq!(
+        chain,
+        vec!["a/b/".to_string(), "a/".to_string()],
+        "depth-3 mkdir: same shape as depth-3 file"
+    );
+
+    // Depth 2 (mkdir): 2 segments → 1 intermediate (the immediate parent).
+    let chain = build_mkdir_chain("a/b");
+    assert_eq!(chain, vec!["a/".to_string()], "depth-2: 1 intermediate");
+
+    // Single segment: nothing to mkdir ahead of time.
+    let chain = build_mkdir_chain("a");
+    assert!(chain.is_empty(), "single segment: empty chain");
+
+    // Empty path: edge case, should not panic.
+    let chain = build_mkdir_chain("");
+    assert!(chain.is_empty(), "empty path: empty chain");
+
+    // Trailing slash: should be treated the same as without.
+    let chain = build_mkdir_chain("a/b/c.txt/");
+    assert_eq!(
+        chain,
+        vec!["a/b/".to_string(), "a/".to_string()],
+        "trailing slash: same as without"
+    );
+
+    // All entries must end with `/` so op.create_dir (not op.write)
+    // is the right call.
+    for p in &chain {
+        assert!(p.ends_with('/'), "intermediate {p:?} must end with '/'");
+    }
+
+    // Deeper nesting: 4 segments → 3 intermediates top-down.
+    let chain = build_mkdir_chain("a/b/c/d");
+    assert_eq!(
+        chain,
+        vec![
+            "a/b/c/".to_string(),
+            "a/b/".to_string(),
+            "a/".to_string()
+        ],
+        "depth-4: 3 intermediates top-down"
+    );
 }

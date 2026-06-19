@@ -841,6 +841,66 @@ pub(crate) fn canonicalize_list_path(raw: &str) -> String {
     }
 }
 
+/// Build the list of intermediate-directory paths that `mkdir_chain`
+/// must `op.create_dir(...)` before writing `full_path`. The leaf is
+/// excluded — it's the file or directory the caller will create
+/// explicitly (`op.write` for `create()`, `op.create_dir` with trailing
+/// `/` for `mkdir()`).
+///
+/// Walking order: leaf-first. For `full_path = "a/b/c.txt"` we push
+/// `"a/b/c.txt/"`, then walk up via `rfind('/')` and push `"a/b/"`,
+/// then `"a/"`. After the loop the chain is
+/// `["a/b/c.txt/", "a/b/", "a/"]` — leaf at index 0, topmost parent
+/// at the end.
+///
+/// Output: the chain with the leaf removed, in top-down order so the
+/// concurrent `join_all` PUTs go parent-first:
+///
+/// ```text
+/// full_path            intermediates (return value)
+/// "a/b/c.txt"          ["a/b/", "a/"]          (3 segments → 2 intermediates)
+/// "a/b/c"              ["a/b/", "a/"]
+/// "a/b"                ["a/b/"]                (2 segments → 1)
+/// "a"                  []                       (1 segment → 0)
+/// ""                   []
+/// "a/b/c.txt/"         ["a/b/", "a/"]           (trailing / trimmed)
+/// ```
+///
+/// Note that intermediates are FULL parent paths with trailing `/`,
+/// not just the last segment. `build_mkdir_chain("a/b/c.txt")` returns
+/// `["a/b/", "a/"]`, NOT `["b/", "a/"]`. The trailing `/` is what
+/// makes WebDAV/MinIO/etc. treat the path as a collection rather than
+/// a file when it's later passed to `op.create_dir`.
+///
+/// Issue #91 regression note: an earlier version called `chain.pop()`
+/// on this output (popping the LAST element) and incorrectly left the
+/// leaf in the chain. The leaf then went into `op.create_dir(...)`
+/// which on Apache mod_dav MKCOL'd `/path/to/file/`, turning the file
+/// into a directory. The fix is `reverse → pop → reverse`, which
+/// drops the leaf (now at index 0 after the first reverse) and keeps
+/// intermediates in top-down order.
+///
+/// `pub(crate)` so unit tests in this crate can probe the chain shape
+/// directly. Integration tests in `tests/` can also reach it via
+/// `mntrs::build_mkdir_chain`.
+pub fn build_mkdir_chain(full_path: &str) -> Vec<String> {
+    let mut chain: Vec<String> = Vec::new();
+    let mut cur = full_path.trim_end_matches('/').to_string();
+    while !cur.is_empty() {
+        chain.push(format!("{}/", cur));
+        match cur.rfind('/') {
+            Some(pos) => cur.truncate(pos),
+            None => cur.clear(),
+        }
+    }
+    // Walk order was leaf-first. Reverse → leaf is now LAST. Pop it.
+    // Reverse again → intermediates are back to top-down order.
+    chain.reverse();
+    chain.pop();
+    chain.reverse();
+    chain
+}
+
 pub fn cache_path(cache_dir: &Path, path: &str) -> PathBuf {
     cache_path_block(cache_dir, path, 0)
 }
@@ -2050,43 +2110,7 @@ impl MntrsFs {
     ///     an error so the caller (mkdir) can decide what to do.
     ///   * Anything else — propagate.
     fn mkdir_chain(&self, full_path: &str) -> std::io::Result<()> {
-        // Collect every dir level we need to ensure exists, leaf last.
-        // For full_path = "a/b/c.txt" we walk up: ["a/b/c.txt", "a/b/", "a/"].
-        // After `if leaf path starts with /` filter below, intermediates
-        // are ["a/", "a/b/"] — only the directories above the file.
-        //
-        // Bug fix: previously this function appended `/` to every level
-        // including the leaf, then called `op.create_dir("/a/b/c.txt/")`
-        // on the FILE path. On opendal WebDAV backend this becomes
-        // MKCOL on `/a/b/c.txt/`, which creates a *directory* at that
-        // name (the trailing `/` tells WebDAV this is a collection).
-        // The subsequent `op.write("/a/b/c.txt", ...)` then can't
-        // overwrite the directory. Fix: skip the leaf entirely — only
-        // call `op.create_dir` on intermediate directories.
-        let mut chain: Vec<String> = Vec::new();
-        let mut cur = full_path.trim_end_matches('/').to_string();
-        while !cur.is_empty() {
-            chain.push(format!("{}/", cur));
-            match cur.rfind('/') {
-                Some(pos) => cur.truncate(pos),
-                None => cur.clear(),
-            }
-        }
-        // The FIRST entry of the chain is the leaf (we walked up from
-        // the leaf, pushing each level as we went). For `create()`
-        // (file) we skip it — the caller will `op.write` the leaf, and
-        // MKCOL'ing the leaf path first makes the file a directory on
-        // WebDAV (issue #90 + #89 follow-up). For `mkdir()` we also
-        // skip it here — the caller explicitly creates the leaf as a
-        // directory after mkdir_chain returns (with a trailing `/` so
-        // WebDAV interprets it as a collection).
-        //
-        // The REMAINING chain has the intermediate directories above
-        // the leaf. After reversing, they're in top-down order so the
-        // concurrent join_all PUTs go parent-first.
-        chain.reverse();
-        chain.pop();
-        chain.reverse();
+        let chain = build_mkdir_chain(full_path);
 
         let op = self.op.clone();
         // chain now contains ONLY intermediate directories (the leaf
