@@ -102,6 +102,15 @@ pub fn shared() -> &'static reqwest::Client {
             // sensitive to latency, consider disabling HTTP/2 in
             // your configuration."
             .http1_only()
+            // #84: hickory-dns async resolver instead of the default
+            // getaddrinfo threadpool. Per opendal HTTP optimization
+            // docs: getaddrinfo blocks the calling thread on DNS
+            // resolution and has no caching, so every connect to a
+            // new host pays full RTT for the lookup. hickory-resolver
+            // is fully async and caches results in-process — a
+            // single mount's reads hit the cached answer after the
+            // first lookup.
+            .hickory_dns(true)
             // Build a fresh client per process. `reqwest::Client` is
             // `Clone` (Arc internally), so callers below just clone the
             // `&'static` and pass it into opendal's `HttpClient::with`.
