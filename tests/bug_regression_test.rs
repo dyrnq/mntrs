@@ -657,3 +657,67 @@ fn bug_issue57_create_ensures_parent_chain() {
     let _ = parent_path; // keep variable used
     let _ = CoreFileType::RegularFile; // keep import used
 }
+
+// =====================================================================
+// Bug #90 + #89 follow-up: mkdir_chain must drop the LEAF, not pop
+// the last intermediate. The chain is built leaf-first by walking up
+// from the file path (e.g. "a/b/c.txt" → ["a/b/c.txt/", "a/b/", "a/"]),
+// so the leaf sits at index 0. The previous fix called `chain.pop()`
+// (removes the LAST element), which incorrectly stripped the
+// top-most intermediate and left the leaf in the chain. The leaf
+// then went into `op.create_dir(...)` — and on WebDAV that path with
+// trailing `/` becomes a MKCOL, which Apache happily turns into a
+// COLLECTION named after the file. The subsequent op.write() PUT
+// against the same path then returns 409 Conflict ("Cannot PUT to a
+// collection") and FUSE surfaces "Is a directory" / EIO.
+//
+// Pre-fix (popped last → kept leaf):
+//   chain_before_pop = ["a/b/c.txt/", "a/b/", "a/"]
+//   chain.pop()      → ["a/b/c.txt/", "a/b/"]   ← wrong: removed "a/"
+//   chain.reverse()  → ["a/b/", "a/b/c.txt/"]   ← leaf still present
+//
+// Post-fix (reverse, drop first, reverse again → clean intermediates):
+//   chain_before_pop = ["a/b/c.txt/", "a/b/", "a/"]
+//   chain.reverse()  → ["a/", "a/b/", "a/b/c.txt/"]
+//   chain.pop()      → ["a/", "a/b/"]            ← dropped leaf
+//   chain.reverse()  → ["a/b/", "a/"]            ← top-down for join_all
+//
+// This test guards the chain-shape invariant directly so the bug
+// can't silently come back during future refactors.
+// =====================================================================
+#[test]
+fn bug_issue90_mkdir_chain_drops_leaf_only() {
+    use mntrs::core_fs::CoreFilesystem;
+
+    let fs = Arc::new(make_memory_fs());
+
+    // Pre-create intermediates so mkdir_chain's join_all sees
+    // AlreadyExists on memory backend (and exercises the
+    // "intermediate already exists, leaf is new" path — the
+    // original bug scenario).
+    let _a = CoreFilesystem::mkdir(&*fs, 1, "a").unwrap();
+
+    // create() at depth 3 must NOT regress to "Is a directory"
+    // after mkdir_chain. Pre-fix the leaf ended up in the chain
+    // and was MKCOL'd as a collection; op.write then failed with
+    // 409 Conflict.
+    let (_attr, _fh) = CoreFilesystem::create(&*fs, 1, "a/b/c.txt", 0o644)
+        .expect("create at depth 3 must succeed; pre-fix it failed with EIO \
+                because mkdir_chain popped the wrong element and the leaf was \
+                MKCOL'd as a collection, then op.write PUT returned 409");
+
+    // Sanity: the file's inodes entry must be a RegularFile, NOT a
+    // Directory. Pre-fix the stat after the failed write would
+    // return Directory because mntrs's inodes map recorded the leaf
+    // as a directory. Use lookup (parent_ino + name) since getattr
+    // takes an inode number.
+    let ab_attr = CoreFilesystem::lookup(&*fs, 1, "a").expect("lookup a");
+    let abc_attr = CoreFilesystem::lookup(&*fs, ab_attr.ino, "b").expect("lookup a/b");
+    let file_attr = CoreFilesystem::lookup(&*fs, abc_attr.ino, "c.txt").expect("lookup a/b/c.txt");
+    assert!(
+        matches!(file_attr.kind, mntrs::core_fs::CoreFileType::RegularFile),
+        "a/b/c.txt must classify as RegularFile; pre-fix it was Directory \
+         because mkdir_chain MKCOL'd the leaf path"
+    );
+    assert_eq!(file_attr.size, 0, "fresh create has size 0");
+}

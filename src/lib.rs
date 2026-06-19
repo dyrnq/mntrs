@@ -2072,55 +2072,37 @@ impl MntrsFs {
                 None => cur.clear(),
             }
         }
-        // The LAST entry of the chain is the leaf (the file itself).
-        // Skip it: op.create_dir on a file path is wrong for any backend,
-        // and op.write (called next) will create the file.
+        // The FIRST entry of the chain is the leaf (we walked up from
+        // the leaf, pushing each level as we went). For `create()`
+        // (file) we skip it — the caller will `op.write` the leaf, and
+        // MKCOL'ing the leaf path first makes the file a directory on
+        // WebDAV (issue #90 + #89 follow-up). For `mkdir()` we also
+        // skip it here — the caller explicitly creates the leaf as a
+        // directory after mkdir_chain returns (with a trailing `/` so
+        // WebDAV interprets it as a collection).
+        //
+        // The REMAINING chain has the intermediate directories above
+        // the leaf. After reversing, they're in top-down order so the
+        // concurrent join_all PUTs go parent-first.
+        chain.reverse();
         chain.pop();
         chain.reverse();
 
         let op = self.op.clone();
+        // chain now contains ONLY intermediate directories (the leaf
+        // was popped above). For paths like `/newsub` where there are no
+        // intermediates (chain becomes empty after pop), there's nothing
+        // to do — op.write on the leaf will handle creation.
+        if chain.is_empty() {
+            return Ok(());
+        }
         rt().block_on(async move {
-            // Try just the leaf first. On S3/GCS/OSS/etc. (flat-namespace
-            // with implicit dirs) this is 1 round-trip and the
-            // intermediate "a/", "a/b/" don't need to exist as actual
-            // objects — they're "common prefixes" surfaced by list
-            // operations. The pre-fix code did 3 sequential PUTs for a
-            // 3-level path, which is what made `mkdir` 2-3× slower than
-            // rclone in the bench (issue #17).
-            let leaf = chain.last().expect("chain built from non-empty path");
-            match op.create_dir(leaf).await {
-                Ok(()) => return Ok(()),
-                Err(e)
-                    if e.kind() == opendal::ErrorKind::Unsupported
-                        || e.kind() == opendal::ErrorKind::AlreadyExists =>
-                {
-                    return Ok(());
-                }
-                Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
-                    // Leaf create_dir returned NotFound — almost
-                    // certainly because an intermediate is missing on a
-                    // hierarchical-namespace backend (HDFS, WebHDFS).
-                    // Fall through to the full chain.
-                    tracing::debug!(path = %leaf,
-                        "leaf create_dir returned NotFound; \
-                         falling back to full mkdir_chain");
-                }
-                Err(e) => {
-                    // Other error on the leaf (e.g. auth, 5xx). Don't
-                    // try the chain — the chain would likely fail the
-                    // same way, and the additional 2 PUTs would
-                    // amplify the failure cost.
-                    return Err(std::io::Error::other(format!(
-                        "create_dir({leaf}) failed: {e}"
-                    )));
-                }
-            }
-
-            // Full chain (hierarchical-namespace fallback). The 3 PUTs
-            // are issued concurrently so wall-clock latency is 1
-            // round-trip (not 3). We can do this because the 3 levels
-            // are independent — no level depends on another's success
-            // for its own request to be well-formed.
+            // Concurrent create_dir for all intermediate directories.
+            // The 3 PUTs are issued concurrently so wall-clock latency is
+            // 1 round-trip (not N). Each level is independent — no
+            // level depends on another's success. The pre-fix sequential
+            // version was what made `mkdir` 2-3× slower than rclone in
+            // the bench (issue #17).
             let futs = chain.iter().map(|p| op.create_dir(p));
             let results = futures::future::join_all(futs).await;
             for (p, r) in chain.iter().zip(results) {
@@ -4445,7 +4427,35 @@ impl CoreFilesystem for MntrsFs {
         // `ls a/` returns EIO. mkdir_chain walks up and creates each
         // level, treating Unsupported (implicit-dir backends) and
         // AlreadyExists (idempotent) as success.
+        //
+        // mkdir_chain pops the leaf from the chain (issue #90 + #89
+        // follow-up — MKCOL'ing a file path with trailing `/` makes
+        // WebDAV create it as a directory). For mkdir() we explicitly
+        // create_dir the leaf here.
         self.mkdir_chain(&full_path)?;
+        // Create the leaf directory itself (mkdir_chain only handled
+        // intermediates after the fix). Use a trailing `/` so WebDAV
+        // interprets it as a collection, not a file.
+        let op = self.op.clone();
+        let leaf = if full_path.ends_with('/') {
+            full_path.clone()
+        } else {
+            format!("{}/", full_path)
+        };
+        match rt().block_on(async { op.create_dir(&leaf).await }) {
+            Ok(()) => {}
+            Err(e)
+                if e.kind() == opendal::ErrorKind::Unsupported
+                    || e.kind() == opendal::ErrorKind::AlreadyExists =>
+            {
+                // Backend doesn't support create_dir (flat namespace
+                // with implicit dirs), or the dir already exists.
+                // Either way, mkdir succeeds.
+            }
+            Err(e) => {
+                return Err(opendal_to_io_error(&e, "mkdir"));
+            }
+        }
         let now = SystemTime::now();
         // Bug C follow-up: use the mtime-aware allocator so the
         // inodes entry's mtime slot is populated. The pre-fix
