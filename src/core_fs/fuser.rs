@@ -113,6 +113,15 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         // for small-write workloads (`dd bs=4k` etc).
         let _ = config.add_capabilities(InitFlags::FUSE_WRITEBACK_CACHE);
 
+        // #88: FUSE_CAP_ASYNC_DIO — when --direct-io is set, request
+        // separate execution contexts for opened files vs the FS operations
+        // on them. Per libfuse include/fuse_common.h:328, this gives
+        // better responsiveness under direct-io because writers don't
+        // block metadata operations on the same fd.
+        if self.direct_io {
+            let _ = config.add_capabilities(InitFlags::FUSE_ASYNC_DIO);
+        }
+
         self.inner.init()
     }
 
