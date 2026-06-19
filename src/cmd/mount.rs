@@ -764,6 +764,12 @@ pub fn mount(
         handle_caching: std::time::Duration::from_secs(vfs_handle_caching),
         disk_total_size: vfs_disk_space_total_size * 1024 * 1024 * 1024 * 1024, // TB to bytes
         writeback_sender: std::sync::OnceLock::new(),
+        // Unix-only — see MntrsFs::fuse_notifier in lib.rs.
+        // The setter (set_fuse_notifier) is also unix-only and is
+        // called from this same mount path immediately after this
+        // struct literal. On Windows the field disappears and the
+        // call site is also gated (issue #93).
+        #[cfg(not(windows))]
         fuse_notifier: std::sync::OnceLock::new(),
 
         mem_cache,
