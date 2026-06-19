@@ -89,6 +89,19 @@ pub fn shared() -> &'static reqwest::Client {
             // enough that the unmount-time FD count
             // is at-or-below the test threshold.
             .pool_max_idle_per_host(4)
+            // #86: HTTP/1.1 only. reqwest defaults to HTTP/2
+            // negotiation via ALPN, which sounds like a win but
+            // hurts S3/WebDAV large-file throughput: the kernel
+            // sends many parallel HTTP/2 streams over a single TCP
+            // connection, head-of-line blocking on a single lost
+            // packet stalls ALL streams, and HTTP/2's per-stream
+            // framing overhead shows up at the 5 MiB-multipart
+            // range we use in writeback. Per opendal's HTTP
+            // optimization docs: "If your workloads involve large
+            // files or require high throughput, and are not
+            // sensitive to latency, consider disabling HTTP/2 in
+            // your configuration."
+            .http1_only()
             // Build a fresh client per process. `reqwest::Client` is
             // `Clone` (Arc internally), so callers below just clone the
             // `&'static` and pass it into opendal's `HttpClient::with`.
