@@ -404,6 +404,13 @@ pub struct MntrsFs {
     /// `inval_inode(ino, 0, -1)` after each successful write
     /// so subsequent O_APPEND opens see the up-to-date file
     /// size instead of the cached pre-write size.
+    ///
+    /// Unix-only: fuser is gated on `cfg(unix)` in Cargo.toml, so
+    /// referencing `fuser::Notifier` here would fail Windows clippy.
+    /// On WinFSP we don't have an inode-cache invalidation hook, but
+    /// WinFSP's write handler is synchronous so the stale-cache
+    /// race doesn't apply (issue #93).
+    #[cfg(not(windows))]
     pub(crate) fuse_notifier: std::sync::OnceLock<fuser::Notifier>,
 
     /// Issue #38: set of paths that currently have a
@@ -1019,10 +1026,15 @@ static OPENDAL_SYNC_OP: once_cell::sync::OnceCell<opendal::Operator> =
 /// from the mount command path after `spawn_mount2` returns
 /// the BackgroundSession. Safe to call multiple times; only
 /// the first call wins.
+///
+/// Unix-only — see `MntrsFs::fuse_notifier` for the rationale
+/// (issue #93).
+#[cfg(not(windows))]
 pub fn set_fuse_notifier(notifier: fuser::Notifier) {
     let _ = FUSE_NOTIFIER.set(notifier);
 }
 
+#[cfg(not(windows))]
 static FUSE_NOTIFIER: once_cell::sync::OnceCell<fuser::Notifier> = once_cell::sync::OnceCell::new();
 
 /// Set the global op for use by the write path's
@@ -3833,6 +3845,14 @@ impl CoreFilesystem for MntrsFs {
         // issue #89). ENOENT is harmless (kernel already
         // dropped the cache); ignore it like the fuser
         // `send_inval` helper does.
+        //
+        // Unix-only — `self.fuse_notifier` is gated
+        // `#[cfg(not(windows))]` on the struct. On WinFSP
+        // the write handler is synchronous (no async
+        // cache-file write), so the kernel never sees a
+        // stale size for the same inode and we don't need
+        // an invalidation hook. See issue #93.
+        #[cfg(not(windows))]
         if let Some(notifier) = self.fuse_notifier.get() {
             let _ = notifier.inval_inode(fuser::INodeNo(_ino), 0, -1);
         }
@@ -5201,6 +5221,7 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         handle_caching: std::time::Duration::from_secs(0),
         disk_total_size: 0,
         writeback_sender: std::sync::OnceLock::new(),
+        #[cfg(not(windows))]
         fuse_notifier: std::sync::OnceLock::new(),
         writeback_pending: Arc::new(dashmap::DashSet::new()),
         // Unbounded mem_cache for unit tests. Production mounts
