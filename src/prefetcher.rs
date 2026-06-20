@@ -22,23 +22,29 @@ pub struct PartQueue {
     current_bytes: u64,
     finished: bool,
     error: Option<String>,
+    /// Shared cancel flag — set by
+    /// `HandlePrefetcher::cancel()` when the
+    /// consumer is gone. `push()` checks this
+    /// to avoid spinning forever (issue #107).
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PartQueue {
-    pub fn new(max_bytes: u64) -> Self {
+    pub fn new(max_bytes: u64, cancelled: Arc<std::sync::atomic::AtomicBool>) -> Self {
         Self {
             parts: VecDeque::new(),
             max_bytes,
             current_bytes: 0,
             finished: false,
             error: None,
+            cancelled,
         }
     }
 
     pub fn push(&mut self, part: Part) -> Result<(), String> {
         while self.current_bytes + part.data.len() as u64 > self.max_bytes {
-            if self.finished {
-                return Err("prefetcher finished".to_string());
+            if self.finished || self.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("prefetcher cancelled".to_string());
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -108,8 +114,11 @@ impl HandlePrefetcher {
         max_queue_bytes: u64,
         chunk_size: u64,
     ) -> Self {
-        let queue = Arc::new(Mutex::new(PartQueue::new(max_queue_bytes)));
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let queue = Arc::new(Mutex::new(PartQueue::new(
+            max_queue_bytes,
+            cancelled.clone(),
+        )));
         let q = queue.clone();
         let c = cancelled.clone();
         std::thread::spawn(move || {
@@ -167,10 +176,15 @@ impl std::fmt::Debug for HandlePrefetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn false_flag() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
 
     #[test]
     fn test_part_queue_push_pop() {
-        let mut q = PartQueue::new(1024);
+        let mut q = PartQueue::new(1024, false_flag());
         q.push(Part {
             offset: 0,
             data: Bytes::from(vec![0u8; 100]),
@@ -183,7 +197,7 @@ mod tests {
 
     #[test]
     fn test_part_queue_pop_empty_finished() {
-        let mut q = PartQueue::new(1024);
+        let mut q = PartQueue::new(1024, false_flag());
         q.set_finished();
         let part = q.pop(0);
         assert!(part.is_none());
@@ -191,7 +205,7 @@ mod tests {
 
     #[test]
     fn test_part_queue_discard_stale() {
-        let mut q = PartQueue::new(1024);
+        let mut q = PartQueue::new(1024, false_flag());
         q.push(Part {
             offset: 0,
             data: Bytes::from(vec![0u8; 50]),
@@ -206,7 +220,7 @@ mod tests {
 
     #[test]
     fn test_part_queue_finished_returns_none() {
-        let mut q = PartQueue::new(1024);
+        let mut q = PartQueue::new(1024, false_flag());
         q.set_finished();
         let part = q.pop(0);
         assert!(part.is_none());
@@ -214,7 +228,7 @@ mod tests {
 
     #[test]
     fn test_part_queue_error_returns_none() {
-        let mut q = PartQueue::new(1024);
+        let mut q = PartQueue::new(1024, false_flag());
         q.set_error("test error".to_string());
         let part = q.pop(0);
         assert!(part.is_none());
@@ -222,7 +236,7 @@ mod tests {
 
     #[test]
     fn test_part_queue_multiple_parts() {
-        let mut q = PartQueue::new(1024);
+        let mut q = PartQueue::new(1024, false_flag());
         q.push(Part {
             offset: 0,
             data: Bytes::from(vec![0u8; 100]),
@@ -242,5 +256,30 @@ mod tests {
         let p2 = q.pop(150).unwrap();
         assert_eq!(p2.offset, 100);
         assert_eq!(p2.data[0], 1);
+    }
+
+    #[test]
+    fn test_push_respects_cancelled() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut q = PartQueue::new(100, flag.clone());
+        // Fill the queue to capacity.
+        q.push(Part {
+            offset: 0,
+            data: Bytes::from(vec![0u8; 100]),
+        })
+        .unwrap();
+        // Now cancel — next push should fail
+        // immediately instead of spinning.
+        flag.store(true, Ordering::Relaxed);
+        let err = q
+            .push(Part {
+                offset: 100,
+                data: Bytes::from(vec![0u8; 50]),
+            })
+            .unwrap_err();
+        assert!(
+            err.contains("cancelled"),
+            "expected cancelled error, got: {err}"
+        );
     }
 }
