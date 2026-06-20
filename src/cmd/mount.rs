@@ -5,8 +5,10 @@ use anyhow::{Result, anyhow};
 use fuser::MountOption;
 use opendal::Operator;
 use opendal::layers::{CapabilityCheckLayer, ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
+#[cfg(feature = "sftp")]
+use opendal::services::Sftp;
 use opendal::services::{
-    AliyunDrive, Azblob, B2, Cos, Fs, Gcs, HdfsNative, Memory, Obs, Oss, S3, Sftp, VercelBlob,
+    AliyunDrive, Azblob, B2, Cos, Fs, Gcs, HdfsNative, Memory, Obs, Oss, S3, VercelBlob,
     Webdav,
 };
 use std::collections::HashMap;
@@ -1359,6 +1361,11 @@ async fn build_operator(storage_url: &str, opts: &HashMap<String, String>) -> Re
     let url = url::Url::parse(storage_url)
         .map_err(|e| anyhow!("invalid storage URL '{storage_url}': {e}"))?;
     match url.scheme() {
+        #[cfg(not(feature = "sftp"))]
+        "sftp" => Err(anyhow!(
+            "sftp support requires building with `--features sftp` (the openssh crate \
+             doesn't compile on Windows; opt-in to keep default builds portable)"
+        )),
         "s3" => build_s3(&url, opts).await,
         "gs" | "gcs" => build_gcs(&url, opts).await,
         "azblob" => build_azblob(&url, opts).await,
@@ -1374,6 +1381,7 @@ async fn build_operator(storage_url: &str, opts: &HashMap<String, String>) -> Re
         "fs" | "file" => build_fs(&url, opts).await,
         "memory" | "mem" => build_memory(&url, opts).await,
         "webdav" | "dav" => build_webdav(&url, opts).await,
+        #[cfg(feature = "sftp")]
         "sftp" => build_sftp(&url, opts).await,
         "aliyun" | "aliyun-drive" => build_aliyun_drive(&url, opts).await,
         s => Err(anyhow!(
@@ -1716,6 +1724,7 @@ async fn build_webdav(url: &url::Url, opts: &HashMap<String, String>) -> Result<
 ///   user                 — SSH username (default: current user)
 ///   key                  — path to SSH private key file
 ///   known_hosts_strategy — "accept" to skip host key verification (default: strict)
+#[cfg(feature = "sftp")]
 async fn build_sftp(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
     let host = url.host_str().unwrap_or("localhost");
     let port = url.port().unwrap_or(22);
