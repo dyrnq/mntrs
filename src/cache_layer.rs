@@ -57,7 +57,14 @@ impl MemCacheLayer {
 
 impl CacheLayer for MemCacheLayer {
     fn get_block(&self, _path: &str, ino: u64, block_idx: u64) -> Option<Bytes> {
-        self.inner.get(ino, block_idx)
+        let r = self.inner.get(ino, block_idx);
+        tracing::debug!(
+            ino = ino,
+            block_idx = block_idx,
+            hit = r.is_some(),
+            "L1 get_block"
+        );
+        r
     }
 
     fn put_block(&self, _path: &str, ino: u64, block_idx: u64, data: Bytes) -> bool {
@@ -66,6 +73,7 @@ impl CacheLayer for MemCacheLayer {
     }
 
     fn invalidate_path(&self, _path: &str, ino: u64) {
+        tracing::debug!(ino = ino, "L1 invalidate_path");
         self.inner.invalidate_ino(ino);
     }
 }
@@ -100,10 +108,32 @@ impl CacheLayer for DiskBlockCache {
         if self.direct_io {
             return None;
         }
+        // Guard against orphaned .block files from a
+        // previous mount session whose disk_cache_index
+        // entry was lost. The L2 preheater in
+        // MultiLevelCache::new re-populates the index
+        // from files on disk at startup; if a file
+        // exists but has no index entry, it is stale
+        // and must not be served (issue #128).
+        let key = (path.to_string(), Some(block_idx));
+        if !self.disk_cache_index.contains_key(&key) {
+            tracing::debug!(
+                path = %path,
+                block_idx = block_idx,
+                "L2 get_block: orphaned .block file (no index entry), skipping"
+            );
+            return None;
+        }
         let cpath = crate::cache_block_path(&self.cache_dir, path, block_idx);
         if !cpath.exists() {
             return None;
         }
+        tracing::debug!(
+            path = %path,
+            block_idx = block_idx,
+            cpath = %cpath.display(),
+            "L2 get_block: HIT"
+        );
         let data = crate::block_format::read_block_cached(&cpath, path)?;
         // Bug B fix: bump the in-memory LRU sort key on every
         // cache hit. The on-disk atime is unreliable on relatime
@@ -164,6 +194,11 @@ impl CacheLayer for DiskBlockCache {
             .filter(|entry| entry.key().0 == path && entry.key().1.is_some())
             .map(|entry| entry.key().clone())
             .collect();
+        tracing::debug!(
+            path = %path,
+            keys_found = to_remove.len(),
+            "L2 invalidate_path"
+        );
         for key in to_remove {
             if let Some(idx) = key.1 {
                 let blk_path = crate::cache_block_path(&self.cache_dir, &key.0, idx);
