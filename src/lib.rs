@@ -2310,7 +2310,15 @@ impl CoreFilesystem for MntrsFs {
                 FileHandleState::Read {
                     path,
                     last_offset: 0,
-                    chunk_size: self.read_chunk_size.max(131072),
+                    // Start at the same value the remote-fetch path
+                    // uses as default (8 MiB). The adaptive doubling
+                    // will grow it on sequential reads. 131072 was the
+                    // prefetcher's own min, not the fetch path's default.
+                    chunk_size: if self.read_chunk_size > 0 {
+                        self.read_chunk_size
+                    } else {
+                        8 * 1024 * 1024
+                    },
                     prefetcher,
                     expires_at: None,
                 },
@@ -2464,6 +2472,15 @@ impl CoreFilesystem for MntrsFs {
                 // with the partial bytes for the next
                 // read in the same region.
                 let cache_is_complete = (b.len() as u64) >= actual_size;
+                tracing::debug!(
+                    path = %path,
+                    offset = offset,
+                    size = size,
+                    cache_bytes = b.len(),
+                    actual_size = actual_size,
+                    cache_is_complete = cache_is_complete,
+                    "read: file-level cache check"
+                );
                 if cache_is_complete {
                     // Bug B fix: bump the in-memory
                     // LRU sort key on every cache hit.
@@ -2530,7 +2547,30 @@ impl CoreFilesystem for MntrsFs {
         // the mem_cache capacity: 256 MiB / 8 MiB blocks = 32
         // blocks, so the cap of `min(actual_size, 256 MiB)`
         // keeps mem_cache pressure bounded.
-        let user_cap = if self.read_chunk_size > 0 {
+        // Adaptive chunk doubling (rclone chunkedreader model).
+        // Read handles carry a per-handle `chunk_size` initialised at
+        // open(). On sequential reads where the last fetch consumed
+        // the full chunk (offset == last_offset, fetched bytes >=
+        // requested), the chunk size doubles up to
+        // read_chunk_size_limit (or 128 MiB if unset). On a random
+        // seek, it resets to the initial value. This cuts round-trips
+        // for `cat 100M` from ~12 (with 8 MiB fixed) to ~3
+        // (8→16→32→64 MiB).
+        let (per_handle_chunk, last_rd_offset) = self
+            .handles
+            .get(&fh)
+            .map(|e| match e.value() {
+                FileHandleState::Read {
+                    chunk_size,
+                    last_offset,
+                    ..
+                } => (*chunk_size, *last_offset),
+                _ => (0, 0),
+            })
+            .unwrap_or((0, 0));
+        let user_cap = if per_handle_chunk > 0 {
+            per_handle_chunk
+        } else if self.read_chunk_size > 0 {
             self.read_chunk_size
         } else {
             8 * 1024 * 1024
@@ -2695,6 +2735,32 @@ impl CoreFilesystem for MntrsFs {
                 );
             }
         }
+        // Adaptive chunk doubling feedback (rclone chunkedreader model).
+        // On sequential read where we consumed a full chunk, double
+        // the per-handle chunk_size for the next call (capped at
+        // read_chunk_size_limit or 128 MiB). On a random seek, reset
+        // to the initial value.
+        let is_sequential = offset == last_rd_offset;
+        let fetched_full = b.len() as u64 >= fetch_size;
+        if let Some(mut entry) = self.handles.get_mut(&fh)
+            && let FileHandleState::Read {
+                last_offset,
+                chunk_size,
+                ..
+            } = entry.value_mut()
+        {
+            *last_offset = offset + len as u64;
+            if is_sequential && fetched_full {
+                let limit = if self.read_chunk_size_limit > 0 {
+                    self.read_chunk_size_limit
+                } else {
+                    128 * 1024 * 1024
+                };
+                *chunk_size = (*chunk_size).saturating_mul(2).min(limit);
+            } else if !is_sequential {
+                *chunk_size = self.read_chunk_size.max(131072);
+            }
+        }
         Ok(result)
     }
 
@@ -2790,12 +2856,102 @@ impl CoreFilesystem for MntrsFs {
         // is where the real network latency lives, and
         // it is triggered separately by flush() /
         // release(), not by this handler.
+        //
+        // Issue #128: when appending to a pre-existing
+        // file whose whole-file cache was never
+        // populated (read went through block cache /
+        // streaming), the cache file is 0 bytes. The
+        // old code did `set_len(offset + data_len)`
+        // which zero-fills [0..offset), then a
+        // subsequent read (after cache invalidation)
+        // falls through to the remote which still has
+        // the old content (writeback not flushed).
+        //
+        // Fix: backfill the cache gap [cache_len ..
+        // offset) from the backend BEFORE writing.
+        // The network I/O happens outside the mutex
+        // to avoid blocking concurrent reads on the
+        // same fh. Gap is capped at 64 MiB to bound
+        // the one-time cost on large sparse writes.
+        const GAP_BACKFILL_MAX: u64 = 64 * 1024 * 1024;
+        tracing::debug!(
+            path = %path,
+            offset = _offset,
+            data_len = _data.len(),
+            has_cache_fd = cache_fd.is_some(),
+            "write: entry"
+        );
+        let gap_data: Option<Vec<u8>> = if _offset > 0 {
+            if let Some(fd) = &cache_fd {
+                let cache_len = fd
+                    .lock()
+                    .ok()
+                    .and_then(|f| f.metadata().ok())
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                if cache_len < _offset {
+                    let gap = _offset - cache_len;
+                    if gap <= GAP_BACKFILL_MAX {
+                        let op = self.op.clone();
+                        let p = path.clone();
+                        let r = rt().block_on(async move {
+                            op.read_with(&p).range(cache_len.._offset).await
+                        });
+                        match r {
+                            Ok(buf) => Some(buf.to_vec()),
+                            Err(e) => {
+                                tracing::warn!(
+                                    path = %path,
+                                    gap = gap,
+                                    "backfill failed; rejecting write to avoid cache corruption"
+                                );
+                                return Err(std::io::Error::other(format!(
+                                    "backfill gap read failed: {e}"
+                                )));
+                            }
+                        }
+                    } else {
+                        tracing::debug!(
+                            path = %path,
+                            gap = gap,
+                            max = GAP_BACKFILL_MAX,
+                            "gap exceeds backfill cap; accepting zero-fill"
+                        );
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         if let Some(fd) = &cache_fd
             && let Ok(mut f) = fd.lock()
         {
+            use std::io::{Seek, Write};
+            // Re-check: another thread may have grown
+            // the cache file while we were reading the
+            // gap. Only backfill if still needed.
+            let actual_len = f.metadata().map(|m| m.len()).unwrap_or(0);
+            if let Some(gap) = &gap_data
+                && actual_len < _offset
+            {
+                let _ = f.seek(std::io::SeekFrom::Start(actual_len));
+                if f.write_all(gap).is_err() {
+                    // Backfill write failed — truncate
+                    // back to avoid serving zero-filled
+                    // data. The write will be retried by
+                    // the kernel.
+                    let _ = f.set_len(actual_len);
+                    return Err(std::io::Error::other("backfill write to cache failed"));
+                }
+            }
             let end = _offset + _data.len() as u64;
             let _ = f.set_len(end);
-            use std::io::{Seek, Write};
             let _ = f.seek(std::io::SeekFrom::Start(_offset));
             f.write_all(_data)?;
         }
@@ -2845,7 +3001,8 @@ impl CoreFilesystem for MntrsFs {
         // an invalidation hook. See issue #93.
         #[cfg(not(windows))]
         if let Some(notifier) = self.fuse_notifier.get() {
-            let _ = notifier.inval_inode(fuser::INodeNo(_ino), 0, -1);
+            let r = notifier.inval_inode(fuser::INodeNo(_ino), 0, -1);
+            tracing::debug!(ino = _ino, result = ?r, "write: inval_inode");
         }
         // #8 (durability): register the cache file
         // for the periodic fsync thread (5 s tick,
