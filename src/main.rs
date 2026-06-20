@@ -109,7 +109,7 @@ enum Commands {
         /// Write-back delay in seconds before uploading dirty cache files (default: 5)
         #[arg(long, default_value = "5")]
         vfs_write_back: u64,
-        /// VFS cache mode: off, writes, full (default: writes)
+        /// VFS cache mode: off, writes, full (default: off, matches rclone)
         #[arg(long, default_value = "off")]
         vfs_cache_mode: String,
         /// Read-ahead size in bytes (default: 0 = off, matches rclone)
@@ -254,7 +254,7 @@ enum Commands {
         /// Write wait timeout in seconds (default: 1, matches rclone)
         #[arg(long, default_value = "1")]
         vfs_write_wait: u64,
-        /// Read wait timeout in seconds (default: 1, matches rclone)
+        /// Read wait timeout in seconds (default: 1)
         #[arg(long, default_value = "1")]
         vfs_read_wait: u64,
         /// Cache poll interval in seconds (default: 60)
@@ -375,11 +375,17 @@ fn main() -> anyhow::Result<()> {
             vfs_disk_space_total_size,
             ..
         } => {
-            let opts: HashMap<String, String> = opt
-                .iter()
-                .filter_map(|kv| kv.split_once('='))
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
+            let mut opts = HashMap::new();
+            for kv in &opt {
+                match kv.split_once('=') {
+                    Some((k, v)) => {
+                        opts.insert(k.to_string(), v.to_string());
+                    }
+                    None => {
+                        return Err(anyhow::anyhow!("--opt value must be KEY=VAL, got: {kv:?}"));
+                    }
+                }
+            }
             mntrs::cmd::mount::mount(
                 &storage,
                 &mountpoint,

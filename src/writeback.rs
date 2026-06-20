@@ -164,8 +164,8 @@ pub fn spawn(
             if let Some(expired) = queue.next().await {
                 let task = expired.into_inner();
                 let _p = task.1.clone();
-                let data = match std::fs::read(&task.2) {
-                    Ok(d) => d,
+                let data: bytes::Bytes = match std::fs::read(&task.2) {
+                    Ok(d) => d.into(),
                     Err(_) => {
                         // Issue #53: cache file vanished (e.g.
                         // evicted by LRU) — drop the task

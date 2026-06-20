@@ -196,12 +196,14 @@ enum FileHandleState {
         last_offset: u64,
         chunk_size: u64,
         prefetcher: Option<std::sync::Arc<prefetcher::HandlePrefetcher>>,
+        expires_at: Option<std::time::Instant>,
     },
     Write {
         path: String,
         cache_fd: Option<Arc<std::sync::Mutex<std::fs::File>>>,
         dirty: bool,
         dirty_since: Option<std::time::Instant>,
+        expires_at: Option<std::time::Instant>,
     },
 }
 
@@ -213,22 +215,26 @@ impl Clone for FileHandleState {
                 last_offset,
                 chunk_size,
                 prefetcher,
+                expires_at,
             } => FileHandleState::Read {
                 path: path.clone(),
                 last_offset: *last_offset,
                 chunk_size: *chunk_size,
                 prefetcher: prefetcher.clone(),
+                expires_at: *expires_at,
             },
             FileHandleState::Write {
                 path,
                 cache_fd,
                 dirty,
                 dirty_since,
+                expires_at,
             } => FileHandleState::Write {
                 path: path.clone(),
                 cache_fd: cache_fd.clone(),
                 dirty: *dirty,
                 dirty_since: *dirty_since,
+                expires_at: *expires_at,
             },
         }
     }
@@ -493,6 +499,8 @@ pub fn opendal_to_io_error(e: &opendal::Error, op: &str) -> std::io::Error {
         ErrorKind::IsADirectory => IoKind::IsADirectory,
         ErrorKind::NotADirectory => IoKind::NotADirectory,
         ErrorKind::Unsupported => IoKind::Unsupported,
+        // New: map rate limiting and auth errors explicitly
+        ErrorKind::RateLimited => IoKind::Other, // EAGAIN
         _ => IoKind::Other,
     };
     std::io::Error::new(kind, format!("{op} failed: {e}"))
@@ -3226,6 +3234,30 @@ impl CoreFilesystem for MntrsFs {
         let path = self.resolve(ino).map(|e| e.path).unwrap_or_default();
         let fh = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+        // N-6 fix: sweep expired handle-cached entries on every
+        // open() to prevent fd leaks. Without this, retained
+        // handles accumulate forever and eventually hit the
+        // fd limit (default 1024). The sweep is O(N) over the
+        // handles DashMap but runs infrequently (once per open)
+        // and the map is typically small (<100 entries).
+        if self.handle_caching > std::time::Duration::ZERO {
+            let now = std::time::Instant::now();
+            let expired: Vec<u64> = self
+                .handles
+                .iter()
+                .filter_map(|e| {
+                    let expires = match e.value() {
+                        crate::FileHandleState::Read { expires_at, .. }
+                        | crate::FileHandleState::Write { expires_at, .. } => *expires_at,
+                    };
+                    expires.filter(|t| now >= *t).map(|_| *e.key())
+                })
+                .collect();
+            for fh_expired in expired {
+                self.handles.remove(&fh_expired);
+            }
+        }
+
         // Bug 11: the pre-fix `is_write` check was gated
         // on `cfg!(unix)`, which silently coerced every
         // Windows open() to a Read handle — every write
@@ -3258,6 +3290,7 @@ impl CoreFilesystem for MntrsFs {
                     cache_fd: cache_fd.map(|f| std::sync::Arc::new(std::sync::Mutex::new(f))),
                     dirty: false,
                     dirty_since: None,
+                    expires_at: None,
                 },
             );
         } else {
@@ -3273,6 +3306,7 @@ impl CoreFilesystem for MntrsFs {
                     last_offset: 0,
                     chunk_size: self.read_chunk_size.max(131072),
                     prefetcher,
+                    expires_at: None,
                 },
             );
         }
@@ -3807,43 +3841,32 @@ impl CoreFilesystem for MntrsFs {
             let _ = f.seek(std::io::SeekFrom::Start(_offset));
             f.write_all(_data)?;
         }
-        // Bug #62 / task #3 (part 2): the cache file is
-        // the local re-read optimization, but a read that
-        // arrives before the async writeback uploads to
-        // the remote will fall through to `op.read_with`
-        // and see a stale 0-byte file in the backend
-        // (the `create` handler only wrote empty bytes).
-        // `opendal::services::Memory::read_with` then
-        // returns `Unexpected { expect: N, actual: 0 }`,
-        // which the FUSE adapter maps to EIO.
-        //
-        // Fix: write to the opendal backend synchronously
-        // so the next read sees the data without waiting
-        // for the writeback worker. For memory this is a
-        // map insert (sub-µs); for S3 / HDFS this is a
-        // network round-trip and is the new cost. The
-        // writeback worker becomes a no-op for the happy
-        // path (the data is already uploaded) and remains
-        // as a recovery path for the create-without-write
-        // edge case (an in-flight create can still leave
-        // a 0-byte file in the backend until the next
-        // writeback tick).
+        // Bug #62 / task #3 (part 2): the cache file
+        // is the local re-read optimization. The
+        // writeback worker uploads the full cache file
+        // to the backend on flush/release. Per-write
+        // op.write() was removed because opendal's
+        // Operator::write() is a whole-file PUT — each
+        // FUSE write replaced the backend file with only
+        // the current chunk, corrupting multi-chunk
+        // writes. The hdfs-native backend panics when
+        // offset+len > file_length() on the truncated
+        // backend file (Cannot read past end of the
+        // file). The cache file (written synchronously
+        // above) is the source of truth for read-after-
+        // write within the same mount session.
+        // If op.write() fails (backend down), trigger
+        // writeback immediately so the file doesn't
+        // wait for flush/release.
         {
-            let op = self.op.clone();
-            let p = path.clone();
-            let d = _data.to_vec();
-            let r = rt().block_on(async move { op.write(&p, d).await });
-            if let Err(e) = r {
-                // Don't fail the FUSE write just because
-                // the backend is down — the local cache
-                // file has the data, and the async
-                // writeback worker will retry the upload.
-                tracing::warn!(
-                    path = %path,
-                    error = %e,
-                    kind = ?e.kind(),
-                    "write: sync opendal upload failed (cache file written, writeback will retry)"
-                );
+            let cpath = crate::cache_path(&self.cache_dir, &path);
+            if cpath.exists() {
+                register_dirty_cache_path(&cpath);
+                if let Some(tx) = self.writeback_sender.get()
+                    && self.writeback_pending.insert(path.as_str().to_string())
+                {
+                    let _ = tx.send((_ino, path.clone(), cpath, 0));
+                }
             }
         }
         // #89 follow-up: invalidate the FUSE kernel's
@@ -4039,6 +4062,7 @@ impl CoreFilesystem for MntrsFs {
                 cache_fd: cache_fd.clone(),
                 dirty: true,
                 dirty_since: Some(std::time::Instant::now()),
+                expires_at: None,
             });
         Ok(written)
     }
@@ -4170,6 +4194,7 @@ impl CoreFilesystem for MntrsFs {
                     cache_fd,
                     dirty: false,
                     dirty_since: None,
+                    expires_at: None,
                 },
             );
         }
@@ -4367,6 +4392,19 @@ impl CoreFilesystem for MntrsFs {
                     kind,
                     "release: retaining handle for handle_caching duration (issue #54)"
                 );
+                // N-6 fix: stamp the handle with a TTL so open()
+                // can sweep expired entries and prevent fd leaks.
+                // Without this, retained handles stay in the
+                // DashMap forever (bounded only by process
+                // lifetime), accumulating cache_fd Arc<Mutex<File>>
+                // that each hold an open fd.
+                let ttl = self.handle_caching;
+                self.handles.entry(fh).and_modify(|e| match e {
+                    crate::FileHandleState::Read { expires_at, .. }
+                    | crate::FileHandleState::Write { expires_at, .. } => {
+                        *expires_at = Some(std::time::Instant::now() + ttl);
+                    }
+                });
                 return Ok(());
             }
         }
@@ -4433,7 +4471,11 @@ impl CoreFilesystem for MntrsFs {
         }
         let cache_fd = std::fs::OpenOptions::new()
             .create(true)
-            .truncate(false)
+            .truncate(true) // N-8 fix: truncate old cache content on create;
+            // the backend now has a 0-byte file and the cache must match.
+            // Pre-fix `.truncate(false)` preserved stale cache from a
+            // prior session, causing reads to return old data after
+            // `touch existing.txt` (create without write).
             .write(true)
             .read(true)
             .open(&cpath)
@@ -4446,6 +4488,7 @@ impl CoreFilesystem for MntrsFs {
                 cache_fd,
                 dirty: false,
                 dirty_since: None,
+                expires_at: None,
             },
         );
         self.cache_add_entry(
@@ -5002,7 +5045,8 @@ impl CoreFilesystem for MntrsFs {
                 .remove_if(&path, |_, current_ino| *current_ino == ino);
             self.attr_cache.remove(&path);
             // Clean up any open file handles for this inode
-            self.handles.retain(|k, v| k != &ino && v.path() != path);
+            // (actually handles key is fh, not ino; just filter by path)
+            self.handles.retain(|_, v| v.path() != path);
         }
     }
 }

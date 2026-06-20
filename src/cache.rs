@@ -535,7 +535,6 @@ impl MemCache for DashMapMemCache {
         // accounting update in that case. (See the victim
         // branch above — `if let Some((_, removed))` is
         // permissive.)
-        self.order.lock().unwrap().push_back(key);
     }
 
     fn invalidate_ino(&self, ino: u64) {

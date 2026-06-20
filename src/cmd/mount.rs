@@ -1505,6 +1505,15 @@ async fn build_hdfs_jni(url: &url::Url, opts: &HashMap<String, String>) -> Resul
             "kerberos-ticket-cache-path" | "kerberos_ticket_cache_path" => {
                 builder = builder.kerberos_ticket_cache_path(v);
             }
+            // N-7 fix: tell users that hdfs-jni doesn't support
+            // dfs.* options; use hdfs-native for Kerberos with
+            // principal/keytab config.
+            k if k.starts_with("dfs.") => {
+                tracing::warn!(
+                    "hdfs-jni does not support {k}={v}; \
+                     use hdfs:// (hdfs-native) for Kerberos principal/keytab"
+                );
+            }
             _ => tracing::warn!("ignored unsupported hdfs-jni option: {k}={v}"),
         }
     }
