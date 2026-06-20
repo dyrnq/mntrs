@@ -165,7 +165,7 @@ impl ErrorLog {
         // on a slow disk.
         if self.tx.try_send(rec).is_err() {
             static DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let d = DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let d = DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if d.is_multiple_of(1000) {
                 tracing::warn!(
                     drops = d,
@@ -197,19 +197,28 @@ fn errno_name(raw: i32) -> &'static str {
         2 => "ENOENT",
         5 => "EIO",
         9 => "EBADF",
+        11 => "EAGAIN",
         12 => "ENOMEM",
         13 => "EACCES",
+        14 => "EFAULT",
         16 => "EBUSY",
         17 => "EEXIST",
+        18 => "EXDEV",
+        19 => "ENODEV",
         20 => "ENOTDIR",
         21 => "EISDIR",
         22 => "EINVAL",
-        24 => "ENFILE",
+        23 => "ENFILE",
+        24 => "EMFILE",
         27 => "EFBIG",
         28 => "ENOSPC",
         30 => "EROFS",
         32 => "EPIPE",
+        36 => "ENAMETOOLONG",
         38 => "ENOSYS",
+        39 => "ENOTEMPTY",
+        40 => "ELOOP",
+        122 => "EDQUOT",
         _ => "UNKNOWN",
     }
 }

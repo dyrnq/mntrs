@@ -43,7 +43,7 @@ pub fn unmount(target: &str) -> Result<()> {
     if let Ok(content) = fs::read_to_string(&db) {
         let filtered: Vec<&str> = content
             .lines()
-            .filter(|l| !l.contains(&mountpoint))
+            .filter(|l| l.split('\0').nth(1) != Some(mountpoint.as_str()))
             .collect();
         if let Err(e) = fs::write(&db, filtered.join("\n")) {
             tracing::debug!(error=%e, "unmount db cleanup failed");

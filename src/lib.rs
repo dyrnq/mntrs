@@ -3155,7 +3155,7 @@ impl CoreFilesystem for MntrsFs {
                     self.inodes.get(&ino).map(|e| e.size).unwrap_or(s).max(s)
                 }
             } else {
-                size.unwrap_or(0)
+                self.inodes.get(&ino).map(|e| e.size).unwrap_or(0)
             };
             Ok(to_core_attr(&self.make_attr(
                 ino,
@@ -3926,7 +3926,7 @@ impl CoreFilesystem for MntrsFs {
         // on read).
         self.disk_cache_index.insert(
             (path.clone(), None),
-            (_data.len() as u64, std::time::Instant::now()),
+            (_offset + _data.len() as u64, std::time::Instant::now()),
         );
         // Issue #39: evict BEFORE the pool worker tries to
         // write the cache file. The pre-fix order submitted
@@ -4982,7 +4982,12 @@ impl CoreFilesystem for MntrsFs {
             if kind == FileType::Directory {
                 return Ok(vec![]);
             }
-            Ok(vec![b"user.etag".to_vec(), b"user.content-type".to_vec()])
+            Ok(vec![
+                b"user.etag".to_vec(),
+                b"user.content-type".to_vec(),
+                b"s3.etag".to_vec(),
+                b"s3.content-type".to_vec(),
+            ])
         } else {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,

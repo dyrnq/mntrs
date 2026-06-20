@@ -425,7 +425,7 @@ pub trait CoreFilesystem: Send + Sync {
         // writes go through the writeback pool. The
         // backends with a native copy primitive
         // (S3 CopyObject, etc.) should override this.
-        let data = self.read(ino_in, fh_in, offset_in, len as u32)?;
+        let data = self.read(ino_in, fh_in, offset_in, (len.min(u32::MAX as u64)) as u32)?;
         let written = self.write(ino_out, fh_out, offset_out, &data)?;
         Ok(written)
     }
