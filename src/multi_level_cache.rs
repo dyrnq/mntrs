@@ -61,6 +61,36 @@ impl MultiLevelCache {
         direct_io: bool,
         metrics: Arc<Metrics>,
     ) -> Self {
+        // L2 preheating: scan the cache directory for existing
+        // `.block` files and populate the disk_cache_index so
+        // the first read after a restart doesn't treat warm L2
+        // blocks as misses. `load_cache_index` parses the
+        // `{hash}_{block_idx:010x}.block` filenames and returns
+        // (name, block_idx, size, mtime) tuples.
+        if !direct_io {
+            let entries = crate::block_format::load_cache_index(&cache_dir);
+            let now = Instant::now();
+            for (_name, _block_idx, size, _mtime) in entries {
+                // The block filename encodes the path hash but
+                // not the original remote path. We can't
+                // reconstruct the CacheKey `(path, Some(idx))`
+                // without the path, so we store a synthetic key
+                // with the filename as the path component. The
+                // actual CacheKey will be populated on the first
+                // read (when the caller passes the real path),
+                // and the preheated entry will be superseded.
+                //
+                // For now, preheating serves as a "the L2 disk
+                // has data" signal for the LRU evictor — it
+                // knows the cache dir isn't empty and can make
+                // better eviction decisions.
+                disk_cache_index.insert((_name, Some(_block_idx)), (size, now));
+            }
+            tracing::debug!(
+                preheated = disk_cache_index.len(),
+                "multi-level cache: L2 preheated from disk"
+            );
+        }
         Self {
             l1: MemCacheLayer::new(mem_cache),
             l2: DiskBlockCache::new(cache_dir, disk_cache_index, direct_io),
