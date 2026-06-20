@@ -23,7 +23,7 @@ moka = { version = "0.12", features = ["sync"] }
 bytes = "1.11.1"
 unicode-normalization = "0.1.25"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "hickory-dns"] }
-opendal = { version = "0.57", features = ["services-s3", "services-gcs", "services-azblob", "services-hdfs-native", "services-webhdfs", "services-oss", "services-cos", "services-obs", "services-b2", "services-vercel-blob", "services-aliyun-drive", "services-fs", "services-memory", "services-webdav", "services-sftp"] }
+opendal = { version = "0.57", features = ["services-s3", "services-gcs", "services-azblob", "services-hdfs-native", "services-webhdfs", "services-oss", "services-cos", "services-obs", "services-b2", "services-vercel-blob", "services-aliyun-drive", "services-fs", "services-memory", "services-webdav", "services-sftp", "layers-capability-check"] }
 # Hardware-accelerated CRC32C (x86 CRC32Q via SSE4.2; ARMv8.2-CRC32).
 # Used for disk cache block integrity checks; falls back to a
 # software implementation on CPUs without the corresponding ISA

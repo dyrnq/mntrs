@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow};
 #[cfg(not(windows))]
 use fuser::MountOption;
 use opendal::Operator;
-use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
+use opendal::layers::{CapabilityCheckLayer, ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
 use opendal::services::{
     AliyunDrive, Azblob, B2, Cos, Fs, Gcs, HdfsNative, Memory, Obs, Oss, S3, Sftp, VercelBlob,
     Webdav,
@@ -1328,6 +1328,7 @@ fn apply_operator_with_tls(
             .layer(TimeoutLayer::new().with_io_timeout(std::time::Duration::from_secs(30)))
             .layer(RetryLayer::new().with_max_times(3).with_factor(2.0))
             .layer(ConcurrentLimitLayer::new(16))
+            .layer(CapabilityCheckLayer::new())
             .finish()
     } else {
         // Non-TLS path: still wrap an explicit HttpClientLayer so we never
@@ -1348,6 +1349,7 @@ fn apply_operator_with_tls(
             .layer(TimeoutLayer::new().with_io_timeout(std::time::Duration::from_secs(30)))
             .layer(RetryLayer::new().with_max_times(3).with_factor(2.0))
             .layer(ConcurrentLimitLayer::new(16))
+            .layer(CapabilityCheckLayer::new())
             .finish()
     };
     Ok(op)
@@ -1408,6 +1410,14 @@ async fn build_s3(url: &url::Url, opts: &HashMap<String, String>) -> Result<Oper
     }
     if let Some(v) = opts.get("region") {
         builder = builder.region(v);
+    }
+    // #76: explicit checksum algorithm. Default is None (opendal picks
+    // CRC32C for AWS S3, which adds server-side validation overhead
+    // on MinIO/local S3 where it's not needed). Users can force a
+    // specific algorithm (CRC32C/CRC32/SHA1/SHA256) or pass an empty
+    // string to disable checksum PUT headers entirely.
+    if let Some(v) = opts.get("checksum-algorithm") {
+        builder = builder.checksum_algorithm(v);
     }
     apply_operator_with_tls(builder, opts)
 }

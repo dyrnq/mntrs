@@ -2281,7 +2281,7 @@ impl MntrsFs {
             // listing rather than propagating EIO. This matches
             // rclone VFS implicit-dir semantics. We still surface
             // every other lister-init error (auth, permission, network).
-            let mut lister = match op.lister(&p).await {
+            let mut lister = match op.lister_with(&p).limit(1000).await {
                 Ok(l) => l,
                 Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
                     return Ok::<_, opendal::Error>(Vec::new());
