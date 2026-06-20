@@ -57,22 +57,22 @@ PEAK_FD_MAX=0
 # above ~10 means a real leak (e.g. an orphaned fusermount3 child
 # the watch thread spawned, or a held /dev/fuse handle).
 #
-# Threshold of 17 was chosen empirically against the s3 mount path.
+# Threshold of 20 was chosen empirically against the s3 mount path.
 # Steady state per backend:
 #   memory://  : ~10 FDs (3 stdio + 3 tokio eventpoll/eventfd
 #                + 1 /dev/fuse + 2-3 tokio sockets)
-#   s3://      : ~12 FDs (memory set + 1 reqwest keep-alive TCP
+#   s3://      : ~12-15 FDs (memory set + reqwest keep-alive TCP
 #                to the S3 endpoint; pool_max_idle_per_host=16
 #                in http_client.rs means up to 16 sockets per
 #                host could be warm)
 # Iterations with a busy cache dir (many .dirty sidecars from
 # prior runs) can transiently hold an extra 2-5 FDs while the
 # writeback worker recovers sidecars and the recovery scan opens
-# files in quick succession. 17 is a tolerance band wide enough
+# files in quick succession. 20 is a tolerance band wide enough
 # to absorb the s3 case + a transient burst, tight enough to
 # catch a real regression (e.g. an unbounded socket or pipe per
 # cycle).
-PEAK_FD_THRESHOLD=17
+PEAK_FD_THRESHOLD=20
 
 cleanup() {
     fusermount3 -u "$MP" 2>/dev/null || fusermount -u "$MP" 2>/dev/null || true

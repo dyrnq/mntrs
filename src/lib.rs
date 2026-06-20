@@ -1889,10 +1889,20 @@ impl MntrsFs {
         // filtering across all shards, so the two-step
         // collect-then-remove is clearer than nesting
         // an .iter().filter() in a `remove_if` lambda.
+        //
+        // Only remove block-level entries (block_idx =
+        // Some(_)). The file-level entry (block_idx =
+        // None) is the whole-file cache written by the
+        // write handler via cache_fd — removing it here
+        // would destroy the cache file we just wrote to,
+        // forcing every subsequent read to fall through
+        // to the remote fetch path (which returns stale
+        // data when the backend only has the per-write
+        // chunk, not the full file).
         let to_remove: Vec<(String, Option<u64>)> = self
             .disk_cache_index
             .iter()
-            .filter(|entry| entry.key().0 == path)
+            .filter(|entry| entry.key().0 == path && entry.key().1.is_some())
             .map(|entry| entry.key().clone())
             .collect();
         for key in to_remove {
