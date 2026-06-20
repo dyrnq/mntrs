@@ -4,6 +4,7 @@
 pub mod backpressure;
 pub mod block_format;
 pub mod cache;
+pub(crate) mod cache_layer;
 pub mod cmd;
 pub mod core_fs;
 pub mod disk_write_pool;
@@ -12,6 +13,9 @@ pub mod fuse_error;
 pub mod http_client;
 pub mod mem_limiter;
 pub mod metrics;
+// multi_level_cache: added for issue #127; allow dead_code until integration.
+#[allow(dead_code)]
+pub(crate) mod multi_level_cache;
 pub mod path;
 pub mod prefetcher;
 pub mod util;

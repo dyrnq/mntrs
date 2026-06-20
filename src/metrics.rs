@@ -205,6 +205,12 @@ pub struct Metrics {
     /// on every snapshot via the
     /// `pending_count()` shim in writeback.rs.
     pub writeback_pending_gauge: AtomicU64,
+    /// Per-level cache hit/miss counters (issue #127).
+    /// L1 = in-memory block cache, L2 = on-disk block cache.
+    pub cache_l1_hit: AtomicU64,
+    pub cache_l1_miss: AtomicU64,
+    pub cache_l2_hit: AtomicU64,
+    pub cache_l2_miss: AtomicU64,
 }
 
 impl Metrics {
@@ -239,6 +245,36 @@ impl Metrics {
             fsync_h: OpHistogram::new(FuseOp::Fsync),
             other_h: OpHistogram::new(FuseOp::Other),
             writeback_pending_gauge: AtomicU64::new(0),
+            cache_l1_hit: AtomicU64::new(0),
+            cache_l1_miss: AtomicU64::new(0),
+            cache_l2_hit: AtomicU64::new(0),
+            cache_l2_miss: AtomicU64::new(0),
+        }
+    }
+
+    /// Record a cache hit at the given level ("l1" or "l2").
+    pub fn record_cache_hit(&self, level: &str) {
+        match level {
+            "l1" => {
+                self.cache_l1_hit.fetch_add(1, Ordering::Relaxed);
+            }
+            "l2" => {
+                self.cache_l2_hit.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    /// Record a cache miss at the given level ("l1" or "l2").
+    pub fn record_cache_miss(&self, level: &str) {
+        match level {
+            "l1" => {
+                self.cache_l1_miss.fetch_add(1, Ordering::Relaxed);
+            }
+            "l2" => {
+                self.cache_l2_miss.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
         }
     }
 
@@ -351,6 +387,27 @@ impl Metrics {
         out.push_str(&format!(
             "writeback_pending {}\n",
             self.writeback_pending_gauge.load(Ordering::Relaxed)
+        ));
+        // Per-level cache counters (issue #127).
+        out.push_str("# HELP cache_hits_total Cache hits by level\n");
+        out.push_str("# TYPE cache_hits_total counter\n");
+        out.push_str(&format!(
+            "cache_hits_total{{level=\"l1\"}} {}\n",
+            self.cache_l1_hit.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "cache_hits_total{{level=\"l2\"}} {}\n",
+            self.cache_l2_hit.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP cache_misses_total Cache misses by level\n");
+        out.push_str("# TYPE cache_misses_total counter\n");
+        out.push_str(&format!(
+            "cache_misses_total{{level=\"l1\"}} {}\n",
+            self.cache_l1_miss.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "cache_misses_total{{level=\"l2\"}} {}\n",
+            self.cache_l2_miss.load(Ordering::Relaxed)
         ));
         out
     }
