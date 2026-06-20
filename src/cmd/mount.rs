@@ -6,7 +6,8 @@ use fuser::MountOption;
 use opendal::Operator;
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
 use opendal::services::{
-    AliyunDrive, Azblob, B2, Cos, Fs, Gcs, HdfsNative, Memory, Obs, Oss, S3, VercelBlob, Webdav,
+    AliyunDrive, Azblob, B2, Cos, Fs, Gcs, HdfsNative, Memory, Obs, Oss, S3, Sftp, VercelBlob,
+    Webdav,
 };
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -1371,9 +1372,10 @@ async fn build_operator(storage_url: &str, opts: &HashMap<String, String>) -> Re
         "fs" | "file" => build_fs(&url, opts).await,
         "memory" | "mem" => build_memory(&url, opts).await,
         "webdav" | "dav" => build_webdav(&url, opts).await,
+        "sftp" => build_sftp(&url, opts).await,
         "aliyun" | "aliyun-drive" => build_aliyun_drive(&url, opts).await,
         s => Err(anyhow!(
-            "unsupported scheme '{s}'; try s3://, gs://, azblob://, hdfs://, hdfs-jni://, webhdfs://, oss://, cos://, obs://, b2://"
+            "unsupported scheme '{s}'; try s3://, gs://, azblob://, hdfs://, webhdfs://, oss://, cos://, obs://, b2://, webdav://, sftp://"
         )),
     }
 }
@@ -1692,4 +1694,40 @@ async fn build_webdav(url: &url::Url, opts: &HashMap<String, String>) -> Result<
         builder = builder.token(v);
     }
     apply_operator_with_tls(builder, opts)
+}
+
+/// Build an SFTP operator from the URL and options.
+///
+/// Usage:
+///   mntrs mount sftp://host:22/remote/path /mnt --opt user=root --opt key=/root/.ssh/id_rsa
+///   mntrs mount sftp://host/remote/path /mnt --opt user=admin --opt password=secret
+///
+/// Options (via --opt):
+///   user                 — SSH username (default: current user)
+///   key                  — path to SSH private key file
+///   known_hosts_strategy — "accept" to skip host key verification (default: strict)
+async fn build_sftp(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+    let host = url.host_str().unwrap_or("localhost");
+    let port = url.port().unwrap_or(22);
+    // opendal SFTP expects the endpoint in `ssh://[user@]host[:port]`
+    // format (same as openssh). A bare `host:port` is passed to ssh as
+    // the destination argument, which ssh then tries to resolve as a
+    // hostname (failing with "Could not resolve hostname host:port").
+    let endpoint = format!("ssh://{host}:{port}");
+    let mut builder = Sftp::default().endpoint(&endpoint);
+    let p = url.path().trim_start_matches('/');
+    if !p.is_empty() {
+        builder = builder.root(p);
+    }
+    if let Some(v) = opts.get("user") {
+        builder = builder.user(v);
+    }
+    if let Some(v) = opts.get("key") {
+        builder = builder.key(v);
+    }
+    if let Some(v) = opts.get("known_hosts_strategy") {
+        builder = builder.known_hosts_strategy(v);
+    }
+    // SFTP uses SSH transport (no TLS layer needed).
+    Ok(Operator::new(builder)?.finish())
 }
