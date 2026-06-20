@@ -50,25 +50,30 @@ fn encode_volume_id(storage_url: &str) -> String {
 
 /// Decode a volume ID back to a storage URL (exact inverse of encode).
 fn decode_volume_id(volume_id: &str) -> String {
-    let mut out = String::with_capacity(volume_id.len());
+    let mut bytes = Vec::new();
     let mut chars = volume_id.chars();
     while let Some(c) = chars.next() {
         if c == '_' {
             let hex: String = chars.by_ref().take(2).collect();
             if hex.len() == 2 {
                 if let Ok(b) = u8::from_str_radix(&hex, 16) {
-                    out.push(b as char);
+                    bytes.push(b);
                     continue;
                 }
             }
             // Malformed or incomplete escape — pass through literally
-            out.push('_');
-            out.push_str(&hex);
+            bytes.push(b'_');
+            bytes.extend_from_slice(hex.as_bytes());
         } else {
-            out.push(c);
+            let mut buf = [0u8; 4];
+            let s = c.encode_utf8(&mut buf);
+            bytes.extend_from_slice(s.as_bytes());
         }
     }
-    out
+    match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    }
 }
 
 // ============================================================
