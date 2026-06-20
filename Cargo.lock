@@ -2220,6 +2220,7 @@ checksum = "96c9c85ce253ff87225e7669979d877a20c98a06604ec9d6dd5f4473e08f1ae1"
 dependencies = [
  "ctor",
  "opendal-core",
+ "opendal-layer-capability-check",
  "opendal-layer-concurrent-limit",
  "opendal-layer-logging",
  "opendal-layer-retry",
@@ -2267,6 +2268,15 @@ dependencies = [
  "url",
  "uuid",
  "web-time",
+]
+
+[[package]]
+name = "opendal-layer-capability-check"
+version = "0.57.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70b6dfeaf60e56f5660dc8cea90326445e913f81d0a96a0b17a3eb80702df649"
+dependencies = [
+ "opendal-core",
 ]
 
 [[package]]
