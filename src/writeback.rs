@@ -244,11 +244,26 @@ pub fn spawn(
                         let write_result: Result<
                             Result<(), opendal::Error>,
                             tokio::time::error::Elapsed,
-                        > = if data.len() > 5 * 1024 * 1024 {
+                        > = if data.len() > 200 * 1024 * 1024 {
+                            // Issue #46 + #73: multipart
+                            // upload for large files.
+                            // Threshold 200 MiB matches rclone
+                            // (avoids multipart overhead for
+                            // mid-size files where a single
+                            // PutObject is faster). Parts are
+                            // uploaded concurrently per-file
+                            // (chunk(5 MiB) = S3 minimum,
+                            // concurrent(2) keeps global HTTP
+                            // in-flight at ~UPLOAD_SEM*2 = 8
+                            // even with all permits busy).
                             let path = remote.clone();
                             let data_clone = data.clone();
                             tokio::time::timeout(Duration::from_secs(120), async move {
-                                let mut w = op_for_multipart.writer(&path).await?;
+                                let mut w = op_for_multipart
+                                    .writer_with(&path)
+                                    .chunk(5 * 1024 * 1024)
+                                    .concurrent(2)
+                                    .await?;
                                 w.write(data_clone).await?;
                                 w.close().await.map(|_| ())
                             })
