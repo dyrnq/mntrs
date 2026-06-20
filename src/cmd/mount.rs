@@ -708,7 +708,7 @@ pub fn mount(
         path_to_ino: dashmap::DashMap::new(),
         lookup_count: dashmap::DashMap::new(),
         dir_cache: dashmap::DashMap::new(),
-        cache_dir: cache_dir_path,
+        cache_dir: cache_dir_path.clone(),
         handles: dashmap::DashMap::new(),
         // Issue #23: per-fh readdir snapshots. Empty
         // until opendir() populates an entry.
@@ -774,10 +774,20 @@ pub fn mount(
         #[cfg(not(windows))]
         fuse_notifier: std::sync::OnceLock::new(),
 
-        mem_cache,
+        mem_cache: mem_cache.clone(),
         attr_cache: dashmap::DashMap::new(),
         disk_cache_index: std::sync::Arc::new(dashmap::DashMap::new()),
         storage_class: storage_class.map(|s| s.to_string()),
+        multi_cache: {
+            let idx = std::sync::Arc::new(dashmap::DashMap::new());
+            crate::multi_level_cache::MultiLevelCache::new(
+                mem_cache.clone(),
+                cache_dir_path.clone(),
+                idx,
+                direct_io,
+                crate::metrics::global(),
+            )
+        },
     };
     tracing::debug!(
         elapsed_ms = _t_mount.elapsed().as_millis() as u64,

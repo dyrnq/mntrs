@@ -13,8 +13,6 @@ pub mod fuse_error;
 pub mod http_client;
 pub mod mem_limiter;
 pub mod metrics;
-// multi_level_cache: added for issue #127; allow dead_code until integration.
-#[allow(dead_code)]
 pub(crate) mod multi_level_cache;
 pub mod path;
 pub mod prefetcher;
@@ -27,7 +25,7 @@ pub use util::*;
 pub use block_format::load_cache_index;
 // Re-export block_format pub(crate) items within crate.
 pub(crate) use block_format::{
-    BLOCK_OVERHEAD, drop_block_cache_for_path, read_block_cached, remove_block_cache_files,
+    BLOCK_OVERHEAD, drop_block_cache_for_path, remove_block_cache_files,
 };
 // Re-export disk_write_pool items used in lib.rs and cmd/.
 pub(crate) use disk_write_pool::{
@@ -497,6 +495,11 @@ pub struct MntrsFs {
     /// at the `Arc` level).
     pub(crate) disk_cache_index: Arc<dashmap::DashMap<CacheKey, (u64, std::time::Instant)>>,
     pub(crate) storage_class: Option<String>,
+    /// Multi-level cache (L1 memory → L2 disk block). Unifies the
+    /// block-level read path: `read_block` checks L1 first, then L2
+    /// (with L1 backfill on L2 hit). `populate` backfills both levels
+    /// after a remote fetch. `invalidate` drops both levels on write.
+    pub(crate) multi_cache: crate::multi_level_cache::MultiLevelCache,
 }
 
 impl MntrsFs {
@@ -1009,56 +1012,6 @@ impl MntrsFs {
         // Same reverse-map maintenance as `alloc_ino`.
         self.path_to_ino.insert(path.to_string(), ino);
         ino
-    }
-
-    /// Drop every block-level disk cache entry for `path`
-    /// (issue #52). Used by setattr truncate and the
-    /// write path after the file-level cache is updated.
-    ///
-    /// Walks the `disk_cache_index` and removes every
-    /// entry whose path matches, then unlinks the
-    /// corresponding `.block` file on disk. The
-    /// block-level cache's mem_cache is dropped
-    /// separately via `mem_cache.invalidate_ino` by
-    /// the caller — this helper only handles the
-    /// disk side.
-    ///
-    /// Without this, a file that was cold-read into
-    /// the block cache, then truncated + written,
-    /// could still serve pre-truncate bytes from the
-    /// block cache after the file-level cache is
-    /// LRU-evicted (issue #52's exact repro).
-    fn invalidate_block_cache_for_path(&self, path: &str) {
-        // Collect matching keys, then remove. DashMap's
-        // `retain` is per-shard, but we want path-based
-        // filtering across all shards, so the two-step
-        // collect-then-remove is clearer than nesting
-        // an .iter().filter() in a `remove_if` lambda.
-        //
-        // Only remove block-level entries (block_idx =
-        // Some(_)). The file-level entry (block_idx =
-        // None) is the whole-file cache written by the
-        // write handler via cache_fd — removing it here
-        // would destroy the cache file we just wrote to,
-        // forcing every subsequent read to fall through
-        // to the remote fetch path (which returns stale
-        // data when the backend only has the per-write
-        // chunk, not the full file).
-        let to_remove: Vec<(String, Option<u64>)> = self
-            .disk_cache_index
-            .iter()
-            .filter(|entry| entry.key().0 == path && entry.key().1.is_some())
-            .map(|entry| entry.key().clone())
-            .collect();
-        for key in to_remove {
-            let (p, block_idx) = (&key.0, key.1);
-            let blk_path = match block_idx {
-                Some(idx) => crate::cache_block_path(&self.cache_dir, p, idx),
-                None => crate::cache_path(&self.cache_dir, p),
-            };
-            let _ = std::fs::remove_file(&blk_path);
-            self.disk_cache_index.remove(&key);
-        }
     }
 
     /// Look up the ino currently registered for `path`.
@@ -2168,34 +2121,19 @@ impl CoreFilesystem for MntrsFs {
                         }
                     }
                 } // close if user_initiated_truncate
-                // Bug 29: invalidate mem_cache after the
-                // truncate. Pre-fix the write path called
-                // `mem_cache.invalidate_ino(ino)` on
-                // every write but setattr did not — so a
-                // file whose blocks were already in
-                // mem_cache (e.g. a complete cat right
-                // before the truncate) would still serve
-                // those pre-truncate blocks to subsequent
-                // reads, returning stale bytes from the
-                // truncated region instead of EOF. The
-                // read path's `b[start..end].min(b.len())`
-                // hides the bug from a quick `cat` but
-                // surfaces clearly on `dd skip=10`
-                // (reads past the new EOF).
-                self.mem_cache.invalidate_ino(ino);
-                // Issue #52: also invalidate the
-                // block-level disk cache. Pre-fix this
-                // path only touched mem_cache + the
-                // file-level cache — any .block files
-                // already on disk (populated by a prior
-                // cold read) would still serve
-                // pre-truncate bytes to subsequent
-                // reads if the file-level cache was
-                // LRU-evicted. The block cache's
-                // mem_cache is dropped above; the
-                // disk index + on-disk .block files
-                // need an explicit sweep.
-                self.invalidate_block_cache_for_path(&_p);
+                // Bug 29 + Issue #52: unified L1 + L2
+                // invalidation after truncate (issue #127).
+                // Pre-fix the write path called
+                // `mem_cache.invalidate_ino(ino)` on every
+                // write but setattr did not — so a file
+                // whose blocks were already cached would
+                // serve pre-truncate bytes to subsequent
+                // reads. Also sweeps the block-level disk
+                // cache (.block files populated by a prior
+                // cold read would otherwise serve stale
+                // bytes if the file-level cache was
+                // LRU-evicted).
+                self.multi_cache.invalidate(&_p, ino);
             }
             // Issue #89 Option B follow-up: when setattr is
             // kernel-driven (fh=None) — e.g. the O_TRUNC open
@@ -2428,28 +2366,19 @@ impl CoreFilesystem for MntrsFs {
             }
         }
 
-        // 2. mem_cache fast path
-        if let Some(data) = self.mem_cache.get(ino, block_idx) {
-            // mem_cache stores data aligned to CACHE_BLOCK_SIZE
-            // boundaries — entry (ino, block_idx) covers file
-            // bytes `[block_idx * CACHE_BLOCK_SIZE,
+        // 2. Multi-level cache (L1 → L2 block)
+        // Replaces the previous separate L1 mem_cache check
+        // (step 2) and L2 block cache check (step 5). The
+        // MultiLevelCache checks L1 first, then L2 (with L1
+        // backfill on L2 hit), and records per-level metrics.
+        if let Some(data) = self.multi_cache.read_block(&path, ino, block_idx) {
+            // Data is aligned to CACHE_BLOCK_SIZE boundaries —
+            // entry (ino, block_idx) covers file bytes
+            // `[block_idx * CACHE_BLOCK_SIZE,
             // (block_idx+1) * CACHE_BLOCK_SIZE)`. The slice
-            // `data` itself starts at the block boundary, NOT at
-            // the original read offset, so we must compute
-            // `start` relative to the block (not the file).
-            //
-            // Pre-fix: `start = offset` was used, which works
-            // when `offset == block_idx * CACHE_BLOCK_SIZE`
-            // (start = 0) but returns empty for any read at a
-            // non-zero intra-block offset because `start ==
-            // data.len()`. The bug was masked when read_chunk_size
-            // was small (each fetch = 1 block, so the kernel
-            // never asked for a non-zero intra-block offset on
-            // the cached block), but surfaces when read_chunk_size
-            // >= CACHE_BLOCK_SIZE: the first fetch populates
-            // mem_cache with 16 MiB, then a 256 KiB read at
-            // offset 8 MiB (the block boundary) hits mem_cache
-            // and returns empty.
+            // `data` starts at the block boundary, NOT at the
+            // original read offset, so compute `start` relative
+            // to the block (not the file).
             let block_start = block_idx * CACHE_BLOCK_SIZE;
             let start = (offset - block_start) as usize;
             let end = (start + size as usize).min(data.len());
@@ -2575,45 +2504,6 @@ impl CoreFilesystem for MntrsFs {
                     );
                 }
             }
-            // 5. Block-level disk cache
-            let cpath = crate::cache_block_path(&self.cache_dir, &path, block_idx);
-            if cpath.exists()
-                // Bug C fix: use the CRC-aware reader instead
-                // of plain `std::fs::read`. `read_block_cached`
-                // returns `None` on a corrupt block (CRC
-                // mismatch or size out-of-range), in which case
-                // we fall through to the remote-fetch path.
-                // The pre-fix code would have returned the
-                // (possibly truncated) `data` to the caller
-                // and *populated `mem_cache` with it* — silent
-                // data corruption.
-                && let Some(b) = read_block_cached(&cpath, &path)
-            {
-                // Bug B fix (block-level): same LRU sort key
-                // bump as for the file-level hit. With block
-                // entries now in `disk_cache_index` (Bug A
-                // fix), this is the difference between "LRU
-                // sees a recent read on a hot block" and
-                // "evictor mistakes it for cold".
-                bump_in_memory_atime(&self.disk_cache_index, &(path.clone(), Some(block_idx)));
-                // read_block_cached returns the 8 MiB block
-                // (CRC trailer stripped). The block covers
-                // file bytes [block_idx * CACHE_BLOCK_SIZE,
-                // (block_idx+1) * CACHE_BLOCK_SIZE), so
-                // `start` must be offset-relative to the
-                // block, not the file. (Same shape of bug as
-                // the mem_cache fix above.)
-                let block_start = block_idx * CACHE_BLOCK_SIZE;
-                let start = (offset - block_start) as usize;
-                let end = (start + size as usize).min(b.len());
-                let result = if start < b.len() {
-                    b[start..end].to_vec()
-                } else {
-                    vec![]
-                };
-                self.mem_cache.put(ino, offset / CACHE_BLOCK_SIZE, b);
-                return Ok(result);
-            }
         }
 
         // 6. Remote fetch with adaptive hard cap and 8 MiB block
@@ -2724,12 +2614,12 @@ impl CoreFilesystem for MntrsFs {
         };
         let len = (b.len() as u32).min(size) as usize;
         let result = b[..len].to_vec();
-        // Populate mem_cache for ALL blocks covered by this fetch,
-        // not just the first one. Without this, a 16 MiB fetch
-        // would store the entire 16 MiB under one (ino, block_idx)
-        // key, evicting anything else in cache and forcing the
-        // next read on a neighbouring block to re-fetch from
-        // remote. Bytes::slice is zero-copy.
+        // Populate L1 (mem_cache) for ALL blocks covered by this
+        // fetch, not just the first one. Without this, a 16 MiB
+        // fetch would store the entire 16 MiB under one
+        // (ino, block_idx) key, evicting anything else in cache
+        // and forcing the next read on a neighbouring block to
+        // re-fetch from remote. Bytes::slice is zero-copy.
         let first_blk = offset / CACHE_BLOCK_SIZE;
         let n_blks = (b.len() as u64).div_ceil(CACHE_BLOCK_SIZE);
         for i in 0..n_blks {
@@ -3084,22 +2974,15 @@ impl CoreFilesystem for MntrsFs {
         // ("append to pre-existing file") would intermittently see
         // truncated content.
         //
-        // We use `retain` to drop every block_idx for this ino in
-        // one pass, because a single write can span multiple
-        // CACHE_BLOCK_SIZE-aligned blocks and we don't track exactly
-        // which ones. The cost is O(mem_cache size for this shard);
-        // mem_cache uses DashMap so shards are independent and the
-        // retain only locks the affected shard(s).
-        self.mem_cache.invalidate_ino(_ino);
-        // Issue #52: also sweep the block-level disk
-        // cache for this path. The write above
-        // changes the file's content, so any .block
-        // files populated by a prior cold read would
-        // now be stale. Without this, a read after
-        // the file-level cache is LRU-evicted would
-        // hit the block cache and return pre-write
-        // bytes.
-        self.invalidate_block_cache_for_path(&path);
+        // Unified L1 + L2 invalidation via multi_cache
+        // (issue #127). Drops every block_idx for this
+        // ino in L1 (mem_cache) and all block-level .block
+        // files for this path in L2 (disk cache). This
+        // replaces the previous two separate calls
+        // (mem_cache.invalidate_ino + invalidate_block_
+        // cache_for_path) with a single multi_cache call
+        // that handles both levels atomically.
+        self.multi_cache.invalidate(&path, _ino);
 
         // #17 (small-write hot-path): pre-fix did a
         // full `handles.insert(fh, Write { path: ...,
@@ -4181,7 +4064,7 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         path_to_ino: Default::default(),
         lookup_count: Default::default(),
         dir_cache: Default::default(),
-        cache_dir,
+        cache_dir: cache_dir.clone(),
         handles: Default::default(),
         // Issue #23: per-fh readdir snapshots. Empty
         // until opendir() populates an entry.
@@ -4240,5 +4123,17 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         attr_cache: Default::default(),
         disk_cache_index: Arc::new(dashmap::DashMap::new()),
         storage_class: None,
+        multi_cache: {
+            let mc: std::sync::Arc<dyn crate::cache::MemCache> =
+                std::sync::Arc::new(crate::cache::DashMapMemCache::new(0));
+            let idx = Arc::new(dashmap::DashMap::new());
+            crate::multi_level_cache::MultiLevelCache::new(
+                mc,
+                cache_dir.clone(),
+                idx,
+                false,
+                crate::metrics::global(),
+            )
+        },
     }
 }
