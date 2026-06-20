@@ -8,8 +8,7 @@ use opendal::layers::{CapabilityCheckLayer, ConcurrentLimitLayer, RetryLayer, Ti
 #[cfg(feature = "sftp")]
 use opendal::services::Sftp;
 use opendal::services::{
-    AliyunDrive, Azblob, B2, Cos, Fs, Gcs, HdfsNative, Memory, Obs, Oss, S3, VercelBlob,
-    Webdav,
+    AliyunDrive, Azblob, B2, Cos, Fs, Gcs, HdfsNative, Memory, Obs, Oss, S3, VercelBlob, Webdav,
 };
 use std::collections::HashMap;
 use std::fs::{self, File};
