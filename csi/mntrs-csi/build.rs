@@ -20,7 +20,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("failed to run protoc");
     eprintln!("mntrs-csi build.rs: protoc --version exit={status}");
 
-    tonic_build::compile_protos("../proto/csi.proto")?;
+    // tonic-build 0.14: prost integration moved to
+    // tonic-prost-build. compile_protos lives there now.
+    tonic_prost_build::compile_protos("../proto/csi.proto")?;
     eprintln!("mntrs-csi build.rs: compile_protos done");
 
     // List output files
