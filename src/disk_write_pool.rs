@@ -694,3 +694,105 @@ pub(crate) fn submit_block_cache_write(
     };
     submit_disk_write(Some(job));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_dir(label: &str) -> std::path::PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("mntrs-dwp-test-{}-{}", label, std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn execute_block_cache_mode_writes_file() {
+        let dir = scratch_dir("blk");
+        let blk_path = dir.join("test.block");
+        let job = DiskWriteJob {
+            cache_fd: None,
+            cache_path: None,
+            remote_path: "remote/path.bin".into(),
+            offset: 0,
+            data: vec![0xAB; 4096],
+            block_cache: Some(blk_path.clone()),
+        };
+        job.execute();
+        assert!(blk_path.exists(), "block file should be created");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn execute_cache_path_mode_writes_and_registers_dirty() {
+        let dir = scratch_dir("cp");
+        let cpath = dir.join("cache-file.bin");
+        let job = DiskWriteJob {
+            cache_fd: None,
+            cache_path: Some(cpath.clone()),
+            remote_path: "remote/cp.bin".into(),
+            offset: 0,
+            data: b"cache path data".to_vec(),
+            block_cache: None,
+        };
+        job.execute();
+        assert!(cpath.exists(), "cache file should exist");
+        assert_eq!(std::fs::read(&cpath).unwrap(), b"cache path data");
+        assert!(DIRTY_CACHE_PATHS.contains(&cpath));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn execute_cache_path_mode_appends_at_offset() {
+        let dir = scratch_dir("cpoff");
+        let cpath = dir.join("offset.bin");
+        std::fs::write(&cpath, b"aaaaaaaaaa").unwrap();
+        let job = DiskWriteJob {
+            cache_fd: None,
+            cache_path: Some(cpath.clone()),
+            remote_path: "offset.bin".into(),
+            offset: 10,
+            data: b"bbbbbbbbbb".to_vec(),
+            block_cache: None,
+        };
+        job.execute();
+        assert_eq!(std::fs::read(&cpath).unwrap(), b"aaaaaaaaaabbbbbbbbbb");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn execute_cache_fd_mode_writes_via_fd() {
+        let dir = scratch_dir("fd");
+        let cpath = dir.join("fd-cache.bin");
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&cpath)
+            .unwrap();
+        let f = Arc::new(std::sync::Mutex::new(f));
+        let job = DiskWriteJob {
+            cache_fd: Some(f),
+            cache_path: Some(cpath.clone()),
+            remote_path: "fd.bin".into(),
+            offset: 0,
+            data: b"fd data".to_vec(),
+            block_cache: None,
+        };
+        job.execute();
+        assert_eq!(std::fs::read(&cpath).unwrap(), b"fd data");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn register_dirty_idempotent() {
+        let p = std::path::PathBuf::from("/tmp/mntrs-test-dirty-xxx");
+        register_dirty_cache_path(&p);
+        assert!(DIRTY_CACHE_PATHS.contains(&p));
+        let before = DIRTY_CACHE_PATHS.len();
+        register_dirty_cache_path(&p);
+        assert_eq!(DIRTY_CACHE_PATHS.len(), before);
+        DIRTY_CACHE_PATHS.remove(&p);
+    }
+}
