@@ -41,6 +41,12 @@ jobs:
       - name: Unit tests (lib only)
         run: cargo test --lib --package mntrs
 
+      - name: Core FS unit tests
+        run: cargo test --package mntrs --test core_fs_unit_test
+
+      - name: Platform tests
+        run: cargo test --package mntrs --test platform_test
+
       # FUSE mount test skipped: GitHub Actions Windows runner cannot
       # load kernel drivers. WinFSP requires a system reboot after install.
       # Build + clippy + unit tests still provide good coverage.

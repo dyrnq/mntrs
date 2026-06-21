@@ -49,6 +49,12 @@ jobs:
       - name: Unit tests (lib only)
         run: cargo test --workspace --lib
 
+      - name: Core FS unit tests
+        run: cargo test --workspace --test core_fs_unit_test
+
+      - name: Platform tests
+        run: cargo test --workspace --test platform_test
+
       - name: Build release
         run: cargo build --release --package mntrs
 
