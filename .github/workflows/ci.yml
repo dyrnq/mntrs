@@ -76,6 +76,54 @@ jobs:
           path: /tmp/target-release.tar.gz
           retention-days: 1
 
+  # === Cross-platform: build + test on macOS and Windows ===
+  # These runners don't support FUSE kernel modules, so only pure-logic
+  # tests (memory backend, no mount) are run.  FUSE integration tests
+  # remain Linux-only (fuse_integration_test is cfg-gated).
+  cross-platform:
+    needs: []
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install FUSE (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install macfuse
+
+      - name: Install FUSE (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: powershell
+        run: choco install -y winfsp
+
+      - name: Build
+        run: cargo build --workspace --exclude mntrs-csi
+
+      - name: Build test binaries
+        run: cargo test --no-run --workspace --exclude mntrs-csi 2>/dev/null || true
+
+      - name: Test (lib)
+        run: cargo test --workspace --exclude mntrs-csi --lib
+
+      - name: Test (core_fs_unit)
+        run: cargo test --workspace --exclude mntrs-csi --test core_fs_unit_test
+
+      - name: Test (platform)
+        run: cargo test --workspace --exclude mntrs-csi --test platform_test
+
+      - name: Clippy
+        run: cargo clippy --workspace --exclude mntrs-csi --all-targets -- -D warnings
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
   # === Matrix: test / clippy / fmt / hdfs-jni / csi-sanity ===
   check:
     needs: build

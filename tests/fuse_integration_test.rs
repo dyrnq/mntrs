@@ -2,6 +2,10 @@
 //! Run with: MINIO_ENDPOINT=http://localhost:9000 cargo test --test fuse_integration_test
 //!
 //! These tests mount a real FUSE filesystem and verify read/write/stat operations.
+//!
+//! Linux-only: uses fusermount3 which isn't available on macOS/Windows CI runners.
+
+#![cfg(target_os = "linux")]
 
 use std::process::Command;
 use std::thread;
