@@ -75,13 +75,15 @@ echo "--- Mounting ---"
 echo "  $(date -Iseconds): preparing mount dirs..."
 mkdir -p "$MNTRS_MNT" "$RCLONE_MNT"
 
+MEM_CACHE_IMPL="${MEM_CACHE_IMPL:-dashmap}"
 # Write mount for mntrs (default: writes cache mode)
-echo "  $(date -Iseconds): starting mntrs mount..."
+echo "  $(date -Iseconds): starting mntrs mount (mem-cache-impl=$MEM_CACHE_IMPL)..."
 "$MNTRS_BIN" mount "s3://$BUCKET" "$MNTRS_MNT" \
     --opt "endpoint=$ENDPOINT" --opt "access-key=$ACCESS_KEY" \
     --opt "secret-key=$SECRET_KEY" --opt "region=$REGION" \
     --vfs-cache-mode=writes --vfs-write-back=5 \
     --vfs-read-ahead=134217728 --async-read \
+    --mem-cache-impl="$MEM_CACHE_IMPL" \
     --daemon --daemon-wait --daemon-timeout=15 2>&1
 echo "  $(date -Iseconds): mntrs mount returned (exit=$?)"
 
@@ -280,19 +282,7 @@ sleep 2
 bench "stat mem" "mem" stat "$MEM_MNT"
 echo "  (memory backend — for reference only)"
 
-# ---- Table ----
-python3 "$SCRIPT_DIR/render_table.py" "$RESULT_TMP"
-if [ -f /tmp/rclone-bench.log ]; then echo "=== rclone log ===" >> "$RESULT_TMP"; cat /tmp/rclone-bench.log >> "$RESULT_TMP"; fi
-rm -f "$RESULT_TMP"
-
-# ---- Summary ----
-echo ""
-ELAPSED=$(( $(date +%s) - START_TIME ))
-echo "============================================"
-printf " %d tests: %d passed, %d failed (%ds)\n" "$TOTAL" "$PASS" "$FAIL" "$ELAPSED"
-echo "============================================"
-
-# Additional read tests
+# Additional read tests (included in comparison table)
 echo ""
 echo "=== 12. Head/tail reads ==="
 CATEGORY="HeadTail"
@@ -384,3 +374,157 @@ echo "=== 20. Lseek ==="
 CATEGORY="Lseek"
 bench "lseek 100M" "mntrs" bash -c "exec 3<'$MNTRS_MNT/100M.bin'; dd bs=1 seek=1000 count=0 of=/dev/null 2>/dev/null <&3; exec 3>&-"
 bench "lseek 100M" "rclone" bash -c "exec 3<'$RCLONE_MNT/100M.bin'; dd bs=1 seek=1000 count=0 of=/dev/null 2>/dev/null <&3; exec 3>&-"
+
+# ---- Table ----
+python3 "$SCRIPT_DIR/render_table.py" "$RESULT_TMP"
+if [ -f /tmp/rclone-bench.log ]; then echo "=== rclone log ===" >> "$RESULT_TMP"; cat /tmp/rclone-bench.log >> "$RESULT_TMP"; fi
+rm -f "$RESULT_TMP"
+
+# ---- Summary ----
+echo ""
+ELAPSED=$(( $(date +%s) - START_TIME ))
+echo "============================================"
+printf " %d tests: %d passed, %d failed (%ds)\n" "$TOTAL" "$PASS" "$FAIL" "$ELAPSED"
+echo "============================================"
+
+# ============================================================
+# rm -rf multi-dimensional benchmarks (issue #134)
+# ============================================================
+_recreate_rm_data() {
+    local label="$1"
+    case "$label" in
+        single)
+            echo "single" > "$MNTRS_MNT/rmtest_single.txt" 2>/dev/null
+            echo "single" > "$RCLONE_MNT/rmtest_single.txt" 2>/dev/null ;;
+        empty_dir)
+            rmdir "$MNTRS_MNT/rmtest_empty" 2>/dev/null; mkdir -p "$MNTRS_MNT/rmtest_empty" 2>/dev/null
+            rmdir "$RCLONE_MNT/rmtest_empty" 2>/dev/null; mkdir -p "$RCLONE_MNT/rmtest_empty" 2>/dev/null ;;
+        small_10)
+            rm -rf "$MNTRS_MNT/rmtest_small_10" 2>/dev/null; mkdir -p "$MNTRS_MNT/rmtest_small_10"; rm -rf "$RCLONE_MNT/rmtest_small_10" 2>/dev/null; mkdir -p "$RCLONE_MNT/rmtest_small_10"; for i in $(seq 1 10); do echo "s$i" > "$MNTRS_MNT/rmtest_small_10/f_$i.txt"; echo "s$i" > "$RCLONE_MNT/rmtest_small_10/f_$i.txt"; done ;;
+        shallow_100)
+            rm -rf "$MNTRS_MNT/rmtest_shallow_100" 2>/dev/null; mkdir -p "$MNTRS_MNT/rmtest_shallow_100"; rm -rf "$RCLONE_MNT/rmtest_shallow_100" 2>/dev/null; mkdir -p "$RCLONE_MNT/rmtest_shallow_100"; for i in $(seq 1 100); do echo "sh100_$i" > "$MNTRS_MNT/rmtest_shallow_100/f_$(printf '%04d' "$i").txt"; echo "sh100_$i" > "$RCLONE_MNT/rmtest_shallow_100/f_$(printf '%04d' "$i").txt"; done ;;
+        shallow_500)
+            rm -rf "$MNTRS_MNT/rmtest_shallow_500" 2>/dev/null; mkdir -p "$MNTRS_MNT/rmtest_shallow_500"; rm -rf "$RCLONE_MNT/rmtest_shallow_500" 2>/dev/null; mkdir -p "$RCLONE_MNT/rmtest_shallow_500"; for i in $(seq 1 500); do echo "sh500_$i" > "$MNTRS_MNT/rmtest_shallow_500/f_$(printf '%04d' "$i").txt"; echo "sh500_$i" > "$RCLONE_MNT/rmtest_shallow_500/f_$(printf '%04d' "$i").txt"; done ;;
+        deep)
+            rm -rf "$MNTRS_MNT/rmtest_deep_3" 2>/dev/null; rm -rf "$RCLONE_MNT/rmtest_deep_3" 2>/dev/null
+            D="$MNTRS_MNT/rmtest_deep_3"; R="$RCLONE_MNT/rmtest_deep_3"
+            mkdir -p "$D/a/b/c" "$D/d/e/f" "$R/a/b/c" "$R/d/e/f" 2>/dev/null
+            for sub in "$D/a" "$D/a/b" "$D/a/b/c" "$D/d" "$D/d/e" "$D/d/e/f"; do for j in $(seq 1 10); do echo "deep_$j" > "$sub/f_$j.txt"; done; done
+            for sub in "$R/a" "$R/a/b" "$R/a/b/c" "$R/d" "$R/d/e" "$R/d/e/f"; do for j in $(seq 1 10); do echo "deep_$j" > "$sub/f_$j.txt"; done; done ;;
+        mixed)
+            rm -rf "$MNTRS_MNT/rmtest_mixed" 2>/dev/null; rm -rf "$RCLONE_MNT/rmtest_mixed" 2>/dev/null
+            mkdir -p "$MNTRS_MNT/rmtest_mixed" "$RCLONE_MNT/rmtest_mixed" 2>/dev/null
+            for i in $(seq 1 50); do dd if=/dev/urandom of="$MNTRS_MNT/rmtest_mixed/s_$(printf '%04d' "$i").bin" bs=4K count=1 2>/dev/null; dd if=/dev/urandom of="$RCLONE_MNT/rmtest_mixed/s_$(printf '%04d' "$i").bin" bs=4K count=1 2>/dev/null; done
+            dd if=/dev/urandom of="$MNTRS_MNT/rmtest_mixed/large_1.bin" bs=1M count=10 2>/dev/null; dd if=/dev/urandom of="$MNTRS_MNT/rmtest_mixed/large_2.bin" bs=1M count=5 2>/dev/null
+            dd if=/dev/urandom of="$RCLONE_MNT/rmtest_mixed/large_1.bin" bs=1M count=10 2>/dev/null; dd if=/dev/urandom of="$RCLONE_MNT/rmtest_mixed/large_2.bin" bs=1M count=5 2>/dev/null ;;
+        nested_empty)
+            rm -rf "$MNTRS_MNT/rmtest_nested_empty" 2>/dev/null; rm -rf "$RCLONE_MNT/rmtest_nested_empty" 2>/dev/null
+            mkdir -p "$MNTRS_MNT/rmtest_nested_empty/a/b/c" "$RCLONE_MNT/rmtest_nested_empty/a/b/c" ;;
+    esac; sync; sleep 1
+}
+
+echo ""; echo "=== 21. rm -rf: unlink baseline ==="; CATEGORY="RmRf"
+_recreate_rm_data single
+bench "rm single file" "mntrs" rm -f "$MNTRS_MNT/rmtest_single.txt"
+bench "rm single file" "rclone" rm -f "$RCLONE_MNT/rmtest_single.txt"
+
+echo ""; echo "=== 22. rm -rf: empty directory ==="; CATEGORY="RmRf"
+_recreate_rm_data empty_dir
+bench "rmdir empty" "mntrs" rmdir "$MNTRS_MNT/rmtest_empty"
+bench "rmdir empty" "rclone" rmdir "$RCLONE_MNT/rmtest_empty"
+_recreate_rm_data nested_empty
+bench "rm -rf nested_empty" "mntrs" rm -rf "$MNTRS_MNT/rmtest_nested_empty"
+bench "rm -rf nested_empty" "rclone" rm -rf "$RCLONE_MNT/rmtest_nested_empty"
+
+echo ""; echo "=== 23. rm -rf: small batch (10 files) ==="; CATEGORY="RmRf"
+_recreate_rm_data small_10
+bench "rm -rf 10 files" "mntrs" rm -rf "$MNTRS_MNT/rmtest_small_10"
+bench "rm -rf 10 files" "rclone" rm -rf "$RCLONE_MNT/rmtest_small_10"
+
+echo ""; echo "=== 24. rm -rf: shallow 100 files ==="; CATEGORY="RmRf"
+_recreate_rm_data shallow_100
+bench "rm -rf 100 files" "mntrs" rm -rf "$MNTRS_MNT/rmtest_shallow_100"
+bench "rm -rf 100 files" "rclone" rm -rf "$RCLONE_MNT/rmtest_shallow_100"
+
+echo ""; echo "=== 25. rm -rf: shallow 500 files ==="; CATEGORY="RmRf"
+_recreate_rm_data shallow_500
+bench "rm -rf 500 files" "mntrs" rm -rf "$MNTRS_MNT/rmtest_shallow_500"
+bench "rm -rf 500 files" "rclone" rm -rf "$RCLONE_MNT/rmtest_shallow_500"
+
+echo ""; echo "=== 26. rm -rf: 3-level deep directory tree ==="; CATEGORY="RmRf"
+_recreate_rm_data deep
+bench "rm -rf deep tree (60 files)" "mntrs" rm -rf "$MNTRS_MNT/rmtest_deep_3"
+bench "rm -rf deep tree (60 files)" "rclone" rm -rf "$RCLONE_MNT/rmtest_deep_3"
+
+echo ""; echo "=== 27. rm -rf: mixed small+large files (52 files, ~15M) ==="; CATEGORY="RmRf"
+_recreate_rm_data mixed
+bench "rm -rf mixed (52 files 15M)" "mntrs" rm -rf "$MNTRS_MNT/rmtest_mixed"
+bench "rm -rf mixed (52 files 15M)" "rclone" rm -rf "$RCLONE_MNT/rmtest_mixed"
+
+# ============================================================
+# Issue #134: coverage gaps (fsync, append, read-after-write, etc.)
+# ============================================================
+
+echo ""; echo "=== 28. fsync / fsyncdir ==="; CATEGORY="Fsync"
+echo "test" > "$MNTRS_MNT/fsync-test.txt" 2>/dev/null; echo "test" > "$RCLONE_MNT/fsync-test.txt" 2>/dev/null
+bench "dd conv=fsync 4K" "mntrs" dd if=/dev/zero of="$MNTRS_MNT/fsync-test.txt" bs=4K count=1 conv=fsync 2>/dev/null
+bench "dd conv=fsync 4K" "rclone" dd if=/dev/zero of="$RCLONE_MNT/fsync-test.txt" bs=4K count=1 conv=fsync 2>/dev/null
+rm -f "$MNTRS_MNT/fsync-test.txt" "$RCLONE_MNT/fsync-test.txt" 2>/dev/null
+
+echo ""; echo "=== 29. Read-after-write same fd ==="; CATEGORY="ReadAfterWrite"
+bench "write+read same fd" "mntrs" bash -c "exec 3<>'$MNTRS_MNT/raw-test.bin'; printf 'hello world' >&3; dd bs=11 count=1 <&3 2>/dev/null; exec 3>&-; rm -f '$MNTRS_MNT/raw-test.bin'"
+bench "write+read same fd" "rclone" bash -c "exec 3<>'$RCLONE_MNT/raw-test.bin'; printf 'hello world' >&3; dd bs=11 count=1 <&3 2>/dev/null; exec 3>&-; rm -f '$RCLONE_MNT/raw-test.bin'"
+echo "hello" > "$MNTRS_MNT/raw-sep.txt" 2>/dev/null; bench "echo+cat sep" "mntrs" cat "$MNTRS_MNT/raw-sep.txt" >/dev/null; rm -f "$MNTRS_MNT/raw-sep.txt"
+echo "hello" > "$RCLONE_MNT/raw-sep.txt" 2>/dev/null; bench "echo+cat sep" "rclone" cat "$RCLONE_MNT/raw-sep.txt" >/dev/null; rm -f "$RCLONE_MNT/raw-sep.txt"
+
+echo ""; echo "=== 30. O_APPEND append ==="; CATEGORY="Append"
+bench "append x3 mntrs" "mntrs" bash -c "echo line1 > '$MNTRS_MNT/append-x3.txt'; echo line2 >> '$MNTRS_MNT/append-x3.txt'; echo line3 >> '$MNTRS_MNT/append-x3.txt'; wc -l < '$MNTRS_MNT/append-x3.txt' | grep -q 3; rm -f '$MNTRS_MNT/append-x3.txt'"
+bench "append x3 rclone" "rclone" bash -c "echo line1 > '$RCLONE_MNT/append-x3.txt'; echo line2 >> '$RCLONE_MNT/append-x3.txt'; echo line3 >> '$RCLONE_MNT/append-x3.txt'; wc -l < '$RCLONE_MNT/append-x3.txt' | grep -q 3; rm -f '$RCLONE_MNT/append-x3.txt'"
+
+echo ""; echo "=== 31. handle_caching: open/read/close loop ==="; CATEGORY="HandleCaching"
+dd if=/dev/urandom of="$MNTRS_MNT/hc-file.bin" bs=64K count=1 2>/dev/null; dd if=/dev/urandom of="$RCLONE_MNT/hc-file.bin" bs=64K count=1 2>/dev/null
+bench "open/read/close x50" "mntrs" bash -c "for i in \$(seq 1 50); do dd if='$MNTRS_MNT/hc-file.bin' bs=4K count=1 of=/dev/null 2>/dev/null; done"
+bench "open/read/close x50" "rclone" bash -c "for i in \$(seq 1 50); do dd if='$RCLONE_MNT/hc-file.bin' bs=4K count=1 of=/dev/null 2>/dev/null; done"
+rm -f "$MNTRS_MNT/hc-file.bin" "$RCLONE_MNT/hc-file.bin" 2>/dev/null
+
+echo ""; echo "=== 32. openat / fd reuse ==="; CATEGORY="FdReuse"
+echo "seeded" > "$MNTRS_MNT/fd-test.txt" 2>/dev/null; echo "seeded" > "$RCLONE_MNT/fd-test.txt" 2>/dev/null
+bench "openat write+cat" "mntrs" bash -c "exec 3<>'$MNTRS_MNT/fd-test.txt'; echo appended >&3; exec 3>&-; cat '$MNTRS_MNT/fd-test.txt' >/dev/null; rm -f '$MNTRS_MNT/fd-test.txt'"
+bench "openat write+cat" "rclone" bash -c "exec 3<>'$RCLONE_MNT/fd-test.txt'; echo appended >&3; exec 3>&-; cat '$RCLONE_MNT/fd-test.txt' >/dev/null; rm -f '$RCLONE_MNT/fd-test.txt'"
+
+echo ""; echo "=== 33. Concurrent writes (4 threads, 4 files) ==="; CATEGORY="ConcurrentWrite"
+bench "concurrent write x4" "mntrs" bash -c "for n in 1 2 3 4; do dd if=/dev/zero of='$MNTRS_MNT/cw-\$n.bin' bs=64K count=16 2>/dev/null & done; wait; for n in 1 2 3 4; do rm -f '$MNTRS_MNT/cw-\$n.bin'; done"
+bench "concurrent write x4" "rclone" bash -c "for n in 1 2 3 4; do dd if=/dev/zero of='$RCLONE_MNT/cw-\$n.bin' bs=64K count=16 2>/dev/null & done; wait; for n in 1 2 3 4; do rm -f '$RCLONE_MNT/cw-\$n.bin'; done"
+
+echo ""; echo "=== 34. Writeback persistence (write -> unmount -> remount -> read) ==="; CATEGORY="WritebackPersistence"
+echo "persistence-test-data-$(date +%s)" > "$MNTRS_MNT/wb-persist.txt" 2>/dev/null
+EXPECTED=$(cat "$MNTRS_MNT/wb-persist.txt" 2>/dev/null)
+sync; sleep 2
+fusermount3 -u "$MNTRS_MNT" 2>/dev/null; sleep 1
+"$MNTRS_BIN" mount "s3://$BUCKET" "$MNTRS_MNT" --opt "endpoint=$ENDPOINT" --opt "access-key=$ACCESS_KEY" --opt "secret-key=$SECRET_KEY" --opt "region=$REGION" --vfs-cache-mode=writes --vfs-write-back=5 --daemon --daemon-wait --daemon-timeout=15 2>/dev/null
+sleep 3
+ACTUAL=$(cat "$MNTRS_MNT/wb-persist.txt" 2>/dev/null)
+if [ "$EXPECTED" = "$ACTUAL" ] && [ -n "$EXPECTED" ]; then bench "wb persist mntrs" "mntrs" true
+else echo "  wb persist mntrs: FAIL (expected='$EXPECTED' actual='$ACTUAL')"; echo "FAIL|wb persist mntrs|mntrs|WritebackPersistence" >> "$RESULT_TMP"; FAIL=$((FAIL + 1)); TOTAL=$((TOTAL + 1)); fi
+rm -f "$MNTRS_MNT/wb-persist.txt" 2>/dev/null
+
+echo ""; echo "=== 35. Prefetcher warm cache (read 10M twice) ==="; CATEGORY="Prefetcher"
+dd if=/dev/urandom of="$MNTRS_MNT/prefetch-10M.bin" bs=1M count=10 2>/dev/null; dd if=/dev/urandom of="$RCLONE_MNT/prefetch-10M.bin" bs=1M count=10 2>/dev/null; sync; sleep 2
+bench "prefetch 1st read" "mntrs" dd if="$MNTRS_MNT/prefetch-10M.bin" bs=64K of=/dev/null 2>/dev/null
+bench "prefetch 1st read" "rclone" dd if="$RCLONE_MNT/prefetch-10M.bin" bs=64K of=/dev/null 2>/dev/null
+bench "prefetch 2nd read" "mntrs" dd if="$MNTRS_MNT/prefetch-10M.bin" bs=64K of=/dev/null 2>/dev/null
+bench "prefetch 2nd read" "rclone" dd if="$RCLONE_MNT/prefetch-10M.bin" bs=64K of=/dev/null 2>/dev/null
+rm -f "$MNTRS_MNT/prefetch-10M.bin" "$RCLONE_MNT/prefetch-10M.bin" 2>/dev/null
+
+echo ""; echo "=== 36. mkdir -p deep 5 levels ==="; CATEGORY="MkdirDeep"
+bench "mkdir -p a/b/c/d/e" "mntrs" mkdir -p "$MNTRS_MNT/mkdirp-deep/a/b/c/d/e" 2>/dev/null
+bench "mkdir -p a/b/c/d/e" "rclone" mkdir -p "$RCLONE_MNT/mkdirp-deep/a/b/c/d/e" 2>/dev/null
+rm -rf "$MNTRS_MNT/mkdirp-deep" "$RCLONE_MNT/mkdirp-deep" 2>/dev/null
+
+echo ""; echo "=== 37. Bulk stat (100 files) ==="; CATEGORY="BulkStat"
+mkdir -p "$MNTRS_MNT/bulkstat" "$RCLONE_MNT/bulkstat" 2>/dev/null
+for i in $(seq 1 100); do echo "bs_$i" > "$MNTRS_MNT/bulkstat/f_$i.txt"; echo "bs_$i" > "$RCLONE_MNT/bulkstat/f_$i.txt"; done
+sync; sleep 1
+bench "stat x100" "mntrs" bash -c "for f in '$MNTRS_MNT'/bulkstat/f_*.txt; do stat \$f >/dev/null 2>&1; done"
+bench "stat x100" "rclone" bash -c "for f in '$RCLONE_MNT'/bulkstat/f_*.txt; do stat \$f >/dev/null 2>&1; done"
+rm -rf "$MNTRS_MNT/bulkstat" "$RCLONE_MNT/bulkstat" 2>/dev/null
