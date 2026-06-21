@@ -118,6 +118,11 @@ jobs:
       - name: Test (platform)
         run: cargo test --workspace --exclude mntrs-csi --test platform_test
 
+      - name: Test (winfsp — Windows only)
+        if: matrix.os == 'windows-latest'
+        shell: powershell
+        run: cargo test --workspace --exclude mntrs-csi --test winfsp_integration_test
+
       - name: Clippy
         run: cargo clippy --workspace --exclude mntrs-csi --all-targets -- -D warnings
 
