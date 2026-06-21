@@ -355,3 +355,307 @@ pub fn detect_cgroup_memory_limit() -> Option<u64> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    // ── fnmatch ────────────────────────────────────────────────────
+
+    #[test]
+    fn fnmatch_exact() {
+        assert!(fnmatch("hello.txt", "hello.txt", false));
+        assert!(!fnmatch("hello.txt", "hello.tx", false));
+    }
+
+    #[test]
+    fn fnmatch_star_prefix() {
+        assert!(fnmatch("*.txt", "hello.txt", false));
+        assert!(!fnmatch("*.txt", "hello.bin", false));
+    }
+
+    #[test]
+    fn fnmatch_star_suffix() {
+        assert!(fnmatch("hello.*", "hello.txt", false));
+        assert!(fnmatch("hello.*", "hello.", false));
+        // * is greedy — "hello.*" matches "hello.txt.bak" because
+        // * consumes "txt.bak" (any sequence of characters).
+        // To assert single-extension, use a different pattern.
+        assert!(fnmatch("hello.*", "hello.txt.bak", false));
+    }
+
+    #[test]
+    fn fnmatch_star_middle() {
+        assert!(fnmatch("a*c", "abc", false));
+        assert!(fnmatch("a*c", "ac", false));
+        assert!(fnmatch("a*c", "axxxxxc", false));
+        assert!(!fnmatch("a*c", "acb", false));
+    }
+
+    #[test]
+    fn fnmatch_multi_star() {
+        assert!(fnmatch("a*b*c", "axbyc", false));
+        assert!(fnmatch("*a*b*", "xyzabq", false));
+    }
+
+    #[test]
+    fn fnmatch_question_mark() {
+        assert!(fnmatch("h?llo", "hello", false));
+        assert!(fnmatch("h??lo", "hello", false));
+        assert!(!fnmatch("h?llo", "hllo", false));
+        assert!(!fnmatch("h?llo", "heello", false));
+    }
+
+    #[test]
+    fn fnmatch_star_and_question() {
+        assert!(fnmatch("*.?xt", "hello.txt", false));
+        assert!(!fnmatch("*.?xt", "hello.tx", false));
+    }
+
+    #[test]
+    fn fnmatch_empty_pattern() {
+        assert!(fnmatch("", "", false));
+        assert!(!fnmatch("", "a", false));
+    }
+
+    #[test]
+    fn fnmatch_empty_name() {
+        assert!(!fnmatch("a", "", false));
+        assert!(fnmatch("*", "", false));
+    }
+
+    #[test]
+    fn fnmatch_case_insensitive() {
+        assert!(fnmatch("HELLO", "hello", true));
+        assert!(fnmatch("*.TXT", "hello.txt", true));
+        assert!(fnmatch("A?C", "abc", true));
+        assert!(!fnmatch("A?C", "abd", true));
+    }
+
+    #[test]
+    fn fnmatch_no_star_exact_required() {
+        assert!(!fnmatch("abc", "abcd", false));
+        assert!(!fnmatch("abc", "ab", false));
+        assert!(fnmatch("abc", "abc", false));
+    }
+
+    // ── canonicalize_list_path ──────────────────────────────────────
+
+    #[test]
+    fn canonicalize_empty() {
+        assert_eq!(canonicalize_list_path(""), "");
+        assert_eq!(canonicalize_list_path("/"), "");
+    }
+
+    #[test]
+    fn canonicalize_simple_dir() {
+        assert_eq!(canonicalize_list_path("foo"), "foo/");
+        assert_eq!(canonicalize_list_path("foo/"), "foo/");
+    }
+
+    #[test]
+    fn canonicalize_nested_dir() {
+        assert_eq!(canonicalize_list_path("foo/bar"), "foo/bar/");
+        assert_eq!(canonicalize_list_path("foo/bar/"), "foo/bar/");
+    }
+
+    #[test]
+    fn canonicalize_strip_leading_slash() {
+        assert_eq!(canonicalize_list_path("/foo"), "foo/");
+        assert_eq!(canonicalize_list_path("/foo/"), "foo/");
+        assert_eq!(canonicalize_list_path("/foo/bar"), "foo/bar/");
+    }
+
+    #[test]
+    fn canonicalize_collapse_double_slash() {
+        assert_eq!(canonicalize_list_path("//foo//bar//"), "foo/bar/");
+        assert_eq!(canonicalize_list_path("foo//bar"), "foo/bar/");
+    }
+
+    #[test]
+    fn canonicalize_idempotent() {
+        let a = canonicalize_list_path("foo/bar");
+        let b = canonicalize_list_path(&a);
+        assert_eq!(a, b);
+    }
+
+    // ── opendal_to_io_error ─────────────────────────────────────────
+
+    #[test]
+    fn opendal_error_kind_mapping() {
+        use opendal::ErrorKind;
+        use std::io::ErrorKind as IoKind;
+
+        let cases: &[(ErrorKind, IoKind)] = &[
+            (ErrorKind::NotFound, IoKind::NotFound),
+            (ErrorKind::AlreadyExists, IoKind::AlreadyExists),
+            (ErrorKind::PermissionDenied, IoKind::PermissionDenied),
+            (ErrorKind::IsADirectory, IoKind::IsADirectory),
+            (ErrorKind::NotADirectory, IoKind::NotADirectory),
+            (ErrorKind::Unsupported, IoKind::Unsupported),
+            (ErrorKind::RateLimited, IoKind::WouldBlock),
+        ];
+        for (ek, expected_io) in cases {
+            let err = opendal::Error::new(*ek, "test error");
+            let io_err = opendal_to_io_error(&err, "test_op");
+            assert_eq!(
+                io_err.kind(),
+                *expected_io,
+                "{ek:?} should map to {expected_io:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn opendal_error_unknown_maps_to_other() {
+        let err = opendal::Error::new(opendal::ErrorKind::Unexpected, "boom");
+        let io_err = opendal_to_io_error(&err, "do_something");
+        assert_eq!(io_err.kind(), std::io::ErrorKind::Other);
+        assert!(io_err.to_string().contains("do_something failed"));
+    }
+
+    #[test]
+    fn opendal_error_message_includes_op_name() {
+        let err = opendal::Error::new(opendal::ErrorKind::NotFound, "missing file");
+        let io_err = opendal_to_io_error(&err, "unlink");
+        assert!(io_err.to_string().contains("unlink failed"));
+    }
+
+    // ── opendal_timestamp_to_system_time ────────────────────────────
+
+    #[test]
+    fn timestamp_modern_is_unchanged() {
+        use std::time::{Duration, SystemTime};
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let clamped = opendal_timestamp_to_system_time(t);
+        assert_eq!(clamped, t);
+    }
+
+    #[test]
+    fn timestamp_pre_epoch_clamped() {
+        use std::time::{Duration, SystemTime};
+        let t = SystemTime::UNIX_EPOCH - Duration::from_secs(86400);
+        let clamped = opendal_timestamp_to_system_time(t);
+        assert_eq!(clamped, SystemTime::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn timestamp_exactly_epoch_is_ok() {
+        use std::time::SystemTime;
+        let clamped = opendal_timestamp_to_system_time(SystemTime::UNIX_EPOCH);
+        assert_eq!(clamped, SystemTime::UNIX_EPOCH);
+    }
+
+    // ── cache_path_block / cache_block_path ─────────────────────────
+
+    #[test]
+    fn cache_path_block_zero_is_whole_file() {
+        let dir = Path::new("/tmp/cache");
+        let p = cache_path_block(dir, "hello.txt", 0);
+        assert!(p.starts_with(dir));
+        let filename = p.file_name().unwrap().to_str().unwrap();
+        assert!(
+            !filename.contains('_'),
+            "block_index=0 should have no _ suffix, got {filename}"
+        );
+        assert_eq!(filename.len(), 20);
+    }
+
+    #[test]
+    fn cache_path_block_nonzero_has_suffix() {
+        let dir = Path::new("/tmp/cache");
+        let p = cache_path_block(dir, "hello.txt", 3);
+        let filename = p.file_name().unwrap().to_str().unwrap();
+        assert!(
+            filename.contains("_0003"),
+            "block_index=3 should have _0003, got {filename}"
+        );
+    }
+
+    #[test]
+    fn cache_block_path_format() {
+        let dir = Path::new("/tmp/cache");
+        let p = cache_block_path(dir, "hello.txt", 7);
+        let filename = p.file_name().unwrap().to_str().unwrap();
+        assert!(filename.ends_with(".block"));
+        assert!(filename.contains("_0000000007"));
+    }
+
+    #[test]
+    fn cache_path_same_hash_for_same_path() {
+        let dir = Path::new("/tmp/cache");
+        let p1 = cache_path_block(dir, "hello.txt", 0);
+        let p2 = cache_path_block(dir, "hello.txt", 0);
+        assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn cache_path_different_for_different_paths() {
+        let dir = Path::new("/tmp/cache");
+        let p1 = cache_path_block(dir, "hello.txt", 0);
+        let p2 = cache_path_block(dir, "world.txt", 0);
+        assert_ne!(p1, p2);
+    }
+
+    // ── bump_in_memory_atime ────────────────────────────────────────
+
+    #[test]
+    fn bump_in_memory_atime_updates_instant() {
+        let idx = dashmap::DashMap::new();
+        let key: CacheKey = ("test/path".to_string(), None);
+        let old = std::time::Instant::now();
+        idx.insert(key.clone(), (4096, old));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        bump_in_memory_atime(&idx, &key);
+        let (_sz, new_instant) = *idx.get(&key).unwrap().value();
+        assert!(new_instant > old, "bumped atime should be more recent");
+    }
+
+    #[test]
+    fn bump_in_memory_atime_noop_on_missing_key() {
+        let idx = dashmap::DashMap::new();
+        let key: CacheKey = ("absent".to_string(), None);
+        bump_in_memory_atime(&idx, &key);
+        assert!(idx.is_empty());
+    }
+
+    // ── detect_cgroup_memory_limit ──────────────────────────────────
+
+    #[test]
+    fn detect_cgroup_memory_limit_returns_none_or_value() {
+        let result = detect_cgroup_memory_limit();
+        if let Some(val) = result {
+            assert!(val > 0);
+            assert!(val < u64::MAX);
+        }
+    }
+
+    // ── path_hash determinism ───────────────────────────────────────
+
+    #[test]
+    fn path_hash_deterministic_within_process() {
+        let h1 = path_hash("hello.txt");
+        let h2 = path_hash("hello.txt");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn path_hash_different_for_different_paths() {
+        let h1 = path_hash("hello.txt");
+        let h2 = path_hash("world.txt");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn path_hash_returns_value_gt_1() {
+        assert!(path_hash("") >= 2);
+        assert!(path_hash("anything") >= 2);
+    }
+
+    #[test]
+    fn path_hash_shorter_than_u64_max() {
+        let h = path_hash("test");
+        assert!(h < (1u64 << 63));
+    }
+}
