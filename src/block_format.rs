@@ -685,8 +685,9 @@ impl ChecksummedBytes {
 #[cfg(test)]
 mod disk_cache_crc_tests {
     use super::{
-        BLOCK_FORMAT_VERSION, BLOCK_MAGIC, BLOCK_OVERHEAD, LEGACY_BLOCK_FORMAT_VERSION_V1,
-        LEGACY_BLOCK_FORMAT_VERSION_V2, crc32c_checksum, crc32c_checksum_concat, read_block_cached,
+        BLOCK_CRC_TRAILER, BLOCK_FORMAT_VERSION, BLOCK_HEADER_SIZE, BLOCK_MAGIC, BLOCK_OVERHEAD,
+        LEGACY_BLOCK_FORMAT_VERSION_V1, LEGACY_BLOCK_FORMAT_VERSION_V2, MAX_PATH_LEN,
+        crc32c_checksum, crc32c_checksum_concat, read_block_cached,
     };
     use crate::CACHE_BLOCK_SIZE;
     use std::path::PathBuf;
@@ -931,6 +932,338 @@ mod disk_cache_crc_tests {
         std::fs::write(&p, &content).unwrap();
         let out = read_block_cached(&p, "test/block.bin");
         let _ = out; // exercised for sanity
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── tornado write: v3 block truncated before CRC trailer ──────
+
+    #[test]
+    fn crc_torn_write_truncated_before_trailer_is_none() {
+        let dir = scratch("torn_trunc");
+        let p = dir.join("block.bin");
+        let content: Vec<u8> = (0..4096u32).map(|i| (i & 0xff) as u8).collect();
+        let full = build_v3_block("test/block.bin", &content);
+        // Truncate: drop the 4-byte CRC trailer.
+        let truncated = &full[..full.len() - BLOCK_CRC_TRAILER];
+        // Also drop a few more bytes from the compressed payload
+        // so the remaining data is definitely not a valid block.
+        let chopped = &truncated[..truncated.len() - 3];
+        std::fs::write(&p, chopped).unwrap();
+
+        let out = read_block_cached(&p, "test/block.bin");
+        assert!(
+            out.is_none(),
+            "truncated block missing CRC must return None"
+        );
+        assert!(!p.exists(), "truncated block must be unlinked");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn crc_torn_write_no_room_for_trailer_is_none() {
+        // Block has valid magic+version header but after_header
+        // is < BLOCK_CRC_TRAILER — the "too short for trailer"
+        // branch in read_new_format.
+        let dir = scratch("torn_short");
+        let p = dir.join("block.bin");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(BLOCK_MAGIC);
+        buf.extend_from_slice(&BLOCK_FORMAT_VERSION.to_le_bytes());
+        // Only 2 bytes of payload — less than the 4-byte CRC trailer.
+        buf.extend_from_slice(&[0xAA, 0xBB]);
+        std::fs::write(&p, &buf).unwrap();
+
+        let out = read_block_cached(&p, "test/block.bin");
+        assert!(out.is_none(), "header + 2 bytes must return None");
+        assert!(!p.exists(), "malformed block must be unlinked");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── legacy CRC trailer: wrong size ────────────────────────────
+
+    #[test]
+    fn crc_legacy_trailer_too_short_is_none() {
+        let dir = scratch("legacy_short_tail");
+        let p = dir.join("block.bin");
+        let content: Vec<u8> = vec![0u8; CACHE_BLOCK_SIZE as usize + 2];
+        // Exactly CACHE_BLOCK_SIZE + 2: not 8 MiB exactly
+        // (unprotected), not 8 MiB + 4 (protected), and not
+        // < 8 MiB (partial). This lands in the "no-man's-land"
+        // else branch → unlink + None.
+        std::fs::write(&p, &content).unwrap();
+
+        let out = read_block_cached(&p, "test/block.bin");
+        assert!(
+            out.is_none(),
+            "legacy block with wrong-sized trailer must return None"
+        );
+        assert!(!p.exists(), "malformed legacy block must be unlinked");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn crc_legacy_trailer_corrupt_try_into_fails() {
+        // Write CACHE_BLOCK_SIZE + 4 bytes (size triggers
+        // protected path) but the 4 trailer bytes aren't a
+        // valid CRC of the content → mismatch → unlink.
+        let dir = scratch("legacy_corrupt_crc");
+        let p = dir.join("block.bin");
+        let content: Vec<u8> = (0..CACHE_BLOCK_SIZE as u32)
+            .map(|i| (i & 0xff) as u8)
+            .collect();
+        let correct_crc = crc32c_checksum(&content);
+        // Corrupt one byte of the CRC
+        let bad_crc = correct_crc ^ 0xDEADBEEF;
+        let mut buf = content.clone();
+        buf.extend_from_slice(&bad_crc.to_le_bytes());
+        std::fs::write(&p, &buf).unwrap();
+
+        let out = read_block_cached(&p, "test/block.bin");
+        assert!(
+            out.is_none(),
+            "legacy block with wrong CRC must return None"
+        );
+        assert!(!p.exists(), "corrupt legacy block must be unlinked");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── v3 path mismatch (CRC valid, path wrong) ──────────────────
+
+    #[test]
+    fn crc_v3_path_mismatch_unlinks_and_returns_none() {
+        let dir = scratch("v3_path_mismatch");
+        let p = dir.join("block.bin");
+        let content: Vec<u8> = (0..4096u32).map(|i| (i & 0xff) as u8).collect();
+        let buf = build_v3_block("stored/path.bin", &content);
+        std::fs::write(&p, &buf).unwrap();
+
+        // Read with a different expected_path — CRC is valid,
+        // but the embedded path doesn't match what we asked for.
+        let out = read_block_cached(&p, "expected/different.bin");
+        assert!(
+            out.is_none(),
+            "v3 block with wrong embedded path must return None"
+        );
+        assert!(!p.exists(), "path-mismatch block must be unlinked");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn crc_v3_path_not_utf8_unlinks() {
+        let dir = scratch("v3_bad_utf8");
+        let p = dir.join("block.bin");
+        let content: Vec<u8> = (0..4096u32).map(|i| (i & 0xff) as u8).collect();
+        let compressed = lz4_flex::compress_prepend_size(&content);
+        // Construct a v3 block with non-UTF-8 path bytes
+        let bad_path: Vec<u8> = vec![0xFF, 0xFE, 0xFD, 0x80]; // invalid UTF-8
+        let mut buf = Vec::new();
+        buf.extend_from_slice(BLOCK_MAGIC);
+        buf.extend_from_slice(&BLOCK_FORMAT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(bad_path.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&bad_path);
+        buf.extend_from_slice(&compressed);
+        let crc = crc32c_checksum_concat(
+            &{
+                let mut h = Vec::with_capacity(8);
+                h.extend_from_slice(BLOCK_MAGIC);
+                h.extend_from_slice(&BLOCK_FORMAT_VERSION.to_le_bytes());
+                h
+            },
+            &buf[BLOCK_HEADER_SIZE..],
+        );
+        buf.extend_from_slice(&crc.to_le_bytes());
+        std::fs::write(&p, &buf).unwrap();
+
+        let out = read_block_cached(&p, "test/block.bin");
+        assert!(
+            out.is_none(),
+            "v3 block with non-UTF-8 path must return None"
+        );
+        assert!(!p.exists(), "bad-UTF-8 block must be unlinked");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── zero-byte content edge case ───────────────────────────────
+
+    #[test]
+    fn crc_v3_zero_content_round_trip() {
+        let dir = scratch("v3_zero");
+        let p = dir.join("block.bin");
+        let content: Vec<u8> = vec![];
+        std::fs::write(&p, build_v3_block("test/block.bin", &content)).unwrap();
+        let out = read_block_cached(&p, "test/block.bin").expect("zero-content block must be Some");
+        assert!(out.is_empty(), "zero-content block must be empty");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── LZ4 decompress failure (valid CRC, corrupt payload) ───────
+
+    #[test]
+    fn crc_v2_garbage_payload_lz4_fails() {
+        let dir = scratch("v2_garbage");
+        let p = dir.join("block.bin");
+        let garbage: Vec<u8> = (0..128u32)
+            .map(|i| (i.wrapping_mul(17) & 0xff) as u8)
+            .collect();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(BLOCK_MAGIC);
+        buf.extend_from_slice(&LEGACY_BLOCK_FORMAT_VERSION_V2.to_le_bytes());
+        buf.extend_from_slice(&garbage);
+        let crc = crc32c_checksum_concat(
+            &{
+                let mut h = Vec::with_capacity(8);
+                h.extend_from_slice(BLOCK_MAGIC);
+                h.extend_from_slice(&LEGACY_BLOCK_FORMAT_VERSION_V2.to_le_bytes());
+                h
+            },
+            &garbage,
+        );
+        buf.extend_from_slice(&crc.to_le_bytes());
+        std::fs::write(&p, &buf).unwrap();
+
+        // CRC passes (computed over garbage), but lz4_flex can't
+        // decompress garbage → decode_lz4_payload returns None →
+        // unlink.
+        let out = read_block_cached(&p, "test/block.bin");
+        assert!(
+            out.is_none(),
+            "v2 block with garbage payload must return None"
+        );
+        assert!(!p.exists(), "garbage-payload block must be unlinked");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn crc_lz4_decompressed_too_large_is_unlinked() {
+        let dir = scratch("lz4_oversized");
+        let p = dir.join("block.bin");
+        // Build a v3 block whose lz4 payload decompresses to a
+        // size larger than CACHE_BLOCK_SIZE. Use a large repeat
+        // pattern that lz4 compresses well.
+        let big: Vec<u8> = vec![0xAB; CACHE_BLOCK_SIZE as usize + 1];
+        let compressed = lz4_flex::compress_prepend_size(&big);
+        let path_bytes = b"test/block.bin";
+        let mut buf = Vec::new();
+        buf.extend_from_slice(BLOCK_MAGIC);
+        buf.extend_from_slice(&BLOCK_FORMAT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(path_bytes);
+        buf.extend_from_slice(&compressed);
+        let crc = crc32c_checksum_concat(
+            &{
+                let mut h = Vec::with_capacity(8);
+                h.extend_from_slice(BLOCK_MAGIC);
+                h.extend_from_slice(&BLOCK_FORMAT_VERSION.to_le_bytes());
+                h
+            },
+            &buf[BLOCK_HEADER_SIZE..],
+        );
+        buf.extend_from_slice(&crc.to_le_bytes());
+        std::fs::write(&p, &buf).unwrap();
+
+        let out = read_block_cached(&p, "test/block.bin");
+        assert!(
+            out.is_none(),
+            "block decompressing > CACHE_BLOCK_SIZE must return None"
+        );
+        assert!(!p.exists(), "oversized-decompressed block must be unlinked");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── v3 block: path_len out of bounds ──────────────────────────
+
+    #[test]
+    fn crc_v3_path_len_exceeds_max_path_len_unlinks() {
+        let dir = scratch("v3_long_path");
+        let p = dir.join("block.bin");
+        let content: Vec<u8> = (0..1024u32).map(|i| (i & 0xff) as u8).collect();
+        let compressed = lz4_flex::compress_prepend_size(&content);
+        // Craft a v3 block with path_len > MAX_PATH_LEN
+        let mut buf = Vec::new();
+        buf.extend_from_slice(BLOCK_MAGIC);
+        buf.extend_from_slice(&BLOCK_FORMAT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&((MAX_PATH_LEN + 1) as u16).to_le_bytes());
+        // Don't write actual path bytes — just enough to reach
+        // the path_len check in read_new_format (it checks
+        // path_len > MAX_PATH_LEN first).
+        buf.extend_from_slice(&[0u8; 4]); // junk
+        buf.extend_from_slice(&compressed);
+        let crc = crc32c_checksum_concat(
+            &{
+                let mut h = Vec::with_capacity(8);
+                h.extend_from_slice(BLOCK_MAGIC);
+                h.extend_from_slice(&BLOCK_FORMAT_VERSION.to_le_bytes());
+                h
+            },
+            &buf[BLOCK_HEADER_SIZE..],
+        );
+        buf.extend_from_slice(&crc.to_le_bytes());
+        std::fs::write(&p, &buf).unwrap();
+
+        let out = read_block_cached(&p, "test/block.bin");
+        assert!(
+            out.is_none(),
+            "v3 block with path_len > MAX_PATH_LEN must return None"
+        );
+        assert!(!p.exists(), "oversized-path block must be unlinked");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn crc_v3_path_len_exceeds_content_len_unlinks() {
+        let dir = scratch("v3_path_oob");
+        let p = dir.join("block.bin");
+        // Craft a v3 block where path_len claims 100 but content
+        // only has 10 bytes after the path_len field.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(BLOCK_MAGIC);
+        buf.extend_from_slice(&BLOCK_FORMAT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(100u16).to_le_bytes());
+        buf.extend_from_slice(b"junk"); // only 4 bytes
+        let crc = crc32c_checksum_concat(
+            &{
+                let mut h = Vec::with_capacity(8);
+                h.extend_from_slice(BLOCK_MAGIC);
+                h.extend_from_slice(&BLOCK_FORMAT_VERSION.to_le_bytes());
+                h
+            },
+            &buf[BLOCK_HEADER_SIZE..],
+        );
+        buf.extend_from_slice(&crc.to_le_bytes());
+        std::fs::write(&p, &buf).unwrap();
+
+        let out = read_block_cached(&p, "test/block.bin");
+        assert!(
+            out.is_none(),
+            "v3 block path_len exceeding available content must return None"
+        );
+        assert!(!p.exists(), "OOB-path block must be unlinked");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── v3 block too short for path_len field ─────────────────────
+
+    #[test]
+    fn crc_v3_too_short_for_path_len_field() {
+        let dir = scratch("v3_tiny");
+        let p = dir.join("block.bin");
+        // Exactly 1 byte of content (after header + CRC trailer):
+        // `content.len() = 1`, but we need at least 2 for the
+        // u16 path_len field.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(BLOCK_MAGIC);
+        buf.extend_from_slice(&BLOCK_FORMAT_VERSION.to_le_bytes());
+        buf.push(0x00); // 1 byte payload
+        let crc = crc32c_checksum(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        std::fs::write(&p, &buf).unwrap();
+
+        let out = read_block_cached(&p, "test/block.bin");
+        assert!(
+            out.is_none(),
+            "v3 block with < 2 content bytes must return None"
+        );
+        assert!(!p.exists(), "tiny v3 block must be unlinked");
         std::fs::remove_dir_all(&dir).ok();
     }
 
