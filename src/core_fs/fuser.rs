@@ -869,3 +869,104 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::io_err_to_fuse_errno;
+
+    /// Extract the inner i32 from a fuser::Errno.
+    /// Safe: fuser::Errno is #[repr(transparent)] over i32.
+    fn errno_i32(e: fuser::Errno) -> i32 {
+        unsafe { std::mem::transmute::<fuser::Errno, i32>(e) }
+    }
+
+    // ── explicit ErrorKind → Errno mappings ──────────────────────
+
+    #[test]
+    fn not_found_maps_to_enoent() {
+        let e = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(errno_i32(io_err_to_fuse_errno(e)), libc::ENOENT);
+    }
+
+    #[test]
+    fn permission_denied_maps_to_eacces() {
+        let e = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(errno_i32(io_err_to_fuse_errno(e)), libc::EACCES);
+    }
+
+    #[test]
+    fn already_exists_maps_to_eexist() {
+        let e = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+        assert_eq!(errno_i32(io_err_to_fuse_errno(e)), libc::EEXIST);
+    }
+
+    #[test]
+    fn invalid_input_maps_to_einval() {
+        let e = std::io::Error::from(std::io::ErrorKind::InvalidInput);
+        assert_eq!(errno_i32(io_err_to_fuse_errno(e)), libc::EINVAL);
+    }
+
+    #[test]
+    fn not_a_directory_maps_to_enotdir() {
+        let e = std::io::Error::from(std::io::ErrorKind::NotADirectory);
+        assert_eq!(errno_i32(io_err_to_fuse_errno(e)), libc::ENOTDIR);
+    }
+
+    #[test]
+    fn is_a_directory_maps_to_eisdir() {
+        let e = std::io::Error::from(std::io::ErrorKind::IsADirectory);
+        assert_eq!(errno_i32(io_err_to_fuse_errno(e)), libc::EISDIR);
+    }
+
+    #[test]
+    fn out_of_memory_maps_to_enomem() {
+        let e = std::io::Error::from(std::io::ErrorKind::OutOfMemory);
+        assert_eq!(errno_i32(io_err_to_fuse_errno(e)), libc::ENOMEM);
+    }
+
+    #[test]
+    fn storage_full_maps_to_enospc() {
+        let e = std::io::Error::from(std::io::ErrorKind::StorageFull);
+        assert_eq!(errno_i32(io_err_to_fuse_errno(e)), libc::ENOSPC);
+    }
+
+    #[test]
+    fn timed_out_maps_to_etimedout() {
+        let e = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        assert_eq!(errno_i32(io_err_to_fuse_errno(e)), libc::ETIMEDOUT);
+    }
+
+    #[test]
+    fn interrupted_maps_to_eintr() {
+        let e = std::io::Error::from(std::io::ErrorKind::Interrupted);
+        assert_eq!(errno_i32(io_err_to_fuse_errno(e)), libc::EINTR);
+    }
+
+    #[test]
+    fn unsupported_maps_to_enosys() {
+        let e = std::io::Error::from(std::io::ErrorKind::Unsupported);
+        assert_eq!(errno_i32(io_err_to_fuse_errno(e)), libc::ENOSYS);
+    }
+
+    // ── fallback: unknown kind → EIO ─────────────────────────────
+
+    #[test]
+    fn unknown_kind_falls_back_to_eio() {
+        let e = std::io::Error::other("custom");
+        assert_eq!(errno_i32(io_err_to_fuse_errno(e)), libc::EIO);
+    }
+
+    // ── raw OS error code passthrough ────────────────────────────
+
+    #[test]
+    fn raw_os_error_maps_to_corresponding_errno() {
+        let e = std::io::Error::from_raw_os_error(9); // EBADF
+        assert_eq!(errno_i32(io_err_to_fuse_errno(e)), 9);
+    }
+
+    #[test]
+    fn raw_os_error_zero_falls_back_to_eio() {
+        let e = std::io::Error::from_raw_os_error(0);
+        assert_eq!(errno_i32(io_err_to_fuse_errno(e)), libc::EIO);
+    }
+}
