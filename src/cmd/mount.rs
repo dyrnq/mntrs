@@ -692,9 +692,10 @@ pub fn mount(
     let mem_cache: std::sync::Arc<dyn crate::cache::MemCache> = match mem_cache_impl {
         "dashmap" => std::sync::Arc::new(crate::cache::DashMapMemCache::new(mem_cache_bytes)),
         "moka" => std::sync::Arc::new(crate::cache::MokaMemCache::new(mem_cache_bytes)),
+        "foyer" => std::sync::Arc::new(crate::cache::FoyerMemCache::new(mem_cache_bytes)),
         other => {
             return Err(anyhow!(
-                "unknown --mem-cache-impl {other:?}; valid: dashmap, moka"
+                "unknown --mem-cache-impl {other:?}; valid: dashmap, moka, foyer"
             ));
         }
     };

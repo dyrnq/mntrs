@@ -95,7 +95,7 @@ enum Commands {
         /// changes eviction policy (FIFO vs TinyLFU). Use
         /// with `--mem-cache-metrics-interval` for a
         /// head-to-head A/B.
-        #[arg(long, default_value = "dashmap", value_parser = ["dashmap", "moka"])]
+        #[arg(long, default_value = "dashmap", value_parser = ["dashmap", "moka", "foyer"])]
         mem_cache_impl: String,
         /// Emit mem_cache stats (hits/misses/inserts/evictions/
         /// entries/used/capacity) as one structured tracing

@@ -601,6 +601,107 @@ impl MemCache for DashMapMemCache {
     }
 }
 
+/// Concrete `MemCache` backed by `foyer-memory` with LRU eviction.
+///
+/// Foyer is a high-performance concurrent cache with intrusive
+/// linked-list LRU, sharded by default (8 shards), and
+/// byte-weighted capacity. The `weighter` makes the capacity
+/// limit byte-based (like the other impls) rather than
+/// count-based.
+pub struct FoyerMemCache {
+    inner: foyer_memory::Cache<MemCacheKey, Bytes>,
+    /// Reverse index: per-ino set of cache keys, so
+    /// `invalidate_ino` is O(K) per ino, not O(N).
+    /// Same pattern as DashMapMemCache.
+    by_ino: DashMap<u64, std::collections::HashSet<MemCacheKey>>,
+    capacity_bytes: u64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    inserts: AtomicU64,
+    evictions: AtomicU64,
+}
+
+impl FoyerMemCache {
+    pub fn new(mem_limit: u64) -> Self {
+        use foyer_memory::{CacheBuilder, LruConfig};
+        let cap = if mem_limit == 0 {
+            usize::MAX / 2
+        } else {
+            mem_limit as usize
+        };
+        let inner: foyer_memory::Cache<MemCacheKey, Bytes> = CacheBuilder::new(cap)
+            .with_name("mntrs-mem")
+            .with_shards(8)
+            .with_eviction_config(LruConfig {
+                high_priority_pool_ratio: 0.9,
+            })
+            .with_weighter(|_k: &MemCacheKey, v: &Bytes| v.len())
+            .build();
+        Self {
+            inner,
+            by_ino: DashMap::new(),
+            capacity_bytes: mem_limit,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            inserts: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+        }
+    }
+}
+
+impl MemCache for FoyerMemCache {
+    fn get(&self, ino: u64, block_idx: u64) -> Option<Bytes> {
+        let key = (ino, block_idx);
+        let result = self.inner.get(&key).map(|e| e.value().clone());
+        if result.is_some() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn put(&self, ino: u64, block_idx: u64, data: Bytes) {
+        let key = (ino, block_idx);
+        self.inner.insert(key, data);
+        self.by_ino.entry(ino).or_default().insert(key);
+        self.inserts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn invalidate_ino(&self, ino: u64) {
+        if let Some((_, keys)) = self.by_ino.remove(&ino) {
+            for k in keys {
+                self.inner.remove(&k);
+            }
+        }
+    }
+
+    fn clear(&self) {
+        self.inner.clear();
+        self.by_ino.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.inner.usage()
+    }
+
+    fn used_bytes(&self) -> u64 {
+        self.inner.usage() as u64
+    }
+
+    fn stats(&self) -> MemCacheStats {
+        MemCacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            inserts: self.inserts.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+            entries: self.inner.usage() as u64,
+            used_bytes: self.inner.usage() as u64,
+            capacity_bytes: self.capacity_bytes,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
