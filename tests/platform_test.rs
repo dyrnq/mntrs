@@ -88,7 +88,6 @@ mod macos_tests {
 
 #[cfg(windows)]
 mod windows_tests {
-    use mntrs::cmd::mount::build_operator_sync;
 
     #[test]
     fn windows_drive_letter_detection() {
