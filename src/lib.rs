@@ -3710,22 +3710,13 @@ impl CoreFilesystem for MntrsFs {
         let cpath = crate::cache_path(&self.cache_dir, &full_path);
         let _ = std::fs::remove_file(&cpath);
         // Clean block-level cache entries (disk + index).
-        // O(K) via inodes.size() (see `remove_block_cache_files`
-        // for the rationale and the previous-O(N) bug this
-        // replaces). `size` is bound out of the `if let` so the
-        // block-level `disk_cache_index` cleanup below can use it
-        // (Bug A follow-up).
+        // O(1) via find_ino_by_path + inodes.get: replaces a
+        // full-table scan with a two-hop lookup (path→ino via
+        // path_to_ino DashMap, ino→InodeEntry via inodes DashMap).
         let file_size: u64 = self
-            .inodes
-            .iter()
-            .find_map(|entry| {
-                let v = entry.value();
-                if v.path == full_path {
-                    Some(v.size)
-                } else {
-                    None
-                }
-            })
+            .find_ino_by_path(&full_path)
+            .and_then(|ino| self.inodes.get(&ino))
+            .map(|e| e.size)
             .unwrap_or(0);
         if file_size > 0 {
             remove_block_cache_files(&self.cache_dir, &full_path, file_size);
@@ -4292,5 +4283,158 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
                 crate::metrics::global(),
             )
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn scratch_dir(label: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("mntrs-evict-{}", label));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Construct a MntrsFs suitable for disk-cache eviction tests.
+    /// cache_max_size is honoured; cache_min_free_space can be 0.
+    fn new_test_fs_evict(cache_dir: PathBuf, cache_max_size: u64) -> MntrsFs {
+        let mut fs = new_test_fs(
+            opendal::Operator::new(opendal::services::Memory::default())
+                .unwrap()
+                .finish(),
+            cache_dir,
+        );
+        fs.cache_max_size = cache_max_size;
+        fs.cache_min_free_space = 0;
+        fs
+    }
+
+    /// Insert a synthetic cache entry (file on disk + index).
+    fn insert_cache_entry(fs: &MntrsFs, path: &str, size: u64, atime: Instant) {
+        let cpath = cache_path(&fs.cache_dir, path);
+        std::fs::write(&cpath, vec![0u8; size as usize]).unwrap();
+        fs.disk_cache_index
+            .insert((path.to_string(), None), (size, atime));
+    }
+
+    // ── evict_lru_if_needed ──────────────────────────────────────
+
+    #[test]
+    fn evict_lru_noop_when_total_under_limit() {
+        let dir = scratch_dir("noop");
+        let fs = new_test_fs_evict(dir, 10 * 1024 * 1024);
+        insert_cache_entry(&fs, "small.bin", 1024, Instant::now());
+        fs.evict_lru_if_needed();
+        assert_eq!(
+            fs.disk_cache_index.len(),
+            1,
+            "single entry under limit should not be evicted"
+        );
+    }
+
+    #[test]
+    fn evict_lru_respects_size_limit() {
+        let dir = scratch_dir("size");
+        let fs = new_test_fs_evict(dir, 2048);
+        let now = Instant::now();
+        insert_cache_entry(&fs, "a.bin", 1024, now);
+        insert_cache_entry(&fs, "b.bin", 1024, now - Duration::from_secs(10));
+        insert_cache_entry(&fs, "c.bin", 1024, now - Duration::from_secs(20));
+
+        // total = 3072, limit = 2048 → need to free 1024
+        fs.evict_lru_if_needed();
+        let remaining: u64 = fs.disk_cache_index.iter().map(|e| e.value().0).sum();
+        assert!(
+            remaining <= 2048,
+            "total after eviction {} should be <= limit 2048",
+            remaining
+        );
+        assert!(
+            fs.disk_cache_index.len() <= 2,
+            "at most 2 entries should remain"
+        );
+    }
+
+    #[test]
+    fn evict_lru_evicts_oldest_first() {
+        let dir = scratch_dir("oldest");
+        let fs = new_test_fs_evict(dir, 1024);
+        let now = Instant::now();
+        // newest
+        insert_cache_entry(&fs, "new.bin", 1024, now);
+        // middle
+        insert_cache_entry(&fs, "mid.bin", 1024, now - Duration::from_secs(60));
+        // oldest — should be evicted first
+        insert_cache_entry(&fs, "old.bin", 1024, now - Duration::from_secs(120));
+
+        // total = 3072, limit = 1024 → need 2048 freed = 2 entries
+        fs.evict_lru_if_needed();
+
+        // the newest entry should survive
+        assert!(
+            fs.disk_cache_index
+                .contains_key(&("new.bin".to_string(), None)),
+            "newest entry should survive eviction"
+        );
+        // both older entries should be gone
+        assert!(
+            !fs.disk_cache_index
+                .contains_key(&("old.bin".to_string(), None)),
+            "oldest entry should be evicted"
+        );
+        assert!(
+            !fs.disk_cache_index
+                .contains_key(&("mid.bin".to_string(), None)),
+            "middle entry should be evicted"
+        );
+        assert_eq!(fs.disk_cache_index.len(), 1);
+    }
+
+    #[test]
+    fn evict_lru_handles_block_entries() {
+        let dir = scratch_dir("block");
+        let fs = new_test_fs_evict(dir, 1024);
+        let now = Instant::now();
+        // file-level entry
+        insert_cache_entry(&fs, "big.bin", 1024, now);
+        // two block-level entries for the same file (idx 0, idx 1)
+        for blk in 0..2u64 {
+            let cpath = cache_block_path(&fs.cache_dir, "big.bin", blk);
+            std::fs::write(&cpath, vec![0u8; 512]).unwrap();
+            fs.disk_cache_index.insert(
+                ("big.bin".to_string(), Some(blk)),
+                (512, now - Duration::from_secs(10)),
+            );
+        }
+
+        // total = 1024 + 512 + 512 = 2048, limit = 1024 → free 1024
+        fs.evict_lru_if_needed();
+
+        let remaining: u64 = fs.disk_cache_index.iter().map(|e| e.value().0).sum();
+        assert!(
+            remaining <= 1024,
+            "total after eviction {} should be <= 1024",
+            remaining
+        );
+        // block entries (older) should be gone
+        assert!(
+            !fs.disk_cache_index
+                .contains_key(&("big.bin".to_string(), Some(0))),
+            "block 0 should be evicted"
+        );
+        assert!(
+            !fs.disk_cache_index
+                .contains_key(&("big.bin".to_string(), Some(1))),
+            "block 1 should be evicted"
+        );
+        // file-level entry (newer) should survive
+        assert!(
+            fs.disk_cache_index
+                .contains_key(&("big.bin".to_string(), None)),
+            "file-level entry should survive"
+        );
     }
 }
