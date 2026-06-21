@@ -286,7 +286,7 @@ pub fn opendal_to_io_error(e: &opendal::Error, op: &str) -> std::io::Error {
         ErrorKind::NotADirectory => IoKind::NotADirectory,
         ErrorKind::Unsupported => IoKind::Unsupported,
         // New: map rate limiting and auth errors explicitly
-        ErrorKind::RateLimited => IoKind::Other, // EAGAIN
+        ErrorKind::RateLimited => IoKind::WouldBlock,
         _ => IoKind::Other,
     };
     std::io::Error::new(kind, format!("{op} failed: {e}"))
