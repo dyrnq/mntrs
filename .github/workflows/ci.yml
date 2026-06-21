@@ -15,19 +15,66 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  # === Shared build job (all other jobs cache from this) ===
+  # === Compile once, share artifacts to all check jobs ===
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3 protobuf-compiler
-      - name: Build workspace
-        run: cargo build --workspace
-      - name: Build CSI plugin
+
+      - name: Build workspace (debug) + test binaries
+        run: |
+          cargo build --workspace
+          cargo test --no-run --workspace 2>/dev/null || echo "(test compile skipped — incremental ok)"
+      - name: Build mntrs-csi (debug)
         run: cargo build --package mntrs-csi
+      - name: Build workspace (release) + test binaries
+        run: |
+          if cargo build --release --workspace --features hdfs-jni 2>/dev/null; then
+            cargo test --no-run --release --workspace --features hdfs-jni 2>/dev/null || echo "(hdfs-jni test compile skipped)"
+          else
+            cargo build --release --workspace
+            cargo test --no-run --release --workspace 2>/dev/null || echo "(release test compile skipped)"
+          fi
+      - name: Build mntrs-csi (release)
+        run: cargo build --release -p mntrs-csi
+
+      # Upload only the directories cargo needs for incremental
+      # re-use: fingerprints (tells cargo what's already compiled),
+      # deps (pre-built rlibs/so's), and binaries + test binaries.
+      # Skipping incremental/ (.o files, ~70% of size) keeps the
+      # artifact under 500 MB.
+      - name: Package target/debug artifacts
+        run: |
+          tar czf /tmp/target-debug.tar.gz -C target/debug \
+            .fingerprint deps build mntrs mntrs-csi \
+            core_fs_unit_test fuse_integration_test \
+            libmntrs*.rlib libmntrs*.so libmntrs*.d \
+            2>/dev/null || echo "(partial tar — ok for incremental)"
+      - name: Upload target/debug
+        uses: actions/upload-artifact@v4
+        with:
+          name: target-debug
+          path: /tmp/target-debug.tar.gz
+          retention-days: 1
+
+      - name: Package target/release artifacts
+        run: |
+          tar czf /tmp/target-release.tar.gz -C target/release \
+            .fingerprint deps build mntrs mntrs-csi \
+            hdfs_integration_test core_fs_unit_test fuse_integration_test \
+            libmntrs*.rlib libmntrs*.so libmntrs*.d \
+            2>/dev/null || echo "(partial tar — ok for incremental)"
+      - name: Upload target/release
+        uses: actions/upload-artifact@v4
+        with:
+          name: target-release
+          path: /tmp/target-release.tar.gz
+          retention-days: 1
 
   # === Matrix: test / clippy / fmt / hdfs-jni / csi-sanity ===
   check:
@@ -54,6 +101,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libfuse3-dev fuse3 protobuf-compiler
           sudo grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+
+      - name: Download target/debug
+        uses: actions/download-artifact@v4
+        with:
+          name: target-debug
+      - name: Extract target/debug
+        run: mkdir -p target/debug && tar xzf target-debug.tar.gz -C target/debug && rm target-debug.tar.gz
+
+      - name: Download target/release
+        uses: actions/download-artifact@v4
+        with:
+          name: target-release
+      - name: Extract target/release
+        run: mkdir -p target/release && tar xzf target-release.tar.gz -C target/release && rm target-release.tar.gz
 
       - name: Test (lib)
         if: matrix.task == 'test'
