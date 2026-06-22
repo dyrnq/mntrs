@@ -3,7 +3,7 @@
 #![allow(clippy::all)]
 
 #[cfg(not(windows))]
-use mntrs::cmd::mount::{mount_internal, unmount_internal};
+use mntrs::cmd::mount::{mount_internal, pending_writebacks, unmount_internal};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -563,6 +563,18 @@ impl node_server::Node for NodeService {
 
         if is_mountpoint(&staging_path) {
             tracing::info!(staging=%staging_path, "unstaging FUSE mount");
+            // Issue #139: drain in-flight writeback uploads before
+            // unmounting. mntrs stages the mount in-process (a
+            // dedicated OS thread running mount_internal), so the
+            // process-global writeback counter reflects this mount's
+            // uploads. Without the drain, unmount interrupts uploads
+            // and data sits in `.dirty` sidecars that only the *next*
+            // mount recovers — which may be on a different node after
+            // K8s rescheduling, so a node termination before remount
+            // loses data. The drain is best-effort: on timeout it
+            // proceeds to unmount (today's behaviour) rather than
+            // blocking the gRPC handler forever.
+            drain_writebacks(drain_timeout()).await;
             unmount_internal(&staging_path)
                 .map_err(|e| Status::internal(format!("unstage unmount failed: {e}")))?;
         }
@@ -957,6 +969,65 @@ fn is_mountpoint_in(path: &str, mounts_content: &str) -> bool {
 /// CSI and the standalone binary.
 fn is_mountpoint(path: &str) -> bool {
     mntrs::cmd::mount::is_mount_point(path)
+}
+
+/// Configurable writeback-drain timeout for CSI unstage. Issue #139.
+///
+/// `MNTRS_CSI_DRAIN_TIMEOUT_SECS` env var overrides (default 60 s,
+/// capped at 300 s so a misconfiguration can't hold the unstage RPC
+/// open beyond K8s's typical CSI operation window). `0` disables the
+/// drain entirely (restores the pre-fix behaviour for operators who
+/// prefer immediate unmount).
+fn drain_timeout() -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 60;
+    const MAX_SECS: u64 = 300;
+    let secs = std::env::var("MNTRS_CSI_DRAIN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SECS)
+        .min(MAX_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Wait for in-flight writeback uploads to complete (or `timeout` to
+/// elapse) before unmounting. Issue #139.
+///
+/// Polls `pending_writebacks()` (the process-global counter of queued
+/// + uploading tasks) until it reaches 0. Uses `tokio::time::sleep` so
+/// the tonic gRPC handler yields between polls — it does NOT block the
+/// runtime worker thread. On timeout, returns so the caller proceeds
+/// to unmount; the `.dirty` sidecar recovery path is unchanged, this
+/// only adds a best-effort window for uploads to finish.
+async fn drain_writebacks(timeout: std::time::Duration) {
+    if timeout.is_zero() {
+        return;
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last_logged = usize::MAX;
+    loop {
+        let pending = pending_writebacks();
+        if pending == 0 {
+            tracing::info!("csi drain: writeback queue empty, proceeding to unmount");
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                pending,
+                timeout_secs = timeout.as_secs(),
+                "csi drain: timeout reached with uploads still in flight; \
+                 proceeding to unmount (.dirty sidecars recovered on next mount)"
+            );
+            return;
+        }
+        if pending != last_logged {
+            tracing::info!(
+                pending,
+                "csi drain: waiting for writeback uploads to complete"
+            );
+            last_logged = pending;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
 }
 
 // Bug 14 follow-up: removed `fn wait_for_mount` —
