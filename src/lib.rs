@@ -537,20 +537,18 @@ impl MntrsFs {
             return;
         }
 
-        // Build a min-heap by (last_access_instant, key, size)
-        // so we can pop the oldest entries first. The third
-        // element (size) is carried for accounting. The key is
-        // the full `CacheKey` (path + optional block_idx), so
-        // block-level and file-level cache files compete on
-        // equal footing for the eviction budget.
-        use std::cmp::Reverse;
-        use std::collections::BinaryHeap;
+        // Fast path: sum entry sizes only (O(N), no key clone, no
+        // heap build). The min-heap construction (O(N log N) plus a
+        // `CacheKey` clone — a `String` alloc — per entry) is
+        // deferred until we know eviction is actually needed. The
+        // common case on a write-heavy mount is "cache under limit,
+        // nothing to free", so this skips the expensive part on most
+        // calls. Issue #135#2 (safe variant: no running-total
+        // atomic, so no replace/underflow accounting hazard — the
+        // scan remains the source of truth).
         let mut total: u64 = 0;
-        let mut heap: BinaryHeap<Reverse<(std::time::Instant, CacheKey, u64)>> = BinaryHeap::new();
         for entry in self.disk_cache_index.iter() {
-            let (key, (size, last_access)) = (entry.key().clone(), *entry.value());
-            total += size;
-            heap.push(Reverse((last_access, key, size)));
+            total += entry.value().0;
         }
 
         // Free-space check (only if cache_min_free_space > 0).
@@ -588,6 +586,22 @@ impl MntrsFs {
         let to_free = size_limit.max(need_free.unwrap_or(0));
         if to_free == 0 {
             return;
+        }
+
+        // Slow path: build the min-heap by (last_access_instant, key,
+        // size) so we can pop the oldest entries first. The third
+        // element (size) is carried for accounting. The key is the
+        // full `CacheKey` (path + optional block_idx), so block-level
+        // and file-level cache files compete on equal footing for the
+        // eviction budget. Built only when `to_free > 0` — the rare
+        // eviction case — so the per-entry String clone is never paid
+        // on the common no-eviction path.
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let mut heap: BinaryHeap<Reverse<(std::time::Instant, CacheKey, u64)>> = BinaryHeap::new();
+        for entry in self.disk_cache_index.iter() {
+            let (key, (size, last_access)) = (entry.key().clone(), *entry.value());
+            heap.push(Reverse((last_access, key, size)));
         }
 
         // Pop oldest entries until enough space freed. Each pop
