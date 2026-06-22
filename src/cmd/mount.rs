@@ -703,6 +703,19 @@ pub fn mount(
         elapsed_ms = _t_mount.elapsed().as_millis() as u64,
         "mount: after mem_cache creation"
     );
+    // Issue #128: the L2 block-cache index MUST be the same Arc
+    // shared by `MntrsFs.disk_cache_index` (where the read path's
+    // step6 inserts block entries) and `MultiLevelCache`'s
+    // `DiskBlockCache` (where the write path's invalidate looks
+    // them up to remove stale block files). Pre-fix these were two
+    // separate `Arc::new(DashMap::new())` calls, so invalidate
+    // always saw an empty map (`keys_found=0`), never removed the
+    // stale `.block` files, and the next read served them —
+    // "append to pre-existing file" returned the pre-append
+    // content. Create the Arc once and pass it to both.
+    let disk_cache_index: std::sync::Arc<
+        dashmap::DashMap<crate::util::CacheKey, (u64, std::time::Instant)>,
+    > = std::sync::Arc::new(dashmap::DashMap::new());
     let fs = MntrsFs {
         op: Arc::new(op),
         inodes: dashmap::DashMap::new(),
@@ -777,14 +790,13 @@ pub fn mount(
 
         mem_cache: mem_cache.clone(),
         attr_cache: dashmap::DashMap::new(),
-        disk_cache_index: std::sync::Arc::new(dashmap::DashMap::new()),
+        disk_cache_index: disk_cache_index.clone(),
         storage_class: storage_class.map(|s| s.to_string()),
         multi_cache: {
-            let idx = std::sync::Arc::new(dashmap::DashMap::new());
             crate::multi_level_cache::MultiLevelCache::new(
                 mem_cache.clone(),
                 cache_dir_path.clone(),
-                idx,
+                disk_cache_index.clone(),
                 direct_io,
                 crate::metrics::global(),
             )

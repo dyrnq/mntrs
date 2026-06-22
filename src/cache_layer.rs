@@ -73,7 +73,7 @@ impl CacheLayer for MemCacheLayer {
     }
 
     fn invalidate_path(&self, _path: &str, ino: u64) {
-        tracing::debug!(ino = ino, "L1 invalidate_path");
+        tracing::debug!(ino, "L1 invalidate_path (mem_cache by ino)");
         self.inner.invalidate_ino(ino);
     }
 }
@@ -202,7 +202,7 @@ impl CacheLayer for DiskBlockCache {
         tracing::debug!(
             path = %path,
             keys_found = to_remove.len(),
-            "L2 invalidate_path"
+            "L2 invalidate_path (block files by disk_cache_index)"
         );
         for key in to_remove {
             if let Some(idx) = key.1 {
@@ -211,6 +211,11 @@ impl CacheLayer for DiskBlockCache {
             }
             self.disk_cache_index.remove(&key);
         }
+        // Issue #128: bump the path's cache generation so any async
+        // block-cache pool job captured by a read BEFORE this write
+        // (and still queued) self-skips instead of re-creating a stale
+        // `.block` file the loop above just removed.
+        crate::disk_write_pool::bump_path_cache_gen(path);
     }
 }
 

@@ -302,6 +302,61 @@ fn open_write_handle_then_read_via_separate_handle() {
     fs.unlink(1, "wr.bin").unwrap();
 }
 
+// ── issue #128: append to pre-existing file ─────────────────────────
+
+/// Regression for issue #128. Append to a **pre-existing** file (one
+/// read via the mount *before* the append) must return the appended
+/// content, not the pre-append bytes.
+///
+/// Pre-fix, `MntrsFs.disk_cache_index` and `MultiLevelCache`'s
+/// `DiskBlockCache` held two separate `Arc<DashMap>`s. The read path
+/// inserted block-cache entries into the former; the write path's
+/// `invalidate_path` looked them up in the (empty) latter, found
+/// nothing, and never removed the stale `.block` files. The next read
+/// served the stale block → "append to pre-existing" returned the
+/// pre-append content. This test fails on the pre-fix code (read2
+/// returns `hello`, not `helloappended`) and passes once the two
+/// `disk_cache_index` Arcs are shared.
+#[test]
+fn append_to_pre_existing_file_after_read() {
+    let op = Operator::new(Memory::default()).unwrap().finish();
+    // Pre-existing file on the backend — NOT created via the mount.
+    // A mount read of this file populates the block-level cache
+    // (mem_cache + .block file) but not the whole-file cache, which
+    // is the precondition for #128.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async { op.write("pre.txt", b"hello".to_vec()).await })
+        .unwrap();
+
+    let dir = std::env::temp_dir().join(format!("mntrs-bug128-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let fs = new_test_fs(op, dir.clone());
+
+    // read1: populates the block-level cache.
+    let attr = fs.lookup(1, "pre.txt").unwrap();
+    let rd = fs.open(attr.ino, 0).unwrap();
+    assert_eq!(fs.read(attr.ino, rd, 0, 5).unwrap(), b"hello");
+    fs.release(attr.ino, rd).unwrap();
+
+    // append via a write handle (O_WRONLY = 1 on unix).
+    let wh = fs.open(attr.ino, 1).unwrap();
+    assert_eq!(fs.write(attr.ino, wh, 5, b"appended").unwrap(), 8);
+    fs.flush(attr.ino, wh).unwrap();
+    fs.release(attr.ino, wh).unwrap();
+
+    // read2 via a fresh read handle: must reflect the append.
+    let rd2 = fs.open(attr.ino, 0).unwrap();
+    let got = fs.read(attr.ino, rd2, 0, 13).unwrap();
+    assert_eq!(
+        got, b"helloappended",
+        "append to pre-existing file must be visible after re-read (issue #128)"
+    );
+    fs.release(attr.ino, rd2).unwrap();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── setattr ─────────────────────────────────────────────────────────
 
 #[test]

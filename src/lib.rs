@@ -2354,6 +2354,11 @@ impl CoreFilesystem for MntrsFs {
             .map(|m| m.len())
             .unwrap_or(0);
         let actual_size = cache_meta_size.max(file_size);
+        tracing::debug!(
+            ino, offset, size, file_size, cache_meta_size, actual_size,
+            path = %path,
+            "read: entry"
+        );
         if offset >= actual_size {
             return Ok(vec![]);
         }
@@ -2394,6 +2399,12 @@ impl CoreFilesystem for MntrsFs {
         // MultiLevelCache checks L1 first, then L2 (with L1
         // backfill on L2 hit), and records per-level metrics.
         if let Some(data) = self.multi_cache.read_block(&path, ino, block_idx) {
+            tracing::debug!(
+                ino,
+                block_idx,
+                hit_len = data.len(),
+                "read: multi_cache hit"
+            );
             // Data is aligned to CACHE_BLOCK_SIZE boundaries —
             // entry (ino, block_idx) covers file bytes
             // `[block_idx * CACHE_BLOCK_SIZE,
@@ -2496,6 +2507,11 @@ impl CoreFilesystem for MntrsFs {
                     "read: file-level cache check"
                 );
                 if cache_is_complete {
+                    tracing::debug!(
+                        ino,
+                        cache_bytes = b.len(),
+                        "read: file-level cache hit (complete)"
+                    );
                     // Bug B fix: bump the in-memory
                     // LRU sort key on every cache hit.
                     // The on-disk atime is unreliable
@@ -2668,6 +2684,13 @@ impl CoreFilesystem for MntrsFs {
         };
         let len = (b.len() as u32).min(size) as usize;
         let result = b[..len].to_vec();
+        tracing::debug!(
+            ino,
+            offset,
+            fetch_len = b.len(),
+            result_len = result.len(),
+            "read: remote fetch"
+        );
         // Populate L1 (mem_cache) for ALL blocks covered by this
         // fetch, not just the first one. Without this, a 16 MiB
         // fetch would store the entire 16 MiB under one
@@ -3046,6 +3069,7 @@ impl CoreFilesystem for MntrsFs {
                 offset: _offset,
                 data: _data.to_vec(),
                 block_cache: None,
+                cache_gen: 0,
             }),
         };
         submit_disk_write(job);
@@ -3157,6 +3181,7 @@ impl CoreFilesystem for MntrsFs {
         // cache_for_path) with a single multi_cache call
         // that handles both levels atomically.
         self.multi_cache.invalidate(&path, _ino);
+        tracing::debug!(path = %path, ino = _ino, "write: invalidated L1+L2 cache for path");
 
         // #17 (small-write hot-path): pre-fix did a
         // full `handles.insert(fh, Write { path: ...,
@@ -4252,6 +4277,13 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
     // Initialize the disk-IO thread pool for async
     // writes. Default size: min(num_cpus, 8).
     init_disk_write_pool(None);
+    // Issue #128: share one disk_cache_index Arc between the
+    // `disk_cache_index` field (read-path inserts) and `multi_cache`'s
+    // `DiskBlockCache` (write-path invalidate lookups). Pre-fix these
+    // were two separate Arcs, so invalidate never saw inserted entries
+    // and stale `.block` files survived appends.
+    let disk_cache_index: Arc<dashmap::DashMap<CacheKey, (u64, std::time::Instant)>> =
+        Arc::new(dashmap::DashMap::new());
     MntrsFs {
         op: Arc::new(op),
         inodes: Default::default(),
@@ -4315,16 +4347,15 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         // overwrite this in cmd/mount.rs after the size is known.
         mem_cache: std::sync::Arc::new(crate::cache::DashMapMemCache::new(0)),
         attr_cache: Default::default(),
-        disk_cache_index: Arc::new(dashmap::DashMap::new()),
+        disk_cache_index: disk_cache_index.clone(),
         storage_class: None,
         multi_cache: {
             let mc: std::sync::Arc<dyn crate::cache::MemCache> =
                 std::sync::Arc::new(crate::cache::DashMapMemCache::new(0));
-            let idx = Arc::new(dashmap::DashMap::new());
             crate::multi_level_cache::MultiLevelCache::new(
                 mc,
                 cache_dir.clone(),
-                idx,
+                disk_cache_index.clone(),
                 false,
                 crate::metrics::global(),
             )

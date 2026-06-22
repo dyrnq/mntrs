@@ -119,6 +119,42 @@ pub(crate) struct DiskWriteJob {
     /// the pool worker has no `&self` reference; see
     /// `submit_block_cache_write` callers.
     pub(crate) block_cache: Option<PathBuf>,
+    /// Cache-generation snapshot captured at submit time
+    /// (block-cache mode only). The pool worker compares it
+    /// against the current `PATH_CACHE_GEN` for `remote_path`
+    /// before writing the `.block` file; if a write invalidated
+    /// the path in the meantime (bumping the gen), the stale
+    /// block write is skipped — otherwise it would re-create a
+    /// `.block` file the invalidate already removed, and the
+    /// next read would serve it (issue #128). 0 for non-block
+    /// modes (the check only runs in the `block_cache` branch).
+    pub(crate) cache_gen: u64,
+}
+
+/// Per-remote-path cache generation counter (issue #128).
+///
+/// Bumped by `DiskBlockCache::invalidate_path` on every write to a
+/// path. The read path's async block-cache pool job captures the gen
+/// at submit time and skips the `.block` write if the gen advanced —
+/// i.e. a write invalidated the path while the pool job was queued.
+/// Without this, the pool job can land a STALE `.block` file after
+/// invalidate, and the next read serves it.
+pub(crate) static PATH_CACHE_GEN: once_cell::sync::Lazy<dashmap::DashMap<String, u64>> =
+    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+
+/// Read the current cache generation for `path` (0 if unseen).
+pub(crate) fn path_cache_gen(path: &str) -> u64 {
+    PATH_CACHE_GEN.get(path).map(|g| *g).unwrap_or(0)
+}
+
+/// Bump the cache generation for `path` (invalidates pending pool
+/// writes captured against an older gen). Called by the write path's
+/// L2 invalidate.
+pub(crate) fn bump_path_cache_gen(path: &str) {
+    PATH_CACHE_GEN
+        .entry(path.to_string())
+        .and_modify(|g| *g = g.wrapping_add(1))
+        .or_insert(1);
 }
 
 impl DiskWriteJob {
@@ -133,6 +169,21 @@ impl DiskWriteJob {
         // a remote S3 fetch to populate the block-level
         // disk cache.
         if let Some(path) = &self.block_cache {
+            // Issue #128: skip the stale block write if a write
+            // invalidated this path since the read captured `cache_gen`.
+            // The pool job was queued during a read; if a write (append,
+            // truncate, …) bumped the path's gen in the meantime, the
+            // block data we're about to persist is now stale and would
+            // shadow the fresh whole-file cache / remote on the next read.
+            if path_cache_gen(&self.remote_path) != self.cache_gen {
+                tracing::debug!(
+                    path = %self.remote_path,
+                    job_gen = self.cache_gen,
+                    cur_gen = path_cache_gen(&self.remote_path),
+                    "block-cache pool write skipped (path invalidated since read)"
+                );
+                return;
+            }
             Self::do_block_cache_write(path, &self.remote_path, &self.data);
             return;
         }
@@ -691,6 +742,7 @@ pub(crate) fn submit_block_cache_write(
         offset: 0,
         data,
         block_cache: Some(blk_path),
+        cache_gen: path_cache_gen(remote_path),
     };
     submit_disk_write(Some(job));
 }
@@ -717,6 +769,7 @@ mod tests {
             offset: 0,
             data: vec![0xAB; 4096],
             block_cache: Some(blk_path.clone()),
+            cache_gen: 0,
         };
         job.execute();
         assert!(blk_path.exists(), "block file should be created");
@@ -734,6 +787,7 @@ mod tests {
             offset: 0,
             data: b"cache path data".to_vec(),
             block_cache: None,
+            cache_gen: 0,
         };
         job.execute();
         assert!(cpath.exists(), "cache file should exist");
@@ -754,6 +808,7 @@ mod tests {
             offset: 10,
             data: b"bbbbbbbbbb".to_vec(),
             block_cache: None,
+            cache_gen: 0,
         };
         job.execute();
         assert_eq!(std::fs::read(&cpath).unwrap(), b"aaaaaaaaaabbbbbbbbbb");
@@ -779,6 +834,7 @@ mod tests {
             offset: 0,
             data: b"fd data".to_vec(),
             block_cache: None,
+            cache_gen: 0,
         };
         job.execute();
         assert_eq!(std::fs::read(&cpath).unwrap(), b"fd data");
