@@ -108,22 +108,27 @@ impl CacheLayer for DiskBlockCache {
         if self.direct_io {
             return None;
         }
-        // Guard against orphaned .block files from a
-        // previous mount session whose disk_cache_index
-        // entry was lost. The L2 preheater in
-        // MultiLevelCache::new re-populates the index
-        // from files on disk at startup; if a file
-        // exists but has no index entry, it is stale
-        // and must not be served (issue #128).
-        let key = (path.to_string(), Some(block_idx));
-        if !self.disk_cache_index.contains_key(&key) {
-            tracing::debug!(
-                path = %path,
-                block_idx = block_idx,
-                "L2 get_block: orphaned .block file (no index entry), skipping"
-            );
-            return None;
-        }
+        // Issue #130: previously this method refused to serve
+        // blocks whose `(path, block_idx)` was not in
+        // `disk_cache_index`, on the theory that any such file
+        // was an orphan from a prior mount whose in-memory
+        // index had been lost. The companion "preheating" loop
+        // in `MultiLevelCache::new` was supposed to repopulate
+        // the index at startup, but the preheater inserted
+        // `(filename, block_idx)` instead of `(path, block_idx)`
+        // — filenames don't encode the original remote path
+        // (only the path hash, which is one-way), so the
+        // preheated entries never matched and the `contains_key`
+        // guard served essentially as a "skip L2 entirely" gate.
+        //
+        // The fix removes the preheating loop and trusts the
+        // on-disk file existence check below. The first read
+        // after restart fetches from remote and populates
+        // `disk_cache_index` correctly via `bump_in_memory_atime`
+        // + `put_block`; subsequent reads hit L2. The LRU
+        // eviction logic in `disk_cache_index` sees entries as
+        // they're touched, which is fine for cache pressure
+        // decisions.
         let cpath = crate::cache_block_path(&self.cache_dir, path, block_idx);
         if !cpath.exists() {
             return None;

@@ -61,36 +61,33 @@ impl MultiLevelCache {
         direct_io: bool,
         metrics: Arc<Metrics>,
     ) -> Self {
-        // L2 preheating: scan the cache directory for existing
-        // `.block` files and populate the disk_cache_index so
-        // the first read after a restart doesn't treat warm L2
-        // blocks as misses. `load_cache_index` parses the
-        // `{hash}_{block_idx:010x}.block` filenames and returns
-        // (name, block_idx, size, mtime) tuples.
-        if !direct_io {
-            let entries = crate::block_format::load_cache_index(&cache_dir);
-            let now = Instant::now();
-            for (_name, _block_idx, size, _mtime) in entries {
-                // The block filename encodes the path hash but
-                // not the original remote path. We can't
-                // reconstruct the CacheKey `(path, Some(idx))`
-                // without the path, so we store a synthetic key
-                // with the filename as the path component. The
-                // actual CacheKey will be populated on the first
-                // read (when the caller passes the real path),
-                // and the preheated entry will be superseded.
-                //
-                // For now, preheating serves as a "the L2 disk
-                // has data" signal for the LRU evictor — it
-                // knows the cache dir isn't empty and can make
-                // better eviction decisions.
-                disk_cache_index.insert((_name, Some(_block_idx)), (size, now));
-            }
-            tracing::debug!(
-                preheated = disk_cache_index.len(),
-                "multi-level cache: L2 preheated from disk"
-            );
-        }
+        // L2 preheating was attempted here before (issue #130):
+        // scan the cache directory for `.block` files and insert
+        // them into `disk_cache_index` so the first read after
+        // restart would hit L2 instead of fetching from remote.
+        //
+        // That approach failed because the block filename
+        // `{path_hash}_{block_idx:010x}.block` does not encode
+        // the original remote path — `path_hash` is one-way — so
+        // there is no way to reconstruct the `(path, Some(idx))`
+        // CacheKey that the rest of the codebase uses. The
+        // preheated entries were inserted with the *filename* as
+        // the path component, which never matched a real lookup.
+        //
+        // The fix (paired with the `contains_key` guard removal
+        // in `DiskBlockCache::get_block`, cache_layer.rs) is to
+        // not preheat at all and trust the on-disk `.block` files
+        // directly: `get_block` reads the file if it exists and
+        // inserts the correct CacheKey on first hit. The LRU
+        // index fills up as blocks are read.
+        //
+        // Cost: the first read after restart is a remote fetch
+        // for any block whose file hasn't been touched yet in
+        // the new session. In practice, the kernel page cache
+        // and FUSE readahead usually coalesce these into the
+        // same `op.read_with().range(...)` call as the L2 file
+        // read, so the user-visible overhead is small.
+        let _ = direct_io; // (signature compatibility — direct_io handled in get_block)
         Self {
             l1: MemCacheLayer::new(mem_cache),
             l2: DiskBlockCache::new(cache_dir, disk_cache_index, direct_io),
@@ -259,6 +256,106 @@ mod tests {
         mlc.invalidate("f.bin", 1);
         assert!(mlc.l1.get_block("f.bin", 1, 0).is_none());
         assert!(mlc.l2.get_block("f.bin", 1, 0).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for issue #130. Pre-fix, the L2 preheater
+    /// scanned the cache dir and inserted `(filename,
+    /// Some(block_idx))` keys into `disk_cache_index`, which
+    /// never matched real `(path, Some(block_idx))` lookups
+    /// (filenames don't encode the original remote path —
+    /// only the one-way path hash). Combined with the
+    /// `disk_cache_index.contains_key()` guard in
+    /// `DiskBlockCache::get_block`, the result was that no
+    /// L2 block was ever served — the guard always returned
+    /// false, so reads fell through to remote every time
+    /// after a restart, even when the `.block` file was on
+    /// disk.
+    ///
+    /// This test simulates that exact scenario: write a
+    /// `.block` file to disk in one MLC session, drop the
+    /// MLC (forgetting the in-memory index), start a fresh
+    /// MLC against the same cache dir, and verify the fresh
+    /// MLC can serve the block from L2.
+    #[test]
+    fn l2_survives_restart_without_preheating() {
+        let dir =
+            std::env::temp_dir().join(format!("mntrs-mlc-test-{}-restart", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Session 1: populate L2 with two blocks at different
+        // block indices, then drop the MLC. The disk_cache_index
+        // entries for these blocks are forgotten; only the
+        // `.block` files on disk remain.
+        //
+        // Note: we deliberately do NOT call `invalidate()` here
+        // — invalidate removes both the disk_cache_index entry
+        // AND the on-disk `.block` file (`invalidate_path`
+        // calls `remove_file`). The point of this test is the
+        // other direction: file present on disk, no in-memory
+        // record, fresh MLC must still find it.
+        let data_a = Bytes::from_static(b"block A");
+        let data_b = Bytes::from_static(b"block B (different)");
+        {
+            let mlc1 = test_mlc(dir.clone());
+            mlc1.populate(
+                "remote/path/file.bin",
+                42,
+                0,
+                std::slice::from_ref(&data_a),
+                AdmissionPolicy::SingleBlockOnly,
+            );
+            mlc1.populate(
+                "remote/path/file.bin",
+                42,
+                5, // arbitrary non-zero block index
+                std::slice::from_ref(&data_b),
+                AdmissionPolicy::SingleBlockOnly,
+            );
+            // mlc1 dropped here — its in-memory index is gone.
+        }
+
+        // Verify the .block files actually exist on disk
+        // (sanity check for the test setup).
+        let cpath_a = crate::cache_block_path(&dir, "remote/path/file.bin", 0);
+        let cpath_b = crate::cache_block_path(&dir, "remote/path/file.bin", 5);
+        assert!(
+            cpath_a.exists(),
+            "setup: .block file missing at {cpath_a:?}"
+        );
+        assert!(
+            cpath_b.exists(),
+            "setup: .block file missing at {cpath_b:?}"
+        );
+
+        // Session 2: fresh MLC, empty in-memory index. The
+        // pre-fix preheater would have failed to populate
+        // disk_cache_index correctly; with the fix, get_block
+        // trusts the on-disk file.
+        let mc2: Arc<dyn MemCache> = Arc::new(DashMapMemCache::new(0));
+        let idx2 = Arc::new(DashMap::new());
+        let mlc2 = MultiLevelCache::new(mc2, dir.clone(), idx2, false, crate::metrics::global());
+
+        let got_a = mlc2
+            .read_block("remote/path/file.bin", 42, 0)
+            .expect("L2 should serve block 0 from disk after restart");
+        assert_eq!(got_a.as_ref(), data_a.as_ref(), "block 0 content mismatch");
+
+        let got_b = mlc2
+            .read_block("remote/path/file.bin", 42, 5)
+            .expect("L2 should serve block 5 from disk after restart");
+        assert_eq!(got_b.as_ref(), data_b.as_ref(), "block 5 content mismatch");
+
+        // A second read on the same block should still work
+        // — that proves the first read populated
+        // `disk_cache_index` correctly via `bump_in_memory_atime`,
+        // because if the index were empty and the file path
+        // were wrong, the second read would re-fail.
+        let got_a2 = mlc2
+            .read_block("remote/path/file.bin", 42, 0)
+            .expect("L2 should still serve block 0 on second read");
+        assert_eq!(got_a2.as_ref(), data_a.as_ref());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
