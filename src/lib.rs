@@ -3010,10 +3010,13 @@ impl CoreFilesystem for MntrsFs {
         // power loss between the FUSE write and the
         // kernel's lazy page-cache flushback can zero
         // the cache file.
-        if cache_fd.is_some() {
-            let cpath = crate::cache_path(&self.cache_dir, &path);
-            register_dirty_cache_path(&cpath);
-        }
+        //
+        // Single registration point: the `register_dirty_cache_path`
+        // call inside the `cpath.exists()` block above covers both
+        // the cache_fd path (cache_fd.is_some() ⇒ cpath.exists()) and
+        // the no-fd fallback (pre-existing file). A second call here
+        // was redundant (DashSet insert is idempotent) — removed in
+        // issue #135#1.
         // #27 (disk-IO thread pool): for the no-fd
         // fallback (the open() path that couldn't open
         // the cache file — rare, only when $HOME is
