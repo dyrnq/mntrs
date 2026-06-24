@@ -1,31 +1,13 @@
 # tests/e2e/csi/hdfs-kerberos-pod.yaml
 #
 # HDFS Pod + Service manifest for csi-e2e.yml's kerberos HDFS deploy.
-#
-# This is rendered with envsubst so NODE_IP / NODE_NAME (resolved in the
-# workflow step from `kubectl get nodes`) flow into hostAliases. The
-# workflow invokes:
-#
-#     envsubst < tests/e2e/csi/hdfs-kerberos-pod.yaml \
-#       | kubectl --kubeconfig /tmp/kubeconfig apply -f -
-#
-# The previous heredoc `<<EOF` rendered as a single contiguous YAML
-# stream with leading-space indentation, and the unquoted heredoc plus
-# bash variable expansion produced:
-#
-#   error parsing STDIN: error converting YAML to JSON:
-#     yaml: line 46: did not find expected '-' indicator
-#
-# (line 46 of the stdin stream was the comment about hostNetwork,
-# which go-yaml refuses when list items follow.) Pulling the manifest
-# into a real YAML file with `---` doc separators and ${VAR} placeholders
-# sidesteps both: kubectl reads from a path (no stdin quoting), and
-# envsubst only substitutes the two declared vars.
+# Rendered with envsubst (NODE_IP / NODE_NAME placeholders in
+# hostAliases) and piped to `kubectl apply -f -`.
 #
 # Why hostNetwork + hostAliases + 4 DN bind overrides:
-#   See [[kerberos-single-node-k3s-hostnet]] — single-node k3s/iptables
+#   See [[kerberos-single-node-k3s-hostnet]]. Single-node k3s/iptables
 #   has no local iface for the Service ClusterIP, so DN data sockets
-#   must bind the short 'hdfs' (-> hostAliases -> node IP).
+#   must bind the short 'hdfs' (which hostAliases maps to node IP).
 #   HDFS_HOSTNAME=FQDN keeps dfs.datanode.hostname for advertise.
 ---
 apiVersion: v1
@@ -67,7 +49,7 @@ spec:
   hostname: hdfs
   hostAliases:
     - ip: ${NODE_IP}
-      hostnames: [${NODE_NAME}, hdfs]
+      hostnames: ['${NODE_NAME}', hdfs]
   containers:
     - name: hdfs
       image: dyrnq/hdfs:latest-debian
