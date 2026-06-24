@@ -105,7 +105,23 @@ jobs:
       - name: Test mount
         run: |
           sudo mkdir -p /mnt/mntrs-test && sudo chmod 777 /mnt/mntrs-test
-          MOUNT_OPTS="--opt endpoint=http://localhost:9000 --opt access-key=minioadmin --opt secret-key=minioadmin --opt region=us-east-1"
+          # MOUNT_OPTS is backend-specific. s3 needs the MinIO endpoint +
+          # creds; hdfs needs the hdfs-native fork switch (Cargo.toml
+          # [patch.crates-io]) to talk to the DataNode via host_name
+          # rather than the in-container loopback ip_addr that won't
+          # resolve on the docker host. Other backends (memory) need
+          # no extra opts. See issue #148.
+          case "${{ matrix.backend.name }}" in
+            s3)
+              MOUNT_OPTS="--opt endpoint=http://localhost:9000 --opt access-key=minioadmin --opt secret-key=minioadmin --opt region=us-east-1"
+              ;;
+            hdfs)
+              MOUNT_OPTS="--opt dfs.client.use.datanode.hostname=true"
+              ;;
+            *)
+              MOUNT_OPTS=""
+              ;;
+          esac
           # hdfs backend uses --daemon --daemon-wait (parent exits after spawn); other backends run in foreground
           # Per SESSION_PITFALLS §2.2: --daemon re-execs, $! is unreliable — use mount table only
           # Per SESSION_PITFALLS §2.4: hdfs-native can return root entry / trailing slashes; ls may EIO briefly
