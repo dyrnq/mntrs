@@ -128,21 +128,17 @@ jobs:
         run: |
           sudo mkdir -p /mnt/mntrs-test && sudo chmod 777 /mnt/mntrs-test
           MOUNT_OPTS="--opt endpoint=${{ matrix.test.endpoint }} --opt access-key=minioadmin --opt secret-key=minioadmin --opt region=us-east-1"
-          # hdfs backend uses --daemon --daemon-wait (parent exits after spawn); other backends run in foreground
-          if [ "${{ matrix.test.name }}" = "hdfs" ]; then
-            ./target/release/mntrs mount ${{ matrix.test.storage }} /mnt/mntrs-test $MOUNT_OPTS --allow-other --daemon --daemon-wait --daemon-timeout=20 >/dev/null 2>&1 &
-          else
-            ./target/release/mntrs mount ${{ matrix.test.storage }} /mnt/mntrs-test $MOUNT_OPTS 2>&1 &
-          fi
-
-          # Readiness probe: wait up to 60s for mount + ls to both succeed
-          # Per SESSION_PITFALLS §2.2/§2.4/§2.6
+          # hdfs backend uses --daemon --daemon-wait (parent exits after spawn);
+          # other backends run in foreground.
           MOUNT_LOG="/tmp/mntrs-mount-csi-${{ matrix.test.name }}.log"
-          # Re-direct mount output to MOUNT_LOG (was /dev/null, lost debug info).
-          # MNTRS_DAEMON_LOG redirects the daemon child's tracing output
-          # to the same file (parent shell's stdout/stderr alone wouldn't
-          # capture it because --daemon --daemon-wait forks a child that
-          # holds the FUSE session after the parent exits).
+          # MNTRS_DAEMON_LOG redirects the daemon child's tracing output to
+          # MOUNT_LOG (the parent shell's stdout/stderr alone wouldn't capture
+          # it because --daemon --daemon-wait forks a child that holds the
+          # FUSE session after the parent exits). Pre-fix this step mounted
+          # TWICE (once to /dev/null, once to MOUNT_LOG); the second mount of
+          # the same path was rejected by the kernel and surfaced as a
+          # spurious fusermount3 /etc/mtab error masking the real hdfs
+          # failure (csi-integration run 28102259330, 2026-06-24).
           if [ "${{ matrix.test.name }}" = "hdfs" ]; then
             MNTRS_DAEMON_LOG="$MOUNT_LOG" \
               ./target/release/mntrs mount ${{ matrix.test.storage }} /mnt/mntrs-test $MOUNT_OPTS --allow-other --daemon --daemon-wait --daemon-timeout=20 > "$MOUNT_LOG" 2>&1 &
