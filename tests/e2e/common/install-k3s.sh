@@ -34,11 +34,15 @@ install_k3s() {
         sleep 10
     done
 
-    sudo mkdir -p /root/.kube "$(dirname "$kubeconfig")"
+    sudo mkdir -p /root/.kube "$(dirname "$kubeconfig")" "$HOME/.kube"
     sudo cp /etc/rancher/k3s/k3s.yaml "$kubeconfig"
     sudo chown "$(id -u)":"$(id -g)" "$kubeconfig"
-    mkdir -p ~/.kube
-    cp "$kubeconfig" ~/.kube/config
+    # Mirror to ~/.kube/config only if different from primary path
+    # (csi-integration passes '~/.kube/config' as \$kubeconfig — would cp to itself).
+    if [ "$kubeconfig" != "$HOME/.kube/config" ]; then
+        mkdir -p ~/.kube
+        cp "$kubeconfig" ~/.kube/config
+    fi
     kubectl --kubeconfig "$kubeconfig" wait --for=condition=Ready node --all --timeout=60s
 }
 
