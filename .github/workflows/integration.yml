@@ -112,12 +112,12 @@ jobs:
           docker logs hdfs 2>&1 | tail -5
           docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | head -10
           docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -mkdir -p /test
-          # chmod 777 / so the GHA runner user (not hdfs) can create
-          # files at the HDFS root that the FUSE mount exposes
-          # (/mnt/mntrs-test/_ci_*, /_ci_dir, etc.). Without this the
-          # mount-tests fail with AccessControlException on
-          # ClientProtocol.create inode="/".
-          docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -chmod 777 /
+          # HDFS root is 755:hdfs:supergroup by default. chmod 777 / so the
+          # GHA runner user can create at the FUSE mount root; chmod 777 /test
+          # so the test seed file is in a subdir any user can read+write.
+          # See tests/e2e/common/hdfs-prep.sh for the shared prep rationale
+          # and the matching csi/hdfs.sh + csi/hdfs-kerberos.sh callers.
+          bash tests/e2e/common/hdfs-prep.sh docker
           echo "hello hdfs" | docker exec -i -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt
 
       # ---- Mount + read/write test ----

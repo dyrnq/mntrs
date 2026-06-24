@@ -506,9 +506,9 @@ fi
 log "[3/8] creating test data in HDFS (Kerberos)..."
 # kinit first (ticket may have expired)
 ${KUBECTL} -n "${HDFS_NAMESPACE}" exec hdfs -- /usr/bin/kinit -kt /etc/hadoop/hdfs.keytab "${HDFS_PRINCIPAL}" 2>/dev/null || true
-${KUBECTL} -n "${HDFS_NAMESPACE}" exec hdfs -- /opt/hadoop/bin/hdfs dfs -chmod 777 / 2>/dev/null || true
-${KUBECTL} -n "${HDFS_NAMESPACE}" exec hdfs -- /opt/hadoop/bin/hdfs dfs -mkdir -p /test 2>/dev/null || true
-${KUBECTL} -n "${HDFS_NAMESPACE}" exec hdfs -- /opt/hadoop/bin/hdfs dfs -chmod 777 /test 2>/dev/null || true
+# shellcheck source=tests/e2e/common/hdfs-prep.sh
+. "$(cd "$(dirname "$0")" && pwd)/../common/hdfs-prep.sh"
+hdfs_prep_kubectl_kerberos "${HDFS_NAMESPACE}"
 # Seed the pre-existing test file. The put writes a block to the DataNode,
 # which can transiently fail right after the HDFS Pod boots (DN registration
 # still settling, or a not-yet-valid TGT) with `1 node(s) are excluded` — and

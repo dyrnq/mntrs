@@ -298,12 +298,11 @@ fi
 log "[3/7] creating test data in HDFS..."
 # The HDFS Pod boots with drwxr-xr-x on / (owner hdfs:supergroup).
 # With simple auth, opendal authenticates as the OS user (root inside its
-# container), so it can't write to / without this chmod.
-# kubectl exec runs as root; in simple-auth mode the superuser is hdfs,
-# so we su - hdfs for the dfs commands.
-${KUBECTL} -n "${HDFS_NAMESPACE}" exec hdfs -- su - hdfs -c "/opt/hadoop/bin/hdfs dfs -chmod 777 /" 2>/dev/null || true
-${KUBECTL} -n "${HDFS_NAMESPACE}" exec hdfs -- su - hdfs -c "/opt/hadoop/bin/hdfs dfs -mkdir -p /test" 2>/dev/null || true
-${KUBECTL} -n "${HDFS_NAMESPACE}" exec hdfs -- su - hdfs -c "/opt/hadoop/bin/hdfs dfs -chmod 777 /test" 2>/dev/null || true
+# container), so it can't write to / without this chmod. See
+# tests/e2e/common/hdfs-prep.sh for the shared prep rationale.
+# shellcheck source=tests/e2e/common/hdfs-prep.sh
+. "$(cd "$(dirname "$0")" && pwd)/../common/hdfs-prep.sh"
+hdfs_prep_kubectl_simple "${HDFS_NAMESPACE}"
 echo "hello from csi hdfs e2e" | ${KUBECTL} -n "${HDFS_NAMESPACE}" exec -i hdfs -- su - hdfs -c "/opt/hadoop/bin/hdfs dfs -put -f - /test/pre-existing.txt" 2>/dev/null
 ${KUBECTL} -n "${HDFS_NAMESPACE}" exec hdfs -- su - hdfs -c "/opt/hadoop/bin/hdfs dfs -chmod 644 /test/pre-existing.txt" 2>/dev/null || true
 ${KUBECTL} -n "${HDFS_NAMESPACE}" exec hdfs -- su - hdfs -c "/opt/hadoop/bin/hdfs dfs -ls /test/" 2>/dev/null
