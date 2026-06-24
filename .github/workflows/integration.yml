@@ -72,10 +72,23 @@ jobs:
           # any Kerberos dependency — no in-line config mounts needed.
           # HDFS_HOSTNAME drives the placeholder rendering in the entrypoint
           # (fs.defaultFS, datanode hostname).
-          docker run -d --name hdfs \
+          # Run the HDFS container in --network host mode so the DN
+          # binds directly to the host's network stack on 9866 / 8020 /
+          # 9864. With the default bridge network + -p port forwarding,
+          # DN binds to localhost:9866 *inside* the container and the
+          # host's 127.0.0.1:9866 routes through docker's userland
+          # proxy — which ConnectionReset's the block-read TCP connect
+          # even though the same proxy works for the NN RPC at 8020
+          # (probed working with s3/MinIO at 9000 too). The fork patch
+          # alone does not fix this because host_name='localhost' on
+          # the docker host still resolves to 127.0.0.1, same as
+          # ip_addr. host network avoids the proxy entirely — the
+          # container's 127.0.0.1:9866 IS the host's 127.0.0.1:9866,
+          # so mntrs's connection (also on the host) lands directly
+          # on the DN listener.
+          docker run -d --name hdfs --network host \
             -e HADOOP_SECURITY_AUTHENTICATION=simple \
             -e HDFS_HOSTNAME=localhost \
-            -p 8020:8020 -p 9866:9866 -p 9864:9864 \
             dyrnq/hdfs:latest-debian
 
           # Wait for NameNode + DataNode (must have ≥1 live datanode)
