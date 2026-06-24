@@ -289,6 +289,61 @@ jobs:
             exit 1
           fi
 
+      # HDFS diagnostic dump — runs on success OR failure (always()),
+      # BEFORE Cleanup so the container still exists. Bundles the
+      # full container log, dfsadmin -report, host-side port listings,
+      # the docker inspect metadata, and a probe of the host's
+      # 127.0.0.1:<port> reachability so post-mortem has a single
+      # artifact to grep instead of re-running.
+      - name: Collect HDFS diagnostics
+        if: matrix.backend.name == 'hdfs' && always()
+        run: |
+          DIAG=/tmp/hdfs-diag
+          mkdir -p "${DIAG}"
+          # docker logs (full, with timestamps). Use --details to
+          # preserve stream identifiers (stdout vs stderr) which
+          # helps tell entrypoint from s6 service output.
+          docker logs --details --timestamps hdfs > "${DIAG}/docker-logs.txt" 2>&1 || true
+          # dfsadmin -report — full output (head -200 to bound size;
+          # a healthy single-DN cluster is <50 lines).
+          docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfsadmin -report > "${DIAG}/dfsadmin-report.txt" 2>&1 || true
+          # NameNode + DataNode RPC endpoints (sanity: are they
+          # actually listening?).
+          docker exec hdfs bash -c 'echo "--- namenode rpc ---"; ss -ltnp 2>/dev/null | grep -E ":(8020|9866|9864|9867) " || true; echo "--- datanode rpc ---"; ss -ltn 2>/dev/null | grep -E ":(8020|9866|9864|9867) " || true' > "${DIAG}/ss.txt" 2>&1 || true
+          # Container inspect — network mode, port bindings, env
+          # (HDFS_HOSTNAME etc.), and image digest for cross-run
+          # correlation.
+          docker inspect hdfs > "${DIAG}/docker-inspect.json" 2>&1 || true
+          # Host-side reachability probe — does the GHA runner's
+          # 127.0.0.1 actually accept TCP on the HDFS ports? This
+          # distinguishes "DN not bound" (connect refused) from
+          # "docker proxy reset" (TCP RST) from "bind ok, client
+          # mismatch" (bind ok).
+          for p in 8020 9866 9864 9867; do
+            {
+              echo "--- 127.0.0.1:${p} ---"
+              timeout 3 bash -c "exec 3<>/dev/tcp/127.0.0.1/${p} && echo OK || echo FAIL"
+            } >> "${DIAG}/host-loopback-probe.txt" 2>&1 || true
+          done
+          # Mount log + previously-uploaded dfsadmin report
+          # (cross-reference).
+          cp /tmp/mntrs-mount-hdfs.log "${DIAG}/" 2>/dev/null || true
+          cp /tmp/hdfs-dfsadmin-report.txt "${DIAG}/" 2>/dev/null || true
+          ls -la "${DIAG}"
+        # Upload to a stable artifact name; overwrite is fine since
+        # only one hdfs job runs per matrix at a time.
+        # NOTE: must use a separate step with upload-artifact@v4 —
+        # combining the dump script and the upload into one step
+        # doesn't work because run: doesn't accept uses:.
+
+      - name: Upload HDFS diagnostics
+        if: matrix.backend.name == 'hdfs' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hdfs-diag-${{ matrix.backend.name }}
+          path: /tmp/hdfs-diag
+          if-no-files-found: warn
+
       - name: Cleanup
         if: always()
         run: |
