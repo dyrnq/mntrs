@@ -537,15 +537,15 @@ jobs:
                 env:
                   - {name: HDFS_HOSTNAME, value: hdfs.csi-mntrs.svc.cluster.local}
                   # docker-hdfs#12: DatanodeHttpServer hard-codes bind URI
-                  # to `http://localhost:<ephemeral>` and the upstream #11
+                  # to http://localhost:(ephemeral-port) and the upstream #11
                   # fix (dfs.datanode.bind-host=0.0.0.0) does not cover
-                  # it. On Debian 13 / OpenJDK 21 `localhost` → [::1]
+                  # it. On Debian 13 / OpenJDK 21 localhost resolves to [::1]
                   # and bind([::1]:0) returns EADDRNOTAVAIL (no IPv6 lo
                   # in the pod netns on a k3s CI host). Force the JVM
-                  # to IPv4 stack so `localhost` → 127.0.0.1 and the
+                  # to IPv4 stack so localhost resolves to 127.0.0.1 and the
                   # info server starts. Tracked in dyrnq/docker-hdfs#12;
                   # drop this once upstream patches DatanodeHttpServer
-                  # to honor `dfs.datanode.bind-host`.
+                  # to honor dfs.datanode.bind-host.
                   - {name: JAVA_TOOL_OPTIONS, value: "-Djava.net.preferIPv4Stack=true"}
                   # hostNetwork flips the DN→NN hairpin source to the node IP;
                   # skip the NameNode reverse-DNS check on registration so the
