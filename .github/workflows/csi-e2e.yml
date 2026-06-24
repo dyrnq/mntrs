@@ -481,6 +481,7 @@ jobs:
           # tests/e2e/csi/hdfs-kerberos.sh. See [[kerberos-single-node-k3s-hostnet]].
           NODE_IP=$(kubectl --kubeconfig /tmp/kubeconfig get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
           NODE_NAME=$(kubectl --kubeconfig /tmp/kubeconfig get nodes -o jsonpath='{.items[0].metadata.name}')
+          export NODE_IP NODE_NAME
           echo "node: ${NODE_NAME} ip: ${NODE_IP}"
           # Create the namespace first; the previous heredoc referenced
           # `namespace: csi-mntrs` without ever creating it, so the apply
