@@ -52,7 +52,7 @@ jobs:
       - name: Setup MinIO bucket
         run: |
           pip3 install awscli
-          AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin             aws --endpoint-url http://localhost:9000 --no-verify-ssl s3 mb s3://test-bucket 2>/dev/null || true
+          AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin aws --endpoint-url http://localhost:9000 --no-verify-ssl s3 mb s3://test-bucket 2>/dev/null || true
           echo "test" > /tmp/hello.txt
 
       - name: Run FUSE integration tests
