@@ -1,0 +1,60 @@
+# tests/e2e/csi/hdfs-pod.yaml
+#
+# HDFS Pod + Service manifest for csi-e2e.yml's simple-auth HDFS deploy.
+#
+# Renders with `kubectl apply -f <file>` — no heredoc, no bash variable
+# expansion, no leading-space ambiguity. See the workflow step for the
+# caller; the csi-mntrs namespace must already exist (the workflow's
+# Run e2e step creates it via hdfs.sh, so we add an explicit
+# `kubectl create namespace` before this apply).
+#
+# Image: dyrnq/hdfs:latest-debian (Debian 13 / Java 21 / Hadoop 3.5.0).
+# Why preferIPv4Stack: see docker-hdfs#12 — DataNode info server binds
+# [::1]:0 and crashes on netns without ::1. Tracked at the upstream
+# issue; drop the env once DatanodeHttpServer honors dfs.datanode.bind-host.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hdfs
+  namespace: csi-mntrs
+spec:
+  type: ClusterIP
+  selector:
+    app: hdfs
+  ports:
+    - name: nn-rpc
+      port: 8020
+      targetPort: 8020
+    - name: dn-data
+      port: 9866
+      targetPort: 9866
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hdfs
+  namespace: csi-mntrs
+  labels:
+    app: hdfs
+spec:
+  hostname: hdfs
+  containers:
+    - name: hdfs
+      image: dyrnq/hdfs:latest-debian
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: HADOOP_SECURITY_AUTHENTICATION
+          value: simple
+        - name: HDFS_HOSTNAME
+          value: hdfs
+        # docker-hdfs#12: DataNode info server binds [::1]:0 and
+        # crashes with BindException when the netns has no ::1 route.
+        # The image does NOT default preferIPv4Stack.
+        - name: JAVA_TOOL_OPTIONS
+          value: -Djava.net.preferIPv4Stack=true
+      ports:
+        - containerPort: 8020
+          name: nn-rpc
+        - containerPort: 9866
+          name: dn-data

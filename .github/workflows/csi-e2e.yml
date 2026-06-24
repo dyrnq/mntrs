@@ -275,37 +275,13 @@ jobs:
 
       - name: Deploy HDFS Pod
         run: |
-          kubectl --kubeconfig /tmp/kubeconfig apply -f - <<'EOF'
-          apiVersion: v1
-          kind: Service
-          metadata: {name: hdfs, namespace: csi-mntrs}
-          spec:
-            type: ClusterIP
-            selector: {app: hdfs}
-            ports:
-              - {name: nn-rpc, port: 8020, targetPort: 8020}
-              - {name: dn-data, port: 9866, targetPort: 9866}
-          ---
-          apiVersion: v1
-          kind: Pod
-          metadata: {name: hdfs, namespace: csi-mntrs, labels: {app: hdfs}}
-          spec:
-            hostname: hdfs
-            containers:
-              - name: hdfs
-                image: dyrnq/hdfs:latest-debian
-                imagePullPolicy: IfNotPresent
-                env:
-                  - {name: HADOOP_SECURITY_AUTHENTICATION, value: simple}
-                  - {name: HDFS_HOSTNAME, value: hdfs}
-                  # docker-hdfs#12: DataNode info server binds [::1]:0 and
-                  # crashes with BindException when the netns has no ::1
-                  # route. The image does NOT default preferIPv4Stack.
-                  - {name: JAVA_TOOL_OPTIONS, value: -Djava.net.preferIPv4Stack=true}
-                ports:
-                  - {containerPort: 8020, name: nn-rpc}
-                  - {containerPort: 9866, name: dn-data}
-          EOF
+          # Create the namespace first; the previous heredoc referenced
+          # `namespace: csi-mntrs` without ever creating it, so the apply
+          # failed with `namespaces "csi-mntrs" not found` (csi-e2e run
+          # 28102259330, 2026-06-24).
+          kubectl --kubeconfig /tmp/kubeconfig create namespace csi-mntrs \
+            --dry-run=client -o yaml | kubectl --kubeconfig /tmp/kubeconfig apply -f -
+          kubectl --kubeconfig /tmp/kubeconfig apply -f tests/e2e/csi/hdfs-pod.yaml
 
           # Wait for Pod Running
           kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs wait --for=condition=Ready pod/hdfs --timeout=120s
@@ -506,73 +482,19 @@ jobs:
           NODE_IP=$(kubectl --kubeconfig /tmp/kubeconfig get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
           NODE_NAME=$(kubectl --kubeconfig /tmp/kubeconfig get nodes -o jsonpath='{.items[0].metadata.name}')
           echo "node: ${NODE_NAME} ip: ${NODE_IP}"
-          kubectl --kubeconfig /tmp/kubeconfig apply -f - <<EOF
-          apiVersion: v1
-          kind: Service
-          metadata: {name: hdfs, namespace: csi-mntrs}
-          spec:
-            type: ClusterIP
-            selector: {app: hdfs}
-            ports:
-              - {name: nn-rpc, port: 8020, targetPort: 8020}
-              - {name: dn-data, port: 9866, targetPort: 9866}
-              - {name: dn-http, port: 9864, targetPort: 9864}
-              - {name: kdc, port: 88, targetPort: 88}
-              - {name: kadmin, port: 749, targetPort: 749}
-          ---
-          apiVersion: v1
-          kind: Pod
-          metadata: {name: hdfs, namespace: csi-mntrs, labels: {app: hdfs}}
-          spec:
-            hostNetwork: true
-            dnsPolicy: ClusterFirstWithHostNet
-            hostname: hdfs
-            hostAliases:
-              - ip: ${NODE_IP}
-                hostnames: [${NODE_NAME}, hdfs]
-            containers:
-              - name: hdfs
-                image: dyrnq/hdfs:latest-debian
-                imagePullPolicy: IfNotPresent
-                env:
-                  - {name: HDFS_HOSTNAME, value: hdfs.csi-mntrs.svc.cluster.local}
-                  # docker-hdfs#12: DatanodeHttpServer hard-codes bind URI
-                  # to http://localhost:(ephemeral-port) and the upstream #11
-                  # fix (dfs.datanode.bind-host=0.0.0.0) does not cover
-                  # it. On Debian 13 / OpenJDK 21 localhost resolves to [::1]
-                  # and bind([::1]:0) returns EADDRNOTAVAIL (no IPv6 lo
-                  # in the pod netns on a k3s CI host). Force the JVM
-                  # to IPv4 stack so localhost resolves to 127.0.0.1 and the
-                  # info server starts. Tracked in dyrnq/docker-hdfs#12;
-                  # drop this once upstream patches DatanodeHttpServer
-                  # to honor dfs.datanode.bind-host.
-                  - {name: JAVA_TOOL_OPTIONS, value: "-Djava.net.preferIPv4Stack=true"}
-                  # hostNetwork flips the DN→NN hairpin source to the node IP;
-                  # skip the NameNode reverse-DNS check on registration so the
-                  # node-name hostname (which doesn't match the FQDN) is allowed.
-                  - {name: HDFS-SITE.XML_dfs.namenode.datanode.registration.ip-hostname-check, value: "false"}
-                  # BIND the DN sockets to the short 'hdfs' -> hostAliases ->
-                  # node IP (a real local iface under hostNetwork). The entrypoint
-                  # default dfs.datanode.address=FQDN:9866 resolves the FQDN to the
-                  # Service ClusterIP; on single-node k3s/iptables that is NOT a
-                  # local iface, so the DN crashes with EADDRNOTAVAIL before
-                  # registering (0 datanodes). Binding 0.0.0.0 instead makes the
-                  # DN register the cni0 gateway (10.42.0.1) and the NameNode
-                  # excludes it ('1 node(s) are excluded'). The short-name+hostNetwork
-                  # combo is the only one that works; HDFS_HOSTNAME=FQDN keeps
-                  # dfs.datanode.hostname=FQDN for advertise. Verified 13/13 on a
-                  # k3s replica. Hadoop 3.5.0 has no dfs.datanode.bind-host key.
-                  - {name: HDFS-SITE.XML_dfs.datanode.address, value: "hdfs:9866"}
-                  - {name: HDFS-SITE.XML_dfs.datanode.http.address, value: "hdfs:9864"}
-                  - {name: HDFS-SITE.XML_dfs.datanode.https.address, value: "hdfs:9865"}
-                  - {name: HDFS-SITE.XML_dfs.datanode.ipc.address, value: "hdfs:9867"}
-              ports:
-                - {containerPort: 8020, name: nn-rpc}
-                - {containerPort: 9866, name: dn-data}
-                - {containerPort: 9864, name: dn-http}
-                - {containerPort: 88, name: kdc}
-                - {containerPort: 749, name: kadmin}
-          EOF
+          # Create the namespace first; the previous heredoc referenced
+          # `namespace: csi-mntrs` without ever creating it, so the apply
+          # failed with `namespaces "csi-mntrs" not found` (csi-e2e run
+          # 28102259330, 2026-06-24).
+          kubectl --kubeconfig /tmp/kubeconfig create namespace csi-mntrs \
+            --dry-run=client -o yaml | kubectl --kubeconfig /tmp/kubeconfig apply -f -
+          # Pull the manifest out of the workflow so kubectl reads from a
+          # file (no stdin quoting, no leading-space ambiguity that bit the
+          # previous heredoc with `yaml: line 46: did not find expected '-'
+          # indicator`). envsubst renders only NODE_IP / NODE_NAME, declared
+          # inline below to keep the substitution surface tight.
+          envsubst '$NODE_IP $NODE_NAME' < tests/e2e/csi/hdfs-kerberos-pod.yaml \
+            | kubectl --kubeconfig /tmp/kubeconfig apply -f -
 
           # Wait for Pod Running (300s: a cold runner first-pulls dyrnq/hdfs
           # ~1GB before the pod can start).
