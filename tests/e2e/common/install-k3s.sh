@@ -34,7 +34,7 @@ install_k3s() {
         sleep 10
     done
 
-    sudo mkdir -p /root/.kube
+    sudo mkdir -p /root/.kube "$(dirname "$kubeconfig")"
     sudo cp /etc/rancher/k3s/k3s.yaml "$kubeconfig"
     sudo chown "$(id -u)":"$(id -g)" "$kubeconfig"
     mkdir -p ~/.kube
