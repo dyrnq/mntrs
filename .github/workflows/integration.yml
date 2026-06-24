@@ -190,6 +190,23 @@ jobs:
             exit 1
           fi
 
+          # Pre-flight: the FUSE mount root maps to HDFS /, which the
+          # image boots as 755:hdfs:supergroup. The GHA runner user
+          # (or any non-hdfs user) can `ls` (read) but not `create`.
+          # Catches the missing-chmod-777 class of bug with a clear
+          # pointer to the prep script, instead of letting every later
+          # write fail with a cryptic AccessControlException.
+          if [ "${{ matrix.backend.name }}" = "hdfs" ]; then
+            if ! touch /mnt/mntrs-test/.preflight_probe 2>/dev/null; then
+              echo "::error::HDFS root not writable by $(id -un) — FUSE mount-tests would all fail with AccessControlException"
+              echo "  fix: tests/e2e/common/hdfs-prep.sh docker (chmod 777 / + chmod 777 /test)"
+              FAIL=1
+            else
+              rm -f /mnt/mntrs-test/.preflight_probe
+              echo "preflight OK: mount root writable by $(id -un)"
+            fi
+          fi
+
           # Per SESSION_PITFALLS §2.6: CI green ≠ tests pass — track failures explicitly
           if mount | grep -q /mnt/mntrs-test; then
             echo "--- 1. ls ---"

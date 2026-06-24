@@ -159,3 +159,72 @@ fn test_url_port_parsing() {
     assert_eq!(url.host_str(), Some("namenode"));
     assert_eq!(url.port(), None);
 }
+
+// ---------------------------------------------------------------------
+// Regression: HDFS root ACL scenario (issue #148 follow-up, 2026-06-24)
+//
+// The dyrnq/hdfs image boots HDFS with drwxr-xr-x hdfs:supergroup on /.
+// Any non-hdfs FUSE mount user (GHA `runner`, local `bill`, k8s
+// nodeplugin sidecar) cannot create at the FUSE mount root, so the
+// first write fails with:
+//
+//   org.apache.hadoop.security.AccessControlException:
+//     Permission denied: user=<user>, access=WRITE, inode="/"
+//
+// at `ClientProtocol.create inode="/"`. csi/hdfs.sh and
+// csi/hdfs-kerberos.sh work around this with `chmod 777 / +
+// chmod 777 /test`; integration.yml had been missing the same
+// workaround and surfaced the bug on 2026-06-24 via the ebe45ef
+// diag-dump. Fix: tests/e2e/common/hdfs-prep.sh as the single
+// source of truth, with 3 callers (csi simple, csi kerberos,
+// integration docker).
+//
+// The actual hdfs-native error surface is exercised by the
+// e2e/integration workflow (real HDFS container, real FUSE mount).
+// These unit tests are the cheap, drift-detecting check.
+// ---------------------------------------------------------------------
+
+/// Guards against prep-site drift: every caller must source the
+/// shared `tests/e2e/common/hdfs-prep.sh` script. If a 4th caller
+/// is added (e.g. a new hdfs e2e), it must also source it. CI runs
+/// this on every push so a missed source line fails the build.
+#[test]
+fn hdfs_prep_shared_script_referenced_by_all_callers() {
+    let callers = [
+        "tests/e2e/csi/hdfs.sh",
+        "tests/e2e/csi/hdfs-kerberos.sh",
+        ".github/workflows/integration.yml",
+    ];
+    for caller in callers {
+        let content = std::fs::read_to_string(caller)
+            .unwrap_or_else(|e| panic!("read {caller}: {e}"));
+        assert!(
+            content.contains("hdfs-prep.sh"),
+            "{caller} does not reference tests/e2e/common/hdfs-prep.sh — \
+             the shared chmod 777 / + /test prep will be silently \
+             missing and mount-tests will fail with \
+             AccessControlException on the first write. \
+             See hdfs_native_root_acl_scenario_documented for context."
+        );
+    }
+}
+
+/// Marker test: searchable string for the bug class. The real
+/// behavior is verified by the e2e/integration workflow; this test
+/// is a tripwire for `grep` and a comment that compiles.
+#[test]
+fn hdfs_native_root_acl_scenario_documented() {
+    // Scenario: HDFS / is 755:hdfs:supergroup (image default).
+    // Effect: any non-hdfs user creating a file at HDFS / gets
+    //   org.apache.hadoop.security.AccessControlException:
+    //   Permission denied: user=<user>, access=WRITE, inode="/"
+    // Discovered: 2026-06-24 (issue #148 follow-up; integration
+    //   hdfs mount-tests failed after the ebe45ef diag dump
+    //   surfaced it via the hdfs-diag-hdfs artifact).
+    // Fix: tests/e2e/common/hdfs-prep.sh shared by 3 callers
+    //   (csi/hdfs.sh, csi/hdfs-kerberos.sh, integration.yml)
+    //   + a pre-flight touch probe in integration.yml's
+    //   readiness loop that fails fast with a clear pointer
+    //   to the prep script.
+    let _marker: &str = "hdfs-root-acl-denied-as-non-hdfs-user";
+}
