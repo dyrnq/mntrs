@@ -307,13 +307,24 @@ impl controller_server::Controller for ControllerService {
         _request: Request<ControllerGetCapabilitiesRequest>,
     ) -> Result<Response<ControllerGetCapabilitiesResponse>, Status> {
         Ok(Response::new(ControllerGetCapabilitiesResponse {
-            capabilities: vec![ControllerServiceCapability {
-                r#type: Some(controller_service_capability::Type::Rpc(
-                    controller_service_capability::Rpc {
-                        r#type: controller_service_capability::rpc::Type::CreateDeleteVolume as i32,
-                    },
-                )),
-            }],
+            capabilities: vec![
+                ControllerServiceCapability {
+                    r#type: Some(controller_service_capability::Type::Rpc(
+                        controller_service_capability::Rpc {
+                            r#type: controller_service_capability::rpc::Type::CreateDeleteVolume
+                                as i32,
+                        },
+                    )),
+                },
+                ControllerServiceCapability {
+                    r#type: Some(controller_service_capability::Type::Rpc(
+                        controller_service_capability::Rpc {
+                            r#type: controller_service_capability::rpc::Type::PublishUnpublishVolume
+                                as i32,
+                        },
+                    )),
+                },
+            ],
         }))
     }
 

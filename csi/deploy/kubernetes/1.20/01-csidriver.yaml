@@ -3,5 +3,5 @@ kind: CSIDriver
 metadata:
   name: csi-mntrs
 spec:
-  attachRequired: true
+  attachRequired: false
   podInfoOnMount: true
