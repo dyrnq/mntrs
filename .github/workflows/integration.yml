@@ -13,37 +13,7 @@ on:
     - cron: '0 4 * * 0'
 
 jobs:
-  build-hdfs-image:
-    runs-on: ubuntu-latest
-    permissions:
-      packages: write
-    outputs:
-      image: ghcr.io/${{ github.repository_owner }}/mntrs-hdfs:ci-test-${{ github.sha }}
-    env:
-      # Kerberos principal hostname baked into the image. The
-      # hdfs-kerberos job must run the container with
-      # `--hostname ${HDFS_HOSTNAME}` for SASL auth to work — see
-      # that job for details.
-      HDFS_HOSTNAME: hdfs.test
-    steps:
-      - uses: actions/checkout@v4
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push HDFS image
-        uses: docker/build-push-action@v6
-        with:
-          context: docker/hdfs
-          push: true
-          tags: ghcr.io/${{ github.repository_owner }}/mntrs-hdfs:ci-test-${{ github.sha }}
-          build-args: |
-            HDFS_HOSTNAME=${{ env.HDFS_HOSTNAME }}
-
   mount-tests:
-    needs: build-hdfs-image
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -94,58 +64,42 @@ jobs:
       - name: Setup HDFS (HDFS only)
         if: matrix.backend.name == 'hdfs'
         run: |
-          # Configure HDFS as single-node HA nameservice cluster.
-          # OpenDAL hdfs-native backend uses hdfs://nameservice internally,
-          # so the NameNode must register under the nameservice name.
-          cat > /tmp/core-site-simple.xml << 'XML'
-          <configuration>
-            <property><name>fs.defaultFS</name><value>hdfs://nameservice</value></property>
-            <property><name>hadoop.security.authentication</name><value>simple</value></property>
-            <property><name>hadoop.security.authorization</name><value>false</value></property>
-          </configuration>
-          XML
-          cat > /tmp/hdfs-site-simple.xml << 'XML'
-          <configuration>
-            <property><name>dfs.replication</name><value>1</value></property>
-            <property><name>dfs.permissions.enabled</name><value>false</value></property>
-            <property><name>dfs.nameservices</name><value>nameservice</value></property>
-            <property><name>dfs.ha.namenodes.nameservice</name><value>nn0</value></property>
-            <property><name>dfs.namenode.rpc-address.nameservice.nn0</name><value>0.0.0.0:8020</value></property>
-            <property><name>dfs.namenode.http-address.nameservice.nn0</name><value>0.0.0.0:9870</value></property>
-            <property><name>dfs.client.failover.proxy.provider.nameservice</name><value>org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider</value></property>
-            <property><name>dfs.datanode.address</name><value>0.0.0.0:9866</value></property>
-            <property><name>dfs.datanode.http.address</name><value>0.0.0.0:9864</value></property>
-          </configuration>
-          XML
+          # Uses the public dyrnq/hdfs:latest-debian image (source:
+          # /data/work/docker-hdfs). Its entrypoint has first-class
+          # simple-auth support: HADOOP_SECURITY_AUTHENTICATION=simple
+          # strips the krb5kdc + kadmind s6 services and skips the
+          # keytab/keystore bootstrap, so namenode/datanode start without
+          # any Kerberos dependency — no in-line config mounts needed.
+          # HDFS_HOSTNAME drives the placeholder rendering in the entrypoint
+          # (fs.defaultFS, datanode hostname).
           docker run -d --name hdfs \
-            --add-host nameservice:127.0.0.1 \
+            -e HADOOP_SECURITY_AUTHENTICATION=simple \
+            -e HDFS_HOSTNAME=localhost \
             -p 8020:8020 -p 9866:9866 -p 9864:9864 \
-            -v /tmp/core-site-simple.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro \
-            -v /tmp/hdfs-site-simple.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro \
-            ghcr.io/dyrnq/mntrs-hdfs:ci-test-${{ github.sha }}
+            dyrnq/hdfs:latest-debian
 
           # Wait for NameNode + DataNode (must have ≥1 live datanode)
           for i in $(seq 1 30); do
             # Probe readiness by attempting a real write instead of parsing
             # dfsadmin text output — avoids brittle regex on format changes.
-            if echo "probe" | docker exec -i -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -put - /_readiness_probe 2>/dev/null \
-               && docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -rm /_readiness_probe >/dev/null 2>&1; then
+            if echo "probe" | docker exec -i -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -put - /_readiness_probe 2>/dev/null \
+               && docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -rm /_readiness_probe >/dev/null 2>&1; then
               echo "HDFS ready after ${i} attempts"
               break
             fi
             echo "  attempt $i: waiting for HDFS write readiness..."
             if [ $i -eq 30 ]; then
               echo "::error::HDFS not ready after 30 attempts"
-              docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | head -20
+              docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | head -20
               docker logs hdfs 2>&1 | tail -20
               exit 1
             fi
             sleep 3
           done
           docker logs hdfs 2>&1 | tail -5
-          docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | head -10
-          docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -mkdir -p /test
-          echo "hello hdfs" | docker exec -i -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt
+          docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | head -10
+          docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -mkdir -p /test
+          echo "hello hdfs" | docker exec -i -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt
 
       # ---- Mount + read/write test ----
       - name: Test mount
@@ -195,7 +149,7 @@ jobs:
             pgrep -alf mntrs || echo "(no mntrs process)"
             if [ "${{ matrix.backend.name }}" = "hdfs" ]; then
               echo "--- HDFS dfsadmin -report (server side) ---"
-              docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | tee /tmp/hdfs-dfsadmin-report.txt | head -30 || true
+              docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | tee /tmp/hdfs-dfsadmin-report.txt | head -30 || true
             fi
             echo "--- fusermount might be needed ---"
             exit 1
@@ -335,7 +289,6 @@ jobs:
 
 
   hdfs-kerberos:
-    needs: build-hdfs-image
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -350,58 +303,23 @@ jobs:
 
       - name: Start HDFS container
         env:
-          # MUST match the HDFS_HOSTNAME build-arg used in
-          # build-hdfs-image, otherwise the kerberos principal baked
-          # into the keytab won't match the runtime hostname and SASL
-          # auth will fail with 'Connection reset by peer'.
           HDFS_HOSTNAME: hdfs.test
         run: |
-          # Generate HA+Kerberos config. hdfs-native (OpenDAL) hardcodes
-          # hdfs://nameservice internally; the container must run in HA
-          # nameservice mode or the RPC protocol won't match and the client
-          # gets 'Connection reset by peer' (SESSION_PITFALLS §2.1).
-          cat > /tmp/core-site-ha-krb.xml << 'XML'
-          <configuration>
-            <property><name>fs.defaultFS</name><value>hdfs://nameservice</value></property>
-            <property><name>hadoop.security.authentication</name><value>kerberos</value></property>
-            <property><name>hadoop.security.authorization</name><value>true</value></property>
-            <property><name>hadoop.rpc.protection</name><value>authentication</value></property>
-          </configuration>
-          XML
-          cat > /tmp/hdfs-site-ha-krb.xml << 'XML'
-          <configuration>
-            <property><name>dfs.replication</name><value>1</value></property>
-            <property><name>dfs.permissions.enabled</name><value>false</value></property>
-            <property><name>dfs.nameservices</name><value>nameservice</value></property>
-            <property><name>dfs.ha.namenodes.nameservice</name><value>nn0</value></property>
-            <property><name>dfs.namenode.rpc-address.nameservice.nn0</name><value>0.0.0.0:8020</value></property>
-            <property><name>dfs.namenode.http-address.nameservice.nn0</name><value>0.0.0.0:9870</value></property>
-            <property><name>dfs.client.failover.proxy.provider.nameservice</name><value>org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider</value></property>
-            <property><name>dfs.namenode.kerberos.principal</name><value>hdfs/hdfs.test@TEST.LOCAL</value></property>
-            <property><name>dfs.namenode.keytab.file</name><value>/tmp/hdfs.keytab</value></property>
-            <property><name>dfs.datanode.kerberos.principal</name><value>hdfs/hdfs.test@TEST.LOCAL</value></property>
-            <property><name>dfs.datanode.keytab.file</name><value>/tmp/hdfs.keytab</value></property>
-            <property><name>dfs.web.authentication.kerberos.principal</name><value>HTTP/hdfs.test@TEST.LOCAL</value></property>
-            <property><name>dfs.web.authentication.kerberos.keytab</name><value>/tmp/hdfs.keytab</value></property>
-            <property><name>dfs.block.access.token.enable</name><value>true</value></property>
-            <property><name>dfs.data.transfer.protection</name><value>authentication</value></property>
-            <property><name>dfs.http.policy</name><value>HTTP_ONLY</value></property>
-            <property><name>dfs.datanode.address</name><value>0.0.0.0:9866</value></property>
-            <property><name>dfs.datanode.http.address</name><value>0.0.0.0:9864</value></property>
-            <property><name>ignore.secure.ports.for.testing</name><value>true</value></property>
-            <property><name>dfs.namenode.secondary.http-address</name><value>0.0.0.0:0</value></property>
-          </configuration>
-          XML
+          # Use the public dyrnq/hdfs:latest-debian image in kerberos mode
+          # (default — no HADOOP_SECURITY_AUTHENTICATION=simple). The
+          # entrypoint renders in-tree config from HDFS_HOSTNAME, starts
+          # krb5kdc → kadmind → namenode → datanode, and bootstraps the
+          # KDC database + principals + keytab on first run.
+          # Principal: hdfs/hdfs.test@TEST.LOCAL
+          # Keytab: /etc/hadoop/hdfs.keytab (user hdfs)
+          # krb5.conf: realm=TEST.LOCAL, kdc=localhost:88
+          # No inline config mounts needed — the in-tree templates carry
+          # the same kerberos settings the old HA nameservice config did.
           set -x
           docker run -d --name hdfs --hostname "$HDFS_HOSTNAME" \
-            --add-host nameservice:127.0.0.1 \
+            -e HDFS_HOSTNAME="$HDFS_HOSTNAME" \
             -p 8020:8020 -p 88:88 -p 749:749 -p 9866:9866 -p 9864:9864 \
-            -v /tmp/core-site-ha-krb.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro \
-            -v /tmp/hdfs-site-ha-krb.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro \
-            ${{ needs.build-hdfs-image.outputs.image }}
-          HDFS_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' hdfs)
-          echo "HDFS container hostname: $(docker exec hdfs hostname)"
-          echo "HDFS container IP: $HDFS_IP"
+            dyrnq/hdfs:latest-debian
 
           echo "=== Wait for KDC port 88 ==="
           for i in $(seq 1 30); do
@@ -419,30 +337,21 @@ jobs:
           done
 
           echo "=== Wait for NameNode + DataNode (kinit retry inside loop) ==="
-          # s6-overlay starts krb5kdc first, then kadmin (depends on krb5kdc),
-          # then namenode (depends on krb5kdc), then datanode (depends on namenode).
-          # Even with correct ordering, kinit may need a few retries before the
-          # KDC database is fully loaded. Retry kinit until it succeeds, then
-          # poll dfsadmin for the live datanode.
-          # kinit must run as the same user (mntrs) that the subsequent
-          # hdfs dfsadmin runs as — ticket caches are per-uid, and
-          # hdfs.keytab must be readable by mntrs (chmod 644 in the image
-          # already handles that). Running kinit as root would put
-          # the ticket in /tmp/krb5cc_0 which mntrs can't see.
+          # kinit as user hdfs with the in-tree keytab (/etc/hadoop/hdfs.keytab).
           KINITED=0
           for i in $(seq 1 20); do
             echo "  attempt $i..."
-            if docker exec -u mntrs hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/${HDFS_HOSTNAME}@TEST.LOCAL 2>/dev/null; then
+            if docker exec -u hdfs hdfs /usr/bin/kinit -kt /etc/hadoop/hdfs.keytab hdfs/${HDFS_HOSTNAME}@TEST.LOCAL 2>/dev/null; then
               KINITED=1
             fi
             if [ $KINITED -eq 1 ] \
-               && docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | grep -q "Live datanodes"; then
+               && docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | grep -q "Live datanodes"; then
               echo "HDFS ready (kinit took attempt $i)"
               break
             fi
             if [ $i -eq 20 ]; then
               echo "::error::HDFS did not become ready after 20 attempts (kinit_ok=$KINITED)"
-              docker exec -u mntrs hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/${HDFS_HOSTNAME}@TEST.LOCAL 2>&1
+              docker exec -u hdfs hdfs /usr/bin/kinit -kt /etc/hadoop/hdfs.keytab hdfs/${HDFS_HOSTNAME}@TEST.LOCAL 2>&1
               docker exec hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1
               docker logs hdfs 2>&1 | tail -30
               exit 1
@@ -455,20 +364,16 @@ jobs:
           docker exec hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | head -10
 
           echo "=== Extracting Kerberos config ==="
-          docker cp hdfs:/tmp/testuser.keytab /tmp/testuser.keytab
-          docker cp hdfs:/tmp/hdfs.keytab /tmp/hdfs.keytab
+          docker cp hdfs:/etc/hadoop/hdfs.keytab /tmp/hdfs.keytab
           docker cp hdfs:/etc/krb5.conf /tmp/krb5.conf
-          # Add both the kdc alias and the hdfs hostname to the host's
-          # /etc/hosts. The kdc alias points to the container's IP
-          # (where the KDC service is reachable); the hdfs hostname
-          # must point to 127.0.0.1 because docker's port forward
-          # exposes the container's 8020 on the host's loopback. If we
-          # pointed hdfs.test at the container IP, the hdfs client
-          # would try a direct TCP connection bypassing the port
-          # forward, which the container's iptables rules don't accept.
-          echo "${HDFS_IP} kdc" | sudo tee -a /etc/hosts
+          # hdfs.test must point to 127.0.0.1 because docker's port forward
+          # exposes the container's ports on the host's loopback. The image's
+          # krb5.conf has kdc=localhost:88 and admin_server=localhost:749;
+          # those ports are published (-p 88:88 -p 749:749), so localhost
+          # from the host reaches the container's KDC via the port forward.
+          # No separate kdc alias or nameservice entry is needed — the new
+          # image runs in single-namenode (non-HA) mode.
           echo "127.0.0.1 hdfs.test" | sudo tee -a /etc/hosts
-          echo "127.0.0.1 nameservice" | sudo tee -a /etc/hosts
           docker cp hdfs:/opt/hadoop/etc/hadoop/core-site.xml /tmp/core-site.xml
           docker cp hdfs:/opt/hadoop/etc/hadoop/hdfs-site.xml /tmp/hdfs-site.xml
 
@@ -477,22 +382,13 @@ jobs:
           HDFS_HOSTNAME: hdfs.test
         run: |
           sudo cp /tmp/krb5.conf /etc/krb5.conf
-          # Fix GSSAPI hostname canonicalization: MIT Kerberos's
-          # krb5_sname_to_principal uses getaddrinfo(AI_CANONNAME) which
-          # may return 'localhost' instead of the actual hostname when
-          # /etc/hosts has multiple names on the 127.0.0.1 line.
-          # rdns=false disables reverse-DNS canonicalization;
-          # dns_lookup_kdc/realm=false avoids blocking DNS URI queries.
-          sudo sed -i '/^\[libdefaults\]/a\\trdns = false\n\tdns_lookup_kdc = false\n\tdns_lookup_realm = false' /etc/krb5.conf
-          # Per SESSION_PITFALLS §2.4: hdfs-native uses libhdfs which goes
-          # through GSSAPI. testuser's ticket can't always negotiate with
-          # the hdfs service principal on every hdfs image config — at the
-          # SASL layer we got 'Connection reset by peer' (os error 104).
-          # The hdfs image's superuser is hdfs/${HDFS_HOSTNAME}; using
-          # the hdfs.keytab for the host's kinit guarantees the client
-          # principal matches what the RPC handler expects, which is
-          # what this test is verifying (kerberos auth roundtrip, not
-          # non-superuser ACL semantics).
+          # The image's krb5.conf already has rdns=false; add the two DNS
+          # lookup knobs to avoid blocking on DNS in CI (no external DNS).
+          # dns_lookup_kdc/realm=false is safe here because the krb5.conf
+          # has explicit kdc=localhost and admin_server=localhost entries.
+          sudo sed -i '/^\[libdefaults\]/a\dns_lookup_kdc = false\n\tdns_lookup_realm = false' /etc/krb5.conf
+          # kinit with the hdfs principal (superuser). The keytab was
+          # extracted from the container's /etc/hadoop/hdfs.keytab.
           kinit -kt /tmp/hdfs.keytab hdfs/${HDFS_HOSTNAME}@TEST.LOCAL
           klist
 
@@ -509,12 +405,12 @@ jobs:
           klist
 
           echo "=== 2. Create test data in HDFS ==="
-          docker exec -u mntrs hdfs /usr/bin/kinit -kt /tmp/hdfs.keytab hdfs/${HDFS_HOSTNAME}@TEST.LOCAL
-          docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -mkdir -p /test
-          docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -chmod 777 /test
-          echo "hello kerberos hdfs" | docker exec -i -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt
-          docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -chmod 644 /test/hello.txt
-          docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -ls /test/
+          docker exec -u hdfs hdfs /usr/bin/kinit -kt /etc/hadoop/hdfs.keytab hdfs/${HDFS_HOSTNAME}@TEST.LOCAL
+          docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -mkdir -p /test
+          docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -chmod 777 /test
+          echo "hello kerberos hdfs" | docker exec -i -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt
+          docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -chmod 644 /test/hello.txt
+          docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -ls /test/
 
           echo "=== 3. Export Hadoop config for OpenDAL native HDFS backend ==="
           mkdir -p /tmp/hadoop-conf
@@ -530,7 +426,7 @@ jobs:
           cat /etc/krb5.conf
           echo "---"
           echo "/etc/hosts:"
-          grep -E 'kdc|hdfs.test|nameservice' /etc/hosts || echo "(no entries)"
+          grep -E 'hdfs\.test' /etc/hosts || echo "(no entries)"
 
           echo "=== 5. Mount ==="
           sudo mkdir -p /mnt/hdfs && sudo chmod 777 /mnt/hdfs

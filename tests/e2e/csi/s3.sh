@@ -116,10 +116,10 @@ log "  cluster reachable: $(${KUBECTL} get nodes -o jsonpath='{range .items[*]}{
 if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
     log "[1/9] skip build (SKIP_BUILD=1), using ${IMAGE}"
 else
-    log "[1/9] building mntrs-csi (musl static)..."
-    rustup target add x86_64-unknown-linux-musl 2>/dev/null || true
-    (cd "${REPO_ROOT}" && cargo build --release --package mntrs-csi --target x86_64-unknown-linux-musl)
-    cp "${REPO_ROOT}/target/x86_64-unknown-linux-musl/release/mntrs-csi" "${REPO_ROOT}/docker/csi/mntrs-csi"
+    log "[1/9] building mntrs-csi (glibc)..."
+    rustup target add x86_64-unknown-linux-gnu 2>/dev/null || true
+    (cd "${REPO_ROOT}" && cargo build --release --package mntrs-csi --target x86_64-unknown-linux-gnu)
+    cp "${REPO_ROOT}/target/x86_64-unknown-linux-gnu/release/mntrs-csi" "${REPO_ROOT}/docker/csi/mntrs-csi"
 
     log "  building image ${IMAGE}..."
     (cd "${REPO_ROOT}/docker/csi" && docker build -t "${IMAGE}" .)
@@ -240,7 +240,7 @@ else
     # wait for the Ready condition.
     for label in app=csi-controller-mntrs app=csi-nodeplugin-mntrs; do
         for i in $(seq 1 30); do
-            if ${KUBECTL} -n "${CSI_NAMESPACE}" get pod -l "$label" -o name 2>/dev/null | grep -q .; then
+            if ${KUBECTL} -n "${CSI_NAMESPACE}" get pod -l "$label" -o name 2>/dev/null | grep . > /dev/null; then
                 break
             fi
             sleep 1

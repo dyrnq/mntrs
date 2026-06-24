@@ -197,3 +197,463 @@ jobs:
           echo
           echo "=== recent events (last 30) ==="
           kubectl --kubeconfig /tmp/kubeconfig get events --sort-by=.lastTimestamp 2>&1 | tail -30 || true
+
+  csi-e2e-hdfs:
+    name: csi-e2e (HDFS)
+    runs-on: ubuntu-latest
+
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/mntrs-csi:ci-test-e2e-hdfs-${{ github.sha }}
+      KUBECONFIG: /tmp/kubeconfig
+      REGISTRY: ghcr.io
+      REGISTRY_USER: ${{ github.actor }}
+      REGISTRY_PASS: ${{ secrets.GITHUB_TOKEN }}
+      KEEP_ON_FAIL: '1'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install k3s
+        run: |
+          for i in 1 2 3; do
+            echo "k3s install attempt $i..."
+            if curl -sfL --retry 3 --retry-delay 5 https://get.k3s.io | sh -; then
+              break
+            fi
+            echo "::warning::k3s install attempt $i failed, retrying in 10s"
+            sleep 10
+          done
+          sudo mkdir -p /root/.kube
+          sudo cp /etc/rancher/k3s/k3s.yaml /tmp/kubeconfig
+          sudo chown "$(id -u)":"$(id -g)" /tmp/kubeconfig
+          mkdir -p ~/.kube
+          cp /tmp/kubeconfig ~/.kube/config
+          kubectl --kubeconfig /tmp/kubeconfig wait --for=condition=Ready node --all --timeout=60s
+
+      - name: Install FUSE prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          set +e
+          sudo modprobe fuse 2>/dev/null
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-3
+          if [ ! -e /dev/fuse ]; then
+            sudo mknod /dev/fuse c 10 229
+            sudo chmod 666 /dev/fuse
+          fi
+          sudo grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null || \
+            echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools protobuf-compiler
+
+      - name: Build mntrs-csi (static musl)
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --package mntrs-csi --target x86_64-unknown-linux-musl
+
+      - name: Stage docker context
+        run: |
+          mkdir -p docker/csi
+          cp target/x86_64-unknown-linux-musl/release/mntrs-csi docker/csi/
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push CSI image
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/csi
+          push: true
+          tags: ${{ env.IMAGE }}
+
+      - name: Deploy HDFS Pod
+        run: |
+          kubectl --kubeconfig /tmp/kubeconfig apply -f - <<'EOF'
+          apiVersion: v1
+          kind: Service
+          metadata: {name: hdfs, namespace: csi-mntrs}
+          spec:
+            type: ClusterIP
+            selector: {app: hdfs}
+            ports:
+              - {name: nn-rpc, port: 8020, targetPort: 8020}
+              - {name: dn-data, port: 9866, targetPort: 9866}
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: hdfs, namespace: csi-mntrs, labels: {app: hdfs}}
+          spec:
+            hostname: hdfs
+            containers:
+              - name: hdfs
+                image: dyrnq/hdfs:latest-debian
+                imagePullPolicy: IfNotPresent
+                env:
+                  - {name: HADOOP_SECURITY_AUTHENTICATION, value: simple}
+                  - {name: HDFS_HOSTNAME, value: hdfs}
+                  # docker-hdfs#12: DataNode info server binds [::1]:0 and
+                  # crashes with BindException when the netns has no ::1
+                  # route. The image does NOT default preferIPv4Stack.
+                  - {name: JAVA_TOOL_OPTIONS, value: -Djava.net.preferIPv4Stack=true}
+                ports:
+                  - {containerPort: 8020, name: nn-rpc}
+                  - {containerPort: 9866, name: dn-data}
+          EOF
+
+          # Wait for Pod Running
+          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs wait --for=condition=Ready pod/hdfs --timeout=120s
+
+          # Add Service ClusterIP to /etc/hosts for hostNetwork nodeplugin
+          SVC_IP=$(kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs get svc hdfs -o jsonpath='{.spec.clusterIP}')
+          echo "$SVC_IP hdfs" | sudo tee -a /etc/hosts
+
+          # Wait for NameNode + DataNode (must have >=1 live datanode)
+          # kubectl exec runs as root; in simple-auth mode the superuser is hdfs.
+          for i in $(seq 1 30); do
+            if kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs exec hdfs -- su - hdfs -c "/opt/hadoop/bin/hdfs dfsadmin -report" 2>&1 | grep "Live datanodes" > /dev/null; then
+              echo "HDFS ready after ${i} attempts"
+              break
+            fi
+            echo "  attempt $i: waiting for HDFS..."
+            if [ $i -eq 30 ]; then
+              echo "::error::HDFS not ready after 30 attempts"
+              kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs exec hdfs -- su - hdfs -c "/opt/hadoop/bin/hdfs dfsadmin -report" 2>&1 | head -20
+              kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs logs hdfs 2>&1 | tail -20
+              exit 1
+            fi
+            sleep 3
+          done
+          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs logs hdfs 2>&1 | tail -5
+          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs exec hdfs -- su - hdfs -c "/opt/hadoop/bin/hdfs dfsadmin -report" 2>&1 | head -10
+
+      - name: Run e2e
+        run: |
+          set +e
+          bash tests/e2e/csi/hdfs.sh 2>&1 | tee /tmp/hdfs-e2e.log
+          SCRIPT_EXIT=${PIPESTATUS[0]}
+          echo "=== hdfs.sh exit code: ${SCRIPT_EXIT} ==="
+          exit "${SCRIPT_EXIT}"
+
+      - name: Upload hdfs.sh log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hdfs-e2e-log
+          path: /tmp/hdfs-e2e.log
+          if-no-files-found: warn
+
+      - name: Capture kubelet journal (always, for postmortem)
+        if: always()
+        run: |
+          sudo journalctl -u k3s --since "10 minutes ago" --no-pager > /tmp/k3s-journal-hdfs.log 2>&1 || true
+          echo "k3s journal size: $(wc -l < /tmp/k3s-journal-hdfs.log) lines"
+
+      - name: Upload kubelet journal
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k3s-journal-hdfs
+          path: /tmp/k3s-journal-hdfs.log
+          if-no-files-found: warn
+
+      - name: Dump on failure
+        if: failure()
+        run: |
+          echo "=== csi-mntrs pods ==="
+          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs get pods -o wide
+          echo
+          echo "=== csi-controller log (last 50) ==="
+          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs logs -l app=csi-controller-mntrs --tail=50 2>&1 || true
+          echo
+          echo "=== csi-nodeplugin log (last 50) ==="
+          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs logs -l app=csi-nodeplugin-mntrs --tail=50 2>&1 || true
+          echo
+          echo "=== test pod events (dynamic) ==="
+          kubectl --kubeconfig /tmp/kubeconfig describe pod mntrs-csi-e2e-hdfs-dyn 2>&1 || true
+          echo
+          echo "=== test pod events (static) ==="
+          kubectl --kubeconfig /tmp/kubeconfig describe pod mntrs-csi-e2e-hdfs 2>&1 || true
+          echo
+          echo "=== recent events (last 30) ==="
+          kubectl --kubeconfig /tmp/kubeconfig get events --sort-by=.lastTimestamp 2>&1 | tail -30 || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs delete pod hdfs --force --grace-period=0 --ignore-not-found 2>/dev/null || true
+          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs delete svc hdfs --ignore-not-found 2>/dev/null || true
+
+  csi-e2e-hdfs-kerberos:
+    name: csi-e2e (HDFS Kerberos)
+    runs-on: ubuntu-latest
+
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/mntrs-csi:ci-test-e2e-hdfs-krb-${{ github.sha }}
+      KUBECONFIG: /tmp/kubeconfig
+      REGISTRY: ghcr.io
+      REGISTRY_USER: ${{ github.actor }}
+      REGISTRY_PASS: ${{ secrets.GITHUB_TOKEN }}
+      KEEP_ON_FAIL: '1'
+      SKIP_BUILD: '1'
+      HDFS_HOSTNAME: hdfs.csi-mntrs.svc.cluster.local
+      HDFS_REALM: TEST.LOCAL
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install k3s
+        run: |
+          for i in 1 2 3; do
+            echo "k3s install attempt $i..."
+            if curl -sfL --retry 3 --retry-delay 5 https://get.k3s.io | sh -; then
+              break
+            fi
+            echo "::warning::k3s install attempt $i failed, retrying in 10s"
+            sleep 10
+          done
+          sudo mkdir -p /root/.kube
+          sudo cp /etc/rancher/k3s/k3s.yaml /tmp/kubeconfig
+          sudo chown "$(id -u)":"$(id -g)" /tmp/kubeconfig
+          mkdir -p ~/.kube
+          cp /tmp/kubeconfig ~/.kube/config
+          kubectl --kubeconfig /tmp/kubeconfig wait --for=condition=Ready node --all --timeout=60s
+
+      - name: Install FUSE prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          set +e
+          sudo modprobe fuse 2>/dev/null
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-3
+          if [ ! -e /dev/fuse ]; then
+            sudo mknod /dev/fuse c 10 229
+            sudo chmod 666 /dev/fuse
+          fi
+          sudo grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null || \
+            echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler krb5-user
+
+      - name: Build mntrs-csi (glibc dynamic)
+        run: |
+          rustup target add x86_64-unknown-linux-gnu
+          cargo build --release --package mntrs-csi --target x86_64-unknown-linux-gnu
+
+      - name: Stage docker context
+        run: |
+          mkdir -p docker/csi
+          cp target/x86_64-unknown-linux-gnu/release/mntrs-csi docker/csi/
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push CSI image
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/csi
+          push: true
+          tags: ${{ env.IMAGE }}
+
+      # Build a shell-capable kubectl image for the nodeplugin's kubectl-fetch
+      # initContainer. rancher/kubectl:v1.35.5 is distroless (no /bin/sh), but
+      # the initContainer runs `command: ["/bin/sh","-c", ...]` to fetch the
+      # keytab + krb5.conf and sed-rewrite the KDC address — so it needs a
+      # shell. We extract the kubectl binary from the rancher image and drop it
+      # into alpine. Pushed to GHCR so the cluster can pull it.
+      - name: Build and push kubectl image
+        run: |
+          set -e
+          KUBECTL_IMG=ghcr.io/${{ github.repository_owner }}/kubectl-shell:${{ github.sha }}
+          docker create --name kx rancher/kubectl:v1.35.5
+          docker cp kx:/bin/kubectl /tmp/kubectl-bin
+          docker rm kx
+          mkdir -p /tmp/kbld
+          cp /tmp/kubectl-bin /tmp/kbld/kubectl
+          printf '%s\n' 'FROM alpine:3.21' \
+            'RUN apk add --no-cache ca-certificates' \
+            'COPY kubectl /usr/local/bin/kubectl' \
+            'RUN chmod +x /usr/local/bin/kubectl' > /tmp/kbld/Dockerfile
+          docker build -t "${KUBECTL_IMG}" /tmp/kbld
+          docker push "${KUBECTL_IMG}"
+          echo "KUBECTL_IMAGE=${KUBECTL_IMG}" >> "$GITHUB_ENV"
+
+      - name: Deploy HDFS Kerberos Pod
+        run: |
+          # The runner is the sole k3s node. hostNetwork makes the HDFS pod
+          # share it so the DataNode can bind a real local interface (the node
+          # IP), instead of the Service ClusterIP which is NOT a local iface on
+          # single-node k3s/iptables and makes the DN crash with EADDRNOTAVAIL.
+          # hostAliases maps the short 'hdfs' (used by the DN bind overrides
+          # below) AND the node name (hostNetwork flips the pod's OS hostname to
+          # the node's, which Java's getLocalHost must be able to resolve) to
+          # the node IP. Verified 13/13 on a single-node k3s (iptables) replica;
+          # identical to the working multi-node config in
+          # tests/e2e/csi/hdfs-kerberos.sh. See [[kerberos-single-node-k3s-hostnet]].
+          NODE_IP=$(kubectl --kubeconfig /tmp/kubeconfig get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+          NODE_NAME=$(kubectl --kubeconfig /tmp/kubeconfig get nodes -o jsonpath='{.items[0].metadata.name}')
+          echo "node: ${NODE_NAME} ip: ${NODE_IP}"
+          kubectl --kubeconfig /tmp/kubeconfig apply -f - <<EOF
+          apiVersion: v1
+          kind: Service
+          metadata: {name: hdfs, namespace: csi-mntrs}
+          spec:
+            type: ClusterIP
+            selector: {app: hdfs}
+            ports:
+              - {name: nn-rpc, port: 8020, targetPort: 8020}
+              - {name: dn-data, port: 9866, targetPort: 9866}
+              - {name: dn-http, port: 9864, targetPort: 9864}
+              - {name: kdc, port: 88, targetPort: 88}
+              - {name: kadmin, port: 749, targetPort: 749}
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: hdfs, namespace: csi-mntrs, labels: {app: hdfs}}
+          spec:
+            hostNetwork: true
+            dnsPolicy: ClusterFirstWithHostNet
+            hostname: hdfs
+            hostAliases:
+              - ip: ${NODE_IP}
+                hostnames: [${NODE_NAME}, hdfs]
+            containers:
+              - name: hdfs
+                image: dyrnq/hdfs:latest-debian
+                imagePullPolicy: IfNotPresent
+                env:
+                  - {name: HDFS_HOSTNAME, value: hdfs.csi-mntrs.svc.cluster.local}
+                  # docker-hdfs#12: DatanodeHttpServer hard-codes bind URI
+                  # to `http://localhost:<ephemeral>` and the upstream #11
+                  # fix (dfs.datanode.bind-host=0.0.0.0) does not cover
+                  # it. On Debian 13 / OpenJDK 21 `localhost` → [::1]
+                  # and bind([::1]:0) returns EADDRNOTAVAIL (no IPv6 lo
+                  # in the pod netns on a k3s CI host). Force the JVM
+                  # to IPv4 stack so `localhost` → 127.0.0.1 and the
+                  # info server starts. Tracked in dyrnq/docker-hdfs#12;
+                  # drop this once upstream patches DatanodeHttpServer
+                  # to honor `dfs.datanode.bind-host`.
+                  - {name: JAVA_TOOL_OPTIONS, value: "-Djava.net.preferIPv4Stack=true"}
+                  # hostNetwork flips the DN→NN hairpin source to the node IP;
+                  # skip the NameNode reverse-DNS check on registration so the
+                  # node-name hostname (which doesn't match the FQDN) is allowed.
+                  - {name: HDFS-SITE.XML_dfs.namenode.datanode.registration.ip-hostname-check, value: "false"}
+                  # BIND the DN sockets to the short 'hdfs' -> hostAliases ->
+                  # node IP (a real local iface under hostNetwork). The entrypoint
+                  # default dfs.datanode.address=FQDN:9866 resolves the FQDN to the
+                  # Service ClusterIP; on single-node k3s/iptables that is NOT a
+                  # local iface, so the DN crashes with EADDRNOTAVAIL before
+                  # registering (0 datanodes). Binding 0.0.0.0 instead makes the
+                  # DN register the cni0 gateway (10.42.0.1) and the NameNode
+                  # excludes it ('1 node(s) are excluded'). The short-name+hostNetwork
+                  # combo is the only one that works; HDFS_HOSTNAME=FQDN keeps
+                  # dfs.datanode.hostname=FQDN for advertise. Verified 13/13 on a
+                  # k3s replica. Hadoop 3.5.0 has no dfs.datanode.bind-host key.
+                  - {name: HDFS-SITE.XML_dfs.datanode.address, value: "hdfs:9866"}
+                  - {name: HDFS-SITE.XML_dfs.datanode.http.address, value: "hdfs:9864"}
+                  - {name: HDFS-SITE.XML_dfs.datanode.https.address, value: "hdfs:9865"}
+                  - {name: HDFS-SITE.XML_dfs.datanode.ipc.address, value: "hdfs:9867"}
+              ports:
+                - {containerPort: 8020, name: nn-rpc}
+                - {containerPort: 9866, name: dn-data}
+                - {containerPort: 9864, name: dn-http}
+                - {containerPort: 88, name: kdc}
+                - {containerPort: 749, name: kadmin}
+          EOF
+
+          # Wait for Pod Running (300s: a cold runner first-pulls dyrnq/hdfs
+          # ~1GB before the pod can start).
+          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs wait --for=condition=Ready pod/hdfs --timeout=300s
+
+          # Add Service ClusterIP to /etc/hosts for hostNetwork nodeplugin
+          SVC_IP=$(kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs get svc hdfs -o jsonpath='{.spec.clusterIP}')
+          echo "$SVC_IP hdfs" | sudo tee -a /etc/hosts
+
+          # Wait for NameNode + DataNode (must have >=1 live datanode)
+          for i in $(seq 1 30); do
+            kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs exec hdfs -- /usr/bin/kinit -kt /etc/hadoop/hdfs.keytab "hdfs/${HDFS_HOSTNAME}@${HDFS_REALM}" 2>/dev/null
+            if kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs exec hdfs -- /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | grep "Live datanodes" > /dev/null; then
+              echo "HDFS ready after ${i} attempts"
+              break
+            fi
+            echo "  attempt $i: waiting for HDFS..."
+            if [ $i -eq 30 ]; then
+              echo "::error::HDFS not ready after 30 attempts"
+              kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs exec hdfs -- /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | head -20
+              kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs logs hdfs 2>&1 | tail -30
+              exit 1
+            fi
+            sleep 3
+          done
+          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs logs hdfs 2>&1 | tail -5
+          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs exec hdfs -- /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | head -10
+
+      - name: Run e2e
+        run: |
+          set +e
+          bash tests/e2e/csi/hdfs-kerberos.sh 2>&1 | tee /tmp/hdfs-krb-e2e.log
+          SCRIPT_EXIT=${PIPESTATUS[0]}
+          echo "=== hdfs-kerberos.sh exit code: ${SCRIPT_EXIT} ==="
+          exit "${SCRIPT_EXIT}"
+
+      - name: Upload hdfs-kerberos.sh log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hdfs-krb-e2e-log
+          path: /tmp/hdfs-krb-e2e.log
+          if-no-files-found: warn
+
+      - name: Capture kubelet journal (always, for postmortem)
+        if: always()
+        run: |
+          sudo journalctl -u k3s --since "10 minutes ago" --no-pager > /tmp/k3s-journal-hdfs-krb.log 2>&1 || true
+          echo "k3s journal size: $(wc -l < /tmp/k3s-journal-hdfs-krb.log) lines"
+
+      - name: Upload kubelet journal
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k3s-journal-hdfs-krb
+          path: /tmp/k3s-journal-hdfs-krb.log
+          if-no-files-found: warn
+
+      - name: Dump on failure
+        if: failure()
+        run: |
+          echo "=== csi-mntrs pods ==="
+          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs get pods -o wide
+          echo
+          echo "=== csi-controller log (last 50) ==="
+          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs logs -l app=csi-controller-mntrs --tail=50 2>&1 || true
+          echo
+          echo "=== csi-nodeplugin log (last 50) ==="
+          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs logs -l app=csi-nodeplugin-mntrs --tail=50 2>&1 || true
+          echo
+          echo "=== test pod events (dynamic) ==="
+          kubectl --kubeconfig /tmp/kubeconfig describe pod mntrs-csi-e2e-hdfs-krb-dyn 2>&1 || true
+          echo
+          echo "=== test pod events (static) ==="
+          kubectl --kubeconfig /tmp/kubeconfig describe pod mntrs-csi-e2e-hdfs-krb 2>&1 || true
+          echo
+          echo "=== recent events (last 30) ==="
+          kubectl --kubeconfig /tmp/kubeconfig get events --sort-by=.lastTimestamp 2>&1 | tail -30 || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs delete pod hdfs --force --grace-period=0 --ignore-not-found 2>/dev/null || true
+          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs delete svc hdfs --ignore-not-found 2>/dev/null || true

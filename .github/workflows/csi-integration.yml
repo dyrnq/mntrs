@@ -42,29 +42,8 @@ jobs:
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/mntrs-csi:ci-test-${{ github.sha }}
 
-  build-hdfs-image:
-    runs-on: ubuntu-latest
-    permissions:
-      packages: write
-    outputs:
-      image: ghcr.io/${{ github.repository_owner }}/mntrs-hdfs:ci-test-${{ github.sha }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push HDFS image
-        uses: docker/build-push-action@v6
-        with:
-          context: docker/hdfs
-          push: true
-          tags: ghcr.io/${{ github.repository_owner }}/mntrs-hdfs:ci-test-${{ github.sha }}
-
   csi-test:
-    needs: [build-csi-image, build-hdfs-image]
+    needs: [build-csi-image]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -114,41 +93,26 @@ jobs:
             aws --endpoint-url http://localhost:9000 --no-verify-ssl s3 cp /tmp/s3-test.txt s3://test-bucket/
 
       # ---- HDFS: start container in simple auth mode ----
+      # Uses the public dyrnq/hdfs:latest-debian image (source:
+      # /data/work/docker-hdfs). Its entrypoint has first-class simple-auth
+      # support: HADOOP_SECURITY_AUTHENTICATION=simple strips the krb5kdc +
+      # kadmind s6 services and skips the keytab/keystore bootstrap, so the
+      # namenode/datanode start without any Kerberos dependency. No in-line
+      # config mounts needed — HDFS_HOSTNAME drives the placeholder rendering
+      # in the entrypoint (fs.defaultFS, datanode hostname). The repo's
+      # docker/hdfs (Kerberos-only) is kept in-tree but no longer built by CI.
       - name: Setup HDFS (hdfs only)
         if: matrix.test.name == 'hdfs'
         run: |
-          # Configure HDFS as single-node HA nameservice cluster.
-          # OpenDAL hdfs-native backend uses hdfs://nameservice internally.
-          cat > /tmp/core-site-simple.xml << 'XML'
-          <configuration>
-            <property><name>fs.defaultFS</name><value>hdfs://nameservice</value></property>
-            <property><name>hadoop.security.authentication</name><value>simple</value></property>
-            <property><name>hadoop.security.authorization</name><value>false</value></property>
-          </configuration>
-          XML
-          cat > /tmp/hdfs-site-simple.xml << 'XML'
-          <configuration>
-            <property><name>dfs.replication</name><value>1</value></property>
-            <property><name>dfs.permissions.enabled</name><value>false</value></property>
-            <property><name>dfs.nameservices</name><value>nameservice</value></property>
-            <property><name>dfs.ha.namenodes.nameservice</name><value>nn0</value></property>
-            <property><name>dfs.namenode.rpc-address.nameservice.nn0</name><value>0.0.0.0:8020</value></property>
-            <property><name>dfs.namenode.http-address.nameservice.nn0</name><value>0.0.0.0:9870</value></property>
-            <property><name>dfs.client.failover.proxy.provider.nameservice</name><value>org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider</value></property>
-            <property><name>dfs.datanode.address</name><value>0.0.0.0:9866</value></property>
-            <property><name>dfs.datanode.http.address</name><value>0.0.0.0:9864</value></property>
-          </configuration>
-          XML
           docker run -d --name hdfs \
-            --add-host nameservice:127.0.0.1 \
+            -e HADOOP_SECURITY_AUTHENTICATION=simple \
+            -e HDFS_HOSTNAME=localhost \
             -p 8020:8020 -p 9866:9866 -p 9864:9864 \
-            -v /tmp/core-site-simple.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro \
-            -v /tmp/hdfs-site-simple.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro \
-            ${{ needs.build-hdfs-image.outputs.image }}
+            dyrnq/hdfs:latest-debian
           for i in $(seq 1 30); do
             # Probe readiness by attempting a real write
-            if echo "probe" | docker exec -i -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -put - /_readiness_probe 2>/dev/null \
-               && docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -rm /_readiness_probe >/dev/null 2>&1; then
+            if echo "probe" | docker exec -i -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -put - /_readiness_probe 2>/dev/null \
+               && docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -rm /_readiness_probe >/dev/null 2>&1; then
               echo "HDFS ready after ${i} attempts"
               break
             fi
@@ -156,8 +120,8 @@ jobs:
             sleep 3
           done
           docker logs hdfs 2>&1 | tail -5
-          docker exec -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -mkdir -p /test
-          echo "hello hdfs" | docker exec -i -u mntrs hdfs /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt
+          docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -mkdir -p /test
+          echo "hello hdfs" | docker exec -i -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt
 
       # ---- Mount + read/write test ----
       - name: Test mntrs mount
