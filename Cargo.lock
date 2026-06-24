@@ -1243,8 +1243,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 [[package]]
 name = "hdfs-native"
 version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51610510377a0847d53b78b53f9c6c9b7df3ffb300d1181b2e04f68bba363734"
+source = "git+https://github.com/dyrnq/hdfs-native.git?rev=419cd0ea737289232f1b35e2680313d814bf90aa#419cd0ea737289232f1b35e2680313d814bf90aa"
 dependencies = [
  "aes",
  "base64",

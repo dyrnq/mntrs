@@ -72,6 +72,26 @@ sftp = ["opendal/services-sftp"]
 [workspace]
 members = [".", "csi/mntrs-csi"]
 
+[patch.crates-io]
+# Fork of hdfs-native 0.13.5 adding `dfs.client.use.datanode.hostname` support,
+# so the client connects to DataNodes via host_name (k8s Service DNS) instead of
+# ip_addr (127.0.0.1 in-container loopback). Original upstream issue:
+# Kimahriman/hdfs-native#302.
+#
+# Upstream has since implemented the SAME feature (PR #303, merge commit
+# e339b560, 2026-06-23) — equivalent constants/method/default. It is on master
+# but NOT yet in a release: v0.14.0 (2026-06-04) predates it, and no v0.14.1+
+# tag exists as of 2026-06-24. So this fork is kept temporarily (option C).
+#
+# TODO: revert to the crates.io version (delete this [patch.crates-io] block)
+# once BOTH are published:
+#   1. hdfs-native releases a version >= 0.14.1 containing #303, AND
+#   2. opendal upgrades its opendal-service-hdfs-native dep to pull that version.
+# At that point the dyrnq/hdfs-native fork can be archived. See
+# [[hdfs-native-fork-temporary]].
+hdfs-native = { git = "https://github.com/dyrnq/hdfs-native.git", rev = "419cd0ea737289232f1b35e2680313d814bf90aa" }
+
 [[bin]]
 name = "mntrs"
 path = "src/main.rs"
+
