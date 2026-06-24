@@ -196,8 +196,8 @@ fn hdfs_prep_shared_script_referenced_by_all_callers() {
         ".github/workflows/integration.yml",
     ];
     for caller in callers {
-        let content = std::fs::read_to_string(caller)
-            .unwrap_or_else(|e| panic!("read {caller}: {e}"));
+        let content =
+            std::fs::read_to_string(caller).unwrap_or_else(|e| panic!("read {caller}: {e}"));
         assert!(
             content.contains("hdfs-prep.sh"),
             "{caller} does not reference tests/e2e/common/hdfs-prep.sh — \
