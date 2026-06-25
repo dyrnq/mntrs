@@ -18,10 +18,17 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      # Issue #151: A/B matrix for mem_cache impl. fuse-integration
+      # ignores the mem_cache_impl value (the FUSE tests don't depend
+      # on it) so we exclude the `moka` row there to keep CI time
+      # at 3 jobs total: fuse-integration, bench-comparison×dashmap,
+      # bench-comparison×moka.
       matrix:
-        mode:
-          - name: fuse-integration
-          - name: bench-comparison
+        mode: [fuse-integration, bench-comparison]
+        mem_cache_impl: [dashmap, moka]
+        exclude:
+          - mode: fuse-integration
+            mem_cache_impl: moka
 
     services:
       minio:
@@ -56,11 +63,11 @@ jobs:
           setup_minio_bucket test-bucket "" "" ""
 
       - name: Run FUSE integration tests
-        if: matrix.mode.name == 'fuse-integration'
+        if: matrix.mode == 'fuse-integration'
         run: cargo test --test fuse_integration_test -- --test-threads=1 --nocapture
 
       - name: Setup rclone
-        if: matrix.mode.name == 'bench-comparison'
+        if: matrix.mode == 'bench-comparison'
         run: |
           curl -sSL https://downloads.rclone.org/rclone-current-linux-amd64.deb -o rclone.deb
           sudo dpkg -i rclone.deb
@@ -69,8 +76,15 @@ jobs:
             access_key_id minioadmin secret_access_key minioadmin \
             endpoint http://localhost:9000 region us-east-1
 
+      # Issue #151: pass mem_cache_impl to bench/run_all.sh so the
+      # mount uses the selected impl (`--mem-cache-impl=$MEM_CACHE_IMPL`
+      # in run_all.sh:86). A/B matrix above yields two bench-comparison
+      # jobs: one per impl. artifact names are suffixed with the impl
+      # so they don't collide in the Actions UI.
       - name: Run benchmark
-        if: matrix.mode.name == 'bench-comparison'
+        if: matrix.mode == 'bench-comparison'
+        env:
+          MEM_CACHE_IMPL: ${{ matrix.mem_cache_impl }}
         run: |
           MNTRS_BIN=./target/release/mntrs RCLONE_MNT=/tmp/rclone-mnt MNTRS_MNT=/tmp/mntrs-bench \
             ENDPOINT=http://localhost:9000 BUCKET=bench-bucket \
@@ -78,21 +92,21 @@ jobs:
             bash bench/run_all.sh 2>&1 | tee bench-result.txt
 
       - name: Upload benchmark results
-        if: matrix.mode.name == 'bench-comparison'
+        if: matrix.mode == 'bench-comparison'
         uses: actions/upload-artifact@v4
         with:
-          name: bench-result
+          name: bench-result-${{ matrix.mem_cache_impl }}
           path: bench-result.txt
 
       - name: Upload rclone log
-        if: matrix.mode.name == 'bench-comparison'
+        if: matrix.mode == 'bench-comparison'
         uses: actions/upload-artifact@v4
         with:
-          name: rclone-bench-log
+          name: rclone-bench-log-${{ matrix.mem_cache_impl }}
           path: /tmp/rclone-bench.log
 
       - name: Check regressions
-        if: matrix.mode.name == 'bench-comparison'
+        if: matrix.mode == 'bench-comparison'
         run: |
           # Compare bench-result.txt against bench/baseline.txt. The
           # script reports 2 distinct regression classes:
