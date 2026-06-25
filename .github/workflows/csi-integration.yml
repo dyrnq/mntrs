@@ -257,11 +257,10 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          kubectl delete pod mntrs-csi-test-${{ matrix.test.name }} --ignore-not-found
-          if mount | grep -q /mnt/mntrs-test; then
-            sudo fusermount3 -u /mnt/mntrs-test
-          fi
-          docker rm -f hdfs 2>/dev/null || true
+          . tests/e2e/common/ci-cleanup.sh
+          cleanup_k8s_pod_svc mntrs-csi-test-${{ matrix.test.name }} default
+          cleanup_fuse_mount /mnt/mntrs-test
+          cleanup_docker_container hdfs
 
       # Per SESSION_PITFALLS §2.6: CI green ≠ tests pass — on failure,
       # preserve the mount log for post-mortem. The mount itself
