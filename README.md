@@ -183,10 +183,9 @@ Three-tier cache: **memory → disk → remote**. Block-level (8 MB) indexing. D
 |------|---------|-------------|
 | `--vfs-cache-max-size` | 1024 MB | Disk cache upper limit (LRU) |
 | `--vfs-cache-min-free-space` | 100 MB | Min free space before eviction |
-| `--vfs-cache-max-age` | 3600s | Max cache file age |
-| `--vfs-cache-mode` | `writes` | `off` / `writes` / `full` |
-| `--vfs-cache-poll-interval` | 60s | Stale-object poll interval |
-| `--vfs-cache-mode` | `writes` | `off` / `writes` / `full` |
+| `--vfs-cache-max-age` | 3600s | Max cache file age (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
+| `--vfs-cache-mode` | `writes` | `off` / `minimal` / `writes` / `full` (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
+| `--vfs-cache-poll-interval` | 60s | Stale-object poll interval (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
 | `--mem-limit` | 256 MB | Memory cache upper limit |
 | `--dir-cache-time` | 10s | Directory listing TTL |
 | `--attr-timeout` | 1s | File attribute TTL (kernel) |
@@ -239,17 +238,24 @@ echo "hello" > /mnt/s3/file.txt     # cached + async write-back
 cat /mnt/s3/file.txt               # served from cache (hot)
 
 # Sync
-sync /mnt/s3/file.txt              # fsync → waits for write-back queue
+sync /mnt/s3/file.txt              # fdatasync → cache file durable on local disk
 ```
 
 **Mechanisms**:
 
-- **Write-back queue** with exponential backoff (3 attempts)
-- **`.dirty` sidecar** for crash recovery (scanned on mount init)
+- **Write-back queue** with exponential backoff (5 attempts; cycle cap 10 at 60s cooldown)
+- **fdatasync on flush/release** before the FUSE reply (`Issue #34` — local-durability half)
+- **`.dirty` sidecar** for crash recovery (scanned on mount init; left on disk for retry-exhausted paths)
 - **`PendingUploadHook`** updates inode size/mtime after successful upload
-- **`fsync` semantics** (flush waits up to 5 min for queue drain; CSI uses 1 hour)
+- **Retry-cycle counter** (4th tuple field, `Issue #53`) prevents silent re-enqueue drops
 - **Multipart upload** via `op.writer()` auto-chunks >5 GB
 - **CRC64 integrity** for disk cache
+
+For the full durability model — including the rclone-compat shadow
+fields (`--vfs-cache-mode`, `--vfs-cache-max-age`,
+`--vfs-cache-poll-interval`, `--poll-interval`, `--vfs-refresh`)
+that are accepted on the CLI but not yet implemented — see
+[`docs/durability.md`](docs/durability.md).
 
 ---
 
