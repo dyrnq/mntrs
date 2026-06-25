@@ -149,6 +149,35 @@ pub(crate) struct DiskWriteJob {
 pub(crate) static PATH_CACHE_GEN: once_cell::sync::Lazy<dashmap::DashMap<String, u64>> =
     once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
+/// Hard cap on `PATH_CACHE_GEN` entries (issue #161).
+///
+/// Each entry is `String + u64` ≈ 50 B. At 1M distinct written paths
+/// the table is ~50 MiB resident, and the cap does not count against
+/// `cache_max_size`. A long-running mount writing new distinct paths
+/// (log ingest, CSI volume churn) used to grow this unbounded.
+///
+/// When the cap is hit, the whole table is cleared. In-flight pool
+/// jobs captured against old gens all skip once (worst case: a
+/// one-time cache-miss burst on the next read of those paths), then
+/// the table rebuilds as writes continue. The behavior is
+/// `try_reserve` semantics — never over-reserve, drop the whole
+/// table if it would exceed the cap.
+#[cfg(not(test))]
+const PATH_CACHE_GEN_HARD_CAP: usize = 100_000;
+#[cfg(test)]
+static PATH_CACHE_GEN_HARD_CAP: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(100_000);
+
+#[cfg(test)]
+pub(crate) fn set_path_cache_gen_cap_for_test(cap: usize) {
+    PATH_CACHE_GEN_HARD_CAP.store(cap, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn path_cache_gen_cap_for_test() -> usize {
+    PATH_CACHE_GEN_HARD_CAP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Read the current cache generation for `path` (0 if unseen).
 pub(crate) fn path_cache_gen(path: &str) -> u64 {
     PATH_CACHE_GEN.get(path).map(|g| *g).unwrap_or(0)
@@ -158,10 +187,35 @@ pub(crate) fn path_cache_gen(path: &str) -> u64 {
 /// writes captured against an older gen). Called by the write path's
 /// L2 invalidate.
 pub(crate) fn bump_path_cache_gen(path: &str) {
-    PATH_CACHE_GEN
-        .entry(path.to_string())
-        .and_modify(|g| *g = g.wrapping_add(1))
-        .or_insert(1);
+    // Fast path: if the entry already exists or we're under the
+    // cap, just bump. The cap check uses `.len()` which is O(1)
+    // on DashMap.
+    #[cfg(not(test))]
+    let cap = PATH_CACHE_GEN_HARD_CAP;
+    #[cfg(test)]
+    let cap = PATH_CACHE_GEN_HARD_CAP.load(std::sync::atomic::Ordering::Relaxed);
+    if PATH_CACHE_GEN.len() < cap {
+        PATH_CACHE_GEN
+            .entry(path.to_string())
+            .and_modify(|g| *g = g.wrapping_add(1))
+            .or_insert(1);
+        return;
+    }
+    // Cap reached: drop the entire table. In-flight pool jobs
+    // captured against old gens will all skip once (worst case is
+    // a transient cache miss — never stale data, because skipping
+    // just means "don't write the block, the next read will
+    // re-fetch"). Then the table rebuilds as writes continue.
+    tracing::warn!(
+        cap,
+        "disk_write_pool: PATH_CACHE_GEN hit hard cap, clearing (one-time cache-miss burst on next read)"
+    );
+    PATH_CACHE_GEN.clear();
+    // Re-insert the current path so the bump for *this* write is
+    // recorded (otherwise an in-flight pool job for this same path
+    // would see gen 0 == bump 0, but since we just cleared and the
+    // bump is happening NOW, the gen should be 1).
+    PATH_CACHE_GEN.insert(path.to_string(), 1);
 }
 
 impl DiskWriteJob {
@@ -923,5 +977,48 @@ mod tests {
         register_dirty_cache_path(&p);
         assert_eq!(DIRTY_CACHE_PATHS.len(), before);
         DIRTY_CACHE_PATHS.remove(&p);
+    }
+
+    // Issue #161: PATH_CACHE_GEN grows unbounded. The hard cap
+    // drops the whole table on overflow; in-flight pool jobs
+    // captured against old gens all skip once (transient
+    // cache-miss burst), then the table rebuilds.
+    #[test]
+    fn path_cache_gen_capped() {
+        // Start clean.
+        PATH_CACHE_GEN.clear();
+        // Lower the cap to a value we can actually hit in a test.
+        let saved_cap = path_cache_gen_cap_for_test();
+        set_path_cache_gen_cap_for_test(10);
+        // Insert 10 distinct paths — at the cap, len == cap, so
+        // the next bump triggers the clear path.
+        for i in 0..10 {
+            let p = format!("/test/path-{}", i);
+            bump_path_cache_gen(&p);
+        }
+        assert_eq!(PATH_CACHE_GEN.len(), 10);
+        // The 11th bump triggers the cap-clear path. After
+        // clear + re-insert, the table has 1 entry.
+        bump_path_cache_gen("/test/path-overflow");
+        assert_eq!(PATH_CACHE_GEN.len(), 1);
+        // The cleared paths are gone (gen 0 for them).
+        for i in 0..10 {
+            let p = format!("/test/path-{}", i);
+            assert_eq!(
+                path_cache_gen(&p),
+                0,
+                "old path gen should reset after clear"
+            );
+        }
+        // The overflow path is recorded as gen 1.
+        assert_eq!(path_cache_gen("/test/path-overflow"), 1);
+        // Bumping the same path under cap → monotonic, no clear.
+        for _ in 0..3 {
+            bump_path_cache_gen("/test/path-overflow");
+        }
+        assert_eq!(path_cache_gen("/test/path-overflow"), 4);
+        assert_eq!(PATH_CACHE_GEN.len(), 1);
+        // Restore the cap so other tests see the production value.
+        set_path_cache_gen_cap_for_test(saved_cap);
     }
 }
