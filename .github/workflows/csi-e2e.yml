@@ -131,6 +131,16 @@ jobs:
           out_dir: /tmp/csi-dump-s3
           artifact_name: csi-failure-dump-s3
 
+      # csi-e2e previously had NO GHCR cleanup, so the per-SHA image
+      # accumulated forever (security audit H2). Run unconditionally
+      # (`if: always()`) so a failure case still cleans up — the
+      # script is idempotent.
+      - name: Delete test image from GHCR
+        if: always()
+        run: |
+          . tests/e2e/common/cleanup-ghcr-image.sh
+          cleanup_ghcr_image "$IMAGE"
+
   csi-e2e-hdfs:
     name: csi-e2e (HDFS)
     runs-on: ubuntu-latest
@@ -202,6 +212,12 @@ jobs:
           test_pod: mntrs-csi-e2e-hdfs
           out_dir: /tmp/csi-dump-hdfs
           artifact_name: csi-failure-dump-hdfs
+
+      - name: Delete test image from GHCR
+        if: always()
+        run: |
+          . tests/e2e/common/cleanup-ghcr-image.sh
+          cleanup_ghcr_image "$IMAGE"
 
       - name: Cleanup
         if: always()
@@ -311,6 +327,12 @@ jobs:
           test_pod: mntrs-csi-e2e-hdfs-krb
           out_dir: /tmp/csi-dump-hdfs-krb
           artifact_name: csi-failure-dump-hdfs-krb
+
+      - name: Delete test image from GHCR
+        if: always()
+        run: |
+          . tests/e2e/common/cleanup-ghcr-image.sh
+          cleanup_ghcr_image "$IMAGE"
 
       - name: Cleanup
         if: always()
