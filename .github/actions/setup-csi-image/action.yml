@@ -1,0 +1,59 @@
+name: 'Setup CSI image'
+description: >-
+  Build the mntrs-csi binary, log in to GHCR, and push the CSI image.
+  Replaces the 4 inline "Install build deps + Build mntrs-csi + Log in to
+  GHCR + Build and push CSI image" step chains in csi-integration.yml
+  and csi-e2e.yml (3 jobs). Wraps tests/e2e/common/build-csi.sh.
+inputs:
+  target:
+    description: 'rust target triple (e.g. x86_64-unknown-linux-musl for musl static, x86_64-unknown-linux-gnu for kerberos)'
+    default: 'x86_64-unknown-linux-musl'
+  image_tag:
+    description: 'image tag (e.g. ghcr.io/owner/mntrs-csi:tag) — caller interpolates github.repository_owner'
+    required: true
+  docker_context:
+    description: 'docker build context path (where the binary is staged)'
+    default: 'docker/csi'
+  install_deps:
+    description: >-
+      space-separated apt packages to install before cargo build. Pass ""
+      to skip. The hdfs-kerberos csi-e2e job uses "protobuf-compiler krb5-user";
+      the musl callers use "musl-tools protobuf-compiler".
+    default: 'musl-tools protobuf-compiler'
+  registry_username:
+    description: 'docker registry username (caller interpolates github.actor in workflow context)'
+    required: true
+  registry_password:
+    description: 'docker registry password (caller interpolates secrets.GITHUB_TOKEN in workflow context)'
+    required: true
+  registry:
+    description: 'docker registry host'
+    default: 'ghcr.io'
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+
+    - if: inputs.install_deps != ''
+      shell: bash
+      run: >-
+        sudo apt-get update
+        && sudo apt-get install -y ${{ inputs.install_deps }}
+
+    - shell: bash
+      run: >-
+        . tests/e2e/common/build-csi.sh
+        && build_csi "${{ inputs.target }}" "${{ inputs.docker_context }}"
+
+    - uses: docker/login-action@v3
+      with:
+        registry: ${{ inputs.registry }}
+        username: ${{ inputs.registry_username }}
+        password: ${{ inputs.registry_password }}
+
+    - uses: docker/build-push-action@v6
+      with:
+        context: ${{ inputs.docker_context }}
+        push: true
+        tags: ${{ inputs.image_tag }}

@@ -60,9 +60,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install k3s
-        run: bash tests/e2e/common/install-k3s.sh 3 /tmp/kubeconfig
-
       # FUSE is required for mntrs' FUSE mounts. The GitHub runner's
       # Ubuntu image ships without fuse3 userland tools and without
       # /dev/fuse, so the csi-mntrs nodeplugin (privileged but
@@ -70,35 +67,18 @@ jobs:
       # 120s `kubectl wait` blows up. Install the kernel module,
       # userland tools, the device node, and the FUSE policy — same
       # recipe csi-integration.yml has been using all along.
-      - name: Install FUSE prerequisites
-        if: runner.os == 'Linux'
-        run: bash tests/e2e/common/install-linux-deps.sh csi-e2e "" no no
-
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools protobuf-compiler
-          # musl build is fine for k3s + GHCR; the Dockerfile pins a base
-          # that can run it.
-
-      - name: Build mntrs-csi (static musl)
-        run: |
-          . tests/e2e/common/build-csi.sh
-          build_csi x86_64-unknown-linux-musl docker/csi
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
+      - uses: ./.github/actions/setup-k3s-test-env
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          retries: '3'
+          kubeconfig: /tmp/kubeconfig
+          fuse_mode: csi-e2e
 
-      - name: Build and push CSI image
-        uses: docker/build-push-action@v6
+      - uses: ./.github/actions/setup-csi-image
         with:
-          context: docker/csi
-          push: true
-          tags: ${{ env.IMAGE }}
+          target: x86_64-unknown-linux-musl
+          image_tag: ${{ env.IMAGE }}
+          registry_username: ${{ github.actor }}
+          registry_password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run e2e
         env:
@@ -143,10 +123,13 @@ jobs:
           if-no-files-found: warn
 
       - name: Dump on failure
-        if: failure()
-        run: |
-          . tests/e2e/common/csi-dump-failure.sh
-          csi_dump_failure /tmp/kubeconfig csi-mntrs mntrs-csi-e2e
+        uses: ./.github/actions/csi-failure-dump
+        with:
+          kubeconfig: /tmp/kubeconfig
+          namespace: csi-mntrs
+          test_pod: mntrs-csi-e2e
+          out_dir: /tmp/csi-dump-s3
+          artifact_name: csi-failure-dump-s3
 
   csi-e2e-hdfs:
     name: csi-e2e (HDFS)
@@ -163,36 +146,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install k3s
-        run: bash tests/e2e/common/install-k3s.sh 3 /tmp/kubeconfig
-
-      - name: Install FUSE prerequisites
-        if: runner.os == 'Linux'
-        run: bash tests/e2e/common/install-linux-deps.sh csi-e2e "" no no
-
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools protobuf-compiler
-
-      - name: Build mntrs-csi (static musl)
-        run: |
-          . tests/e2e/common/build-csi.sh
-          build_csi x86_64-unknown-linux-musl docker/csi
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
+      - uses: ./.github/actions/setup-k3s-test-env
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          retries: '3'
+          kubeconfig: /tmp/kubeconfig
+          fuse_mode: csi-e2e
 
-      - name: Build and push CSI image
-        uses: docker/build-push-action@v6
+      - uses: ./.github/actions/setup-csi-image
         with:
-          context: docker/csi
-          push: true
-          tags: ${{ env.IMAGE }}
+          target: x86_64-unknown-linux-musl
+          image_tag: ${{ env.IMAGE }}
+          registry_username: ${{ github.actor }}
+          registry_password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Deploy HDFS Pod
         run: |
@@ -230,10 +195,13 @@ jobs:
           if-no-files-found: warn
 
       - name: Dump on failure
-        if: failure()
-        run: |
-          . tests/e2e/common/csi-dump-failure.sh
-          csi_dump_failure /tmp/kubeconfig csi-mntrs mntrs-csi-e2e-hdfs
+        uses: ./.github/actions/csi-failure-dump
+        with:
+          kubeconfig: /tmp/kubeconfig
+          namespace: csi-mntrs
+          test_pod: mntrs-csi-e2e-hdfs
+          out_dir: /tmp/csi-dump-hdfs
+          artifact_name: csi-failure-dump-hdfs
 
       - name: Cleanup
         if: always()
@@ -259,36 +227,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install k3s
-        run: bash tests/e2e/common/install-k3s.sh 3 /tmp/kubeconfig
-
-      - name: Install FUSE prerequisites
-        if: runner.os == 'Linux'
-        run: bash tests/e2e/common/install-linux-deps.sh csi-e2e "" no no
-
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler krb5-user
-
-      - name: Build mntrs-csi (glibc dynamic)
-        run: |
-          . tests/e2e/common/build-csi.sh
-          build_csi x86_64-unknown-linux-gnu docker/csi
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
+      - uses: ./.github/actions/setup-k3s-test-env
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          retries: '3'
+          kubeconfig: /tmp/kubeconfig
+          fuse_mode: csi-e2e
 
-      - name: Build and push CSI image
-        uses: docker/build-push-action@v6
+      # hdfs-kerberos uses glibc dynamic (musl static-pie is incompatible
+      # with kerberos dynamic linking — see [[kerberos-csi-fix-dlopen-auth]]).
+      # install_deps adds krb5-user alongside protobuf-compiler (the musl
+      # callers get musl-tools too, which we don't need here).
+      - uses: ./.github/actions/setup-csi-image
         with:
-          context: docker/csi
-          push: true
-          tags: ${{ env.IMAGE }}
+          target: x86_64-unknown-linux-gnu
+          image_tag: ${{ env.IMAGE }}
+          install_deps: 'protobuf-compiler krb5-user'
+          registry_username: ${{ github.actor }}
+          registry_password: ${{ secrets.GITHUB_TOKEN }}
 
       # Build a shell-capable kubectl image for the nodeplugin's kubectl-fetch
       # initContainer. rancher/kubectl:v1.35.5 is distroless (no /bin/sh), but
@@ -349,10 +304,13 @@ jobs:
           if-no-files-found: warn
 
       - name: Dump on failure
-        if: failure()
-        run: |
-          . tests/e2e/common/csi-dump-failure.sh
-          csi_dump_failure /tmp/kubeconfig csi-mntrs mntrs-csi-e2e-hdfs-krb
+        uses: ./.github/actions/csi-failure-dump
+        with:
+          kubeconfig: /tmp/kubeconfig
+          namespace: csi-mntrs
+          test_pod: mntrs-csi-e2e-hdfs-krb
+          out_dir: /tmp/csi-dump-hdfs-krb
+          artifact_name: csi-failure-dump-hdfs-krb
 
       - name: Cleanup
         if: always()

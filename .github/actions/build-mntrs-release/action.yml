@@ -1,0 +1,58 @@
+name: 'Build mntrs release'
+description: >-
+  Build the mntrs binary in release mode. Combines checkout,
+  rust-toolchain, rust-cache, FUSE setup (modprobe + /dev/fuse +
+  /etc/fuse.conf user_allow_other), the FUSE build deps, and
+  `cargo build --release -p mntrs` into one step. Replaces the 5 inline
+  "Install deps + Build mntrs" pairs in integration.yml (mount-tests,
+  hdfs-kerberos, memory-stress-loop, lifecycle-stress,
+  s3-lifecycle-stress).
+inputs:
+  extra_deps:
+    description: >-
+      extra apt packages to install alongside libfuse3-dev + fuse3 +
+      protobuf-compiler (e.g. "krb5-user" for the hdfs-kerberos job).
+      Pass "" to skip.
+    default: ''
+  setup_fuse_device:
+    description: >-
+      Run modprobe fuse + mknod /dev/fuse. The csi-e2e jobs need this
+      (mntrs-csi runs in a privileged pod that mounts through /dev/fuse);
+      the standard integration.yml jobs only need user_allow_other.
+      Pass "no" for memory-only / non-mount tests if you want to skip
+      the mknod (idempotent on re-run).
+    default: 'yes'
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+
+    - shell: bash
+      run: >-
+        sudo apt-get update
+        && sudo apt-get install -y
+        libfuse3-dev fuse3 protobuf-compiler ${{ inputs.extra_deps }}
+
+    # FUSE setup — needed for every job that does a real mount. The
+    # `user_allow_other` line in /etc/fuse.conf is what enables mntrs's
+    # `--allow-other` flag (without it, mntrs refuses to mount with
+    # `Error: --allow-other requires 'user_allow_other' in /etc/fuse.conf`).
+    # modprobe + mknod are no-ops if the kernel module is already loaded
+    # or the device node already exists (CI runners are sometimes
+    # pre-configured either way).
+    - if: inputs.setup_fuse_device == 'yes'
+      shell: bash
+      run: |
+        sudo modprobe fuse 2>/dev/null || true
+        if [ ! -e /dev/fuse ]; then
+          sudo mknod /dev/fuse c 10 229 2>/dev/null || true
+          sudo chmod 666 /dev/fuse 2>/dev/null || true
+        fi
+        if ! sudo grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null; then
+          echo 'user_allow_other' | sudo tee -a /etc/fuse.conf >/dev/null
+        fi
+
+    - shell: bash
+      run: cargo build --release -p mntrs

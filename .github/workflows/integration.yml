@@ -42,11 +42,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install deps
-        run: bash tests/e2e/common/install-linux-deps.sh standard "" yes no
-
-      - name: Build mntrs
-        run: cargo build --release -p mntrs
+      # Note: the action installs libfuse3-dev + fuse3 + protobuf-compiler.
+      # This matches the prior "Install deps" step for mount-tests (which
+      # also installed protobuf-compiler) — see install-linux-deps.sh
+      # history for the 5-variant diff.
+      - uses: ./.github/actions/build-mntrs-release
 
       # ---- S3 backend: create bucket + upload test file ----
       - name: Setup MinIO (S3 only)
@@ -242,20 +242,17 @@ jobs:
       # the mount log and HDFS dfsadmin report for post-mortem. Pattern adapted
       # from bench.yml ("Upload rclone log" + "actions/upload-artifact@v4").
       - name: Upload mount log (failure)
-        if: failure()
-        uses: actions/upload-artifact@v4
+        uses: ./.github/actions/upload-log-on-failure
         with:
           name: mount-log-${{ matrix.backend.name }}
           path: /tmp/mntrs-mount-${{ matrix.backend.name }}.log
-          if-no-files-found: warn
 
       - name: Upload HDFS dfsadmin report (failure, hdfs only)
-        if: failure() && matrix.backend.name == 'hdfs'
-        uses: actions/upload-artifact@v4
+        if: matrix.backend.name == 'hdfs'
+        uses: ./.github/actions/upload-log-on-failure
         with:
           name: hdfs-dfsadmin-report
           path: /tmp/hdfs-dfsadmin-report.txt
-          if-no-files-found: warn
 
 
   hdfs-kerberos:
@@ -265,8 +262,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install deps
-        run: bash tests/e2e/common/install-linux-deps.sh standard "krb5-user" no no
+      # build-mntrs-release installs libfuse3-dev + fuse3 + protobuf-compiler
+      # + extra_deps. The krb5-user dep is what the kerberos test needs.
+      # The previous "Install deps" (now removed) only installed
+      # libfuse3-dev + fuse3 + krb5-user (no protobuf-compiler) — adding
+      # protobuf-compiler is harmless (mntrs alone doesn't call protoc,
+      # but the build env already has it for csi builds).
+      - uses: ./.github/actions/build-mntrs-release
+        with:
+          extra_deps: krb5-user
 
       - name: Start HDFS container
         env:
@@ -314,9 +318,6 @@ jobs:
           kinit -kt /tmp/hdfs.keytab hdfs/${HDFS_HOSTNAME}@TEST.LOCAL
           klist
 
-      - name: Build mntrs
-        run: cargo build --release -p mntrs
-
       - name: Test HDFS Kerberos mount
         env:
           HDFS_HOSTNAME: hdfs.test
@@ -350,12 +351,10 @@ jobs:
       # Per SESSION_PITFALLS §2.6: preserve post-mortem on failure.
       # Pattern adapted from bench.yml ("Upload rclone log" + actions/upload-artifact@v4).
       - name: Upload mount log (failure)
-        if: failure()
-        uses: actions/upload-artifact@v4
+        uses: ./.github/actions/upload-log-on-failure
         with:
           name: mount-log-hdfs-kerberos
           path: /tmp/mntrs-mount.log
-          if-no-files-found: warn
 
   # Stress loop on the memory backend — surfaces flakes that
   # single-run tests miss. The memory backend has no remote
@@ -368,11 +367,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install deps
-        run: bash tests/e2e/common/install-linux-deps.sh standard "" no no
-
-      - name: Build mntrs
-        run: cargo build --release -p mntrs
+      - uses: ./.github/actions/build-mntrs-release
 
       - name: Run 50-iteration stress loop
         run: |
@@ -381,12 +376,10 @@ jobs:
           ./tests/e2e/mount/stress_loop.sh 50 > "$STRESS_LOG" 2>&1
 
       - name: Upload stress log (failure)
-        if: failure()
-        uses: actions/upload-artifact@v4
+        uses: ./.github/actions/upload-log-on-failure
         with:
           name: stress-loop-log
           path: /tmp/mntrs-stress-loop.log
-          if-no-files-found: warn
 
       - name: Cleanup
         if: always()
@@ -404,11 +397,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install deps
-        run: bash tests/e2e/common/install-linux-deps.sh standard "" no no
-
-      - name: Build mntrs
-        run: cargo build --release -p mntrs
+      - uses: ./.github/actions/build-mntrs-release
 
       - name: Lifecycle stress (memory, 50 iterations)
         run: |
@@ -417,12 +406,10 @@ jobs:
           ./tests/e2e/mount/lifecycle_stress.sh 50 target/release/mntrs /tmp/mntrs-lifecycle > "$LIFECYCLE_LOG" 2>&1
 
       - name: Upload lifecycle stress log (failure)
-        if: failure()
-        uses: actions/upload-artifact@v4
+        uses: ./.github/actions/upload-log-on-failure
         with:
           name: lifecycle-stress-log
           path: /tmp/mntrs-lifecycle-stress.log
-          if-no-files-found: warn
 
       - name: Cleanup
         if: always()
@@ -450,14 +437,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install deps
-        run: bash tests/e2e/common/install-linux-deps.sh standard "" no yes
+      # Add $HOME/go/bin to GITHUB_PATH so the `go install github.com/minio/mc`
+      # below puts `mc` on PATH for the rest of the job. The original
+      # install-linux-deps.sh had with_gopath=yes doing this; the
+      # build-mntrs-release action doesn't touch GITHUB_PATH.
+      - name: Set GITHUB_PATH for go install
+        run: echo "$HOME/go/bin" >> "$GITHUB_PATH"
+
+      - uses: ./.github/actions/build-mntrs-release
 
       - name: Install mc (MinIO client)
         run: go install github.com/minio/mc@latest
-
-      - name: Build mntrs
-        run: cargo build --release -p mntrs
 
       - name: Create S3 bucket
         run: |
@@ -482,14 +472,12 @@ jobs:
           ./tests/e2e/mount/writeback_recovery.sh target/release/mntrs /tmp/mntrs-wb-cache > "$WB_RECOVERY_LOG" 2>&1
 
       - name: Upload s3 lifecycle + writeback logs (failure)
-        if: failure()
-        uses: actions/upload-artifact@v4
+        uses: ./.github/actions/upload-log-on-failure
         with:
           name: s3-lifecycle-stress-log
           path: |
             /tmp/mntrs-s3-lifecycle-stress.log
             /tmp/mntrs-writeback-recovery.log
-          if-no-files-found: warn
 
       - name: Cleanup
         if: always()
