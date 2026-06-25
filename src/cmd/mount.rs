@@ -730,6 +730,8 @@ pub fn mount(
         // Issue #38: empty pending set; populated on
         // first flush/release.
         writeback_pending: std::sync::Arc::new(dashmap::DashSet::new()),
+        // Issue #132: shared adaptive prefetch window controller.
+        backpressure: std::sync::Arc::new(crate::backpressure::BackpressureController::new()),
         dir_cache_ttl: std::time::Duration::from_secs(dir_cache_time),
         attr_ttl: std::time::Duration::from_secs(attr_timeout),
         stat_cache_ttl: std::time::Duration::from_secs(stat_cache_ttl),

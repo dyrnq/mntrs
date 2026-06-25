@@ -11,6 +11,9 @@ use bytes::Bytes;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
+
+use crate::backpressure::BackpressureController;
 
 /// A chunk of data downloaded from remote.
 #[derive(Clone)]
@@ -152,6 +155,15 @@ pub struct HandlePrefetcher {
     /// or error). Lets callers/tests confirm `cancel()` actually
     /// stopped the thread rather than leaving it parked.
     download_done: Arc<AtomicBool>,
+    /// Issue #132: adaptive prefetch window. The download thread
+    /// reads `current_window()` at the top of each loop and calls
+    /// `record_part_fetched(bytes, elapsed)` after a successful read.
+    /// The FUSE read path calls `record_part_consumed(bytes, elapsed)`
+    /// after popping a part. Cloning the `Arc` into the spawn closure
+    /// keeps the controller alive for the prefetcher's lifetime even
+    /// if the caller drops its reference (the spawn thread itself
+    /// keeps the controller reference count >= 1).
+    backpressure: Arc<BackpressureController>,
 }
 
 impl HandlePrefetcher {
@@ -161,6 +173,7 @@ impl HandlePrefetcher {
         file_size: u64,
         max_queue_bytes: u64,
         chunk_size: u64,
+        backpressure: Arc<BackpressureController>,
     ) -> Self {
         let cancelled = Arc::new(AtomicBool::new(false));
         let cond = Arc::new(Condvar::new());
@@ -173,15 +186,36 @@ impl HandlePrefetcher {
         let c = cancelled.clone();
         let cv = cond.clone();
         let done = download_done.clone();
+        let bp = backpressure.clone();
+        // `chunk_size` is the FIRST-loop value only. Issue #132: from
+        // the second iteration onward, the window comes from
+        // `BackpressureController::current_window()`. This keeps the
+        // very first prefetch chunk equal to the prior fixed value
+        // (no first-read regression) while letting the window grow or
+        // shrink based on consumer rate vs producer rate thereafter.
+        let first_chunk = chunk_size;
         std::thread::spawn(move || {
             let mut offset = 0u64;
             'download: while offset < file_size {
                 if c.load(Ordering::Relaxed) {
                     break;
                 }
-                let end = (offset + chunk_size).min(file_size);
+                // Issue #132: adaptive window. Read the controller
+                // each iteration so a long-running prefetch can
+                // respond to changing consumer rate. The first
+                // iteration uses the constructor's `first_chunk`
+                // (== prior fixed value) so the initial chunk is
+                // unchanged from the pre-#132 behavior.
+                let window = if offset == 0 {
+                    first_chunk
+                } else {
+                    bp.current_window()
+                };
+                let end = (offset + window).min(file_size);
+                let t0 = Instant::now();
                 let result =
                     crate::rt().block_on(async { op.read_with(&path).range(offset..end).await });
+                let elapsed = t0.elapsed();
                 match result {
                     Ok(buf) => {
                         let part = Part {
@@ -189,6 +223,16 @@ impl HandlePrefetcher {
                             data: Bytes::from(buf.to_vec()),
                         };
                         let part_len = part.data.len() as u64;
+                        // Issue #132: feed the producer rate. Skip
+                        // the first call (cold-start: TLS handshake
+                        // + connection setup inflate elapsed and
+                        // would push `fetch_rate` toward zero,
+                        // biasing the window toward max on every
+                        // mount). `record_part_fetched` already
+                        // skips `elapsed == 0` internally.
+                        if offset > 0 {
+                            bp.record_part_fetched(part_len, elapsed);
+                        }
                         let mut qlock = q.lock().unwrap();
                         // Backpressure: park on the Condvar while the
                         // queue is full. `cond.wait` releases the
@@ -243,6 +287,7 @@ impl HandlePrefetcher {
             cancelled,
             cond,
             download_done,
+            backpressure,
         }
     }
 
@@ -267,7 +312,20 @@ impl HandlePrefetcher {
         self.download_done.load(Ordering::SeqCst)
     }
 
-    pub fn pop(&self, offset: u64) -> Option<Part> {
+    /// Pop a part covering `offset`. `consume_started` is an `Instant`
+    /// captured by the caller when it began the FUSE read; we use the
+    /// elapsed time since then as the consumer-side `elapsed` input to
+    /// `BackpressureController::record_part_consumed`. This lets the
+    /// adaptive window (issue #132) shrink when reads are slow and
+    /// grow when reads are keeping up with the prefetcher.
+    ///
+    /// `consume_started` may be `None` for callers that don't track
+    /// their own start time (e.g. tests, or the cold-start `None` from
+    /// the FUSE path before the first tick). In that case the
+    /// controller sees `elapsed = 0` and the existing
+    /// `if elapsed.as_secs_f64() <= 0.0 { return; }` guard skips the
+    /// update — no EMA pollution.
+    pub fn pop(&self, offset: u64, consume_started: Option<Instant>) -> Option<Part> {
         let mut g = self.queue.lock().unwrap();
         let before = g.current_bytes();
         let part = g.pop(offset);
@@ -276,6 +334,16 @@ impl HandlePrefetcher {
             // room for a pusher parked on the Condvar. notify_one is
             // a no-op if nothing is parked.
             self.cond.notify_one();
+        }
+        drop(g);
+        // Issue #132: feed the consumer rate. Only on a real part
+        // pop (not a None or a stale-drop-empty pop). `elapsed == 0`
+        // is a no-op per the controller's own guard.
+        if let Some(p) = &part
+            && let Some(t0) = consume_started
+        {
+            self.backpressure
+                .record_part_consumed(p.data.len() as u64, t0.elapsed());
         }
         part
     }
@@ -491,7 +559,14 @@ mod tests {
 
         // max_queue_bytes=8, chunk_size=8 → first 8 B chunk fills the
         // queue (8/8); the second push parks on the Condvar.
-        let hp = HandlePrefetcher::new(op, "big.bin".into(), 64 * 1024, 8, 8);
+        let hp = HandlePrefetcher::new(
+            op,
+            "big.bin".into(),
+            64 * 1024,
+            8,
+            8,
+            std::sync::Arc::new(BackpressureController::new()),
+        );
 
         // Let the download thread fetch the first chunk and park.
         std::thread::sleep(Duration::from_millis(150));

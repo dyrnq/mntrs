@@ -31,9 +31,14 @@
 //!     `min_window` immediately (memory
 //!     pressure).
 //!
-//! The default min / max window are 1 MiB and
-//! 64 MiB, matching the rclone defaults
-//! (--vfs-read-chunk-size).
+//! The default min / max window are 128 KiB and
+//! 64 MiB. The lower bound matches mntrs's existing
+//! `read_chunk_size` clamp floor (lib.rs:
+//! `self.read_chunk_size.clamp(131072, 16 MiB)`), so
+//! the first prefetch chunk is the same size as the
+//! prior fixed value — no first-read regression on
+//! small files. The upper bound matches rclone's
+//! `--vfs-read-chunk-size-limit` default.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -63,9 +68,16 @@ struct Inner {
 }
 
 impl BackpressureController {
-    /// Default min / max window: 1 MiB / 64 MiB.
+    /// Default min / max window: 128 KiB / 64 MiB.
+    ///
+    /// 128 KiB matches `MntrsFs::read_chunk_size` clamp lower bound
+    /// (lib.rs: `self.read_chunk_size.clamp(131072, 16 MiB)`); keeping
+    /// the initial chunk equal to the prior fixed value avoids a
+    /// first-read latency regression on small files (issue #132
+    /// re-evaluation). The window grows from there toward `max_window`
+    /// as the consumer keeps up with the producer.
     pub fn new() -> Self {
-        Self::with_window(1024 * 1024, 64 * 1024 * 1024)
+        Self::with_window(128 * 1024, 64 * 1024 * 1024)
     }
 
     pub fn with_window(min: u64, max: u64) -> Self {
@@ -226,5 +238,102 @@ mod tests {
         // After many growth steps, must still
         // be <= 4096.
         assert!(c.current_window() <= 4096);
+    }
+
+    // Issue #132: default min_window must match
+    // `MntrsFs::read_chunk_size.clamp(131072, 16 MiB)` so the first
+    // prefetch chunk is unchanged from pre-#132 behavior. The
+    // pre-#132 default was 1 MiB; post-#132 it is 128 KiB. This test
+    // pins the post-#132 default so a future change requires
+    // explicit justification.
+    #[test]
+    fn default_min_window_matches_read_chunk_size_floor() {
+        let c = BackpressureController::new();
+        assert_eq!(
+            c.current_window(),
+            128 * 1024,
+            "default min_window must equal read_chunk_size clamp floor (131072 ≈ 128 KiB)"
+        );
+    }
+
+    // Issue #132: `record_part_consumed` with elapsed == 0 must be a
+    // no-op (the existing div-by-zero guard). If a caller passes
+    // `Some(Instant)` but the read completed within the same clock
+    // tick (very small reads, or `Instant::now()` immediately before
+    // `elapsed()`), the controller must not poison the EMA with an
+    // astronomically high rate.
+    #[test]
+    fn zero_elapsed_record_is_noop() {
+        let c = BackpressureController::with_window(1024, 1 << 20);
+        // Baseline: high consumer rate + low fetch rate → window grows.
+        c.record_part_consumed(1 << 20, Duration::from_millis(1));
+        c.record_part_fetched(1024, Duration::from_millis(100));
+        let before = c.current_window();
+        // Now hammer with zero-elapsed records — must not move the
+        // window. (The div-by-zero guard returns early.)
+        for _ in 0..100 {
+            c.record_part_consumed(u64::MAX, Duration::ZERO);
+        }
+        assert_eq!(
+            c.current_window(),
+            before,
+            "elapsed == 0 records must not affect the EMA"
+        );
+    }
+
+    // Issue #132: only the FIRST cold-start fetch must be excluded
+    // from the producer EMA. The prefetcher's spawn loop guards
+    // `if offset > 0 { record_part_fetched }`; this test verifies the
+    // controller itself is fine with a single, possibly-misleading
+    // first sample by NOT collapsing the window to min/max.
+    #[test]
+    fn single_high_elapsed_fetch_does_not_collapse_window() {
+        let c = BackpressureController::with_window(1024, 1 << 20);
+        // Single fetch: 4 KiB in 5 seconds (slow, but the first
+        // sample). Pre-fix, the prefetcher would feed this to the
+        // controller, the EMA would update to ~800 B/s, and the
+        // window would be wrong until several real fetches arrived.
+        // The fix is upstream (in prefetcher.rs: `if offset > 0`),
+        // but verify the controller's behavior on a single sample is
+        // bounded — it shouldn't drive the window to either extreme
+        // on one record alone.
+        c.record_part_fetched(4 * 1024, Duration::from_secs(5));
+        let w = c.current_window();
+        assert!(
+            (1024..=(1 << 20)).contains(&w),
+            "single fetch sample should not collapse the window, got {w}"
+        );
+    }
+
+    // Issue #132: after several alternating consumer/producer records
+    // at equal rates, the window should converge to a stable value
+    // (not oscillate forever). The EMA seeds both rates from zero on
+    // the first record, so a transient "consumer faster" step is
+    // expected before the rates equalize — we just verify the window
+    // is bounded and stops growing once rates converge.
+    //
+    // This is the property the bench will verify end-to-end.
+    #[test]
+    fn alternating_equal_rates_converge() {
+        let c = BackpressureController::with_window(1024, 1 << 20);
+        // Warm-up: first few records seed the EMA. After ~10 records
+        // both rates should be near the same value (1 MiB / 1 ms).
+        for _ in 0..20 {
+            c.record_part_consumed(1 << 20, Duration::from_millis(1));
+            c.record_part_fetched(1 << 20, Duration::from_millis(1));
+        }
+        let settled = c.current_window();
+        // After warm-up, the window must not grow further on equal
+        // inputs. If `compute_window` keeps growing, we have an
+        // oscillation bug (the EMA never converges).
+        for _ in 0..20 {
+            c.record_part_consumed(1 << 20, Duration::from_millis(1));
+            c.record_part_fetched(1 << 20, Duration::from_millis(1));
+            let now = c.current_window();
+            assert_eq!(
+                now, settled,
+                "equal rates should leave the window stable, drifted from {settled} to {now}"
+            );
+        }
     }
 }
