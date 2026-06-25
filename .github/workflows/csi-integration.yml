@@ -168,9 +168,16 @@ jobs:
     permissions:
       packages: write
     steps:
+      # Delete the specific tag the build-csi-image job pushed, not
+      # all versions of the package (the previous "DELETE /versions"
+      # call would clobber any concurrent run's image). The script
+      # is in tests/e2e/common/cleanup-ghcr-image.sh. checkout is
+      # needed because this job runs after csi-test and doesn't
+      # otherwise have the repo on disk.
+      - uses: actions/checkout@v4
       - name: Delete test image from GHCR
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/mntrs-csi:ci-test-${{ github.sha }}
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token 2>/dev/null || true
-          gh api --method DELETE \
-            "/orgs/${{ github.repository_owner }}/packages/container/mntrs-csi/versions" \
-            2>/dev/null || echo "Image cleanup skipped"
+          . tests/e2e/common/cleanup-ghcr-image.sh
+          cleanup_ghcr_image "$IMAGE" "${{ github.repository_owner }}"
