@@ -495,18 +495,27 @@ fn rename_chain_a_to_b_to_c() {
 fn rename_missing_source_no_panic() {
     // rename on a non-existent path should not panic.
     // The memory backend triggers the stage-2 fallback
-    // (read cache file → write to dst), and since the
-    // cache file doesn't exist either, it reads an empty
-    // Vec, writes that to dst, and returns Ok(()).
-    // Result: src stays absent, dst may exist as empty.
+    // (read cache file → op.write to dst). Since the
+    // cache file doesn't exist either, the fallback
+    // detects the source-missing case (issue #197) and
+    // returns Err(NotFound) instead of silently
+    // succeeding (which would violate POSIX rename).
+    // Pre-PR-#192 behavior: empty dst file was created.
+    // PR #192: returned Ok(()) — POSIX violation.
+    // PR #197: returns Err(NotFound) — POSIX-compliant.
     let fs = make_fs();
-    assert!(fs.rename(1, "no_such_file.txt", 1, "dst.txt").is_ok());
+    let res = fs.rename(1, "no_such_file.txt", 1, "dst.txt");
+    assert!(res.is_err(), "rename of missing source must fail");
+    assert_eq!(
+        res.unwrap_err().kind(),
+        std::io::ErrorKind::NotFound,
+        "rename of missing source must return ENOENT"
+    );
     assert!(fs.lookup(1, "no_such_file.txt").is_err());
-    // dst MAY exist (memory backend fallback artefact) — just
-    // verify we don't crash; clean up if present.
-    if let Ok(_e) = fs.lookup(1, "dst.txt") {
-        fs.unlink(1, "dst.txt").unwrap();
-    }
+    assert!(
+        fs.lookup(1, "dst.txt").is_err(),
+        "dst must NOT be created when source is missing"
+    );
 }
 
 #[test]
