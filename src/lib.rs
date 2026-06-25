@@ -3873,9 +3873,20 @@ impl CoreFilesystem for MntrsFs {
         // a hard error — that's the same behavior as before this
         // change, except now we don't pay the cost of the
         // unconditional pre-delete.
-        let backend_ok = rt().block_on(async move {
+        // Issue #197: the block_on closure returns Result<bool, io::Error>.
+        //   Ok(true)  — backend confirmed the rename, or the copy+delete
+        //                fallback completed. Migrate cache + inodes.
+        //   Ok(false) — fallback failed for a non-source-missing reason
+        //                (transient backend error). Preserve the existing
+        //                "don't lose data on a transient" semantics by
+        //                returning Ok(()) to FUSE.
+        //   Err(NotFound) — the source itself is missing. POSIX rename
+        //                requires ENOENT, so propagate. Issue #192's fix
+        //                (return Ok(())) was a POSIX violation; this
+        //                restores the correct semantics.
+        let backend_result: Result<bool, std::io::Error> = rt().block_on(async move {
             match op.rename(&src_clone, &dst_clone).await {
-                Ok(()) => true,
+                Ok(()) => Ok(true),
                 Err(e) if e.kind() == opendal::ErrorKind::Unsupported => {
                     tracing::debug!(
                         path = %src_clone, error = %e,
@@ -3915,10 +3926,10 @@ impl CoreFilesystem for MntrsFs {
                     // know success/failure, not the metadata.
                     let stage1: Result<opendal::Metadata, opendal::Error> =
                         op.copy(&src_clone, &dst_clone).await;
-                    let copy_ok = match stage1 {
+                    let copy_result: Result<bool, std::io::Error> = match stage1 {
                         Ok(_meta) => {
                             tracing::debug!(src = %src_clone, dst = %dst_clone, "rename fallback: op.copy ok");
-                            true
+                            Ok(true)
                         }
                         Err(copy_err) if copy_err.kind() == opendal::ErrorKind::Unsupported => {
                             // Stage 2: cache file + op.write.
@@ -3938,27 +3949,35 @@ impl CoreFilesystem for MntrsFs {
                                     if read_err.kind()
                                         == std::io::ErrorKind::NotFound =>
                                 {
-                                    Vec::new()
+                                    // Issue #197: source is missing.
+                                    // POSIX rename(non-existent, dst)
+                                    // requires ENOENT. Return Err so
+                                    // fn rename propagates to FUSE
+                                    // instead of silently succeeding.
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::NotFound,
+                                        format!("rename source not found: {}", src_clone),
+                                    ));
                                 }
                                 Err(read_err) => {
                                     tracing::error!(
                                         path = %cpath_src.display(), error = %read_err,
                                         "rename fallback stage-2: read cache file failed, keeping source intact"
                                     );
-                                    return false;
+                                    return Ok(false);
                                 }
                             };
                             match op.write(&dst_clone, bytes).await {
                                 Ok(_meta) => {
                                     tracing::debug!(src = %src_clone, dst = %dst_clone, "rename fallback stage-2: op.write ok");
-                                    true
+                                    Ok(true)
                                 }
                                 Err(write_err) => {
                                     tracing::error!(
                                         src = %src_clone, dst = %dst_clone, error = %write_err,
                                         "rename fallback stage-2: op.write failed, keeping source intact"
                                     );
-                                    return false;
+                                    Ok(false)
                                 }
                             }
                         }
@@ -3967,7 +3986,7 @@ impl CoreFilesystem for MntrsFs {
                                 src = %src_clone, dst = %dst_clone, error = %copy_err,
                                 "rename fallback: op.copy failed, keeping source intact"
                             );
-                            return false;
+                            Ok(false)
                         }
                     };
                     let del_res = op.delete(&src_clone).await;
@@ -3979,19 +3998,21 @@ impl CoreFilesystem for MntrsFs {
                     } else {
                         tracing::debug!(src = %src_clone, "rename fallback: delete src ok");
                     }
-                    copy_ok
+                    copy_result
                 }
                 Err(e) => {
                     tracing::warn!(
                         path = %src_clone, error = %e,
                         "server-side rename failed with non-Unsupported error; not falling back"
                     );
-                    false
+                    Ok(false)
                 }
             }
         });
-        if !backend_ok {
-            return Ok(());
+        match backend_result {
+            Ok(true) => {}
+            Ok(false) => return Ok(()),
+            Err(io_err) => return Err(io_err),
         }
         // Migrate cache file
         let cpath_src = crate::cache_path(&self.cache_dir, &src);
