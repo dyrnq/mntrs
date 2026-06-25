@@ -104,8 +104,16 @@ start_hdfs_container() {
                 "hdfs/${hostname}@TEST.LOCAL" 2>/dev/null; then
                 kinit_ok=1
             fi
+            # dfsadmin MUST run as the `hdfs` user (matching kinit).
+            # `docker exec` defaults to root, and the container's keytab
+            # only has the `hdfs/<hostname>@TEST.LOCAL` principal — root
+            # has no matching ticket and dfsadmin fails with
+            # `Client cannot authenticate via:[TOKEN, KERBEROS]`. (The
+            # csi-e2e path gets this for free because `kubectl exec`
+            # defaults to the pod's USER directive (hdfs); the docker
+            # path doesn't.)
             if [ "$kinit_ok" -eq 1 ] \
-                && docker exec "$container" /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 \
+                && docker exec -u hdfs "$container" /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 \
                     | grep -q "Live datanodes"; then
                 echo "HDFS ready (kinit took attempt $i)"
                 break
@@ -128,7 +136,7 @@ start_hdfs_container() {
                 docker exec -u hdfs "$container" \
                     /usr/bin/kinit -kt /etc/hadoop/hdfs.keytab \
                     "hdfs/${hostname}@TEST.LOCAL" 2>&1
-                docker exec "$container" \
+                docker exec -u hdfs "$container" \
                     /opt/hadoop/bin/hdfs dfsadmin -report 2>&1
                 docker logs "$container" 2>&1 | tail -30
             else
@@ -144,7 +152,7 @@ start_hdfs_container() {
     # Success diagnostics — mirrors the original mount-tests simple
     # behaviour. Cheap informational logs that help postmortem.
     docker logs "$container" 2>&1 | tail -5
-    docker exec "$container" /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | head -10
+    docker exec -u hdfs "$container" /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | head -10
 }
 
 # Direct invocation dispatch (when not sourced).
