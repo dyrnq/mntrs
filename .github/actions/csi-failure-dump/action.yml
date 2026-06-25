@@ -1,0 +1,37 @@
+name: 'CSI failure dump'
+description: >-
+  On job failure, run csi-dump-failure.sh to capture k8s pod logs,
+  kubectl describe, events, and host-side reachability probes, then
+  upload the dump directory as a GHA artifact. Replaces the 3 "Dump on
+  failure" steps in csi-e2e.yml.
+inputs:
+  kubeconfig:
+    description: 'kubeconfig path'
+    default: '/tmp/kubeconfig'
+  namespace:
+    description: 'k8s namespace of the test pod'
+    default: 'csi-mntrs'
+  test_pod:
+    description: 'test pod name'
+    required: true
+  out_dir:
+    description: 'local dir to write dump files to (also the artifact path)'
+    default: '/tmp/csi-dump'
+  artifact_name:
+    description: 'GHA artifact name'
+    default: 'csi-failure-dump'
+runs:
+  using: composite
+  steps:
+    - if: failure()
+      shell: bash
+      run: >-
+        . tests/e2e/common/csi-dump-failure.sh
+        && csi_dump_failure "${{ inputs.kubeconfig }}" "${{ inputs.namespace }}" "${{ inputs.test_pod }}" "${{ inputs.out_dir }}"
+
+    - if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact_name }}
+        path: ${{ inputs.out_dir }}
+        if-no-files-found: warn

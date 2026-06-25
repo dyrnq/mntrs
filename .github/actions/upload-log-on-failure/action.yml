@@ -1,0 +1,22 @@
+name: 'Upload log on failure'
+description: >-
+  Upload a log file to GHA artifacts only on job failure. Replaces the
+  7+ "Upload X log (failure)" steps in integration.yml (6) and
+  csi-integration.yml (1). The original pattern used `if: failure()`
+  + `actions/upload-artifact@v4` with a 4-line body.
+inputs:
+  name:
+    description: 'artifact name'
+    required: true
+  path:
+    description: 'log file or directory path'
+    required: true
+runs:
+  using: composite
+  steps:
+    - if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+        if-no-files-found: warn
