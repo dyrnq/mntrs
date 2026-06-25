@@ -1,0 +1,32 @@
+name: 'Setup k3s test env'
+description: >-
+  Install k3s, FUSE prerequisites, and prepare a kubeconfig file.
+  Replaces the duplicated "Install k3s" + "Install FUSE" steps in
+  csi-e2e.yml (3 jobs) and csi-integration.yml (1 job).
+  Wraps tests/e2e/common/install-k3s.sh and install-linux-deps.sh.
+inputs:
+  retries:
+    description: 'k3s install retries (csi-integration uses 1, csi-e2e uses 3)'
+    default: '3'
+  kubeconfig:
+    description: 'kubeconfig output path'
+    default: '/tmp/kubeconfig'
+  fuse_mode:
+    description: >-
+      install-linux-deps mode — csi-e2e installs kernel module + /dev/fuse
+      + userland tools; standard just installs the build-time dev packages.
+    default: 'csi-e2e'
+runs:
+  using: composite
+  steps:
+    - if: runner.os == 'Linux'
+      shell: bash
+      run: >-
+        . tests/e2e/common/install-k3s.sh
+        && install_k3s "${{ inputs.retries }}" "${{ inputs.kubeconfig }}"
+
+    - if: runner.os == 'Linux'
+      shell: bash
+      run: >-
+        . tests/e2e/common/install-linux-deps.sh
+        && install_linux_deps "${{ inputs.fuse_mode }}" "" no no
