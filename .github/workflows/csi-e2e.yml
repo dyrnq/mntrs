@@ -136,8 +136,8 @@ jobs:
       - name: Capture kubelet journal (always, for postmortem)
         if: always()
         run: |
-          sudo journalctl -u k3s --since "10 minutes ago" --no-pager > /tmp/k3s-journal.log 2>&1 || true
-          echo "k3s journal size: $(wc -l < /tmp/k3s-journal.log) lines"
+          . tests/e2e/common/capture-kubelet-journal.sh
+          capture_kubelet_journal /tmp/k3s-journal.log
 
       - name: Upload kubelet journal
         if: always()
@@ -150,23 +150,8 @@ jobs:
       - name: Dump on failure
         if: failure()
         run: |
-          echo "=== csi-mntrs pods ==="
-          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs get pods -o wide
-          echo
-          echo "=== csi-controller log (last 50) ==="
-          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs logs -l app=csi-controller-mntrs --tail=50 2>&1 || true
-          echo
-          echo "=== csi-nodeplugin log (last 50) ==="
-          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs logs -l app=csi-nodeplugin-mntrs --tail=50 2>&1 || true
-          echo
-          echo "=== test pod events (dynamic) ==="
-          kubectl --kubeconfig /tmp/kubeconfig describe pod mntrs-csi-e2e-dyn 2>&1 || true
-          echo
-          echo "=== test pod events (static) ==="
-          kubectl --kubeconfig /tmp/kubeconfig describe pod mntrs-csi-e2e 2>&1 || true
-          echo
-          echo "=== recent events (last 30) ==="
-          kubectl --kubeconfig /tmp/kubeconfig get events --sort-by=.lastTimestamp 2>&1 | tail -30 || true
+          . tests/e2e/common/csi-dump-failure.sh
+          csi_dump_failure /tmp/kubeconfig csi-mntrs mntrs-csi-e2e
 
   csi-e2e-hdfs:
     name: csi-e2e (HDFS)
@@ -243,8 +228,8 @@ jobs:
       - name: Capture kubelet journal (always, for postmortem)
         if: always()
         run: |
-          sudo journalctl -u k3s --since "10 minutes ago" --no-pager > /tmp/k3s-journal-hdfs.log 2>&1 || true
-          echo "k3s journal size: $(wc -l < /tmp/k3s-journal-hdfs.log) lines"
+          . tests/e2e/common/capture-kubelet-journal.sh
+          capture_kubelet_journal /tmp/k3s-journal-hdfs.log
 
       - name: Upload kubelet journal
         if: always()
@@ -257,23 +242,8 @@ jobs:
       - name: Dump on failure
         if: failure()
         run: |
-          echo "=== csi-mntrs pods ==="
-          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs get pods -o wide
-          echo
-          echo "=== csi-controller log (last 50) ==="
-          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs logs -l app=csi-controller-mntrs --tail=50 2>&1 || true
-          echo
-          echo "=== csi-nodeplugin log (last 50) ==="
-          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs logs -l app=csi-nodeplugin-mntrs --tail=50 2>&1 || true
-          echo
-          echo "=== test pod events (dynamic) ==="
-          kubectl --kubeconfig /tmp/kubeconfig describe pod mntrs-csi-e2e-hdfs-dyn 2>&1 || true
-          echo
-          echo "=== test pod events (static) ==="
-          kubectl --kubeconfig /tmp/kubeconfig describe pod mntrs-csi-e2e-hdfs 2>&1 || true
-          echo
-          echo "=== recent events (last 30) ==="
-          kubectl --kubeconfig /tmp/kubeconfig get events --sort-by=.lastTimestamp 2>&1 | tail -30 || true
+          . tests/e2e/common/csi-dump-failure.sh
+          csi_dump_failure /tmp/kubeconfig csi-mntrs mntrs-csi-e2e-hdfs
 
       - name: Cleanup
         if: always()
@@ -382,8 +352,8 @@ jobs:
       - name: Capture kubelet journal (always, for postmortem)
         if: always()
         run: |
-          sudo journalctl -u k3s --since "10 minutes ago" --no-pager > /tmp/k3s-journal-hdfs-krb.log 2>&1 || true
-          echo "k3s journal size: $(wc -l < /tmp/k3s-journal-hdfs-krb.log) lines"
+          . tests/e2e/common/capture-kubelet-journal.sh
+          capture_kubelet_journal /tmp/k3s-journal-hdfs-krb.log
 
       - name: Upload kubelet journal
         if: always()
@@ -396,23 +366,8 @@ jobs:
       - name: Dump on failure
         if: failure()
         run: |
-          echo "=== csi-mntrs pods ==="
-          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs get pods -o wide
-          echo
-          echo "=== csi-controller log (last 50) ==="
-          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs logs -l app=csi-controller-mntrs --tail=50 2>&1 || true
-          echo
-          echo "=== csi-nodeplugin log (last 50) ==="
-          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs logs -l app=csi-nodeplugin-mntrs --tail=50 2>&1 || true
-          echo
-          echo "=== test pod events (dynamic) ==="
-          kubectl --kubeconfig /tmp/kubeconfig describe pod mntrs-csi-e2e-hdfs-krb-dyn 2>&1 || true
-          echo
-          echo "=== test pod events (static) ==="
-          kubectl --kubeconfig /tmp/kubeconfig describe pod mntrs-csi-e2e-hdfs-krb 2>&1 || true
-          echo
-          echo "=== recent events (last 30) ==="
-          kubectl --kubeconfig /tmp/kubeconfig get events --sort-by=.lastTimestamp 2>&1 | tail -30 || true
+          . tests/e2e/common/csi-dump-failure.sh
+          csi_dump_failure /tmp/kubeconfig csi-mntrs mntrs-csi-e2e-hdfs-krb
 
       - name: Cleanup
         if: always()
