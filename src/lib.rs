@@ -3938,7 +3938,24 @@ impl CoreFilesystem for MntrsFs {
                                     if read_err.kind()
                                         == std::io::ErrorKind::NotFound =>
                                 {
-                                    Vec::new()
+                                    // Issue #146: pre-fix this returned
+                                    // an empty Vec, which op.write then
+                                    // committed to dst — silently
+                                    // creating a zero-byte dst when the
+                                    // source was never created. Now
+                                    // return false (keep src intact,
+                                    // don't touch dst) and let the
+                                    // kernel see the failed rename.
+                                    // The src didn't exist, so "keeping
+                                    // src intact" is a no-op on the
+                                    // backend (the dst will also not
+                                    // exist on the backend, so there's
+                                    // nothing to clean up).
+                                    tracing::debug!(
+                                        src = %src_clone, dst = %dst_clone,
+                                        "rename fallback stage-2: cache file not found, source likely never existed; keeping source intact"
+                                    );
+                                    return false;
                                 }
                                 Err(read_err) => {
                                     tracing::error!(

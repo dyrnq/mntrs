@@ -493,20 +493,22 @@ fn rename_chain_a_to_b_to_c() {
 
 #[test]
 fn rename_missing_source_no_panic() {
-    // rename on a non-existent path should not panic.
-    // The memory backend triggers the stage-2 fallback
-    // (read cache file → write to dst), and since the
-    // cache file doesn't exist either, it reads an empty
-    // Vec, writes that to dst, and returns Ok(()).
-    // Result: src stays absent, dst may exist as empty.
+    // Issue #146: rename on a non-existent path used to silently
+    // create an empty dst (memory backend's stage-2 fallback read
+    // an empty Vec from the missing cache file and wrote it to
+    // dst). Now the fallback returns `false` (keep src intact,
+    // no dst side-effect) when the cache file is NotFound.
+    // The kernel sees Ok(()) from the rename syscall, but neither
+    // src nor dst exists on the backend.
     let fs = make_fs();
     assert!(fs.rename(1, "no_such_file.txt", 1, "dst.txt").is_ok());
     assert!(fs.lookup(1, "no_such_file.txt").is_err());
-    // dst MAY exist (memory backend fallback artefact) — just
-    // verify we don't crash; clean up if present.
-    if let Ok(_e) = fs.lookup(1, "dst.txt") {
-        fs.unlink(1, "dst.txt").unwrap();
-    }
+    // dst MUST NOT exist (the fix): the previous behavior wrote
+    // an empty Vec to dst as a side effect of the failed rename.
+    assert!(
+        fs.lookup(1, "dst.txt").is_err(),
+        "rename of missing source must not create an empty dst (issue #146)"
+    );
 }
 
 #[test]
