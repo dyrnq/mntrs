@@ -429,7 +429,7 @@ jobs:
 
           # Wait for NameNode + DataNode (must have >=1 live datanode)
           for i in $(seq 1 30); do
-            kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs exec hdfs -- /usr/bin/kinit -kt /etc/hadoop/hdfs.keytab "hdfs/${HDFS_HOSTNAME}@${HDFS_REALM}" 2>/dev/null
+            kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs exec hdfs -- /usr/bin/kinit -kt /etc/hadoop/hdfs.keytab "hdfs/${HDFS_HOSTNAME}@${HDFS_REALM}" 2>/dev/null || true
             if kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs exec hdfs -- /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | grep "Live datanodes" > /dev/null; then
               echo "HDFS ready after ${i} attempts"
               break
