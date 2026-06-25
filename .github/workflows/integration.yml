@@ -43,10 +43,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libfuse3-dev fuse3 protobuf-compiler
-          sudo grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+        run: bash tests/e2e/common/install-linux-deps.sh standard "" yes no
 
       - name: Build mntrs
         run: cargo build --release -p mntrs
@@ -403,10 +400,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y krb5-user libfuse3-dev fuse3
-          sudo grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+        run: bash tests/e2e/common/install-linux-deps.sh standard "krb5-user" no no
 
       - name: Start HDFS container
         env:
@@ -687,10 +681,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libfuse3-dev fuse3
-          sudo grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+        run: bash tests/e2e/common/install-linux-deps.sh standard "" no no
 
       - name: Build mntrs
         run: cargo build --release -p mntrs
@@ -725,10 +716,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libfuse3-dev fuse3
-          sudo grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+        run: bash tests/e2e/common/install-linux-deps.sh standard "" no no
 
       - name: Build mntrs
         run: cargo build --release -p mntrs
@@ -773,11 +761,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libfuse3-dev fuse3
-          sudo grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
-          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+        run: bash tests/e2e/common/install-linux-deps.sh standard "" no yes
 
       - name: Install mc (MinIO client)
         run: go install github.com/minio/mc@latest

@@ -24,7 +24,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3 protobuf-compiler
+        run: bash tests/e2e/common/install-linux-deps.sh standard "" yes no
 
       - name: Build workspace (debug) + test binaries
         run: |
@@ -97,10 +97,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libfuse3-dev fuse3 protobuf-compiler
-          sudo grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+        run: bash tests/e2e/common/install-linux-deps.sh standard "" yes no
 
       - name: Download target/debug
         uses: actions/download-artifact@v4
