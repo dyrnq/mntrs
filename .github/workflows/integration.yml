@@ -367,10 +367,9 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          if mount | grep -q /mnt/mntrs-test; then
-            sudo fusermount3 -u /mnt/mntrs-test
-          fi
-          docker rm -f hdfs 2>/dev/null || true
+          . tests/e2e/common/ci-cleanup.sh
+          cleanup_fuse_mount /mnt/mntrs-test
+          cleanup_docker_container hdfs
 
       # Per SESSION_PITFALLS §2.6: CI green ≠ tests pass; on failure, preserve
       # the mount log and HDFS dfsadmin report for post-mortem. Pattern adapted
@@ -656,8 +655,9 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          fusermount3 -uz /mnt/hdfs 2>/dev/null
-          docker rm -f hdfs 2>/dev/null
+          . tests/e2e/common/ci-cleanup.sh
+          cleanup_fuse_mount /mnt/hdfs
+          cleanup_docker_container hdfs
 
       # Per SESSION_PITFALLS §2.6: preserve post-mortem on failure.
       # Pattern adapted from bench.yml ("Upload rclone log" + actions/upload-artifact@v4).
@@ -703,7 +703,8 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          fusermount3 -uz /tmp/mntrs-test 2>/dev/null || fusermount -uz /tmp/mntrs-test 2>/dev/null || true
+          . tests/e2e/common/ci-cleanup.sh
+          cleanup_fuse_mount /tmp/mntrs-test
           pkill -9 -f "target/release/mntrs mount" 2>/dev/null || true
 
   # Mount/unmount lifecycle stress — catches process leaks, FD leaks,
@@ -738,7 +739,8 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          fusermount3 -uz /tmp/mntrs-lifecycle 2>/dev/null || true
+          . tests/e2e/common/ci-cleanup.sh
+          cleanup_fuse_mount /tmp/mntrs-lifecycle
           pkill -9 -f "target/release/mntrs mount.*lifecycle" 2>/dev/null || true
 
   # S3 lifecycle stress + writeback crash recovery — verifies
@@ -804,6 +806,7 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          fusermount3 -uz /tmp/mntrs-s3-lifecycle 2>/dev/null || true
-          fusermount3 -uz /tmp/mntrs-wb-recovery 2>/dev/null || true
+          . tests/e2e/common/ci-cleanup.sh
+          cleanup_fuse_mount /tmp/mntrs-s3-lifecycle
+          cleanup_fuse_mount /tmp/mntrs-wb-recovery
           pkill -9 -f "target/release/mntrs mount" 2>/dev/null || true

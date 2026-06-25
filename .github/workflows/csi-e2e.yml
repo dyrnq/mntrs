@@ -278,8 +278,8 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs delete pod hdfs --force --grace-period=0 --ignore-not-found 2>/dev/null || true
-          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs delete svc hdfs --ignore-not-found 2>/dev/null || true
+          . tests/e2e/common/ci-cleanup.sh
+          cleanup_k8s_pod_svc hdfs csi-mntrs /tmp/kubeconfig
 
   csi-e2e-hdfs-kerberos:
     name: csi-e2e (HDFS Kerberos)
@@ -417,5 +417,5 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs delete pod hdfs --force --grace-period=0 --ignore-not-found 2>/dev/null || true
-          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs delete svc hdfs --ignore-not-found 2>/dev/null || true
+          . tests/e2e/common/ci-cleanup.sh
+          cleanup_k8s_pod_svc hdfs csi-mntrs /tmp/kubeconfig
