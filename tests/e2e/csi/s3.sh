@@ -86,8 +86,9 @@ cleanup() {
     ${KUBECTL} delete pod "${E2E_POD_NAME}" -n "${E2E_NAMESPACE}" --force --grace-period=0 --ignore-not-found 2>/dev/null || true
     ${KUBECTL} delete pvc "${E2E_PVC_NAME}" -n "${E2E_NAMESPACE}" --ignore-not-found 2>/dev/null || true
     ${KUBECTL} delete pv "${E2E_PV_NAME}" --ignore-not-found 2>/dev/null || true
-    # Dynamic provision e2e resources (phase 7/8)
+    # Dynamic provision e2e resources (phase 7/8/9)
     ${KUBECTL} delete pod "mntrs-csi-e2e-dyn" -n "${E2E_NAMESPACE}" --force --grace-period=0 --ignore-not-found 2>/dev/null || true
+    ${KUBECTL} delete pod "mntrs-csi-e2e-dyn-2" -n "${E2E_NAMESPACE}" --force --grace-period=0 --ignore-not-found 2>/dev/null || true
     ${KUBECTL} delete pvc "mntrs-csi-e2e-dyn" -n "${E2E_NAMESPACE}" --ignore-not-found 2>/dev/null || true
     # PVs created by the dynamic SC have reclaimPolicy=Delete, so the
     # PVC delete above cascades. No explicit PV delete needed.
@@ -114,9 +115,9 @@ log "  cluster reachable: $(${KUBECTL} get nodes -o jsonpath='{range .items[*]}{
 
 # ---------- 1. build & push image ----------
 if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
-    log "[1/9] skip build (SKIP_BUILD=1), using ${IMAGE}"
+    log "[1/10] skip build (SKIP_BUILD=1), using ${IMAGE}"
 else
-    log "[1/9] building mntrs-csi (glibc)..."
+    log "[1/10] building mntrs-csi (glibc)..."
     rustup target add x86_64-unknown-linux-gnu 2>/dev/null || true
     (cd "${REPO_ROOT}" && cargo build --release --package mntrs-csi --target x86_64-unknown-linux-gnu)
     cp "${REPO_ROOT}/target/x86_64-unknown-linux-gnu/release/mntrs-csi" "${REPO_ROOT}/docker/csi/mntrs-csi"
@@ -133,9 +134,9 @@ fi
 
 # ---------- 2. deploy MinIO ----------
 if [[ "${KEEP_MINIO:-0}" == "1" ]] && ${KUBECTL} get namespace "${MINIO_NAMESPACE}" >/dev/null 2>&1; then
-    log "[2/9] MinIO namespace ${MINIO_NAMESPACE} already exists, skipping"
+    log "[2/10] MinIO namespace ${MINIO_NAMESPACE} already exists, skipping"
 else
-    log "[2/9] deploying MinIO to ${MINIO_NAMESPACE}..."
+    log "[2/10] deploying MinIO to ${MINIO_NAMESPACE}..."
     cat <<EOF | ${KUBECTL} apply -f -
 apiVersion: v1
 kind: Namespace
@@ -180,9 +181,9 @@ fi
 
 # ---------- 3. deploy csi-mntrs ----------
 if [[ "${SKIP_DEPLOY:-0}" == "1" ]]; then
-    log "[3/9] skip deploy (SKIP_DEPLOY=1)"
+    log "[3/10] skip deploy (SKIP_DEPLOY=1)"
 else
-    log "[3/9] deploying csi-mntrs to ${CSI_NAMESPACE}..."
+    log "[3/10] deploying csi-mntrs to ${CSI_NAMESPACE}..."
 
     # Pre-create the docker-registry secret so the pod templates can
     # reference it directly. Earlier versions of this script did
@@ -250,7 +251,7 @@ else
 fi
 
 # ---------- 4. create test bucket ----------
-log "[4/9] creating test bucket ${MINIO_BUCKET}..."
+log "[4/10] creating test bucket ${MINIO_BUCKET}..."
 # Always use the in-cluster MinIO endpoint for the create-bucket job, which
 # runs inside k3s and cannot reach host-level endpoints like localhost:9000.
 MINIO_POD_IP=$(${KUBECTL} -n "${MINIO_NAMESPACE}" get pod -l app=minio -o jsonpath='{.items[0].status.podIP}')
@@ -322,7 +323,7 @@ ${KUBECTL} -n "${MINIO_NAMESPACE}" wait --for=condition=Complete job/create-buck
 log "  bucket ready"
 
 # ---------- 5. create PV + PVC + test pod ----------
-log "[5/9] creating PV + PVC + test pod..."
+log "[5/10] creating PV + PVC + test pod..."
 # Always use the in-cluster MinIO service for K8s resources (PV/PVC/StorageClass),
 # since the CSI driver pods run inside k3s and need a cluster-reachable endpoint.
 MINIO_SVC_IP=$(${KUBECTL} -n "${MINIO_NAMESPACE}" get svc minio -o jsonpath='{.spec.clusterIP}')
@@ -373,7 +374,7 @@ log "  waiting for test pod Ready..."
 ${KUBECTL} -n "${E2E_NAMESPACE}" wait --for=condition=Ready pod/"${E2E_POD_NAME}" --timeout=120s
 
 # ---------- 6. run e2e tests ----------
-log "[6/9] running e2e tests in pod..."
+log "[6/10] running e2e tests in pod..."
 PASS=0
 FAIL=0
 
@@ -424,7 +425,7 @@ pass "  cleanup removed _ci_* files"
 # ---------- 7. dynamic provision e2e ----------
 # Clean up the static PV/PVC/pod before the next phase so names don't
 # clash and so we can re-use the test pod name with a different volume.
-log "[7/9] dynamic provision e2e (StorageClass.parameters + CreateVolume)..."
+log "[7/10] dynamic provision e2e (StorageClass.parameters + CreateVolume)..."
 ${KUBECTL} -n "${E2E_NAMESPACE}" delete pod "${E2E_POD_NAME}" --force --grace-period=0 --ignore-not-found 2>/dev/null
 ${KUBECTL} -n "${E2E_NAMESPACE}" delete pvc "${E2E_PVC_NAME}" --ignore-not-found 2>/dev/null
 ${KUBECTL} delete pv "${E2E_PV_NAME}" --ignore-not-found 2>/dev/null
@@ -522,12 +523,89 @@ assert_in "dynamic: 1M random write+read" "bytes" "${DD_OUT}"
 ${KUBECTL} -n "${E2E_NAMESPACE}" exec "${DYN_POD_NAME}" -- \
     sh -c "rm -f /data/_ci_small.txt /data/_ci_1m.bin" >/dev/null
 
-# ---------- 8. volume expansion assertion ----------
+# ---------- 8. pod rebuild persistence (issue #150) ----------
+# Core CSI guarantee: data persists across pod recreation. Same
+# PVC, different pod. Exercises the full mntrs-csi publish path
+# a second time without rebuilding the StorageClass / PV.
+log "[8/10] pod rebuild persistence..."
+
+# 1. Write 1 MiB random data and capture its md5 inside pod 1.
+ORIG_MD5=$(${KUBECTL} -n "${E2E_NAMESPACE}" exec "${DYN_POD_NAME}" -- \
+    sh -c "dd if=/dev/urandom of=/data/_ci_persist.bin bs=1M count=1 2>/dev/null && \
+           md5sum /data/_ci_persist.bin | awk '{print \$1}'")
+[[ -n "${ORIG_MD5}" ]] || fail "could not capture original md5 of /data/_ci_persist.bin"
+log "  original md5 (pod 1): ${ORIG_MD5}"
+
+# 2. Wait for the FUSE writeback queue to flush. Default
+#    --vfs-write-back is 5s, so 10s is a safe upper bound.
+#    Without this wait, pod 2 may mount before the data has
+#    been uploaded, and the readback fails for the wrong
+#    reason (writeback hasn't happened yet) rather than the
+#    right reason (CSI driver is broken).
+log "  waiting 10s for writeback queue to flush..."
+sleep 10
+
+# 3. Delete the pod (keep PVC + PV). The dynamic provision
+#    SC has reclaimPolicy=Delete, but that only fires on
+#    PVC delete — pod delete is safe.
+${KUBECTL} -n "${E2E_NAMESPACE}" delete pod "${DYN_POD_NAME}" \
+    --force --grace-period=0 --ignore-not-found
+
+# 4. Wait for the pod to fully terminate.
+for i in $(seq 1 30); do
+    POD_PHASE=$(${KUBECTL} -n "${E2E_NAMESPACE}" get pod "${DYN_POD_NAME}" \
+        -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+    if [[ -z "${POD_PHASE}" || "${POD_PHASE}" == "Succeeded" || "${POD_PHASE}" == "Failed" ]]; then
+        break
+    fi
+    sleep 1
+done
+log "  pod 1 terminated after ${i}s"
+
+# 5. Verify the PVC is still Bound.
+PVC_PHASE=$(${KUBECTL} -n "${E2E_NAMESPACE}" get pvc "${DYN_PVC_NAME}" \
+    -o jsonpath='{.status.phase}')
+[[ "${PVC_PHASE}" == "Bound" ]] || fail "PVC went ${PVC_PHASE} after pod delete (expected Bound)"
+log "  PVC still Bound: ${DYN_PVC_NAME}"
+
+# 6. Create a new pod with the SAME PVC. Different name to
+#    avoid the kubelet's name-reuse race.
+DYN_POD_NAME_2="mntrs-csi-e2e-dyn-2"
+cat <<EOF | ${KUBECTL} apply -f -
+apiVersion: v1
+kind: Pod
+metadata: {name: ${DYN_POD_NAME_2}, namespace: ${E2E_NAMESPACE}}
+spec:
+  restartPolicy: Never
+  containers:
+  - name: test
+    image: busybox:1.37
+    command: ["sh", "-c", "sleep 600"]
+    volumeMounts: [{name: data, mountPath: /data}]
+  volumes:
+  - {name: data, persistentVolumeClaim: {claimName: ${DYN_PVC_NAME}}}
+EOF
+${KUBECTL} -n "${E2E_NAMESPACE}" wait --for=condition=Ready pod/"${DYN_POD_NAME_2}" --timeout=300s \
+    || fail "rebuild pod never became Ready"
+
+# 7. Read the file back from pod 2. The CSI driver must
+#    re-publish the same remote path on the new mount, and
+#    the FUSE must serve the data from the backend (not from
+#    a stale local cache that pod 1 may have populated).
+NEW_MD5=$(${KUBECTL} -n "${E2E_NAMESPACE}" exec "${DYN_POD_NAME_2}" -- \
+    md5sum /data/_ci_persist.bin | awk '{print $1}')
+log "  new md5 (pod 2): ${NEW_MD5}"
+[[ "${NEW_MD5}" == "${ORIG_MD5}" ]] || \
+    fail "md5 mismatch after pod rebuild: ${ORIG_MD5} != ${NEW_MD5} (data NOT persisted across pod recreation)"
+
+pass "  data persisted across pod rebuild (md5 match)"
+
+# ---------- 9. volume expansion assertion ----------
 # mntrs-csi does NOT implement ControllerExpandVolume / NodeExpandVolume
 # (returns UNIMPLEMENTED). The driver also does not advertise
 # ControllerExpansion / VolumeExpansion in GetCapabilities, which is the
 # correct signal. We assert the SC + behavior reflects this.
-log "[8/9] volume expansion assertion (driver reports unimplemented)..."
+log "[9/10] volume expansion assertion (driver reports unimplemented)..."
 ALLOW_EXPAND=$(${KUBECTL} get sc "${DYN_SC_NAME}" -o jsonpath='{.allowVolumeExpansion}' 2>/dev/null)
 log "  StorageClass ${DYN_SC_NAME}.allowVolumeExpansion = ${ALLOW_EXPAND:-<unset>}"
 if [[ "${ALLOW_EXPAND}" == "true" ]]; then
@@ -539,8 +617,8 @@ pass "  allowVolumeExpansion is not set (matches driver capability)"
 # Without an explicit EXPAND capability, external-resizer won't try to resize.
 log "  no PVC resize attempted (driver does not advertise VolumeExpansion)"
 
-# ---------- 9. summary ----------
-log "[9/9] e2e done: ${PASS} passed, ${FAIL} failed"
+# ---------- 10. summary ----------
+log "[10/10] e2e done: ${PASS} passed, ${FAIL} failed"
 trap - EXIT  # disable cleanup, leave resources for inspection if requested
 [[ "${KEEP_ON_FAIL:-0}" == "1" && $FAIL -gt 0 ]] || exit 0
 exit 2
