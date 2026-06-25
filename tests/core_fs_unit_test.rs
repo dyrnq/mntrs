@@ -952,3 +952,88 @@ fn releasedir_on_unknown_fh_is_ok() {
     // releasedir with unknown fh should not panic
     assert!(fs.releasedir(1, 9999).is_ok());
 }
+
+// ── batch_remove_path library primitive (issue #158) ─────────────────
+
+// The memory backend doesn't get the S3 BatchDelete speedup — it
+// falls through to the simulate-layer list + N OneShotDelete calls
+// — but it still exercises the recursive code path the public API
+// promises. We verify the API contract: a tree of N files + dirs
+// gets fully removed in one call, all descendants absent
+// afterwards, and re-calling on a missing path is Ok(()).
+//
+// We seed the tree directly via the opendal Operator (not via
+// FUSE callbacks) so the test stays inside a single async runtime.
+// FUSE callback methods like `fs.create` are synchronous and call
+// `rt().block_on` internally — they cannot run inside a
+// `#[tokio::test]` runtime (would cause a nested-runtime panic).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_remove_path_removes_tree() {
+    use mntrs::new_test_fs;
+
+    let op = Operator::new(Memory::default()).unwrap().finish();
+    let dir = std::env::temp_dir().join(format!("mntrs-batch-rm-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let fs = new_test_fs(op.clone(), dir);
+
+    // Seed: a/d.txt, a/b/c.txt, a/b/d.txt, a/b/e.txt
+    op.write("a/d.txt", "d-data").await.unwrap();
+    op.write("a/b/c.txt", "c-data").await.unwrap();
+    op.write("a/b/d.txt", "d-data").await.unwrap();
+    op.write("a/b/e.txt", "e-data").await.unwrap();
+
+    // Recursive backend delete — issue #158 library primitive.
+    fs.batch_remove_path("a").await.unwrap();
+
+    // After the call, the backend has no entries under "a/".
+    let mut found = Vec::new();
+    for entry in op.list("/").await.unwrap() {
+        let p = entry.path().to_string();
+        if p.starts_with("/a") || p.starts_with("a") {
+            found.push(p);
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "batch_remove_path should have removed all of a/, but found: {found:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_remove_path_idempotent_on_missing() {
+    use mntrs::new_test_fs;
+
+    // Per opendal docs: delete is idempotent; missing target is Ok(()).
+    // Verify the wrapper preserves that contract.
+    let op = Operator::new(Memory::default()).unwrap().finish();
+    let dir = std::env::temp_dir().join(format!("mntrs-batch-rm-missing-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let fs = new_test_fs(op, dir);
+    fs.batch_remove_path("nope").await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_remove_path_normalizes_trailing_slash() {
+    use mntrs::new_test_fs;
+
+    let op = Operator::new(Memory::default()).unwrap().finish();
+    let dir = std::env::temp_dir().join(format!("mntrs-batch-rm-slash-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let fs = new_test_fs(op.clone(), dir);
+
+    op.write("x/f.txt", "x").await.unwrap();
+    // "x/" should be equivalent to "x" — both remove the whole subtree.
+    fs.batch_remove_path("x/").await.unwrap();
+
+    let mut found = Vec::new();
+    for entry in op.list("/").await.unwrap() {
+        let p = entry.path().to_string();
+        if p.starts_with("/x") || p.starts_with("x") {
+            found.push(p);
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "x/ should have removed all of x, but found: {found:?}"
+    );
+}

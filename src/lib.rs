@@ -1724,6 +1724,64 @@ impl MntrsFs {
     }
 }
 
+// Library primitive — issue #158.
+//
+// This impl block lives outside the `CoreFilesystem` trait impl
+// because `batch_remove_path` is a public API for non-FUSE callers
+// (CSI driver, future CLI subcommand, library consumers). FUSE can't
+// express "rm -rf" as a single operation — `rm -rf` arrives at the
+// daemon as N independent FUSE_UNLINK + FUSE_RMDIR syscalls, and the
+// kernel already walks the tree depth-first. There's no entry point
+// FUSE could intercept to do a single batched delete.
+//
+// On S3 (and other `BatchDelete` backends) this maps to 1 list RTT +
+// 1 batched `DeleteObjects` per 1000 keys via opendal's
+// simulate-layer fallback, ~10-100× faster than N × `op.delete`. On
+// memory/HDFS/fs the simulate-layer falls through to list + N
+// OneShotDeleter calls, equivalent cost to current per-call
+// behavior (no regression).
+//
+// Local cache cleanup (inodes / attr_cache / disk_cache_index / block
+// files / .dirty sidecars) is intentionally NOT done here: callers
+// are expected to unmount first or accept stale cache until the next
+// mount restart. Doing it inline would double the cost and race
+// with concurrent FUSE reads.
+impl MntrsFs {
+    /// Remove a path and all its descendants in one backend call.
+    ///
+    /// Equivalent to `rm -rf <path>` at the backend level. See the
+    /// module-level impl-block doc comment above for the design
+    /// rationale (why this isn't a FUSE callback, backend cost
+    /// characteristics, and the intentional cache-cleanup gap).
+    ///
+    /// # Errors
+    ///
+    /// Returns the opendal error mapped to `io::ErrorKind` (same
+    /// pattern as `fn unlink` / `fn rmdir`). On S3, partial failures
+    /// inside a single `DeleteObjects` request are surfaced by
+    /// opendal as `ErrorKind::Unexpected` with a per-key breakdown
+    /// in the error context.
+    pub async fn batch_remove_path(&self, path: &str) -> std::io::Result<()> {
+        let normalized = path.trim_end_matches('/');
+        let target = if normalized.is_empty() {
+            "/".to_string()
+        } else {
+            format!("{}/", normalized)
+        };
+        self.op
+            .delete_with(&target)
+            .recursive(true)
+            .await
+            .map_err(|e| opendal_to_io_error(&e, "batch_remove_path"))?;
+        tracing::info!(
+            path = %target,
+            backend = %self.op.info().scheme(),
+            "batch_remove_path: backend delete complete"
+        );
+        Ok(())
+    }
+}
+
 use crate::core_fs::{CoreDirEntry, CoreFileAttr, CoreFileType, CoreFilesystem, CoreVolumeStat};
 
 impl CoreFilesystem for MntrsFs {
