@@ -83,37 +83,15 @@ jobs:
           # container's 127.0.0.1:9866 IS the host's 127.0.0.1:9866,
           # so mntrs's connection (also on the host) lands directly
           # on the DN listener.
-          docker run -d --name hdfs --network host \
-            -e HADOOP_SECURITY_AUTHENTICATION=simple \
-            -e HDFS_HOSTNAME=localhost \
-            dyrnq/hdfs:latest-debian
+          . tests/e2e/common/start-hdfs-container.sh
+          start_hdfs_container simple hdfs localhost
 
-          # Wait for NameNode + DataNode (must have ≥1 live datanode)
-          for i in $(seq 1 30); do
-            # Probe readiness by attempting a real write instead of parsing
-            # dfsadmin text output — avoids brittle regex on format changes.
-            if echo "probe" | docker exec -i -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -put - /_readiness_probe 2>/dev/null \
-               && docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -rm /_readiness_probe >/dev/null 2>&1; then
-              echo "HDFS ready after ${i} attempts"
-              break
-            fi
-            echo "  attempt $i: waiting for HDFS write readiness..."
-            if [ $i -eq 30 ]; then
-              echo "::error::HDFS not ready after 30 attempts"
-              docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | head -20
-              docker logs hdfs 2>&1 | tail -20
-              exit 1
-            fi
-            sleep 3
-          done
-          docker logs hdfs 2>&1 | tail -5
-          docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | head -10
-          docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -mkdir -p /test
           # HDFS root is 755:hdfs:supergroup by default. chmod 777 / so the
           # GHA runner user can create at the FUSE mount root; chmod 777 /test
           # so the test seed file is in a subdir any user can read+write.
           # See tests/e2e/common/hdfs-prep.sh for the shared prep rationale
           # and the matching csi/hdfs.sh + csi/hdfs-kerberos.sh callers.
+          docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -mkdir -p /test
           bash tests/e2e/common/hdfs-prep.sh docker
           echo "hello hdfs" | docker exec -i -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt
 
@@ -416,53 +394,8 @@ jobs:
           # krb5.conf: realm=TEST.LOCAL, kdc=localhost:88
           # No inline config mounts needed — the in-tree templates carry
           # the same kerberos settings the old HA nameservice config did.
-          set -x
-          docker run -d --name hdfs --hostname "$HDFS_HOSTNAME" \
-            -e HDFS_HOSTNAME="$HDFS_HOSTNAME" \
-            -p 8020:8020 -p 88:88 -p 749:749 -p 9866:9866 -p 9864:9864 \
-            dyrnq/hdfs:latest-debian
-
-          echo "=== Wait for KDC port 88 ==="
-          for i in $(seq 1 30); do
-            echo "  kdc attempt $i..."
-            if docker exec hdfs bash -c 'echo > /dev/tcp/127.0.0.1/88' 2>/dev/null; then
-              echo "KDC port 88 up after ${i}s"
-              break
-            fi
-            if [ $i -eq 30 ]; then
-              echo "::error::KDC port 88 never came up"
-              docker logs hdfs 2>&1 | tail -40
-              exit 1
-            fi
-            sleep 2
-          done
-
-          echo "=== Wait for NameNode + DataNode (kinit retry inside loop) ==="
-          # kinit as user hdfs with the in-tree keytab (/etc/hadoop/hdfs.keytab).
-          KINITED=0
-          for i in $(seq 1 20); do
-            echo "  attempt $i..."
-            if docker exec -u hdfs hdfs /usr/bin/kinit -kt /etc/hadoop/hdfs.keytab hdfs/${HDFS_HOSTNAME}@TEST.LOCAL 2>/dev/null; then
-              KINITED=1
-            fi
-            if [ $KINITED -eq 1 ] \
-               && docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | grep -q "Live datanodes"; then
-              echo "HDFS ready (kinit took attempt $i)"
-              break
-            fi
-            if [ $i -eq 20 ]; then
-              echo "::error::HDFS did not become ready after 20 attempts (kinit_ok=$KINITED)"
-              docker exec -u hdfs hdfs /usr/bin/kinit -kt /etc/hadoop/hdfs.keytab hdfs/${HDFS_HOSTNAME}@TEST.LOCAL 2>&1
-              docker exec hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1
-              docker logs hdfs 2>&1 | tail -30
-              exit 1
-            fi
-            sleep 5
-          done
-
-          echo "=== Container status ==="
-          docker logs hdfs 2>&1 | tail -10
-          docker exec hdfs /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | head -10
+          . tests/e2e/common/start-hdfs-container.sh
+          start_hdfs_container kerberos hdfs "$HDFS_HOSTNAME"
 
           echo "=== Extracting Kerberos config ==="
           docker cp hdfs:/etc/hadoop/hdfs.keytab /tmp/hdfs.keytab

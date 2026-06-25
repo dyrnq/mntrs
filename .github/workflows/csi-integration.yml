@@ -109,32 +109,8 @@ jobs:
           # network lets the runner reach DN 9866 directly, same as the
           # working mount-tests (HDFS) job in integration.yml. csi-integration
           # run 28109735440 (2026-06-24).
-          docker run -d --name hdfs --network host \
-            -e HADOOP_SECURITY_AUTHENTICATION=simple \
-            -e HDFS_HOSTNAME=localhost \
-            dyrnq/hdfs:latest-debian
-          for i in $(seq 1 30); do
-            # Probe readiness by attempting a real write
-            if echo "probe" | docker exec -i -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -put - /_readiness_probe 2>/dev/null \
-               && docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -rm /_readiness_probe >/dev/null 2>&1; then
-              echo "HDFS ready after ${i} attempts"
-              break
-            fi
-            echo "  attempt $i: waiting for HDFS write readiness..."
-            sleep 3
-          done
-          docker logs hdfs 2>&1 | tail -5
-          # chmod 777 / + chmod 777 /test so the GHA `runner` user (not the
-          # `hdfs` superuser) can create at the FUSE mount root in the
-          # 'Test mntrs mount' step below. Without this the dyrnq/hdfs
-          # image boots HDFS with drwxr-xr-x hdfs:supergroup on / and the
-          # first `echo > /mnt/mntrs-test/_ci_small.txt` fails with
-          # `org.apache.hadoop.security.AccessControlException:
-          # Permission denied: user=runner, access=WRITE, inode="/"` at
-          # `ClientProtocol.create inode="/"`. Same prep the other HDFS
-          # workflows (integration.yml, csi/hdfs.sh, csi/hdfs-kerberos.sh)
-          # run via the shared tests/e2e/common/hdfs-prep.sh.
-          # (csi-integration run 28102259330, 2026-06-24.)
+          . tests/e2e/common/start-hdfs-container.sh
+          start_hdfs_container simple hdfs localhost
           bash tests/e2e/common/hdfs-prep.sh docker
           echo "hello hdfs" | docker exec -i -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt
 
