@@ -1,0 +1,57 @@
+name: Coverage
+
+# Issue #147: code-coverage workflow using `cargo-llvm-cov`. The job
+# is on `workflow_dispatch` (manual trigger from the Actions tab) so
+# it does not slow every PR — coverage rebuilds everything with
+# `-Cinstrument-coverage` (~3-5 min on a warm cache), and most PRs
+# only need cargo test / clippy / fmt from the regular CI matrix.
+# Trigger periodically via "Run workflow" on the Actions tab, or
+# from the CLI: `gh workflow run coverage.yml`.
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  # Allow running on push to main so the first run after a merge is
+  # automatic; subsequent runs are manual. Coverage drift over time
+  # is the signal we want to track, not per-PR noise.
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/coverage.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install deps
+        # libfuse3-dev + fuse3 (matches the build job in ci.yml).
+        run: bash tests/e2e/common/install-linux-deps.sh standard "" no no
+
+      # `cargo-llvm-cov` wraps `cargo test` with LLVM source-level
+      # instrumentation. We only cover `--lib` for now:
+      #   * integration tests need MinIO/HDFS services (heavy CI)
+      #   * unit tests exercise the bulk of the library code
+      # `--lcov` emits the standard `lcov.info` report, which uploads
+      # below as an artifact and is the input format most coverage
+      # UIs (Codecov, Coveralls, genhtml) consume.
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+
+      - name: Run coverage (lib only)
+        run: cargo llvm-cov --workspace --lib --lcov --output-path lcov.info
+
+      - name: Upload lcov.info artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov-info
+          path: lcov.info
+          retention-days: 30
