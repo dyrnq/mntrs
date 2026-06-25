@@ -68,15 +68,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install k3s + deps
-        run: |
-          curl -sfL https://get.k3s.io | sh -
-          mkdir -p ~/.kube
-          sudo k3s kubectl config view --raw > ~/.kube/config
-          sudo chown $(id -u):$(id -g) ~/.kube/config
-          kubectl wait --for=condition=Ready node --all --timeout=60s
-          sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev protobuf-compiler
-          sudo grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+      - name: Install k3s
+        run: bash tests/e2e/common/install-k3s.sh 1 ~/.kube/config
+
+      - name: Install FUSE
+        run: bash tests/e2e/common/install-linux-deps.sh standard "" yes no
 
       - name: Build mntrs
         run: cargo build --release -p mntrs
