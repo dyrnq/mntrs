@@ -1,4 +1,0 @@
-#!/usr/bin/with-contenv bash
-set -eo pipefail
-echo "[INFO] $(basename $(dirname $0)) service stopping (exit: ${1}, signal: ${2})"
-exit 0

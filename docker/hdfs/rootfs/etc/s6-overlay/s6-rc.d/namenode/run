@@ -1,9 +1,0 @@
-#!/usr/bin/with-contenv bash
-export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
-export HADOOP_HOME=/opt/hadoop
-if [ ! -d /var/lib/hadoop/namenode/current ]; then
-    echo "[namenode] Formatting..."
-    gosu mntrs /opt/hadoop/bin/hdfs namenode -format -force
-fi
-echo "[namenode] Starting..."
-exec gosu mntrs /opt/hadoop/bin/hdfs namenode

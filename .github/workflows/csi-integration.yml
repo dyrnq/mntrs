@@ -78,13 +78,12 @@ jobs:
 
       # ---- HDFS: start container in simple auth mode ----
       # Uses the public dyrnq/hdfs:latest-debian image (source:
-      # /data/work/docker-hdfs). Its entrypoint has first-class simple-auth
-      # support: HADOOP_SECURITY_AUTHENTICATION=simple strips the krb5kdc +
-      # kadmind s6 services and skips the keytab/keystore bootstrap, so the
-      # namenode/datanode start without any Kerberos dependency. No in-line
-      # config mounts needed — HDFS_HOSTNAME drives the placeholder rendering
-      # in the entrypoint (fs.defaultFS, datanode hostname). The repo's
-      # docker/hdfs (Kerberos-only) is kept in-tree but no longer built by CI.
+      # dyrnq/docker-hdfs, separate repo). Its entrypoint has first-class
+      # simple-auth support: HADOOP_SECURITY_AUTHENTICATION=simple strips the
+      # krb5kdc + kadmind s6 services and skips the keytab/keystore bootstrap,
+      # so the namenode/datanode start without any Kerberos dependency. No
+      # in-line config mounts needed — HDFS_HOSTNAME drives the placeholder
+      # rendering in the entrypoint (fs.defaultFS, datanode hostname).
       - name: Setup HDFS (hdfs only)
         if: matrix.test.name == 'hdfs'
         run: |
