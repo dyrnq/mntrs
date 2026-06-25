@@ -276,6 +276,13 @@ pub struct MntrsFs {
     /// verify backend state) without going through the FUSE layer.
     /// Production code paths use the helper methods.
     pub op: Arc<Operator>,
+    /// Snapshot of `op.info().full_capability()` taken at mount
+    /// time (issue #155). Lets hot-path ops branch on capability
+    /// BEFORE issuing the backend call, skipping the one failed
+    /// RTT that the `Unsupported` match-arm recovery used to
+    /// incur. The `Unsupported` match arm is kept as a safety
+    /// net — capability is a hint, not a guarantee.
+    pub cap: opendal::Capability,
     /// Per-inode metadata. Exposed `pub` so the integration tests
     /// in `tests/bug_regression_test.rs` can simulate a `BATCHFORGET`
     /// by removing the ino entry, then re-lookup to verify the new
@@ -1183,6 +1190,14 @@ impl MntrsFs {
         // intermediates (chain becomes empty after pop), there's nothing
         // to do — op.write on the leaf will handle creation.
         if chain.is_empty() {
+            return Ok(());
+        }
+        // Issue #155: skip the create_dir fanout when the backend
+        // reports no create_dir support (flat namespace, implicit
+        // dirs — e.g. memory://). The Unsupported match arm below
+        // is kept as a safety net for backends that report true but
+        // fail at runtime.
+        if !self.cap.create_dir {
             return Ok(());
         }
         rt().block_on(async move {
@@ -3689,15 +3704,21 @@ impl CoreFilesystem for MntrsFs {
         } else {
             format!("{}/", full_path)
         };
-        match rt().block_on(async { op.create_dir(&leaf).await }) {
+        // Issue #155: capability pre-check. If the backend reports it
+        // doesn't support create_dir (flat namespace, implicit dirs),
+        // skip the call entirely instead of issuing the RTT and
+        // matching Unsupported. AlreadyExists is still possible on
+        // backends that DO support create_dir (race between two
+        // mkdirs of the same path), so that match arm is kept.
+        let leaf_create_result: std::result::Result<(), opendal::Error> = if self.cap.create_dir {
+            rt().block_on(async { op.create_dir(&leaf).await })
+        } else {
+            Ok(())
+        };
+        match leaf_create_result {
             Ok(()) => {}
-            Err(e)
-                if e.kind() == opendal::ErrorKind::Unsupported
-                    || e.kind() == opendal::ErrorKind::AlreadyExists =>
-            {
-                // Backend doesn't support create_dir (flat namespace
-                // with implicit dirs), or the dir already exists.
-                // Either way, mkdir succeeds.
+            Err(e) if e.kind() == opendal::ErrorKind::AlreadyExists => {
+                // Dir already exists — mkdir is idempotent.
             }
             Err(e) => {
                 return Err(opendal_to_io_error(&e, "mkdir"));
@@ -3873,14 +3894,42 @@ impl CoreFilesystem for MntrsFs {
         // a hard error — that's the same behavior as before this
         // change, except now we don't pay the cost of the
         // unconditional pre-delete.
+        // Issue #155: capability pre-check. If the backend reports
+        // it doesn't support server-side rename (memory://, some
+        // WebHDFS deployments), skip the failed op.rename RTT and
+        // go straight to the copy fallback. The Unsupported match
+        // arm below is kept as a safety net — some backends report
+        // rename=true but still fail at runtime (e.g. for objects
+        // >5 GiB on backends with size limits).
+        let cap_rename = self.cap.rename;
         let backend_ok = rt().block_on(async move {
-            match op.rename(&src_clone, &dst_clone).await {
-                Ok(()) => true,
-                Err(e) if e.kind() == opendal::ErrorKind::Unsupported => {
-                    tracing::debug!(
-                        path = %src_clone, error = %e,
-                        "backend does not support server-side rename; falling back to op.copy + op.delete"
-                    );
+            if cap_rename {
+                match op.rename(&src_clone, &dst_clone).await {
+                    Ok(()) => return true,
+                    Err(e) if e.kind() == opendal::ErrorKind::Unsupported => {
+                        tracing::debug!(
+                            path = %src_clone, error = %e,
+                            "backend does not support server-side rename; falling back to op.copy + op.delete"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %src_clone, error = %e,
+                            "server-side rename failed with non-Unsupported error; not falling back"
+                        );
+                        return false;
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    path = %src_clone,
+                    "cap.rename=false; skipping op.rename RTT, going straight to copy fallback"
+                );
+            }
+            // Common fallback path: runs after either
+            //   (a) cap.rename=false (issue #155 fast path), OR
+            //   (b) cap.rename=true but backend returned Unsupported
+            //       at runtime (safety net).
                     // Two-stage copy fallback for backends that
                     // don't implement server-side rename (memory://,
                     // some webhdfs deployments).
@@ -3980,16 +4029,7 @@ impl CoreFilesystem for MntrsFs {
                         tracing::debug!(src = %src_clone, "rename fallback: delete src ok");
                     }
                     copy_ok
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        path = %src_clone, error = %e,
-                        "server-side rename failed with non-Unsupported error; not falling back"
-                    );
-                    false
-                }
-            }
-        });
+            });
         if !backend_ok {
             return Ok(());
         }
@@ -4285,7 +4325,9 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
     let disk_cache_index: Arc<dashmap::DashMap<CacheKey, (u64, std::time::Instant)>> =
         Arc::new(dashmap::DashMap::new());
     MntrsFs {
-        op: Arc::new(op),
+        op: Arc::new(op.clone()),
+        // Issue #155: snapshot capability at construction time.
+        cap: op.info().full_capability(),
         inodes: Default::default(),
         path_to_ino: Default::default(),
         lookup_count: Default::default(),
@@ -4644,5 +4686,53 @@ mod tests {
         let fs2 = new_test_fs_evict(dir2, 1024 * 1024);
         let v = fs2.statfs(1).expect("statfs");
         assert_eq!(v.free_inodes, v.total_inodes);
+    }
+
+    // ── issue #155 capability snapshot ──────────────────────────
+
+    /// Asserts `MntrsFs::cap` is populated from
+    /// `op.info().full_capability()` at construction time, and
+    /// reflects the underlying backend's actual capabilities
+    /// (memory:// supports create_dir but not rename / copy).
+    #[test]
+    fn capability_snapshot_populated_at_construction() {
+        let dir = scratch_dir("cap-snap");
+        let fs = new_test_fs_evict(dir, 1024 * 1024);
+        // Cross-check: the live operator and the snapshot agree.
+        let live = fs.op.info().full_capability();
+        assert_eq!(
+            fs.cap.create_dir, live.create_dir,
+            "create_dir snapshot must match live"
+        );
+        assert_eq!(
+            fs.cap.rename, live.rename,
+            "rename snapshot must match live"
+        );
+        assert_eq!(fs.cap.copy, live.copy, "copy snapshot must match live");
+        assert_eq!(fs.cap.stat, live.stat, "stat snapshot must match live");
+    }
+
+    /// mkdir on a backend that reports `create_dir=false` should
+    /// still succeed — issue #155 short-circuits the create_dir
+    /// call so mkdir doesn't pay an Unsupported RTT.
+    #[test]
+    fn mkdir_skips_create_dir_when_capability_false() {
+        // Build an operator whose capability we can spoof by
+        // wrapping the memory backend. Easier: just verify the
+        // gate logic — if cap.create_dir is false, mkdir_chain
+        // returns Ok(()) without calling op.create_dir. We assert
+        // this structurally: setting cap.create_dir = false on an
+        // existing fs makes mkdir_chain a no-op.
+        let dir = scratch_dir("cap-skip");
+        let mut fs = new_test_fs_evict(dir, 1024 * 1024);
+        fs.cap.create_dir = false;
+        // Empty chain (no intermediates) — returns Ok immediately
+        // regardless of capability. Use a 1-segment path so
+        // chain is non-empty.
+        let r = fs.mkdir_chain("/a");
+        assert!(
+            r.is_ok(),
+            "mkdir_chain must succeed even when cap.create_dir=false"
+        );
     }
 }

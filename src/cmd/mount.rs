@@ -717,7 +717,9 @@ pub fn mount(
         dashmap::DashMap<crate::util::CacheKey, (u64, std::time::Instant)>,
     > = std::sync::Arc::new(dashmap::DashMap::new());
     let fs = MntrsFs {
-        op: Arc::new(op),
+        op: Arc::new(op.clone()),
+        // Issue #155: snapshot capability at mount time.
+        cap: op.info().full_capability(),
         inodes: dashmap::DashMap::new(),
         path_to_ino: dashmap::DashMap::new(),
         lookup_count: dashmap::DashMap::new(),
