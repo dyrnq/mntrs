@@ -133,6 +133,7 @@ cleanup() {
     ${KUBECTL} delete pvc "${E2E_PVC_NAME}" -n "${E2E_NAMESPACE}" --ignore-not-found 2>/dev/null || true
     ${KUBECTL} delete pv "${E2E_PV_NAME}" --ignore-not-found 2>/dev/null || true
     ${KUBECTL} delete pod "mntrs-csi-e2e-hdfs-krb-dyn" -n "${E2E_NAMESPACE}" --force --grace-period=0 --ignore-not-found 2>/dev/null || true
+    ${KUBECTL} delete pod "mntrs-csi-e2e-hdfs-krb-dyn-2" -n "${E2E_NAMESPACE}" --force --grace-period=0 --ignore-not-found 2>/dev/null || true
     ${KUBECTL} delete pvc "mntrs-csi-e2e-hdfs-krb-dyn" -n "${E2E_NAMESPACE}" --ignore-not-found 2>/dev/null || true
     ${KUBECTL} delete sc "mntrs-dyn-hdfs-krb-e2e" --ignore-not-found 2>/dev/null || true
     if [[ "${SKIP_DEPLOY:-0}" != "1" && -n "${DEPLOY_DIR:-}" ]]; then
@@ -291,9 +292,9 @@ log "  Kerberos ready; nodeplugin will fetch keytab+krb5.conf from the HDFS Pod"
 
 # ---------- 1. build & push image ----------
 if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
-    log "[1/8] skip build (SKIP_BUILD=1), using ${IMAGE}"
+    log "[1/9] skip build (SKIP_BUILD=1), using ${IMAGE}"
 else
-    log "[1/8] building mntrs-csi (glibc dynamic)..."
+    log "[1/9] building mntrs-csi (glibc dynamic)..."
     rustup target add x86_64-unknown-linux-gnu 2>/dev/null || true
     (cd "${REPO_ROOT}" && cargo build --release --package mntrs-csi --target x86_64-unknown-linux-gnu)
     cp "${REPO_ROOT}/target/x86_64-unknown-linux-gnu/release/mntrs-csi" "${REPO_ROOT}/docker/csi/mntrs-csi"
@@ -310,9 +311,9 @@ fi
 
 # ---------- 2. deploy csi-mntrs (with Kerberos volumes) ----------
 if [[ "${SKIP_DEPLOY:-0}" == "1" ]]; then
-    log "[2/8] skip deploy (SKIP_DEPLOY=1)"
+    log "[2/9] skip deploy (SKIP_DEPLOY=1)"
 else
-    log "[2/8] deploying csi-mntrs to ${CSI_NAMESPACE} with Kerberos volumes..."
+    log "[2/9] deploying csi-mntrs to ${CSI_NAMESPACE} with Kerberos volumes..."
 
     DEPLOY_DIR="$(mktemp -d)"
     SRC="${REPO_ROOT}/csi/deploy/kubernetes/1.20"
@@ -503,7 +504,7 @@ EOF
 fi
 
 # ---------- 3. create test data in HDFS ----------
-log "[3/8] creating test data in HDFS (Kerberos)..."
+log "[3/9] creating test data in HDFS (Kerberos)..."
 # kinit first (ticket may have expired)
 ${KUBECTL} -n "${HDFS_NAMESPACE}" exec hdfs -- /usr/bin/kinit -kt /etc/hadoop/hdfs.keytab "${HDFS_PRINCIPAL}" 2>/dev/null || true
 # shellcheck source=tests/e2e/common/hdfs-prep.sh
@@ -533,7 +534,7 @@ ${KUBECTL} -n "${HDFS_NAMESPACE}" exec hdfs -- /opt/hadoop/bin/hdfs dfs -ls /tes
 log "  test data ready"
 
 # ---------- 4. create PV + PVC + test pod ----------
-log "[4/8] creating Kerberos PV + PVC + test pod..."
+log "[4/9] creating Kerberos PV + PVC + test pod..."
 
 cat <<EOF | ${KUBECTL} apply -f -
 apiVersion: v1
@@ -586,7 +587,7 @@ log "  waiting for test pod Ready..."
 ${KUBECTL} -n "${E2E_NAMESPACE}" wait --for=condition=Ready pod/"${E2E_POD_NAME}" --timeout=300s
 
 # ---------- 5. run e2e tests ----------
-log "[5/8] running Kerberos e2e tests in pod..."
+log "[5/9] running Kerberos e2e tests in pod..."
 PASS=0
 FAIL=0
 
@@ -636,7 +637,7 @@ pass "  cleanup removed _ci_* files"
 PASS=$((PASS+1))
 
 # ---------- 6. dynamic provision e2e ----------
-log "[6/8] dynamic Kerberos provision e2e..."
+log "[6/9] dynamic Kerberos provision e2e..."
 ${KUBECTL} -n "${E2E_NAMESPACE}" delete pod "${E2E_POD_NAME}" --force --grace-period=0 --ignore-not-found 2>/dev/null
 ${KUBECTL} -n "${E2E_NAMESPACE}" delete pvc "${E2E_PVC_NAME}" --ignore-not-found 2>/dev/null
 ${KUBECTL} delete pv "${E2E_PV_NAME}" --ignore-not-found 2>/dev/null
@@ -731,8 +732,80 @@ assert_in "dynamic: 1M random write+read" "bytes" "${DD_OUT}"
 ${KUBECTL} -n "${E2E_NAMESPACE}" exec "${DYN_POD_NAME}" -- \
     sh -c "rm -f /data/_ci_small.txt /data/_ci_1m.bin" >/dev/null
 
-# ---------- 7. volume expansion (pvc resize assertion) ----------
-log "[7/8] volume expansion assertion..."
+# ---------- 7. pod rebuild persistence (issue #150) ----------
+# Core CSI guarantee: data persists across pod recreation. Same
+# PVC, different pod. Exercises the full mntrs-csi publish path
+# a second time without rebuilding the StorageClass / PV. Tests
+# the Kerberos mount survives a nodeplugin re-publish.
+log "[7/9] pod rebuild persistence..."
+
+# 1. Write 1 MiB random data and capture its md5 inside pod 1.
+ORIG_MD5=$(${KUBECTL} -n "${E2E_NAMESPACE}" exec "${DYN_POD_NAME}" -- \
+    sh -c "dd if=/dev/urandom of=/data/_ci_persist.bin bs=1M count=1 2>/dev/null && \
+           md5sum /data/_ci_persist.bin | awk '{print \$1}'")
+[[ -n "${ORIG_MD5}" ]] || fail "could not capture original md5 of /data/_ci_persist.bin"
+log "  original md5 (pod 1): ${ORIG_MD5}"
+
+# 2. Wait for the FUSE writeback queue to flush. Default
+#    --vfs-write-back is 5s, so 10s is a safe upper bound.
+log "  waiting 10s for writeback queue to flush..."
+sleep 10
+
+# 3. Delete the pod (keep PVC + PV).
+${KUBECTL} -n "${E2E_NAMESPACE}" delete pod "${DYN_POD_NAME}" \
+    --force --grace-period=0 --ignore-not-found
+
+# 4. Wait for the pod to fully terminate.
+for i in $(seq 1 30); do
+    POD_PHASE=$(${KUBECTL} -n "${E2E_NAMESPACE}" get pod "${DYN_POD_NAME}" \
+        -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+    if [[ -z "${POD_PHASE}" || "${POD_PHASE}" == "Succeeded" || "${POD_PHASE}" == "Failed" ]]; then
+        break
+    fi
+    sleep 1
+done
+log "  pod 1 terminated after ${i}s"
+
+# 5. Verify the PVC is still Bound.
+PVC_PHASE=$(${KUBECTL} -n "${E2E_NAMESPACE}" get pvc "${DYN_PVC_NAME}" \
+    -o jsonpath='{.status.phase}')
+[[ "${PVC_PHASE}" == "Bound" ]] || fail "PVC went ${PVC_PHASE} after pod delete (expected Bound)"
+log "  PVC still Bound: ${DYN_PVC_NAME}"
+
+# 6. Create a new pod with the SAME PVC. Different name to
+#    avoid the kubelet's name-reuse race. NODE_SELECTOR is
+#    needed in single-node k3s CI to land on the same node as
+#    the HDFS pod (see hdfs-prep.sh).
+DYN_POD_NAME_2="mntrs-csi-e2e-hdfs-krb-dyn-2"
+cat <<EOF | ${KUBECTL} apply -f -
+apiVersion: v1
+kind: Pod
+metadata: {name: ${DYN_POD_NAME_2}, namespace: ${E2E_NAMESPACE}}
+spec:
+  restartPolicy: Never
+  ${NODE_SELECTOR}
+  containers:
+  - name: test
+    image: busybox:1.37
+    command: ["sh", "-c", "sleep 600"]
+    volumeMounts: [{name: data, mountPath: /data}]
+  volumes:
+  - {name: data, persistentVolumeClaim: {claimName: ${DYN_PVC_NAME}}}
+EOF
+${KUBECTL} -n "${E2E_NAMESPACE}" wait --for=condition=Ready pod/"${DYN_POD_NAME_2}" --timeout=300s \
+    || fail "rebuild pod never became Ready"
+
+# 7. Read the file back from pod 2 and verify md5 matches.
+NEW_MD5=$(${KUBECTL} -n "${E2E_NAMESPACE}" exec "${DYN_POD_NAME_2}" -- \
+    md5sum /data/_ci_persist.bin | awk '{print $1}')
+log "  new md5 (pod 2): ${NEW_MD5}"
+[[ "${NEW_MD5}" == "${ORIG_MD5}" ]] || \
+    fail "md5 mismatch after pod rebuild: ${ORIG_MD5} != ${NEW_MD5} (data NOT persisted across pod recreation)"
+
+pass "  data persisted across pod rebuild (md5 match)"
+
+# ---------- 8. volume expansion (pvc resize assertion) ----------
+log "[8/9] volume expansion assertion..."
 # CSI spec requires ControllerExpandVolume for resize; our driver currently
 # doesn't implement it. Assert we get the expected error instead of hanging.
 RESIZE_ERR=$(${KUBECTL} -n "${E2E_NAMESPACE}" patch pvc "${DYN_PVC_NAME}" --type=json \
@@ -740,8 +813,8 @@ RESIZE_ERR=$(${KUBECTL} -n "${E2E_NAMESPACE}" patch pvc "${DYN_PVC_NAME}" --type
 log "  resize result: ${RESIZE_ERR}"
 log "  expansion assertion: CSI driver does not support expansion (expected)"
 
-# ---------- 8. summary ----------
-log "[8/8] Kerberos e2e done: ${PASS} passed, ${FAIL} failed"
+# ---------- 9. summary ----------
+log "[9/9] Kerberos e2e done: ${PASS} passed, ${FAIL} failed"
 trap - EXIT
 [[ "${KEEP_ON_FAIL:-0}" == "1" && $FAIL -gt 0 ]] || exit 0
 exit 2
