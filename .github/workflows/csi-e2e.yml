@@ -221,39 +221,8 @@ jobs:
 
       - name: Deploy HDFS Pod
         run: |
-          # Create the namespace first; the previous heredoc referenced
-          # `namespace: csi-mntrs` without ever creating it, so the apply
-          # failed with `namespaces "csi-mntrs" not found` (csi-e2e run
-          # 28102259330, 2026-06-24).
-          kubectl --kubeconfig /tmp/kubeconfig create namespace csi-mntrs \
-            --dry-run=client -o yaml | kubectl --kubeconfig /tmp/kubeconfig apply -f -
-          kubectl --kubeconfig /tmp/kubeconfig apply -f tests/e2e/csi/hdfs-pod.yaml
-
-          # Wait for Pod Running
-          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs wait --for=condition=Ready pod/hdfs --timeout=120s
-
-          # Add Service ClusterIP to /etc/hosts for hostNetwork nodeplugin
-          SVC_IP=$(kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs get svc hdfs -o jsonpath='{.spec.clusterIP}')
-          echo "$SVC_IP hdfs" | sudo tee -a /etc/hosts
-
-          # Wait for NameNode + DataNode (must have >=1 live datanode)
-          # kubectl exec runs as root; in simple-auth mode the superuser is hdfs.
-          for i in $(seq 1 30); do
-            if kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs exec hdfs -- su - hdfs -c "/opt/hadoop/bin/hdfs dfsadmin -report" 2>&1 | grep "Live datanodes" > /dev/null; then
-              echo "HDFS ready after ${i} attempts"
-              break
-            fi
-            echo "  attempt $i: waiting for HDFS..."
-            if [ $i -eq 30 ]; then
-              echo "::error::HDFS not ready after 30 attempts"
-              kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs exec hdfs -- su - hdfs -c "/opt/hadoop/bin/hdfs dfsadmin -report" 2>&1 | head -20
-              kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs logs hdfs 2>&1 | tail -20
-              exit 1
-            fi
-            sleep 3
-          done
-          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs logs hdfs 2>&1 | tail -5
-          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs exec hdfs -- su - hdfs -c "/opt/hadoop/bin/hdfs dfsadmin -report" 2>&1 | head -10
+          . tests/e2e/common/deploy-hdfs-pod.sh
+          deploy_hdfs_pod simple csi-mntrs /tmp/kubeconfig
 
       - name: Run e2e
         run: |
@@ -391,60 +360,8 @@ jobs:
 
       - name: Deploy HDFS Kerberos Pod
         run: |
-          # The runner is the sole k3s node. hostNetwork makes the HDFS pod
-          # share it so the DataNode can bind a real local interface (the node
-          # IP), instead of the Service ClusterIP which is NOT a local iface on
-          # single-node k3s/iptables and makes the DN crash with EADDRNOTAVAIL.
-          # hostAliases maps the short 'hdfs' (used by the DN bind overrides
-          # below) AND the node name (hostNetwork flips the pod's OS hostname to
-          # the node's, which Java's getLocalHost must be able to resolve) to
-          # the node IP. Verified 13/13 on a single-node k3s (iptables) replica;
-          # identical to the working multi-node config in
-          # tests/e2e/csi/hdfs-kerberos.sh. See [[kerberos-single-node-k3s-hostnet]].
-          NODE_IP=$(kubectl --kubeconfig /tmp/kubeconfig get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
-          NODE_NAME=$(kubectl --kubeconfig /tmp/kubeconfig get nodes -o jsonpath='{.items[0].metadata.name}')
-          export NODE_IP NODE_NAME
-          echo "node: ${NODE_NAME} ip: ${NODE_IP}"
-          # Create the namespace first; the previous heredoc referenced
-          # `namespace: csi-mntrs` without ever creating it, so the apply
-          # failed with `namespaces "csi-mntrs" not found` (csi-e2e run
-          # 28102259330, 2026-06-24).
-          kubectl --kubeconfig /tmp/kubeconfig create namespace csi-mntrs \
-            --dry-run=client -o yaml | kubectl --kubeconfig /tmp/kubeconfig apply -f -
-          # Pull the manifest out of the workflow so kubectl reads from a
-          # file (no stdin quoting, no leading-space ambiguity that bit the
-          # previous heredoc with `yaml: line 46: did not find expected '-'
-          # indicator`). envsubst renders only NODE_IP / NODE_NAME, declared
-          # inline below to keep the substitution surface tight.
-          envsubst '$NODE_IP $NODE_NAME' < tests/e2e/csi/hdfs-kerberos-pod.yaml \
-            | kubectl --kubeconfig /tmp/kubeconfig apply -f -
-
-          # Wait for Pod Running (300s: a cold runner first-pulls dyrnq/hdfs
-          # ~1GB before the pod can start).
-          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs wait --for=condition=Ready pod/hdfs --timeout=300s
-
-          # Add Service ClusterIP to /etc/hosts for hostNetwork nodeplugin
-          SVC_IP=$(kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs get svc hdfs -o jsonpath='{.spec.clusterIP}')
-          echo "$SVC_IP hdfs" | sudo tee -a /etc/hosts
-
-          # Wait for NameNode + DataNode (must have >=1 live datanode)
-          for i in $(seq 1 30); do
-            kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs exec hdfs -- /usr/bin/kinit -kt /etc/hadoop/hdfs.keytab "hdfs/${HDFS_HOSTNAME}@${HDFS_REALM}" 2>/dev/null || true
-            if kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs exec hdfs -- /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | grep "Live datanodes" > /dev/null; then
-              echo "HDFS ready after ${i} attempts"
-              break
-            fi
-            echo "  attempt $i: waiting for HDFS..."
-            if [ $i -eq 30 ]; then
-              echo "::error::HDFS not ready after 30 attempts"
-              kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs exec hdfs -- /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | head -20
-              kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs logs hdfs 2>&1 | tail -30
-              exit 1
-            fi
-            sleep 3
-          done
-          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs logs hdfs 2>&1 | tail -5
-          kubectl --kubeconfig /tmp/kubeconfig -n csi-mntrs exec hdfs -- /opt/hadoop/bin/hdfs dfsadmin -report 2>&1 | head -10
+          . tests/e2e/common/deploy-hdfs-pod.sh
+          deploy_hdfs_pod kerberos csi-mntrs /tmp/kubeconfig
 
       - name: Run e2e
         run: |
