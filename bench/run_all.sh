@@ -528,3 +528,35 @@ sync; sleep 1
 bench "stat x100" "mntrs" bash -c "for f in '$MNTRS_MNT'/bulkstat/f_*.txt; do stat \$f >/dev/null 2>&1; done"
 bench "stat x100" "rclone" bash -c "for f in '$RCLONE_MNT'/bulkstat/f_*.txt; do stat \$f >/dev/null 2>&1; done"
 rm -rf "$MNTRS_MNT/bulkstat" "$RCLONE_MNT/bulkstat" 2>/dev/null
+
+# Issue #132: regression check for the adaptive prefetcher. The new
+# `BackpressureController` wires the producer (HandlePrefetcher) and
+# the consumer (FUSE read) rates into a shared EMA so the prefetch
+# window grows from min_window (128 KiB, matching the prior fixed
+# `read_chunk_size`) toward max_window as the consumer keeps up. This
+# section verifies that the FIRST read (cold start, window = min) and
+# the WARM read (window should have grown mid-stream) still beat or
+# match rclone on the same workload. If the cold-start latency has
+# regressed vs the prior fixed 128 KiB baseline, something is wrong
+# with `BackpressureController::new()` defaults.
+echo ""; echo "=== 38. Prefetcher adaptive (issue #132): cold vs warm 100M read ==="; CATEGORY="PrefetcherAdaptive"
+dd if=/dev/urandom of="$MNTRS_MNT/adaptive-100M.bin" bs=1M count=100 2>/dev/null
+dd if=/dev/urandom of="$RCLONE_MNT/adaptive-100M.bin" bs=1M count=100 2>/dev/null
+sync; sleep 2
+# Cold-start read: nothing in cache, first chunk is the minimum window.
+bench "cat 100M cold" "mntrs" cat "$MNTRS_MNT/adaptive-100M.bin" >/dev/null
+bench "cat 100M cold" "rclone" cat "$RCLONE_MNT/adaptive-100M.bin" >/dev/null
+# Warm read: prefetch queue should be populated, window has grown
+# toward max_window; latency profile is what we'd expect for
+# a steady-state adaptive prefetcher.
+bench "cat 100M warm" "mntrs" cat "$MNTRS_MNT/adaptive-100M.bin" >/dev/null
+bench "cat 100M warm" "rclone" cat "$RCLONE_MNT/adaptive-100M.bin" >/dev/null
+# dd sequential with 1M blocks: stress the adaptive window growth.
+# If the controller never grew the window, mntrs would do many small
+# range reads (128 KiB each = ~800 requests); rclone uses a fixed
+# ~128 KiB as well but the difference shows up in network-bound
+# workloads. We're checking mntrs doesn't regress vs its pre-#132
+# baseline (which was the same fixed 128 KiB).
+bench "dd bs=1M 100M cold" "mntrs" dd if="$MNTRS_MNT/adaptive-100M.bin" bs=1M of=/dev/null 2>/dev/null
+bench "dd bs=1M 100M cold" "rclone" dd if="$RCLONE_MNT/adaptive-100M.bin" bs=1M of=/dev/null 2>/dev/null
+rm -f "$MNTRS_MNT/adaptive-100M.bin" "$RCLONE_MNT/adaptive-100M.bin" 2>/dev/null
