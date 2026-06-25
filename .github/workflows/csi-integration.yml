@@ -117,101 +117,24 @@ jobs:
       # ---- Mount + read/write test ----
       - name: Test mntrs mount
         run: |
-          sudo mkdir -p /mnt/mntrs-test && sudo chmod 777 /mnt/mntrs-test
+          # 8 common sub-tests (mount + readiness, ls, cat pre-existing,
+          # write small, read back, append+verify, 10M write+read, random
+          # seek) live in tests/e2e/common/mount-test.sh. The CSI k3s
+          # smoke test (next step) stays inline — it's csi-integration-only.
+          . tests/e2e/common/mount-test.sh
           MOUNT_OPTS="--opt endpoint=${{ matrix.test.endpoint }} --opt access-key=minioadmin --opt secret-key=minioadmin --opt region=us-east-1"
-          # hdfs backend uses --daemon --daemon-wait (parent exits after spawn);
-          # other backends run in foreground.
-          MOUNT_LOG="/tmp/mntrs-mount-csi-${{ matrix.test.name }}.log"
-          # MNTRS_DAEMON_LOG redirects the daemon child's tracing output to
-          # MOUNT_LOG (the parent shell's stdout/stderr alone wouldn't capture
-          # it because --daemon --daemon-wait forks a child that holds the
-          # FUSE session after the parent exits). Pre-fix this step mounted
-          # TWICE (once to /dev/null, once to MOUNT_LOG); the second mount of
-          # the same path was rejected by the kernel and surfaced as a
-          # spurious fusermount3 /etc/mtab error masking the real hdfs
-          # failure (csi-integration run 28102259330, 2026-06-24).
-          if [ "${{ matrix.test.name }}" = "hdfs" ]; then
-            MNTRS_DAEMON_LOG="$MOUNT_LOG" \
-              ./target/release/mntrs mount ${{ matrix.test.storage }} /mnt/mntrs-test $MOUNT_OPTS --allow-other --daemon --daemon-wait --daemon-timeout=20 > "$MOUNT_LOG" 2>&1 &
-          else
-            ./target/release/mntrs mount ${{ matrix.test.storage }} /mnt/mntrs-test $MOUNT_OPTS > "$MOUNT_LOG" 2>&1 &
-          fi
-
-          FAIL=0
-          READY=0
-          for i in $(seq 1 60); do
-            if mount | grep -q /mnt/mntrs-test; then
-              if ls /mnt/mntrs-test/ >/dev/null 2>&1; then
-                echo "mount ready after ${i}s"
-                READY=1
-                break
-              fi
-            fi
-            sleep 1
-          done
-
-          if [ $READY -eq 0 ]; then
-            echo "::error::${{ matrix.test.name }} mount not ready after 60s"
-            echo "--- mount log ---"
-            cat "$MOUNT_LOG" 2>/dev/null || true
-            echo "--- mount table ---"
-            mount | grep mntrs-test || echo "(no mount)"
-            echo "--- fusermount might be needed ---"
-            exit 1
-          fi
-
-          if mount | grep -q /mnt/mntrs-test; then
-            echo "--- 1. ls ---"
-            ls -laR /mnt/mntrs-test/ 2>&1
-
-            echo "--- 2. cat pre-existing files ---"
-            case "${{ matrix.test.name }}" in
-              s3)
-                GOT=$(cat /mnt/mntrs-test/s3-test.txt 2>/dev/null)
-                if [ "$GOT" = "hello s3" ]; then echo "read pre-existing OK: s3-test.txt"
-                else echo "::error::read pre-existing FAIL: s3-test.txt (got '$GOT')"; FAIL=1; fi
-                ;;
-              hdfs)
-                GOT=$(cat /mnt/mntrs-test/test/hello.txt 2>/dev/null)
-                if [ "$GOT" = "hello hdfs" ]; then echo "read pre-existing OK: test/hello.txt"
-                else echo "::error::read pre-existing FAIL: test/hello.txt (got '$GOT')"; FAIL=1; fi
-                ;;
-            esac
-
-            echo "--- 3. write small file ---"
-            echo "hello from ${{ matrix.test.name }}" > /mnt/mntrs-test/_ci_small.txt 2>/dev/null && echo "write OK" || { echo "write FAIL"; FAIL=1; }
-
-            echo "--- 4. read back ---"
-            GOT=$(cat /mnt/mntrs-test/_ci_small.txt 2>/dev/null)
-            if [ "$GOT" = "hello from ${{ matrix.test.name }}" ]; then echo "read back OK"
-            else echo "read back FAIL: got '$GOT'"; FAIL=1; fi
-
-            echo "--- 5. append ---"
-            echo "more data" >> /mnt/mntrs-test/_ci_small.txt 2>/dev/null && echo "append OK" || { echo "append FAIL"; FAIL=1; }
-
-            echo "--- 6. write+read 10M ---"
-            dd if=/dev/urandom of=/mnt/mntrs-test/_ci_10m.bin bs=1M count=10 2>/dev/null && echo "write 10M OK" || { echo "write 10M FAIL"; FAIL=1; }
-            dd if=/mnt/mntrs-test/_ci_10m.bin of=/dev/null bs=64K 2>/dev/null && echo "read 10M OK" || { echo "read 10M FAIL"; FAIL=1; }
-
-            echo "--- 7. random read 10M ---"
-            for off in 0 500 10000 50000 500000 5000000 9000000 9999999; do
-              dd if=/mnt/mntrs-test/_ci_10m.bin bs=1 count=1 skip=$off of=/dev/null 2>/dev/null && echo "  seek $off OK" || { echo "  seek $off FAIL"; FAIL=1; }
-            done
-
-            echo "--- 8. cleanup ---"
-            rm -f /mnt/mntrs-test/_ci_small.txt /mnt/mntrs-test/_ci_10m.bin 2>/dev/null || true
-
-            if [ $FAIL -eq 0 ]; then
-              echo "✅ ${{ matrix.test.name }} mount OK"
-            else
-              echo "::error::${{ matrix.test.name }} mount tests FAILED"
-              exit 1
-            fi
-          else
-            echo "::error::${{ matrix.test.name }} mount failed: not in mount table"
-            mount | grep mntrs || true
-            exit 1
-          fi
+          case "${{ matrix.test.name }}" in
+            s3)   PRE_EXISTING="s3-test.txt"  && EXPECTED="hello s3"   ;;
+            hdfs) PRE_EXISTING="test/hello.txt" && EXPECTED="hello hdfs" ;;
+            *)    PRE_EXISTING=""              && EXPECTED=""           ;;
+          esac
+          DAEMON_MODE=fg
+          [ "${{ matrix.test.name }}" = "hdfs" ] && DAEMON_MODE=daemon
+          mount_test "${{ matrix.test.name }}" "${{ matrix.test.storage }}" \
+            /mnt/mntrs-test "$MOUNT_OPTS" "$PRE_EXISTING" "$EXPECTED" \
+            "$DAEMON_MODE" "/tmp/mntrs-mount-csi-${{ matrix.test.name }}.log" \
+            || { echo "::error::${{ matrix.test.name }} mount tests FAILED"; exit 1; }
+          echo "✅ ${{ matrix.test.name }} mount OK"
 
       - name: CSI k3s smoke test
         run: |
