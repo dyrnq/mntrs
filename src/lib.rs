@@ -2654,7 +2654,18 @@ impl CoreFilesystem for MntrsFs {
                 let e = (off + chunk_bytes).min(ends_at);
                 let op_c = op.clone();
                 let p_c = p.clone();
-                let r = rt().block_on(async move { op_c.read_with(&p_c).range(off..e).await });
+                // Issue #159: pass content_length_hint so opendal
+                // skips its internal HEAD/Stat() on backends that
+                // plan reads via chunking (S3, etc.). The hint is
+                // advisory only — opendal falls back to its default
+                // planning if it's wrong, so there's no downside if
+                // actual_size drifts.
+                let r = rt().block_on(async move {
+                    op_c.read_with(&p_c)
+                        .range(off..e)
+                        .content_length_hint(actual_size)
+                        .await
+                });
                 match r {
                     Ok(b) => results.push(bytes::Bytes::from(b.to_vec())),
                     Err(_) => {
@@ -2677,10 +2688,16 @@ impl CoreFilesystem for MntrsFs {
         } else {
             let op = self.op.clone();
             let p = path.clone();
-            rt().block_on(async move { op.read_with(&p).range(offset..offset + fetch_size).await })
-                .map_err(|_| std::io::Error::other("read failed"))?
-                .to_vec()
-                .into()
+            // Issue #159: see parallel path above for rationale.
+            rt().block_on(async move {
+                op.read_with(&p)
+                    .range(offset..offset + fetch_size)
+                    .content_length_hint(actual_size)
+                    .await
+            })
+            .map_err(|_| std::io::Error::other("read failed"))?
+            .to_vec()
+            .into()
         };
         let len = (b.len() as u32).min(size) as usize;
         let result = b[..len].to_vec();
