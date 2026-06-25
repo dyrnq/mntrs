@@ -50,9 +50,10 @@ jobs:
 
       - name: Setup MinIO bucket
         run: |
-          pip3 install awscli
-          AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin aws --endpoint-url http://localhost:9000 --no-verify-ssl s3 mb s3://test-bucket 2>/dev/null || true
-          echo "test" > /tmp/hello.txt
+          . tests/e2e/common/setup-minio-bucket.sh
+          # bench uses local /tmp/hello.txt for its FUSE tests, not an
+          # S3 seed upload — pass seed_text="" to skip the cp step.
+          setup_minio_bucket test-bucket "" "" ""
 
       - name: Run FUSE integration tests
         if: matrix.mode.name == 'fuse-integration'

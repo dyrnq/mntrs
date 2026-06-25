@@ -81,12 +81,8 @@ jobs:
       - name: Setup MinIO bucket (s3 only)
         if: matrix.test.name == 's3'
         run: |
-          pip3 install awscli
-          AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
-            aws --endpoint-url http://localhost:9000 --no-verify-ssl s3 mb s3://test-bucket 2>/dev/null || true
-          echo "hello s3" > /tmp/s3-test.txt
-          AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
-            aws --endpoint-url http://localhost:9000 --no-verify-ssl s3 cp /tmp/s3-test.txt s3://test-bucket/
+          . tests/e2e/common/setup-minio-bucket.sh
+          setup_minio_bucket
 
       # ---- HDFS: start container in simple auth mode ----
       # Uses the public dyrnq/hdfs:latest-debian image (source:
