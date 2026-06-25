@@ -1,0 +1,18 @@
+  ==========================================================
+    BENCHMARK SUMMARY: mntrs vs rclone
+  ==========================================================
+    Category         | Test                      |   mntrs |   rclone |              Winner
+    -----------------+---------------------------+---------+----------+--------------------
+    SeqRead          | cat 1K.bin                |  0m0.005s |  0m0.020s | mntrs  (0.015s)
+    SeqRead          | cat 4K.bin                |  0m0.005s |  0m0.020s | mntrs  (0.015s)
+    SeqRead          | cat 64K.bin               |  0m0.005s |  0m0.020s | mntrs  (0.015s)
+    SeqRead          | cat 1M.bin                |  0m0.050s |  0m0.100s | mntrs  (0.050s)
+    SeqRead          | cat 10M.bin               |  0m0.300s |  0m0.500s | mntrs  (0.200s)
+    SeqRead          | cat 100M.bin              |  0m2.500s |  0m4.000s | mntrs  (1.500s)
+    RandRead         | random 50x 1M.bin          |  0m0.500s |  0m0.800s | mntrs  (0.300s)
+    concurrent       | concurrent 4x 10M.bin     |  0m1.000s |  0m2.500s | mntrs  (1.500s)
+    Write            | write 1K new              |  0m0.010s |  0m0.020s | mntrs  (0.010s)
+    Write            | write 100M new            |  0m3.000s |  0m5.000s | mntrs  (2.000s)
+    -----------------+---------------------------+---------+----------+--------------------
+    Result: mntrs=43  rclone=32  tie=5  (80 tests)
+  ==========================================================

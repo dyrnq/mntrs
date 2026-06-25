@@ -93,4 +93,14 @@ jobs:
 
       - name: Check regressions
         if: matrix.mode.name == 'bench-comparison'
-        run: cat bench-result.txt
+        run: |
+          # Compare bench-result.txt against bench/baseline.txt. The
+          # script reports 2 distinct regression classes:
+          #   1. Overall winner count (mntrs vs rclone)
+          #   2. Per-test time on critical workloads (cat 100M, random,
+          #      concurrent — high-signal for FUSE reentrancy/locking)
+          # Threshold 0.20 = 20% regression fails the step. The script
+          # is a no-op if the baseline is missing (with a warning),
+          # so this step is safe to merge before a baseline exists.
+          . tests/e2e/bench/check-regression.sh
+          check_regression bench-result.txt bench/baseline.txt 0.20
