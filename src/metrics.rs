@@ -471,8 +471,7 @@ mod tests {
         let h = OpHistogram::new(FuseOp::Read);
         // Pre-load sum_us to a value that would overflow on
         // a second addition of (say) 1000us.
-        h.sum_us
-            .store(u64::MAX - 500, Ordering::Relaxed);
+        h.sum_us.store(u64::MAX - 500, Ordering::Relaxed);
         h.observe(Duration::from_micros(1_000));
         // Should saturate at u64::MAX, NOT wrap.
         assert_eq!(h.sum_us.load(Ordering::Relaxed), u64::MAX);
