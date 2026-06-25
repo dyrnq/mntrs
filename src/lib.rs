@@ -453,6 +453,14 @@ pub struct MntrsFs {
     /// user's perspective).
     writeback_pending: std::sync::Arc<dashmap::DashSet<String>>,
 
+    /// Issue #132: shared adaptive prefetch-window controller. One
+    /// instance per `MntrsFs` so every prefetcher (and every FUSE
+    /// reader feeding them) shares the same producer-vs-consumer
+    /// rate EMA. Cloned as `Arc` into each `HandlePrefetcher` so the
+    /// download thread's `record_part_fetched` calls update the same
+    /// state the FUSE reader's `record_part_consumed` calls feed.
+    backpressure: std::sync::Arc<backpressure::BackpressureController>,
+
     /// Per-(inode, block) in-memory read cache. Held as a
     /// `dyn MemCache` trait object so the underlying
     /// implementation can be swapped (DashMap today, moka
@@ -682,6 +690,10 @@ impl MntrsFs {
             file_size,
             max_queue,
             chunk,
+            // Issue #132: share the per-mount BackpressureController
+            // so this prefetcher's fetch rate feeds the same EMA
+            // window the FUSE reader's consume rate updates.
+            self.backpressure.clone(),
         )))
     }
 
@@ -2400,6 +2412,10 @@ impl CoreFilesystem for MntrsFs {
     }
 
     fn read(&self, ino: u64, fh: u64, offset: u64, size: u32) -> std::io::Result<Vec<u8>> {
+        // Issue #132: stamp the consumer-side start time so the
+        // prefetcher's `pop` can compute the elapsed consumer time
+        // and feed `BackpressureController::record_part_consumed`.
+        let consume_started = std::time::Instant::now();
         let (path, file_size) = self
             .resolve(ino)
             .map(|e| (e.path, e.size))
@@ -2486,7 +2502,7 @@ impl CoreFilesystem for MntrsFs {
                 prefetcher: Some(p),
                 ..
             } = h.value()
-            && let Some(part) = p.pop(offset)
+            && let Some(part) = p.pop(offset, Some(consume_started))
         {
             // Populate mem_cache for the prefetched part so subsequent
             // reads on the same block range hit the fast path above.
@@ -4422,6 +4438,11 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         #[cfg(not(windows))]
         fuse_notifier: std::sync::OnceLock::new(),
         writeback_pending: Arc::new(dashmap::DashSet::new()),
+        // Issue #132: shared adaptive prefetch window controller.
+        // Default min=128 KiB matches the read_chunk_size clamp
+        // floor (lib.rs `self.read_chunk_size.clamp(131072, 16 MiB)`)
+        // so the first prefetch chunk is unchanged from pre-#132.
+        backpressure: Arc::new(backpressure::BackpressureController::new()),
         // Unbounded mem_cache for unit tests. Production mounts
         // overwrite this in cmd/mount.rs after the size is known.
         mem_cache: std::sync::Arc::new(crate::cache::DashMapMemCache::new(0)),
