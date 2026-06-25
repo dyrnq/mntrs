@@ -165,7 +165,18 @@ impl OpHistogram {
             }
         }
         self.count.fetch_add(1, Ordering::Relaxed);
-        self.sum_us.fetch_add(us, Ordering::Relaxed);
+        // Saturating add guards against `u64` overflow at sustained
+        // high op rates (issue #115: at 1M ops/sec `sum_us` saturates
+        // `u64::MAX` in ~49.7 days; once it wraps the Prometheus sum
+        // metric reports wrong numbers). Saturating is a strict
+        // improvement — the histogram bucket counts are still exact,
+        // and the only loss is the small absolute-precision tail
+        // beyond 1.8e19 µs (~584 years at 1M ops/sec).
+        self.sum_us
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(us))
+            })
+            .ok();
     }
 }
 
@@ -449,6 +460,24 @@ mod tests {
         assert!(h.bucket_counts[1].load(Ordering::Relaxed) >= 1);
         // Total count = 2.
         assert_eq!(h.count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn histogram_sum_us_saturates() {
+        // Issue #115: at 1M ops/sec, sum_us overflows u64 in
+        // ~49.7 days. Saturating_add keeps the metric meaningful
+        // even after the cap is hit (Prometheus reads a stable
+        // value rather than a wrapped/garbage one).
+        let h = OpHistogram::new(FuseOp::Read);
+        // Pre-load sum_us to a value that would overflow on
+        // a second addition of (say) 1000us.
+        h.sum_us.store(u64::MAX - 500, Ordering::Relaxed);
+        h.observe(Duration::from_micros(1_000));
+        // Should saturate at u64::MAX, NOT wrap.
+        assert_eq!(h.sum_us.load(Ordering::Relaxed), u64::MAX);
+        // Bucket counts still increment correctly — only
+        // the running total saturates.
+        assert_eq!(h.count.load(Ordering::Relaxed), 1);
     }
 
     #[test]
