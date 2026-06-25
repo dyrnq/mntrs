@@ -323,158 +323,18 @@ jobs:
         env:
           HDFS_HOSTNAME: hdfs.test
         run: |
-          set -x
-          echo "=== 1. Renew Kerberos ticket (hdfs principal) ==="
-          kinit -kt /tmp/hdfs.keytab hdfs/${HDFS_HOSTNAME}@TEST.LOCAL
-          klist
-
-          echo "=== 2. Create test data in HDFS ==="
-          docker exec -u hdfs hdfs /usr/bin/kinit -kt /etc/hadoop/hdfs.keytab hdfs/${HDFS_HOSTNAME}@TEST.LOCAL
-          docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -mkdir -p /test
-          docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -chmod 777 /test
-          echo "hello kerberos hdfs" | docker exec -i -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -put - /test/hello.txt
-          docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -chmod 644 /test/hello.txt
-          docker exec -u hdfs hdfs /opt/hadoop/bin/hdfs dfs -ls /test/
-
-          echo "=== 3. Export Hadoop config for OpenDAL native HDFS backend ==="
-          mkdir -p /tmp/hadoop-conf
-          cp /tmp/core-site.xml /tmp/hadoop-conf/
-          cp /tmp/hdfs-site.xml /tmp/hadoop-conf/
-          export HADOOP_CONF_DIR=/tmp/hadoop-conf
-          ls -la /tmp/hadoop-conf/
-
-          echo "=== 4. Check HDFS connectivity from host ==="
-          HDFS_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' hdfs)
-          echo "HDFS container IP: $HDFS_IP"
-          echo "krb5.conf:"
-          cat /etc/krb5.conf
-          echo "---"
-          echo "/etc/hosts:"
-          grep -E 'hdfs\.test' /etc/hosts || echo "(no entries)"
-
-          echo "=== 5. Mount ==="
-          sudo mkdir -p /mnt/hdfs && sudo chmod 777 /mnt/hdfs
-          MOUNT_LOG="/tmp/mntrs-mount.log"
-          KRB5CCNAME=$(klist 2>/dev/null | sed -n 's/^Ticket cache: //p')
-          # hdfs-native (libhdfs) needs these to find the kerberos
-          # config and the host's ticket cache. Without HADOOP_CONF_DIR
-          # it falls back to defaults that don't include the test
-          # realm's KDC; without KRB5CCNAME the host process's
-          # existing ticket isn't picked up by the daemon child (which
-          # has no environment except what we explicitly set). Mount
-          # via the hdfs hostname (not localhost) so the GSSAPI
-          # service principal matches what the hdfs server registered
-          # under at kadmin time.
-          HADOOP_CONF_DIR=/tmp/hadoop-conf \
-          KRB5_CONFIG=/etc/krb5.conf \
-          KRB5CCNAME="${KRB5CCNAME}" \
-            MNTRS_DAEMON_LOG="$MOUNT_LOG" \
-            ./target/release/mntrs mount hdfs://${HDFS_HOSTNAME}:8020/ /mnt/hdfs \
-              --allow-other --daemon --daemon-wait --daemon-timeout=20 \
-              --opt dfs.namenode.kerberos.principal=hdfs/${HDFS_HOSTNAME}@TEST.LOCAL \
-              > "$MOUNT_LOG" 2>&1 &
-
-          # Readiness probe: wait up to 60s for mount. Use cat (not ls)
-          # because hdfs-native list_op trips FUSE readdir EIO on some
-          # backends; cat goes through read which is the stable path.
-          READY=0
-          for i in $(seq 1 60); do
-            if mount | grep -q /mnt/hdfs; then
-              if cat /mnt/hdfs/test/hello.txt >/dev/null 2>&1; then
-                echo "mount ready after ${i}s"
-                READY=1
-                break
-              fi
-            fi
-            sleep 1
-          done
-
-          if [ $READY -eq 0 ]; then
-            echo "::error::HDFS Kerberos mount not ready after 60s"
-            echo "--- mount stdout/stderr ---"
-            cat "$MOUNT_LOG"
-            echo "--- mount table ---"
-            mount | grep hdfs || echo "(no hdfs mount)"
-            echo "--- ps mntrs ---"
-            ps aux | grep mntrs | grep -v grep || echo "(no mntrs process)"
-            exit 1
-          fi
-
-          # Per SESSION_PITFALLS §2.6: CI green ≠ tests pass — track failures explicitly
-          FAIL=0
-          if mount | grep -q /mnt/hdfs; then
-            echo "=== 6. Verify ==="
-
-            echo "--- ls ---"
-            ls -laR /mnt/hdfs/ 2>&1
-
-            echo "--- read pre-existing file ---"
-            GOT=$(cat /mnt/hdfs/test/hello.txt 2>/dev/null)
-            if [ "$GOT" = "hello kerberos hdfs" ]; then
-              echo "read pre-existing OK: test/hello.txt"
-            else
-              echo "::error::read pre-existing FAIL: test/hello.txt (got '$GOT')"
-              FAIL=1
-            fi
-
-            echo "--- write small file ---"
-            echo "hello kerberos" > /mnt/hdfs/_ci_small.txt 2>/dev/null && echo "write OK" || { echo "write FAIL"; FAIL=1; }
-
-            echo "--- read back ---"
-            GOT=$(cat /mnt/hdfs/_ci_small.txt 2>/dev/null)
-            if [ "$GOT" = "hello kerberos" ]; then echo "read back OK"
-            else echo "read back FAIL: got '$GOT'"; FAIL=1; fi
-
-            echo "--- append ---"
-            echo "more" >> /mnt/hdfs/_ci_small.txt 2>/dev/null && echo "append OK" || { echo "append FAIL"; FAIL=1; }
-            GOT=$(cat /mnt/hdfs/_ci_small.txt 2>/dev/null)
-            EXPECTED=$(printf "hello kerberos\nmore")
-            if [ "$GOT" = "$EXPECTED" ]; then echo "append verify OK"
-            else echo "::error::append verify FAIL: got '$GOT'"; FAIL=1; fi
-
-            echo "--- append to pre-existing file ---"
-            echo "appended" >> /mnt/hdfs/test/hello.txt 2>/dev/null && echo "append pre-existing OK" || { echo "append pre-existing FAIL"; FAIL=1; }
-            GOT=$(cat /mnt/hdfs/test/hello.txt 2>/dev/null)
-            if echo "$GOT" | grep -q "appended"; then echo "append pre-existing verify OK"
-            else echo "::error::append pre-existing verify FAIL: got '$GOT'"; FAIL=1; fi
-
-            echo "--- write+read 10M sequential ---"
-            dd if=/dev/urandom of=/mnt/hdfs/_ci_10m.bin bs=1M count=10 2>/dev/null && echo "write 10M OK" || { echo "write 10M FAIL"; FAIL=1; }
-            dd if=/mnt/hdfs/_ci_10m.bin of=/dev/null bs=64K 2>/dev/null && echo "read 10M OK" || { echo "read 10M FAIL"; FAIL=1; }
-
-            echo "--- random seek read ---"
-            for off in 0 500 10000 50000 500000 5000000 9000000 9999999; do
-              dd if=/mnt/hdfs/_ci_10m.bin bs=1 count=1 skip=$off of=/dev/null 2>/dev/null && echo "  seek $off OK" || { echo "  seek $off FAIL"; FAIL=1; }
-            done
-
-            echo "--- delete + recreate ---"
-            rm -f /mnt/hdfs/_ci_small.txt 2>/dev/null
-            echo "recreated" > /mnt/hdfs/_ci_small.txt 2>/dev/null && echo "recreate OK" || { echo "recreate FAIL"; FAIL=1; }
-            GOT=$(cat /mnt/hdfs/_ci_small.txt 2>/dev/null)
-            if [ "$GOT" = "recreated" ]; then echo "recreate verify OK"
-            else echo "::error::recreate verify FAIL: got '$GOT'"; FAIL=1; fi
-
-            echo "--- directory create + list + delete ---"
-            mkdir -p /mnt/hdfs/_ci_dir 2>/dev/null && echo "mkdir OK" || { echo "mkdir FAIL"; FAIL=1; }
-            echo "dirfile" > /mnt/hdfs/_ci_dir/file.txt 2>/dev/null
-            GOT=$(ls /mnt/hdfs/_ci_dir/ 2>/dev/null)
-            if [ "$GOT" = "file.txt" ]; then echo "dir list OK"
-            else echo "::error::dir list FAIL: got '$GOT'"; FAIL=1; fi
-            rm -rf /mnt/hdfs/_ci_dir 2>/dev/null && echo "rmdir OK" || { echo "rmdir FAIL"; FAIL=1; }
-
-            echo "--- cleanup ---"
-            rm -f /mnt/hdfs/_ci_small.txt /mnt/hdfs/_ci_10m.bin 2>/dev/null || true
-
-            if [ $FAIL -eq 0 ]; then
-              echo "✅ HDFS Kerberos mount OK"
-            else
-              echo "::error::HDFS Kerberos mount tests FAILED"
-              exit 1
-            fi
-          else
-            echo "::error::HDFS Kerberos mount failed"
-            exit 1
-          fi
+          # All Kerberos-specific prep (host kinit, in-container seed,
+          # HADOOP_CONF_DIR staging, mount-with-GSSAPI, 60s readiness
+          # via `cat` not `ls`, 10 sub-tests) lives in
+          # tests/e2e/common/hdfs-kerberos-mount-test.sh. The script
+          # is Kerberos-only (different from tests/e2e/common/mount-test.sh
+          # which covers memory/s3/hdfs-simple).
+          . tests/e2e/common/hdfs-kerberos-mount-test.sh
+          hdfs_kerberos_mount_test "/mnt/hdfs" "$HDFS_HOSTNAME" "TEST.LOCAL" \
+            "test/hello.txt" "hello kerberos hdfs" \
+            "/tmp/mntrs-mount.log" \
+            || { echo "::error::HDFS Kerberos mount tests FAILED"; exit 1; }
+          echo "✅ HDFS Kerberos mount OK"
 
       - name: Cleanup
         if: always()
@@ -482,6 +342,12 @@ jobs:
           . tests/e2e/common/ci-cleanup.sh
           cleanup_fuse_mount /mnt/hdfs
           cleanup_docker_container hdfs
+          # Security audit H6: securely delete the extracted keytab.
+          # `shred -u` overwrites before unlink so it can't be recovered
+          # from the runner's disk after the job ends. `|| true` because
+          # the keytab may already be gone if the prior step failed
+          # before it was written.
+          shred -u /tmp/hdfs.keytab 2>/dev/null || true
 
       # Per SESSION_PITFALLS §2.6: preserve post-mortem on failure.
       # Pattern adapted from bench.yml ("Upload rclone log" + actions/upload-artifact@v4).
