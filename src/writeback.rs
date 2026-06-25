@@ -241,8 +241,19 @@ pub fn spawn(
                         // return from op.write is
                         // discarded via .map(|_| ()).
                         let op_for_multipart = op.clone();
+                        // Issue #140: keep the opendal Metadata so we
+                        // can refresh inodes.size from
+                        // meta.content_length() after a successful
+                        // upload. For the multipart path the writer
+                        // doesn't return content_length (it tracks
+                        // parts internally), so the single-shot
+                        // branch carries the metadata and the
+                        // multipart branch yields `None` — the
+                        // recovery path falls back to data.len() (the
+                        // bytes we just wrote, which for non-sparse
+                        // files equals the backend size).
                         let write_result: Result<
-                            Result<(), opendal::Error>,
+                            Result<Option<u64>, opendal::Error>,
                             tokio::time::error::Elapsed,
                         > = if data.len() > 200 * 1024 * 1024 {
                             // Issue #46 + #73: multipart
@@ -264,30 +275,80 @@ pub fn spawn(
                                     .chunk(5 * 1024 * 1024)
                                     .concurrent(2)
                                     .await?;
+                                let payload_len = data_clone.len() as u64;
                                 w.write(data_clone).await?;
-                                w.close().await.map(|_| ())
+                                // Multipart writer doesn't return a
+                                // content_length; for non-sparse
+                                // uploads the payload size is the
+                                // canonical size.
+                                Ok(Some(payload_len))
                             })
                             .await
                         } else {
                             let write_fut = op.write(&remote, data.clone());
                             tokio::time::timeout(Duration::from_secs(120), write_fut)
                                 .await
-                                .map(|res| res.map(|_meta| ()))
+                                .map(|res| res.map(|meta| Some(meta.content_length())))
                         };
                         match write_result {
-                            Ok(Ok(_)) => {
-                                // Only update mtime — do NOT update file size (v.2).
-                                // The write function tracks the correct logical size
-                                // via inodes. The cache file may be larger than the
-                                // logical size due to set_len sparse extension, so
-                                // using cache metadata length would corrupt reads.
+                            Ok(Ok(maybe_size)) => {
+                                // Issue #140: after a successful upload,
+                                // refresh the inode size from the
+                                // backend's content_length (opendal
+                                // returns it from the single-shot
+                                // path; multipart falls back to
+                                // data.len()).
                                 //
-                                // Bug 18: same INO_RECOVERY_SENTINEL skip as the
-                                // batched path below. Recovery uploads come through
-                                // this branch too; the and_modify on a missing
-                                // ino=0 is a silent no-op, but the explicit check
-                                // documents intent.
-                                if ino != crate::INO_RECOVERY_SENTINEL {
+                                // Why NOT cache_metadata.len(): the
+                                // on-disk cache file may be larger
+                                // than the logical file size due to
+                                // sparse set_len extension — the
+                                // kernel issues reads up to
+                                // inodes.size (from getattr), so using
+                                // cache_metadata.len would over-report
+                                // and reads beyond the logical size
+                                // would return zero.
+                                //
+                                // Why use opendal's metadata: it's
+                                // the canonical answer from the
+                                // backend (S3 HEAD, HDFS stat, etc.).
+                                // After a successful upload the
+                                // backend has exactly what we wrote,
+                                // and its content_length is the
+                                // authoritative size.
+                                //
+                                // Bug 18: same
+                                // INO_RECOVERY_SENTINEL skip as the
+                                // batched path below. Recovery
+                                // uploads come through this branch
+                                // too; the and_modify on a missing
+                                // ino=0 is a silent no-op, but the
+                                // explicit check documents intent.
+                                if let Some(new_size) = maybe_size {
+                                    if ino != crate::INO_RECOVERY_SENTINEL {
+                                        inodes2.entry(ino).and_modify(|v| {
+                                            // Only overwrite the size
+                                            // if the backend's report
+                                            // is plausibly larger than
+                                            // the in-memory tracking
+                                            // — protects against a
+                                            // pathological metadata
+                                            // reply underreporting
+                                            // (e.g. an S3 multipart
+                                            // that completed before
+                                            // all parts landed).
+                                            if new_size > v.size {
+                                                v.size = new_size;
+                                            }
+                                            v.mtime = Some(std::time::SystemTime::now());
+                                        });
+                                    }
+                                } else if ino != crate::INO_RECOVERY_SENTINEL {
+                                    // No size info from backend
+                                    // (shouldn't happen on the
+                                    // single-shot path, but defensive)
+                                    // — still update mtime like
+                                    // before.
                                     inodes2.entry(ino).and_modify(|v| {
                                         v.mtime = Some(std::time::SystemTime::now());
                                     });
