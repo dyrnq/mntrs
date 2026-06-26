@@ -606,9 +606,39 @@ pub(crate) fn drop_block_cache_for_path(
     }
 }
 
+/// One entry in the on-disk cache index. Issue #227
+/// refactored this from a 4-tuple `(String, u64, u64,
+/// SystemTime)` to a named-field struct per
+/// [[feedback-tuple-vs-struct]]: tuples with >3 fields
+/// are easy to silently reorder at construction or
+/// destructuring sites, and a 4th field today means a
+/// 5th is plausible in 6mo. The struct form makes every
+/// field self-documenting and ensures future field
+/// additions are a compile-time catch at every call site
+/// (vs the tuple's silent default-on-missing-field).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheIndexEntry {
+    /// File name on disk (e.g. `"abcd_000000002a.block"`).
+    /// Encodes both the path hash prefix and the block
+    /// index, so callers can re-derive the block path via
+    /// [`crate::cache_block_path`] when only this is kept.
+    pub name: String,
+    /// Block index within the file (parsed from the hex
+    /// suffix of `name`). `0`-based.
+    pub block_idx: u64,
+    /// Block size in bytes (from `entry.metadata().len()`).
+    /// Note this is the **on-disk** size including the
+    /// `BLOCK_CRC_TRAILER`; the user-visible content size
+    /// is `size - BLOCK_CRC_TRAILER as u64` for full blocks.
+    pub size: u64,
+    /// File modification time (from `entry.metadata().modified()`).
+    /// Used to evict old cache blocks before re-using the slot.
+    pub mtime: std::time::SystemTime,
+}
+
 /// Scan cache dir for block files and rebuild disk_cache_index.
 /// Loaded at startup so cache is warm across restarts.
-pub fn load_cache_index(cache_dir: &Path) -> Vec<(String, u64, u64, std::time::SystemTime)> {
+pub fn load_cache_index(cache_dir: &Path) -> Vec<CacheIndexEntry> {
     let mut entries = Vec::new();
     let Ok(dir) = std::fs::read_dir(cache_dir) else {
         return entries;
@@ -622,7 +652,12 @@ pub fn load_cache_index(cache_dir: &Path) -> Vec<(String, u64, u64, std::time::S
             && let Ok(meta) = entry.metadata()
             && let Ok(mtime) = meta.modified()
         {
-            entries.push((name, block_idx, meta.len(), mtime));
+            entries.push(CacheIndexEntry {
+                name,
+                block_idx,
+                size: meta.len(),
+                mtime,
+            });
         }
     }
     entries
