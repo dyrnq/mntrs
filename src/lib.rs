@@ -3735,6 +3735,132 @@ impl CoreFilesystem for MntrsFs {
         ))
     }
 
+    /// Atomic create: fail with EEXIST if the target already
+    /// exists. Used by the FUSE adapter when the kernel passes
+    /// `O_CREAT|O_EXCL` (issue #160).
+    ///
+    /// Strategy:
+    /// 1. Check `Capability::write_with_if_not_exists` — only
+    ///    S3, GCS, azblob, oss, cos, obs, b2, vercel-blob, fs
+    ///    (and the sftp backend via patch) support it. Memory
+    ///    and HDFS do not, so we fall back to `create()` (which
+    ///    overwrites). On those backends the FUSE adapter will
+    ///    see success and kernel `O_EXCL` users will silently
+    ///    get a new ino pointing at overwritten content — this
+    ///    is the same pre-existing behavior on those backends
+    ///    before #160, so no regression.
+    /// 2. When supported, use `op.write_options` with
+    ///    `if_not_exists: true`. On S3 this maps to
+    ///    `If-None-Match: *` (one RTT, atomic).
+    /// 3. Map backend "already exists" errors to
+    ///    `io::ErrorKind::AlreadyExists` so the fuser adapter
+    ///    converts to EEXIST (POSIX-correct).
+    ///
+    /// Note: the non-excl `create()` path above intentionally
+    /// does NOT check the capability — `O_CREAT` without
+    /// `O_EXCL` is required by POSIX to succeed even if the
+    /// file exists (overwrite), and the current code's
+    /// `op.write(&p, Vec::new())` does exactly that.
+    fn create_excl(
+        &self,
+        _parent: u64,
+        name: &str,
+        _mode: u32,
+    ) -> std::io::Result<(CoreFileAttr, u64)> {
+        if !self.op.info().full_capability().write_with_if_not_exists {
+            // Backend doesn't support atomic create — fall back
+            // to the regular `create()` (overwrite semantics).
+            return self.create(_parent, name, _mode);
+        }
+        // Re-use the same setup as `create()` but with
+        // `if_not_exists: true`. We duplicate the body rather
+        // than refactoring to share: the two paths are
+        // short, the divergence is real (mkdir_chain + cache
+        // setup is the same, only the backend write differs),
+        // and a helper would force a `&str` borrow past the
+        // `block_on` boundary.
+        let parent_path = self.resolve(_parent).map(|e| e.path).unwrap_or_default();
+        let full_path = if parent_path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}/{}", parent_path, name)
+        };
+        self.mkdir_chain(&full_path)?;
+        let op = self.op.clone();
+        let p = full_path.clone();
+        let result = rt().block_on(async move {
+            op.write_options(
+                &p,
+                Vec::<u8>::new(),
+                opendal::options::WriteOptions {
+                    if_not_exists: true,
+                    ..Default::default()
+                },
+            )
+            .await
+        });
+        if let Err(e) = result {
+            // Map backend "already exists" to io ErrorKind so
+            // the fuser adapter returns EEXIST. Different
+            // backends phrase this slightly differently.
+            let kind = e.kind();
+            let already_exists = matches!(
+                kind,
+                opendal::ErrorKind::AlreadyExists | opendal::ErrorKind::ConditionNotMatch
+            ) || format!("{e}").to_lowercase().contains("exists");
+            return Err(if already_exists {
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "create_excl: file exists",
+                )
+            } else {
+                opendal_to_io_error(&e, "create_excl")
+            });
+        }
+        let (kind, size, mtime) = (FileType::RegularFile, 0u64, Some(SystemTime::now()));
+        let now = SystemTime::now();
+        let ino = self.alloc_ino_with_mtime(&full_path, kind, size, mtime.unwrap_or(now));
+        let fh = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let cpath = crate::cache_path(&self.cache_dir, &full_path);
+        if let Some(parent) = cpath.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let cache_fd = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&cpath)
+            .ok()
+            .map(|f| Arc::new(std::sync::Mutex::new(f)));
+        self.handles.insert(
+            fh,
+            FileHandleState::Write {
+                path: full_path.clone(),
+                cache_fd,
+                dirty: false,
+                dirty_since: None,
+                expires_at: None,
+            },
+        );
+        self.cache_add_entry(
+            &parent_path,
+            name,
+            if kind == FileType::Directory {
+                EntryMode::DIR
+            } else {
+                EntryMode::FILE
+            },
+            size,
+            mtime.unwrap_or(SystemTime::UNIX_EPOCH),
+        );
+        self.bump_lookup_count(ino);
+        Ok((
+            to_core_attr(&self.make_attr(ino, size, kind, mtime.unwrap_or(SystemTime::UNIX_EPOCH))),
+            fh,
+        ))
+    }
+
     fn mkdir(&self, _parent: u64, name: &str) -> std::io::Result<CoreFileAttr> {
         let parent_path = self.resolve(_parent).map(|e| e.path).unwrap_or_default();
         let full_path = if parent_path.is_empty() {

@@ -458,11 +458,30 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         name: &OsStr,
         mode: u32,
         _umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
         let name = name.to_string_lossy();
-        match self.inner.create(parent.into(), &name, mode) {
+        // Issue #160: thread O_EXCL through to the
+        // implementation. libc::O_EXCL is 0o200 on Linux/macOS
+        // and 0x40000000 on Windows — we use the bitmask
+        // directly so this compiles cross-platform without a
+        // `libc` dep. When the kernel passes O_EXCL, the
+        // create MUST fail with EEXIST if the target exists;
+        // when it does not, the create can overwrite (POSIX
+        // O_CREAT-without-O_EXCL semantics). On backends that
+        // support `if_not_exists` (S3, GCS, azblob, etc.) the
+        // implementation maps this to one atomic write. On
+        // backends that don't (memory, HDFS), the
+        // implementation falls back to `create()` so this
+        // matches pre-#160 overwrite behavior — no regression.
+        let excl = (flags & 0o200) != 0 || (flags & 0x40000000) != 0;
+        let result = if excl {
+            self.inner.create_excl(parent.into(), &name, mode)
+        } else {
+            self.inner.create(parent.into(), &name, mode)
+        };
+        match result {
             Ok((attr, fh)) => {
                 // Issue #51: forward the implementation-
                 // minted `fh` (from NEXT_HANDLE) instead
@@ -476,12 +495,18 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
                 // corruption — see issue text for the
                 // 3-step repro).
                 let fattr = from_core_attr(&attr);
-                let flags = if self.direct_io {
+                let fopen_flags = if self.direct_io {
                     FopenFlags::FOPEN_DIRECT_IO
                 } else {
                     FopenFlags::empty()
                 };
-                reply.created(&self.attr_ttl, &fattr, Generation(0), FileHandle(fh), flags);
+                reply.created(
+                    &self.attr_ttl,
+                    &fattr,
+                    Generation(0),
+                    FileHandle(fh),
+                    fopen_flags,
+                );
             }
             Err(e) => reply.error(io_err_to_fuse_errno(e)),
         }

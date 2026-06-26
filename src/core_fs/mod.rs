@@ -271,6 +271,25 @@ pub trait CoreFilesystem: Send + Sync {
     /// adapter can return a non-colliding handle.
     fn create(&self, parent: u64, name: &str, mode: u32) -> std::io::Result<(CoreFileAttr, u64)>;
 
+    /// Create a file atomically — fail with EEXIST if the
+    /// target already exists. Used by the fuser adapter
+    /// when the kernel passes `O_CREAT|O_EXCL` (issue #160).
+    ///
+    /// Default implementation: calls `create()` and ignores
+    /// the O_EXCL semantics, so backends that don't override
+    /// this get the pre-existing "overwrite on O_CREAT" POSIX
+    /// behavior. Overrides should map backend "already exists"
+    /// to `io::ErrorKind::AlreadyExists` so the fuser adapter
+    /// can return EEXIST to user space.
+    fn create_excl(
+        &self,
+        parent: u64,
+        name: &str,
+        mode: u32,
+    ) -> std::io::Result<(CoreFileAttr, u64)> {
+        self.create(parent, name, mode)
+    }
+
     /// Create a directory.
     fn mkdir(&self, parent: u64, name: &str) -> std::io::Result<CoreFileAttr>;
 
