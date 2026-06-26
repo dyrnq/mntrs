@@ -376,6 +376,17 @@ pub struct MntrsFs {
     pub(crate) volname: String,
     pub(crate) cache_max_size: u64,
     pub(crate) write_back_delay: Duration,
+    /// Files below this size (bytes) upload immediately on
+    /// flush/release, bypassing the `write_back_delay` queue.
+    /// `0` disables immediate upload entirely. Default 1 MiB.
+    ///
+    /// Issue #138 / #202: small files (SQLite / etcd / RocksDB
+    /// commits) suffer from the 5s uniform write-back delay on
+    /// `close()`. With the per-task delay in writeback::Task,
+    /// files smaller than this threshold enqueue with
+    /// `Duration::ZERO` and the worker uploads them right away.
+    /// Large files still batch through the delay queue.
+    pub(crate) writeback_immediate_threshold: u64,
     pub(crate) cache_mode: String,
     pub(crate) read_ahead: u64,
     /// Minimum file size (bytes) for which the read-path prefetcher
@@ -886,6 +897,46 @@ impl MntrsFs {
         });
     }
 
+    /// Compute the per-task writeback delay for an inode.
+    ///
+    /// Returns `Duration::ZERO` (immediate upload) when the
+    /// inode's logical size is below `writeback_immediate_threshold`,
+    /// or `write_back_delay` (5s default) when it's at/above the
+    /// threshold. Issue #138 / #202: small files (SQLite / etcd
+    /// / RocksDB commits) get immediate upload; large files batch
+    /// through the 5s delay queue.
+    ///
+    /// **Size source:** `inodes.get(&ino).map(|v| v.size)`. The
+    /// size is the LOGICAL size updated synchronously by the write
+    /// path (see `MntrsFs::write` at L3223-3238), so it matches
+    /// the cache file's actual extent. Reads from the inodes map
+    /// cost one DashMap shard lock — much cheaper than
+    /// `fs::metadata` (extra syscall) and immune to the
+    /// sparse-byte inflation from `set_len`.
+    ///
+    /// **Fallback:** if the inode isn't in the inodes map
+    /// (LRU-evicted between handle creation and flush; or recovery
+    /// sentinels like `INO_RECOVERY_SENTINEL = 0` which never have
+    /// an inodes entry), returns `write_back_delay` — the safe
+    /// non-immediate path.
+    fn per_task_writeback_delay(&self, ino: u64) -> Duration {
+        if self.writeback_immediate_threshold == 0 {
+            // Threshold disabled — every upload goes through
+            // the uniform delay queue (pre-#202 behavior).
+            return self.write_back_delay;
+        }
+        let immediate = self
+            .inodes
+            .get(&ino)
+            .map(|v| v.size < self.writeback_immediate_threshold)
+            .unwrap_or(false);
+        if immediate {
+            Duration::ZERO
+        } else {
+            self.write_back_delay
+        }
+    }
+
     /// Recover writeback queue + spawn worker. Shared by fuser + CoreFilesystem init.
     fn common_init_wb(&self) {
         self.alloc_ino("", FileType::Directory, 4096);
@@ -958,7 +1009,8 @@ impl MntrsFs {
                                 INO_RECOVERY_SENTINEL,
                                 remote,
                                 cache_path.clone(),
-                                0, // fresh enqueue (cycle 0)
+                                0,                     // fresh enqueue (cycle 0)
+                                self.write_back_delay, // #202: recovery never immediate (avoids flood)
                             )) {
                                 tracing::warn!(
                                     cache_path=?cache_path,
@@ -3099,7 +3151,13 @@ impl CoreFilesystem for MntrsFs {
                 if let Some(tx) = self.writeback_sender.get()
                     && self.writeback_pending.insert(path.as_str().to_string())
                 {
-                    let _ = tx.send((_ino, path.clone(), cpath, 0));
+                    // Issue #202: small files skip the 5s delay
+                    // queue (per_task_writeback_delay returns
+                    // Duration::ZERO for files < threshold) so
+                    // SQLite / etcd / RocksDB writes hit S3
+                    // before the next flush, not 5s after.
+                    let delay = self.per_task_writeback_delay(_ino);
+                    let _ = tx.send((_ino, path.clone(), cpath, 0, delay));
                 }
             }
         }
@@ -3388,7 +3446,13 @@ impl CoreFilesystem for MntrsFs {
                     // is also protected by the next-mount
                     // recovery path.
                     if self.writeback_pending.insert(path.as_str().to_string()) {
-                        if let Err(e) = tx.send((_ino, path.clone(), cpath, 0)) {
+                        // Issue #202: per-task delay based on
+                        // inodes.size vs writeback_immediate_threshold.
+                        // Small files skip the 5s delay queue
+                        // (Duration::ZERO); large files keep the
+                        // 5s batching behavior.
+                        let delay = self.per_task_writeback_delay(_ino);
+                        if let Err(e) = tx.send((_ino, path.clone(), cpath, 0, delay)) {
                             // Send failed — back out the
                             // pending insert so the next
                             // flush can retry.
@@ -3545,7 +3609,13 @@ impl CoreFilesystem for MntrsFs {
                     // them); the pending-set check is
                     // identical to the flush handler.
                     if self.writeback_pending.insert(path.as_str().to_string()) {
-                        if let Err(e) = tx.send((_ino, path.clone(), cpath, 0)) {
+                        // Issue #202: per-task delay mirrors the
+                        // flush handler above. See the per_task_
+                        // writeback_delay doc comment for the
+                        // size source (inodes.size) and the
+                        // recovery-sentinel fallback.
+                        let delay = self.per_task_writeback_delay(_ino);
+                        if let Err(e) = tx.send((_ino, path.clone(), cpath, 0, delay)) {
                             self.writeback_pending.remove(path.as_str());
                             tracing::warn!(
                                 path=%path,
@@ -4531,6 +4601,11 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         volname: "test".into(),
         cache_max_size: 1024 * 1024 * 1024,
         write_back_delay: std::time::Duration::from_secs(1),
+        // Issue #202: 0 disables immediate upload for tests,
+        // preserving pre-#202 timing assumptions. Individual
+        // tests that want to exercise the immediate path can
+        // override this field directly.
+        writeback_immediate_threshold: 0,
         cache_mode: "writes".into(),
         read_ahead: 0,
         prefetch_threshold: 16 * 1024 * 1024,

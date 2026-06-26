@@ -109,6 +109,12 @@ enum Commands {
         /// Write-back delay in seconds before uploading dirty cache files (default: 5)
         #[arg(long, default_value = "5")]
         vfs_write_back: u64,
+        /// Issue #202: files below this size (bytes) upload
+        /// immediately on close, bypassing the vfs-write-back delay.
+        /// Set to 0 to disable immediate upload entirely.
+        /// Default: 1048576 (1 MiB).
+        #[arg(long, default_value = "1048576")]
+        writeback_immediate_threshold: u64,
         /// VFS cache mode: off, writes, full (default: off, matches rclone)
         #[arg(long, default_value = "off")]
         vfs_cache_mode: String,
@@ -322,6 +328,7 @@ fn main() -> anyhow::Result<()> {
             mem_cache_impl,
             mem_cache_metrics_interval,
             vfs_write_back,
+            writeback_immediate_threshold,
             vfs_cache_mode,
             vfs_read_ahead,
             vfs_read_chunk_size,
@@ -413,6 +420,7 @@ fn main() -> anyhow::Result<()> {
                 &mem_cache_impl,
                 mem_cache_metrics_interval,
                 vfs_write_back,
+                writeback_immediate_threshold,
                 &vfs_cache_mode,
                 vfs_read_ahead,
                 vfs_read_chunk_size,

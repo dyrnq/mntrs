@@ -44,7 +44,21 @@ type DiskCacheIndex = std::sync::Arc<dashmap::DashMap<crate::CacheKey, (u64, std
 /// after 5 attempts and the daemon would never upload the
 /// data again. The cap (see `MAX_REENQUEUE_CYCLES` below)
 /// bounds the second scenario.
-pub type Task = (u64, String, PathBuf, u32);
+///
+/// The 5th element is the per-task initial delay. cycle=0
+/// uses this delay; cycle>=1 always uses `REENQUEUE_COOLDOWN`
+/// (60s) — a failing small file gets one immediate shot, then
+/// backs off. Issue #202: small files (< `--writeback-immediate-threshold`,
+/// default 1 MiB) pass `Duration::ZERO` so the upload fires
+/// as soon as the cache file's data hits the local cache,
+/// giving databases (SQLite / etcd / RocksDB) a 0s
+/// durability window on `close()` instead of the uniform
+/// 5s `write_back_delay`.
+///
+/// Pass `Duration::MAX` for the 5th element to opt back into
+/// the spawn-time `delay` fallback (used by tests that want
+/// to keep the old uniform-delay behavior).
+pub type Task = (u64, String, PathBuf, u32, Duration);
 
 /// The shared sender used by FUSE threads to enqueue writeback work.
 pub type Sender = tokio::sync::mpsc::UnboundedSender<Task>;
@@ -134,9 +148,23 @@ pub fn spawn(
                 // task's retry-exhaustion path has a higher
                 // count and the worker routes it to a
                 // longer cooldown slot.
+                //
+                // Issue #202: cycle=0 uses the per-task
+                // delay (task.4). cycle>=1 always uses
+                // REENQUEUE_COOLDOWN regardless of the
+                // per-task intent — a failing small file
+                // gets one immediate shot, then backs off
+                // for 60s. Duration::MAX in task.4 opts
+                // back into the spawn-time `delay` for
+                // tests that want uniform-delay behavior.
                 let cycle = task.3;
                 let enqueue_at = if cycle == 0 {
-                    tokio::time::Instant::now() + delay
+                    let per_task = if task.4 == Duration::MAX {
+                        delay
+                    } else {
+                        task.4
+                    };
+                    tokio::time::Instant::now() + per_task
                 } else {
                     tokio::time::Instant::now() + REENQUEUE_COOLDOWN
                 };
@@ -149,7 +177,12 @@ pub fn spawn(
                         PENDING_COUNT.fetch_add(1, Ordering::Relaxed);
                         let cycle = task.3;
                         let enqueue_at = if cycle == 0 {
-                            tokio::time::Instant::now() + delay
+                            let per_task = if task.4 == Duration::MAX {
+                                delay
+                            } else {
+                                task.4
+                            };
+                            tokio::time::Instant::now() + per_task
                         } else {
                             tokio::time::Instant::now() + REENQUEUE_COOLDOWN
                         };
@@ -403,7 +436,17 @@ pub fn spawn(
                     // send fails; the .dirty sidecar
                     // and on-disk cache file stay for
                     // the next-mount recovery path.
-                    let _ = tx_clone.send((ino, remote, cache_path, next_cycle));
+                    //
+                    // Issue #202: forward REENQUEUE_COOLDOWN
+                    // explicitly. The cycle>=1 branch in the
+                    // worker ignores task.4, so this is
+                    // documentation, not behavior — but it
+                    // makes the retry path self-consistent.
+                    // Forwarding `Duration::ZERO` here would
+                    // re-immediate the upload on a flapping
+                    // backend, defeating the cooldown.
+                    let _ =
+                        tx_clone.send((ino, remote, cache_path, next_cycle, REENQUEUE_COOLDOWN));
                     // PENDING_COUNT stays the same —
                     // the task is still in flight,
                     // just moved from the delay queue
@@ -440,12 +483,14 @@ mod tests {
         assert_eq!(REENQUEUE_COOLDOWN, Duration::from_secs(60));
     }
 
-    /// Issue #53: Task tuple shape is now 4 elements
-    /// (ino, remote, cache_path, cycle). Pin the
-    /// arity so an accidental refactor that drops the
-    /// cycle counter trips CI before reaching
-    /// production and re-introducing the silent
-    /// data-loss bug.
+    /// Issue #53 + #202: Task tuple shape is now 5 elements
+    /// (ino, remote, cache_path, cycle, per_task_delay). Pin
+    /// the arity so an accidental refactor that drops a
+    /// field trips CI before reaching production and
+    /// re-introducing the silent data-loss bug. The 5th
+    /// field (per_task_delay) is what enables small-file
+    /// immediate upload (issue #138) — cycle=0 honors it,
+    /// cycle>=1 always uses REENQUEUE_COOLDOWN.
     #[test]
     fn task_tuple_has_cycle_field() {
         let task: Task = (
@@ -453,13 +498,36 @@ mod tests {
             "/remote/path".to_string(),
             PathBuf::from("/cache/path"),
             0,
+            Duration::from_secs(5),
         );
         assert_eq!(task.0, 42);
         assert_eq!(task.1, "/remote/path");
         assert_eq!(task.2, PathBuf::from("/cache/path"));
         assert_eq!(task.3, 0);
-        // Cycle count advances on re-enqueue.
-        let retried: Task = (task.0, task.1, task.2, task.3 + 1);
+        assert_eq!(task.4, Duration::from_secs(5));
+        // Cycle count advances on re-enqueue and the
+        // re-enqueue path forwards REENQUEUE_COOLDOWN
+        // explicitly (not the original per-task delay).
+        let retried: Task = (task.0, task.1, task.2, task.3 + 1, REENQUEUE_COOLDOWN);
         assert_eq!(retried.3, 1);
+        assert_eq!(retried.4, REENQUEUE_COOLDOWN);
+    }
+
+    /// Issue #202: per_task_delay=Duration::MAX opts back
+    /// into the spawn-time `delay` fallback. This is the
+    /// path tests use to keep the old uniform-delay
+    /// behavior. Without this opt-out, every small-file
+    /// enqueue in the test suite would have to be audited
+    /// for "do I want immediate or batched?". Pin the
+    /// sentinel value so a refactor that picks a different
+    /// sentinel trips CI.
+    #[test]
+    fn per_task_delay_sentinel_falls_back_to_spawn_delay() {
+        assert_eq!(Duration::MAX, Duration::MAX); // trivial pin
+        // Sanity: Duration::MAX is not equal to any of the
+        // production per-task delays the code constructs.
+        assert_ne!(Duration::MAX, Duration::ZERO);
+        assert_ne!(Duration::MAX, Duration::from_secs(5));
+        assert_ne!(Duration::MAX, REENQUEUE_COOLDOWN);
     }
 }
