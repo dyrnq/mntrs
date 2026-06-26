@@ -1303,8 +1303,14 @@ impl MntrsFs {
     }
 
     fn stat_op(&self, path: &str) -> Option<(FileType, u64, Option<SystemTime>)> {
-        // Check attr cache first
-        if let Some(entry) = self.attr_cache.get(path) {
+        // vfs_refresh (issue #210): skip the attr_cache and
+        // always fetch fresh backend metadata. The inodes
+        // entry is unchanged — locally-written files still
+        // hit the fast path; only the TTL'd backend
+        // metadata cache is bypassed.
+        if !self.vfs_refresh
+            && let Some(entry) = self.attr_cache.get(path)
+        {
             let (kind, size, mtime, ts) = entry.value();
             if ts.elapsed() < self.stat_cache_ttl {
                 return Some((*kind, *size, *mtime));
@@ -4992,5 +4998,67 @@ mod tests {
         let fs2 = new_test_fs_evict(dir2, 1024 * 1024);
         let v = fs2.statfs(1).expect("statfs");
         assert_eq!(v.free_inodes, v.total_inodes);
+    }
+
+    // ── vfs_refresh bypass (issue #210) ──────────────────────────
+
+    /// Pre-populate the attr_cache with a synthetic entry so we
+    /// can assert whether `stat_op` honors or bypasses the cache.
+    fn seed_attr_cache(fs: &MntrsFs, path: &str, kind: FileType, size: u64) {
+        fs.attr_cache.insert(
+            path.to_string(),
+            (kind, size, None, std::time::Instant::now()),
+        );
+    }
+
+    #[test]
+    fn vfs_refresh_bypasses_attr_cache_on_stat() {
+        // Issue #210: when `vfs_refresh=true`, `stat_op` must
+        // skip the attr_cache and call the backend. When
+        // false (default), the cached entry is returned
+        // without a backend round-trip.
+        let dir = scratch_dir("vfs-refresh-bypass");
+        let op = opendal::Operator::new(opendal::services::Memory::default())
+            .unwrap()
+            .finish();
+        // Pre-create a real file on the memory backend so
+        // the backend stat has something to return that's
+        // *different* from the cached value.
+        let _ = op.clone();
+        let op = opendal::Operator::new(opendal::services::Memory::default())
+            .unwrap()
+            .finish();
+        let op_for_seed = op.clone();
+        crate::rt().block_on(async move {
+            op_for_seed
+                .write("cached.bin", "BACKEND_PAYLOAD_42_BYTES_LONG")
+                .await
+                .unwrap();
+        });
+
+        // Case 1: vfs_refresh=false → cache wins
+        let mut fs_off = new_test_fs_evict(dir.clone(), 1024 * 1024);
+        fs_off.op = Arc::new(op.clone());
+        fs_off.vfs_refresh = false;
+        seed_attr_cache(&fs_off, "cached.bin", FileType::RegularFile, 999);
+        let (kind, size, _mtime) = fs_off.stat_op("cached.bin").expect("stat_op off");
+        assert_eq!(
+            size, 999,
+            "vfs_refresh=false must return the cached size (999), not the backend's 29"
+        );
+        assert_eq!(kind, FileType::RegularFile);
+
+        // Case 2: vfs_refresh=true → backend wins
+        let dir2 = scratch_dir("vfs-refresh-bypass-on");
+        let mut fs_on = new_test_fs_evict(dir2, 1024 * 1024);
+        fs_on.op = Arc::new(op.clone());
+        fs_on.vfs_refresh = true;
+        seed_attr_cache(&fs_on, "cached.bin", FileType::RegularFile, 999);
+        let (kind, size, _mtime) = fs_on.stat_op("cached.bin").expect("stat_op on");
+        assert_eq!(
+            size, 29,
+            "vfs_refresh=true must bypass attr_cache and return the backend's size (29)"
+        );
+        assert_eq!(kind, FileType::RegularFile);
     }
 }
