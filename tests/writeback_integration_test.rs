@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use mntrs::writeback::WritebackTask;
 use mntrs::{FileType, InodeEntry, Inodes, writeback};
 use opendal::Operator;
 use opendal::services::Memory;
@@ -119,7 +120,13 @@ impl Harness {
     /// test the uniform-delay fallback path.
     fn enqueue(&self, ino: u64, remote: &str, cache_path: PathBuf, delay: Duration) {
         self.sender
-            .send((ino, remote.to_string(), cache_path, 0, delay))
+            .send(WritebackTask {
+                ino,
+                remote_path: remote.to_string(),
+                cache_path,
+                retry_cycle: 0,
+                per_task_delay: delay,
+            })
             .unwrap();
     }
 
@@ -339,13 +346,13 @@ fn small_file_with_immediate_delay_uploads_fast() {
     let (cache_path, dirty) = h.stage_file("small.bin", b"tiny payload");
 
     h.sender
-        .send((
-            1,
-            "/remote/small.bin".to_string(),
+        .send(WritebackTask {
+            ino: 1,
+            remote_path: "/remote/small.bin".to_string(),
             cache_path,
-            0,
-            Duration::ZERO,
-        ))
+            retry_cycle: 0,
+            per_task_delay: Duration::ZERO,
+        })
         .unwrap();
 
     // .dirty must disappear fast — well under 5s. We give 200ms
@@ -376,13 +383,13 @@ fn large_file_with_default_delay_uses_5s() {
     let (cache_path, dirty) = h.stage_file("large.bin", b"big payload");
 
     h.sender
-        .send((
-            2,
-            "/remote/large.bin".to_string(),
+        .send(WritebackTask {
+            ino: 2,
+            remote_path: "/remote/large.bin".to_string(),
             cache_path,
-            0,
-            Duration::from_secs(5),
-        ))
+            retry_cycle: 0,
+            per_task_delay: Duration::from_secs(5),
+        })
         .unwrap();
 
     // 5s delay means .dirty survives at least 1s.

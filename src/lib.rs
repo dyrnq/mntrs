@@ -382,7 +382,7 @@ pub struct MntrsFs {
     ///
     /// Issue #138 / #202: small files (SQLite / etcd / RocksDB
     /// commits) suffer from the 5s uniform write-back delay on
-    /// `close()`. With the per-task delay in writeback::Task,
+    /// `close()`. With the per-task delay in writeback::WritebackTask,
     /// files smaller than this threshold enqueue with
     /// `Duration::ZERO` and the worker uploads them right away.
     /// Large files still batch through the delay queue.
@@ -1019,13 +1019,13 @@ impl MntrsFs {
                             // but an operator watching this
                             // mount needs to know the worker
                             // is gone NOW. Log at warn.
-                            if let Err(e) = tx.send((
-                                INO_RECOVERY_SENTINEL,
-                                remote,
-                                cache_path.clone(),
-                                0,                     // fresh enqueue (cycle 0)
-                                self.write_back_delay, // #202: recovery never immediate (avoids flood)
-                            )) {
+                            if let Err(e) = tx.send(WritebackTask {
+                                ino: INO_RECOVERY_SENTINEL,
+                                remote_path: remote,
+                                cache_path: cache_path.clone(),
+                                retry_cycle: 0,                        // fresh enqueue
+                                per_task_delay: self.write_back_delay, // #202: recovery never immediate
+                            }) {
                                 tracing::warn!(
                                     cache_path=?cache_path,
                                     error=%e,
@@ -1870,6 +1870,7 @@ impl MntrsFs {
 }
 
 use crate::core_fs::{CoreDirEntry, CoreFileAttr, CoreFileType, CoreFilesystem, CoreVolumeStat};
+use crate::writeback::WritebackTask;
 
 impl CoreFilesystem for MntrsFs {
     fn init(&self) -> std::io::Result<()> {
@@ -3171,7 +3172,13 @@ impl CoreFilesystem for MntrsFs {
                     // SQLite / etcd / RocksDB writes hit S3
                     // before the next flush, not 5s after.
                     let delay = self.per_task_writeback_delay(_ino);
-                    let _ = tx.send((_ino, path.clone(), cpath, 0, delay));
+                    let _ = tx.send(WritebackTask {
+                        ino: _ino,
+                        remote_path: path.clone(),
+                        cache_path: cpath,
+                        retry_cycle: 0,
+                        per_task_delay: delay,
+                    });
                 }
             }
         }
@@ -3466,7 +3473,13 @@ impl CoreFilesystem for MntrsFs {
                         // (Duration::ZERO); large files keep the
                         // 5s batching behavior.
                         let delay = self.per_task_writeback_delay(_ino);
-                        if let Err(e) = tx.send((_ino, path.clone(), cpath, 0, delay)) {
+                        if let Err(e) = tx.send(WritebackTask {
+                            ino: _ino,
+                            remote_path: path.clone(),
+                            cache_path: cpath,
+                            retry_cycle: 0,
+                            per_task_delay: delay,
+                        }) {
                             // Send failed — back out the
                             // pending insert so the next
                             // flush can retry.
@@ -3629,7 +3642,13 @@ impl CoreFilesystem for MntrsFs {
                         // size source (inodes.size) and the
                         // recovery-sentinel fallback.
                         let delay = self.per_task_writeback_delay(_ino);
-                        if let Err(e) = tx.send((_ino, path.clone(), cpath, 0, delay)) {
+                        if let Err(e) = tx.send(WritebackTask {
+                            ino: _ino,
+                            remote_path: path.clone(),
+                            cache_path: cpath,
+                            retry_cycle: 0,
+                            per_task_delay: delay,
+                        }) {
                             self.writeback_pending.remove(path.as_str());
                             tracing::warn!(
                                 path=%path,
