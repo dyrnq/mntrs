@@ -2957,52 +2957,62 @@ impl CoreFilesystem for MntrsFs {
         let fetch_size = (size as u64).min(user_cap).min(hard_cap).min(cap);
 
         // Parallel fetch: if `read_chunk_streams > 1` and the fetch
-        // is large enough to be worth splitting, issue N concurrent
-        // GETs against the backend and concatenate the results.
-        // rclone does the same with `--vfs-read-chunk-streams`.
+        // is large enough to be worth splitting, use OpenDAL's
+        // `Reader` which internally drives N concurrent chunk fetches
+        // via `ConcurrentTasks`. rclone does the same with
+        // `--vfs-read-chunk-streams`. Below the threshold we fall
+        // back to a single `op.read_with().range()` (the
+        // round-trip overhead of splitting + joining exceeds the
+        // parallelism win against a single in-flight request — the
+        // backend is already pipelining).
         //
-        // Threshold: 128 KiB minimum. Below that the round-trip
-        // overhead of splitting + joining exceeds the parallelism
-        // win against a single in-flight request — the backend is
-        // already pipelining. We also don't parallelize for reads
-        // that span only a partial block; those are dominated by
-        // the FUSE reply path, not by backend latency.
+        // Issue #83: pre-#83 this was a hand-rolled `while` loop
+        // calling `op.read_with().range(off..e).await` N times,
+        // each wrapped in `rt().block_on`. Because the FUSE
+        // runtime is single-worker (see `rt()` at L273), the
+        // `block_on` calls executed **serially** — the loop's
+        // "N streams" were N sequential `block_on` round-trips,
+        // not overlapping requests. The `Reader` API actually
+        // overlaps (sibling tasks share the runtime), giving us
+        // real concurrency for the first time. `.gap(128 KiB)`
+        // merges adjacent ranges under one HTTP request when
+        // chunks are close — free HTTP-request reduction on S3.
+        // The `.prefetch(N)` builder proposed in the issue text
+        // is NOT exposed in opendal 0.57 (`ReaderOptions.prefetch`
+        // exists in `raw::ops` but `Reader::new` is `pub(crate)`);
+        // mntrs's own prefetcher (prefetcher.rs + issue #132 +
+        // #201) already covers that need.
         let streams = self.read_chunk_streams.max(1) as u64;
         let use_parallel = streams > 1 && fetch_size > 128 * 1024;
         let b: bytes::Bytes = if use_parallel {
-            // Split fetch_size into N equal chunks, fetch
-            // concurrently. Each chunk populates mem_cache and
-            // disk block cache on its own.
+            // OpenDAL `Reader` splits `[offset..offset+fetch_size)`
+            // into `chunk_bytes`-sized pieces and fetches up to
+            // `streams` of them in parallel. `.gap(128 KiB)` tells
+            // the internal range-merge layer that adjacent chunks
+            // separated by ≤128 KiB may be coalesced into a single
+            // backend request.
             let op = self.op.clone();
             let p = path.clone();
             let chunk_bytes = fetch_size.div_ceil(streams);
-            let ends_at = offset + fetch_size;
-            let mut off = offset;
-            let mut results: Vec<bytes::Bytes> = Vec::with_capacity(streams as usize);
-            while off < ends_at {
-                let e = (off + chunk_bytes).min(ends_at);
-                let op_c = op.clone();
-                let p_c = p.clone();
-                let r = rt().block_on(async move { op_c.read_with(&p_c).range(off..e).await });
-                match r {
-                    Ok(b) => results.push(bytes::Bytes::from(b.to_vec())),
-                    Err(_) => {
-                        return Err(std::io::Error::other("read failed"));
-                    }
-                }
-                off = e;
-            }
-            // Concatenate in order. For the common case where
-            // `size <= fetch_size` (kernel asked for a small
-            // window), the first chunk is all we need; but we
-            // still need to populate caches for the rest, hence
-            // doing the full parallel fetch.
-            let total: usize = results.iter().map(|b| b.len()).sum();
-            let mut combined = bytes::BytesMut::with_capacity(total);
-            for chunk in results {
-                combined.extend_from_slice(&chunk);
-            }
-            combined.freeze()
+            let r = rt()
+                .block_on(async move {
+                    op.reader_with(&p)
+                        .concurrent(streams as usize)
+                        .chunk(chunk_bytes as usize)
+                        .gap(128 * 1024)
+                        .await?
+                        .read(offset..offset + fetch_size)
+                        .await
+                })
+                .map_err(|e| {
+                    tracing::debug!(error = %e, "read: reader.read failed");
+                    std::io::Error::other("read failed")
+                })?;
+            // `Buffer::to_bytes()` is zero-copy when the read
+            // produced contiguous bytes (the common single-range
+            // case); only copies if OpenDAL had to assemble
+            // disjoint pieces.
+            r.to_bytes()
         } else {
             let op = self.op.clone();
             let p = path.clone();
