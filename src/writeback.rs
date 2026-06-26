@@ -72,7 +72,7 @@ pub fn pending_count() -> usize {
 /// real backend outage. Without the cap, a permanent
 /// backend failure would cycle the same task forever
 /// and grow the delay queue unboundedly.
-const MAX_REENQUEUE_CYCLES: u32 = 10;
+pub const MAX_REENQUEUE_CYCLES: u32 = 10;
 
 /// Cooldown between re-enqueue cycles when the in-process
 /// retry loop exhausts. Longer than the first-time enqueue
@@ -82,7 +82,7 @@ const MAX_REENQUEUE_CYCLES: u32 = 10;
 /// drivers (e.g. csi-attacher's default 30 s), so a single
 /// cycle's worth of retries aligns with one K8s resync
 /// window.
-const REENQUEUE_COOLDOWN: Duration = Duration::from_secs(60);
+pub const REENQUEUE_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Spawn the writeback worker inside the global tokio runtime.
 ///
