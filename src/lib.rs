@@ -546,6 +546,16 @@ pub struct MntrsFs {
     pub(crate) file_perms: u16,
     pub(crate) link_perms: u16,
     pub(crate) direct_io: bool,
+    /// Issue #257: when `true`, the read path falls back to
+    /// a partial on-disk cache file if the backend read fails.
+    /// Default `false`. The user **opts in** to "stale data is
+    /// better than EIO" semantics — this is opt-in, not the
+    /// default, because silent stale data can mislead readers
+    /// who think they're seeing fresh bytes. When `false`
+    /// (default), backend read errors surface as `-EIO` to
+    /// the kernel exactly as before. See `docs/durability.md`
+    /// for the trade-off matrix.
+    pub(crate) read_stale_on_backend_error: bool,
     // Issue #209: --poll-interval (the legacy alias for
     // --vfs-cache-poll-interval) is now routed into
     // `cache_poll_interval` at construction time; this
@@ -3022,6 +3032,24 @@ impl CoreFilesystem for MntrsFs {
         // #201) already covers that need.
         let streams = self.read_chunk_streams.max(1) as u64;
         let use_parallel = streams > 1 && fetch_size > 128 * 1024;
+        // Issue #257: opt-in stale-on-backend-error read
+        // fallback. When the user has set
+        // `--vfs-read-stale-on-backend-error=true`, a backend
+        // fetch failure (network/auth/timeout) does NOT
+        // immediately surface as -EIO; we attempt a single
+        // fallback to the file-level disk cache. The cache
+        // file MUST cover the requested `[offset, offset+size)`
+        // range — partial fallback is rejected (returning
+        // partial stale bytes when the backend is unreachable
+        // could mislead the caller into thinking the read
+        // succeeded). The same `read_stale_on_backend_error`
+        // flag is checked on both the parallel and
+        // single-stream branches via `try_backend_or_stale`
+        // below.
+        let try_backend_or_stale =
+            |res: std::io::Result<bytes::Bytes>| -> std::io::Result<bytes::Bytes> {
+                self.try_backend_or_stale(&path, offset, size, res)
+            };
         let b: bytes::Bytes = if use_parallel {
             // OpenDAL `Reader` splits `[offset..offset+fetch_size)`
             // into `chunk_bytes`-sized pieces and fetches up to
@@ -3032,32 +3060,33 @@ impl CoreFilesystem for MntrsFs {
             let op = self.op.clone();
             let p = path.clone();
             let chunk_bytes = fetch_size.div_ceil(streams);
-            let r = rt()
-                .block_on(async move {
-                    op.reader_with(&p)
-                        .concurrent(streams as usize)
-                        .chunk(chunk_bytes as usize)
-                        .gap(128 * 1024)
-                        .await?
-                        .read(offset..offset + fetch_size)
-                        .await
-                })
-                .map_err(|e| {
-                    tracing::debug!(error = %e, "read: reader.read failed");
-                    std::io::Error::other("read failed")
-                })?;
+            let parallel_res = rt().block_on(async move {
+                op.reader_with(&p)
+                    .concurrent(streams as usize)
+                    .chunk(chunk_bytes as usize)
+                    .gap(128 * 1024)
+                    .await?
+                    .read(offset..offset + fetch_size)
+                    .await
+            });
+            let parallel_res = parallel_res.map_err(|e| {
+                tracing::debug!(error = %e, "read: reader.read failed");
+                std::io::Error::other("read failed")
+            });
             // `Buffer::to_bytes()` is zero-copy when the read
             // produced contiguous bytes (the common single-range
             // case); only copies if OpenDAL had to assemble
             // disjoint pieces.
-            r.to_bytes()
+            let bytes_res = parallel_res.map(|buf| buf.to_bytes());
+            try_backend_or_stale(bytes_res)?
         } else {
             let op = self.op.clone();
             let p = path.clone();
-            rt().block_on(async move { op.read_with(&p).range(offset..offset + fetch_size).await })
-                .map_err(|_| std::io::Error::other("read failed"))?
-                .to_vec()
-                .into()
+            let single_res = rt()
+                .block_on(async move { op.read_with(&p).range(offset..offset + fetch_size).await })
+                .map_err(|_| std::io::Error::other("read failed"))
+                .map(|v| bytes::Bytes::from(v.to_vec()));
+            try_backend_or_stale(single_res)?
         };
         let len = (b.len() as u32).min(size) as usize;
         let result = b[..len].to_vec();
@@ -3605,6 +3634,7 @@ impl CoreFilesystem for MntrsFs {
             });
         Ok(written)
     }
+
     fn flush(&self, _ino: u64, _fh: u64) -> std::io::Result<()> {
         // Look up the handle to find the path and dirty state
         let fh_val = _fh;
@@ -4808,6 +4838,77 @@ impl CoreFilesystem for MntrsFs {
     }
 }
 
+// Free-standing helpers on `MntrsFs` (not part of the
+// `CoreFilesystem` trait). Issue #257 helper extracted here
+// so the read path can call it via a method syntax and the
+// unit test in `tests::` can exercise it without going
+// through the full `read()` flow (which requires a
+// registered inode, a writable backend, and a writeback
+// path — impractical for an isolated unit test of the
+// fallback branch).
+impl MntrsFs {
+    /// Issue #257: opt-in fallback for the read path. When
+    /// `read_stale_on_backend_error` is `true` and the
+    /// backend fetch fails, attempt to return bytes from
+    /// the file-level disk cache. Only fires when the
+    /// cache file fully covers `[offset, offset+size)` —
+    /// partial fallback would mislead the caller into
+    /// thinking a partial read succeeded against fresh
+    /// bytes (it didn't; the cache may be stale).
+    pub(crate) fn try_backend_or_stale(
+        &self,
+        path: &str,
+        offset: u64,
+        size: u32,
+        res: std::io::Result<bytes::Bytes>,
+    ) -> std::io::Result<bytes::Bytes> {
+        match res {
+            Ok(b) => Ok(b),
+            Err(backend_err) => {
+                if !self.read_stale_on_backend_error {
+                    return Err(backend_err);
+                }
+                let fcpath = crate::cache_path(&self.cache_dir, path);
+                let cache_meta = std::fs::metadata(&fcpath).ok();
+                let cache_len = cache_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                let end = offset.saturating_add(size as u64);
+                if cache_len < end {
+                    tracing::warn!(
+                        path = %path,
+                        offset,
+                        size,
+                        cache_len,
+                        "read: stale-on-error fallback rejected — cache incomplete",
+                    );
+                    return Err(backend_err);
+                }
+                match std::fs::read(&fcpath) {
+                    Ok(data) => {
+                        tracing::warn!(
+                            path = %path,
+                            offset,
+                            size,
+                            cache_len,
+                            "read: backend failed; returning stale on-disk cache (issue #257 opt-in)",
+                        );
+                        let start = offset as usize;
+                        let end = (start + size as usize).min(data.len());
+                        Ok(bytes::Bytes::from(data[start..end].to_vec()))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path,
+                            error = %e,
+                            "read: stale-on-error fallback cache read failed",
+                        );
+                        Err(backend_err)
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn to_core_attr(a: &FileAttr) -> CoreFileAttr {
     CoreFileAttr {
         ino: a.ino.into(),
@@ -4913,6 +5014,12 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         file_perms: 0o644,
         link_perms: 0o777,
         direct_io: false,
+        // Issue #257: opt-in stale-on-backend-error. Default
+        // off — the test suite asserts the conservative
+        // behaviour (EIO on backend error, no surprise
+        // stale data). Tests that exercise the fallback
+        // path opt in explicitly.
+        read_stale_on_backend_error: false,
         cache_max_age: std::time::Duration::from_secs(3600),
         // Issue #243.3: pre-#243 this was 100 MiB. The 100
         // MiB default contradicted the CLI
@@ -5849,5 +5956,120 @@ mod tests {
             result2.is_none(),
             "no_implicit_dir must short-circuit NotFound without listing"
         );
+    }
+
+    // ── issue #257: opt-in stale-on-backend-error read fallback ──
+
+    // -- issue #257: opt-in stale-on-backend-error read fallback --
+
+    /// Issue #257 happy path: with the opt-in flag set, a
+    /// backend read failure returns bytes from the
+    /// file-level disk cache instead of EIO. The flag
+    /// defaults to `false` elsewhere -- this test sets it
+    /// explicitly. Tests the closure directly via the
+    /// `try_backend_or_stale` method (extracted from
+    /// `read()` for unit-testability).
+    #[test]
+    fn read_falls_back_to_cache_on_backend_error_when_opted_in() {
+        let dir = scratch_dir("257-fallback-ok");
+        let op = opendal::Operator::new(opendal::services::Memory::default())
+            .unwrap()
+            .finish();
+        let fs = new_test_fs(op, dir.clone());
+        let mut fs = fs;
+        fs.read_stale_on_backend_error = true;
+        assert!(
+            fs.read_stale_on_backend_error,
+            "issue #257: opt-in flag must take effect"
+        );
+
+        // Seed the file-level cache file directly. The
+        // path matches what `cache_path()` returns for
+        // "cacheable.bin" -- a hash-named file under
+        // cache_dir.
+        let fcpath = crate::cache_path(&fs.cache_dir, "cacheable.bin");
+        let payload = b"stale-but-readable-bytes!";
+        std::fs::write(&fcpath, payload).unwrap();
+
+        // Synthesize a backend error.
+        let backend_err = std::io::Error::other("synthetic backend failure (issue #257 test)");
+        let res: std::io::Result<bytes::Bytes> = Err(backend_err);
+
+        let fallback = fs
+            .try_backend_or_stale("cacheable.bin", 0, payload.len() as u32, res)
+            .expect("opt-in fallback must return cache bytes");
+        assert_eq!(fallback.as_ref(), payload);
+    }
+
+    /// Issue #257 default-off: with the flag at its default
+    /// value (`false`), the closure passes the backend error
+    /// through unchanged. Cache file may exist; we ignore
+    /// it. This is the conservative behavior -- silent stale
+    /// data is worse than a noisy EIO.
+    #[test]
+    fn read_passes_through_backend_error_by_default() {
+        let dir = scratch_dir("257-no-fallback");
+        let op = opendal::Operator::new(opendal::services::Memory::default())
+            .unwrap()
+            .finish();
+        let fs = new_test_fs(op, dir.clone());
+        assert!(
+            !fs.read_stale_on_backend_error,
+            "default must be off (issue #257 opt-in)"
+        );
+
+        // Even if a cache file exists, default-off must
+        // NOT serve it. Seed the cache file so we can
+        // assert the error kind is preserved (proving we
+        // didn't accidentally fall through to disk).
+        let fcpath = crate::cache_path(&fs.cache_dir, "strict.bin");
+        std::fs::write(&fcpath, b"would-be-stale").unwrap();
+
+        let backend_err = std::io::Error::other("synthetic backend failure");
+        let res: std::io::Result<bytes::Bytes> = Err(backend_err);
+
+        let err = fs
+            .try_backend_or_stale("strict.bin", 0, 12, res)
+            .expect_err("default off must surface backend failure");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        // The error message must be the original backend
+        // error -- not a synthesized "cache incomplete" or
+        // "fallback rejected" message. This pins the
+        // pass-through semantics.
+        assert!(
+            err.to_string().contains("synthetic backend failure"),
+            "default-off must propagate the original error, got: {err}"
+        );
+    }
+
+    /// Issue #257 partial-cache rejection: even when opted
+    /// in, a backend error with an incomplete on-disk
+    /// cache (cache file too short to cover the request)
+    /// must NOT serve partial bytes. The caller gets the
+    /// original backend error; partial fallback is
+    /// rejected because it would mislead the caller into
+    /// thinking the partial bytes are fresh.
+    #[test]
+    fn read_rejects_partial_cache_fallback() {
+        let dir = scratch_dir("257-partial-reject");
+        let op = opendal::Operator::new(opendal::services::Memory::default())
+            .unwrap()
+            .finish();
+        let fs = new_test_fs(op, dir.clone());
+        let mut fs = fs;
+        fs.read_stale_on_backend_error = true;
+
+        // Cache file is only 5 bytes; request asks for 100.
+        let fcpath = crate::cache_path(&fs.cache_dir, "tiny.bin");
+        std::fs::write(&fcpath, b"short").unwrap();
+
+        let backend_err = std::io::Error::other("synthetic backend failure");
+        let res: std::io::Result<bytes::Bytes> = Err(backend_err);
+
+        let err = fs
+            .try_backend_or_stale("tiny.bin", 0, 100, res)
+            .expect_err("partial cache must not be served");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(err.to_string().contains("synthetic backend failure"));
     }
 }

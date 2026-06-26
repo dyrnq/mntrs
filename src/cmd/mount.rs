@@ -389,6 +389,7 @@ pub fn mount_internal(
         60,       // vfs_cache_poll_interval
         0,        // vfs_handle_caching
         0,        // vfs_disk_space_total_size (off)
+        false, // vfs_read_stale_on_backend_error (CSI: never stale-on-error; data integrity > uptime)
     )
 }
 
@@ -619,6 +620,11 @@ pub fn mount(
     vfs_cache_poll_interval: u64,
     vfs_handle_caching: u64,
     vfs_disk_space_total_size: u64,
+    // Issue #257: opt-in stale-on-backend-error read
+    // fallback. Default false. Users opt in to
+    // "stale is better than EIO" semantics via
+    // --vfs-read-stale-on-backend-error.
+    vfs_read_stale_on_backend_error: bool,
 ) -> Result<()> {
     // Issue #209: --poll-interval is the legacy rclone alias
     // for --vfs-cache-poll-interval. When the user explicitly
@@ -790,6 +796,11 @@ pub fn mount(
         file_perms: file_perms.unwrap_or(0o666) as u16,
         link_perms: link_perms.unwrap_or(0o777) as u16,
         direct_io,
+        // Issue #257: opt-in stale-on-backend-error read
+        // fallback. Default false. Users who want
+        // "stale is better than EIO" semantics set
+        // `--vfs-read-stale-on-backend-error`.
+        read_stale_on_backend_error: vfs_read_stale_on_backend_error,
         // Issue #209: --poll-interval is deprecated; route the
         // legacy value into `cache_poll_interval` and warn the
         // user. None (unset) means use --vfs-cache-poll-interval.
