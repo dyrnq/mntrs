@@ -104,7 +104,12 @@ behavior.
 
 rclone uses `st_size` as the "used" stat. mntrs
 reports `--vfs-disk-space-total-size` (configurable,
-default off) in `statfs`. The flag was added before
+default 0 = off) in `statfs`. When off, statfs reports
+a fallback of **256 M 4-KiB blocks = 1 TiB** total (see
+issue #243.4 for the unit note). The CSI plugin
+consumes this value via `node_get_volume_stats` —
+do not change the fallback without re-running
+csi-integration. The flag was added before
 `disk_space_total_size` existed and was never wired.
 
 ### `--vfs-metadata-extension` (UNUSED, `_` prefix)
