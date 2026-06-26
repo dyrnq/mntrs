@@ -1209,7 +1209,7 @@ pub fn mount(
     // until `mount_internal` returns, which is when the
     // WinFSP-level unmount should happen.
     #[cfg(windows)]
-    let mut host: winfsp::host::FileSystemHost<_, winfsp::host::FineGuard> = {
+    let host: winfsp::host::FileSystemHost<_, winfsp::host::FineGuard> = {
         use crate::core_fs::winfsp::WinFspAdapter;
         use std::sync::Arc;
         let adapter = WinFspAdapter::new(Arc::new(fs));
