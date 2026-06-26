@@ -43,6 +43,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: integration
 
       # Note: the action installs libfuse3-dev + fuse3 + protobuf-compiler.
       # This matches the prior "Install deps" step for mount-tests (which
@@ -265,6 +266,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: integration
 
       # build-mntrs-release installs libfuse3-dev + fuse3 + protobuf-compiler
       # + extra_deps. The krb5-user dep is what the kerberos test needs.
@@ -372,6 +374,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: integration
 
       - uses: ./.github/actions/build-mntrs-release
 
@@ -404,6 +407,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: integration
 
       - uses: ./.github/actions/build-mntrs-release
 
@@ -446,6 +450,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: integration
 
       # Add $HOME/go/bin to GITHUB_PATH so the `go install github.com/minio/mc`
       # below puts `mc` on PATH for the rest of the job. The original
