@@ -2131,33 +2131,34 @@ impl CoreFilesystem for MntrsFs {
             // ENOENT, because the caller (FUSE) would then treat
             // something nonexistent as existent.
             let parent_cache_key = canonicalize_list_path(&parent_path);
+            // #232: take the full DirEntryCacheValue (mode, size,
+            // mtime) from the dir_cache snapshot — the data is
+            // already in hand post-#226. For files, keep the
+            // `size.max(cache_file_size)` precedence rule from
+            // the explicit-stat branch (bug 128: a not-yet-
+            // uploaded write makes the cache file the source of
+            // truth for size; the backend's size is stale). For
+            // dirs, dir_cache.size is 0 and there's no cache
+            // file to consult (opendal hdfs-native: implicit
+            // dirs have no INode record). Skips the
+            // std::fs::metadata call for the common case.
             let implicit = self.dir_cache.get(&parent_cache_key).and_then(|entry| {
                 let (_t, entries) = entry.value();
-                entries.get(name).map(|r| r.value().mode)
+                entries.get(name).map(|r| *r.value())
             });
-            if let Some(mode) = implicit {
+            if let Some(DirEntryCacheValue { mode, size, mtime }) = implicit {
                 let kind = match mode {
                     EntryMode::DIR => FileType::Directory,
                     _ => FileType::RegularFile,
                 };
-                // Size/mtime aren't authoritative for implicit dirs
-                // (opendal hdfs-native can't stat them), so return
-                // the cache file's size when we have one — same
-                // precedence rule as the explicit-stat branch — and
-                // 0 / Unknown for the dir case.
-                let cpath = crate::cache_path(&self.cache_dir, &full_path);
-                let (s, m) = match std::fs::metadata(&cpath) {
-                    Ok(meta) => {
-                        let mt = meta.modified().ok();
-                        if kind == FileType::Directory {
-                            (0u64, mt)
-                        } else {
-                            (meta.len(), mt)
-                        }
-                    }
-                    Err(_) => (0u64, None),
+                let s = if kind == FileType::Directory {
+                    0
+                } else {
+                    let cpath = crate::cache_path(&self.cache_dir, &full_path);
+                    let cache_size = std::fs::metadata(&cpath).map(|m| m.len()).unwrap_or(0);
+                    size.max(cache_size)
                 };
-                (kind, s, m)
+                (kind, s, Some(mtime))
             } else {
                 let cpath = crate::cache_path(&self.cache_dir, &full_path);
                 match std::fs::metadata(&cpath) {
@@ -5456,5 +5457,78 @@ mod tests {
             mtime,
         };
         assert_ne!(val, diff_mode, "different mode should be != ");
+    }
+
+    /// Issue #232: when `stat_op` returns NotFound but the
+    /// parent's dir_cache snapshot has the child (HDFS
+    /// implicit-dir scenario), the lookup must reuse the
+    /// snapshot's size/mtime — not re-stat the cache file.
+    /// Pre-fix the implicit branch threw away size/mtime
+    /// from `DirEntryCacheValue` and re-ran
+    /// `std::fs::metadata(&cpath)` for the same data. Post-
+    /// fix the snapshot is the source of truth for files
+    /// not on the backend, matching the HDFS implicit-dir
+    /// contract documented at lookup:2112.
+    #[test]
+    fn lookup_implicit_uses_dir_cache_size_mtime() {
+        use crate::util::canonicalize_list_path;
+        let dir = scratch_dir("lookup-implicit-dir-cache");
+        let fs = new_test_fs_evict(dir, 1024 * 1024);
+        // No files on the memory backend → stat_op("child")
+        // returns None, falling through to the dir_cache
+        // implicit branch.
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        fs.cache_add_entry("", "child", EntryMode::FILE, 12_345, mtime);
+        // The root path is `""`; cache_add_entry canonicalizes
+        // the parent to the same key list_op stores under.
+        let parent_key = canonicalize_list_path("");
+        assert!(
+            fs.dir_cache.get(&parent_key).is_some(),
+            "dir_cache should hold the seeded entry under the canonical root key"
+        );
+        let attr = fs.lookup(1, "child").expect("lookup must succeed");
+        assert_eq!(
+            attr.size, 12_345,
+            "implicit lookup must return the dir_cache's size, not 0 or metadata-derived"
+        );
+        assert_eq!(
+            attr.mtime, mtime,
+            "implicit lookup must return the dir_cache's mtime, not UNIX_EPOCH"
+        );
+    }
+
+    /// Issue #232: bug 128 precedence rule still holds for
+    /// the implicit branch. When the cache file is larger
+    /// than the dir_cache size (a not-yet-uploaded write
+    /// extended the file), the returned size is the
+    /// max(cache_size, dir_cache_size) — the cache file
+    /// wins so read-after-write sees the new size.
+    #[test]
+    fn lookup_implicit_cache_file_size_wins_over_dir_cache() {
+        use crate::util::canonicalize_list_path;
+        let dir = scratch_dir("lookup-implicit-cache-file-wins");
+        let fs = new_test_fs_evict(dir.clone(), 1024 * 1024);
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        // dir_cache says the file is 1000 bytes; cache file
+        // is 2000 bytes (a local write extended it). The
+        // lookup should return 2000.
+        fs.cache_add_entry("", "wfile", EntryMode::FILE, 1000, mtime);
+        let cpath = crate::cache_path(&fs.cache_dir, "wfile");
+        if let Some(parent) = cpath.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&cpath, vec![0u8; 2000]).unwrap();
+        // Confirm the dir_cache entry is reachable.
+        let parent_key = canonicalize_list_path("");
+        assert!(fs.dir_cache.get(&parent_key).is_some());
+        let attr = fs.lookup(1, "wfile").expect("lookup must succeed");
+        assert_eq!(
+            attr.size, 2000,
+            "cache file size (2000) must win over dir_cache size (1000) — bug 128"
+        );
+        assert_eq!(
+            attr.mtime, mtime,
+            "mtime is the dir_cache's server-side modtime (not the cache file's mtime)"
+        );
     }
 }
