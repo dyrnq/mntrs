@@ -156,6 +156,51 @@ impl Ord for LruHeapEntry {
     }
 }
 
+/// Cached value for a single directory entry inside
+/// [`MntrsFs::dir_cache`].
+///
+/// Issue #226 refactored this from a 3-tuple
+/// `(EntryMode, u64, SystemTime)` whose field order was
+/// implicit at every construction and destructure site
+/// (6+ call sites in `list_op`, `cache_add_entry`,
+/// `batch_lookup_from_dir_cache`, and `readdir`'s
+/// post-cache path). The struct form makes the fields
+/// self-documenting at every site and ensures a future
+/// 4th field — most plausibly a `cache_generation: u64`
+/// to detect upstream change for #196-backlog
+/// "readdir cache invalidate by mtime change" — is a
+/// compile-time catch across every site vs the tuple's
+/// silent default-on-missing-field (same failure mode
+/// as issue #53, per [[feedback-tuple-vs-struct]]).
+///
+/// `Copy` is sound because all three fields are `Copy`:
+/// `EntryMode` is an opendal enum, `u64` is trivial,
+/// `SystemTime` is `Copy`. `Copy` lets DashMap's
+/// `*e.value()` work in the read path without `.clone()`
+/// (one deref → struct copy). `PartialEq + Eq` lets
+/// cache invalidation compare entries directly.
+///
+/// The 4-tuple `(String, EntryMode, u64, SystemTime)`
+/// upstream of this struct (in `list_with`'s raw output
+/// at lib.rs:~1471) deliberately stays as a tuple for
+/// now — it's the unflattened backend response, only
+/// consumed at one site (the cache insertion loop), and
+/// refactoring it is a separate concern from the cached
+/// value form. The two tuples converge on `(mode, size,
+/// mtime)` semantically but stay separate types to keep
+/// each PR small.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirEntryCacheValue {
+    /// File kind (FILE / DIR / UNKNOWN). opendal's
+    /// `EntryMode` — see `opendal::EntryMode`.
+    pub mode: EntryMode,
+    /// File size in bytes (0 for directories).
+    pub size: u64,
+    /// Last-modified time from the backend list
+    /// response.
+    pub mtime: SystemTime,
+}
+
 pub type Inodes = Arc<dashmap::DashMap<u64, InodeEntry>>;
 
 use std::path::PathBuf;
@@ -422,7 +467,7 @@ pub struct MntrsFs {
         String,
         (
             std::time::Instant,
-            dashmap::DashMap<String, (EntryMode, u64, std::time::SystemTime)>,
+            dashmap::DashMap<String, DirEntryCacheValue>,
         ),
     >,
     /// Local on-disk cache directory. `pub` so integration tests
@@ -1489,7 +1534,7 @@ impl MntrsFs {
                     return Ok(entries
                         .iter()
                         .map(|r| {
-                            let (name, (mode, size, mtime)) = r.pair();
+                            let (name, DirEntryCacheValue { mode, size, mtime }) = r.pair();
                             (name.clone(), *mode, *size, *mtime)
                         })
                         .collect());
@@ -1721,9 +1766,18 @@ impl MntrsFs {
         // Store entries individually (like rclone DirEntry per name).
         // Only cache on success — caching an empty Vec from an error
         // would propagate the failure for dir_cache_ttl.
-        let dir_entries: dashmap::DashMap<String, (EntryMode, u64, SystemTime)> = result
+        let dir_entries: dashmap::DashMap<String, DirEntryCacheValue> = result
             .iter()
-            .map(|(name, mode, size, mtime)| (name.clone(), (*mode, *size, *mtime)))
+            .map(|(name, mode, size, mtime)| {
+                (
+                    name.clone(),
+                    DirEntryCacheValue {
+                        mode: *mode,
+                        size: *size,
+                        mtime: *mtime,
+                    },
+                )
+            })
             .collect();
         self.dir_cache
             .insert(path.to_string(), (std::time::Instant::now(), dir_entries));
@@ -1789,11 +1843,10 @@ impl MntrsFs {
         let parent_path = parent_path.as_str();
         if let Some(entry) = self.dir_cache.get(parent_path) {
             let (_, entries) = entry.value();
-            entries.insert(name.to_string(), (mode, size, mtime));
+            entries.insert(name.to_string(), DirEntryCacheValue { mode, size, mtime });
         } else {
-            let entries: dashmap::DashMap<String, (EntryMode, u64, SystemTime)> =
-                dashmap::DashMap::new();
-            entries.insert(name.to_string(), (mode, size, mtime));
+            let entries: dashmap::DashMap<String, DirEntryCacheValue> = dashmap::DashMap::new();
+            entries.insert(name.to_string(), DirEntryCacheValue { mode, size, mtime });
             self.dir_cache.insert(
                 parent_path.to_string(),
                 (std::time::Instant::now(), entries),
@@ -1842,7 +1895,7 @@ impl MntrsFs {
         // lookup will hit.
         let cache_key = canonicalize_list_path(&parent_path);
         let cache_key = cache_key.as_str();
-        let cached: Option<dashmap::DashMap<String, (EntryMode, u64, SystemTime)>> =
+        let cached: Option<dashmap::DashMap<String, DirEntryCacheValue>> =
             self.dir_cache.get(cache_key).map(|e| e.value().1.clone());
         let mut out = Vec::with_capacity(names.len());
         for name in names {
@@ -1865,7 +1918,7 @@ impl MntrsFs {
                 .as_ref()
                 .and_then(|entries| entries.get(*name).map(|e| *e.value()));
             match snapshot_hit {
-                Some((mode, size, mtime)) => {
+                Some(DirEntryCacheValue { mode, size, mtime }) => {
                     let kind = match mode {
                         EntryMode::DIR => FileType::Directory,
                         _ => FileType::RegularFile,
@@ -2080,11 +2133,9 @@ impl CoreFilesystem for MntrsFs {
             let parent_cache_key = canonicalize_list_path(&parent_path);
             let implicit = self.dir_cache.get(&parent_cache_key).and_then(|entry| {
                 let (_t, entries) = entry.value();
-                entries
-                    .get(name)
-                    .map(|r| (r.value().0, r.value().1, r.value().2))
+                entries.get(name).map(|r| r.value().mode)
             });
-            if let Some((mode, _im_size, _im_mtime)) = implicit {
+            if let Some(mode) = implicit {
                 let kind = match mode {
                     EntryMode::DIR => FileType::Directory,
                     _ => FileType::RegularFile,
@@ -5340,5 +5391,70 @@ mod tests {
             "third pop should be p (key > alpha)"
         );
         assert_eq!(popped[3].atime, newer.atime, "latest atime should pop last");
+    }
+
+    // ── DirEntryCacheValue (issue #226) ──────────────────────────
+
+    /// Issue #226 + [[feedback-tuple-vs-struct]] + #219/#224/#225
+    /// precedent: `DirEntryCacheValue` field semantics are
+    /// self-pinning via named fields. The test pins the field
+    /// identity via a literal (a missing field is a compile error
+    /// here, not a runtime bug), the `Copy` semantics (DashMap's
+    /// `*e.value()` deref relies on it for the read path), and
+    /// the `Eq` semantics used by cache invalidation paths.
+    /// The 3-field count is enforced by the literal below — the
+    /// struct form is exactly the same shape as the original
+    /// `(EntryMode, u64, SystemTime)` tuple, but a future 4th
+    /// field becomes a compile error at every construction site
+    /// instead of a silent default on missing fields.
+    #[test]
+    fn dir_entry_cache_value_fields_pin_semantics() {
+        let mtime = SystemTime::now();
+        let val: DirEntryCacheValue = DirEntryCacheValue {
+            mode: EntryMode::FILE,
+            size: 4096,
+            mtime,
+        };
+        // Field identity: each field round-trips through the
+        // literal. A future field rename at the struct site
+        // would break this test (compile error, not silent
+        // data drift).
+        assert_eq!(val.mode, EntryMode::FILE);
+        assert_eq!(val.size, 4096);
+        assert_eq!(val.mtime, mtime);
+
+        // Copy semantics: DashMap's `*e.value()` deref relies
+        // on this. If `DirEntryCacheValue` ever loses `Copy`,
+        // every read path using `*e.value()` fails to compile,
+        // which is what we want — no silent .clone() fallback.
+        let copy = val;
+        assert_eq!(val, copy, "DirEntryCacheValue should be Copy + Eq");
+
+        // Eq semantics used by cache invalidation:
+        let same_again = DirEntryCacheValue {
+            mode: EntryMode::FILE,
+            size: 4096,
+            mtime,
+        };
+        assert_eq!(
+            val, same_again,
+            "two DirEntryCacheValue built from the same fields should be Eq"
+        );
+
+        // A different size breaks Eq:
+        let diff_size = DirEntryCacheValue {
+            mode: EntryMode::FILE,
+            size: 8192,
+            mtime,
+        };
+        assert_ne!(val, diff_size, "different size should be != ");
+
+        // A different mode breaks Eq:
+        let diff_mode = DirEntryCacheValue {
+            mode: EntryMode::DIR,
+            size: 4096,
+            mtime,
+        };
+        assert_ne!(val, diff_mode, "different mode should be != ");
     }
 }
