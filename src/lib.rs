@@ -481,6 +481,16 @@ pub struct MntrsFs {
     /// state the FUSE reader's `record_part_consumed` calls feed.
     backpressure: std::sync::Arc<backpressure::BackpressureController>,
 
+    /// Issue #201: per-mount memory budget used by the prefetcher
+    /// (label "prefetch") to gate the next fetch on `try_reserve`.
+    /// One per `MntrsFs` so two mounts in the same process have
+    /// independent budgets. Wired in `cmd/mount.rs::mount()` from
+    /// `--mem-limit` (the same value used for `mem_cache_bytes` —
+    /// the budget is shared between in-flight prefetch and the
+    /// mem_cache, by design). Tests construct their own uncapped
+    /// (cap=0) limiter via `MemoryLimiter::new(0)`.
+    mem_limiter: std::sync::Arc<mem_limiter::MemoryLimiter>,
+
     /// Per-(inode, block) in-memory read cache. Held as a
     /// `dyn MemCache` trait object so the underlying
     /// implementation can be swapped (DashMap today, moka
@@ -714,6 +724,10 @@ impl MntrsFs {
             // so this prefetcher's fetch rate feeds the same EMA
             // window the FUSE reader's consume rate updates.
             self.backpressure.clone(),
+            // Issue #201: per-mount memory budget. The prefetcher
+            // gates each fetch on try_reserve against this
+            // limiter; on Err it shrinks the next window.
+            self.mem_limiter.clone(),
         )))
     }
 
@@ -4653,6 +4667,11 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         // floor (lib.rs `self.read_chunk_size.clamp(131072, 16 MiB)`)
         // so the first prefetch chunk is unchanged from pre-#132.
         backpressure: Arc::new(backpressure::BackpressureController::new()),
+        // Issue #201: cap=0 disables enforcement (MemoryLimiter::new
+        // documents this). The try_reserve path becomes a no-op
+        // increment; tests that exercise the cap behavior construct
+        // their own cap > 0 limiter and pass it explicitly.
+        mem_limiter: mem_limiter::MemoryLimiter::new(0),
         // Unbounded mem_cache for unit tests. Production mounts
         // overwrite this in cmd/mount.rs after the size is known.
         mem_cache: std::sync::Arc::new(crate::cache::DashMapMemCache::new(0)),

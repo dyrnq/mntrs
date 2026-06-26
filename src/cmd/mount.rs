@@ -694,6 +694,21 @@ pub fn mount(
     } else {
         0
     };
+    // Issue #201: per-mount MemoryLimiter. Same cap as
+    // mem_cache_bytes (the `--mem-limit` MiB value expressed in
+    // bytes). When mem_limit == 0, cap=0 disables enforcement —
+    // all `try_reserve` calls succeed and `used()` tracks the
+    // uncapped total for diagnostics only.
+    //
+    // We do NOT call `mem_limiter::install` / `init_global`:
+    // per-mount isolation is the design goal. Two mounts in the
+    // same daemon process get independent budgets. The global
+    // `LIMITER: OnceLock` stays unset so `mem_limiter::global()`
+    // returns None for any future caller that wants a
+    // process-wide default — leaving that door open without
+    // forcing a single shared cap.
+    let mem_limiter: std::sync::Arc<crate::mem_limiter::MemoryLimiter> =
+        crate::mem_limiter::MemoryLimiter::new(mem_cache_bytes);
     let mem_cache: std::sync::Arc<dyn crate::cache::MemCache> = match mem_cache_impl {
         "dashmap" => std::sync::Arc::new(crate::cache::DashMapMemCache::new(mem_cache_bytes)),
         "moka" => std::sync::Arc::new(crate::cache::MokaMemCache::new(mem_cache_bytes)),
@@ -737,6 +752,10 @@ pub fn mount(
         writeback_pending: std::sync::Arc::new(dashmap::DashSet::new()),
         // Issue #132: shared adaptive prefetch window controller.
         backpressure: std::sync::Arc::new(crate::backpressure::BackpressureController::new()),
+        // Issue #201: per-mount prefetch budget. Same cap as
+        // mem_cache_bytes; the budget is shared between in-flight
+        // prefetch and the mem_cache, by design.
+        mem_limiter: mem_limiter.clone(),
         dir_cache_ttl: std::time::Duration::from_secs(dir_cache_time),
         attr_ttl: std::time::Duration::from_secs(attr_timeout),
         stat_cache_ttl: std::time::Duration::from_secs(stat_cache_ttl),
