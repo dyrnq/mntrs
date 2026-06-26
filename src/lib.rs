@@ -73,6 +73,29 @@ pub struct InodeEntry {
     pub mtime: Option<SystemTime>,
 }
 
+/// File metadata returned by [`MntrsFs::stat_op`]. Issue #224
+/// refactored this from a 3-tuple `(FileType, u64,
+/// Option<SystemTime>)` to a named-field struct per
+/// [[feedback-tuple-vs-struct]] and the audit tracker in
+/// #223. The 3-tuple is exactly the three `kind` / `size` /
+/// `mtime` fields of [`InodeEntry`] (minus `path`), so the
+/// struct form makes the relationship explicit at the call
+/// site and ensures a future field addition (e.g. `atime`)
+/// is a compile-time catch at every destructure site vs the
+/// tuple's silent default-on-missing-field.
+///
+/// `Copy` is sound because all three fields are `Copy` and
+/// the struct is a small value type passed by-value through
+/// `stat_op` returns — `Copy` lets call sites destructure
+/// without `.clone()` and lets `Option<FileStat>` be moved
+/// freely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStat {
+    pub kind: FileType,
+    pub size: u64,
+    pub mtime: Option<SystemTime>,
+}
+
 pub type Inodes = Arc<dashmap::DashMap<u64, InodeEntry>>;
 
 use std::path::PathBuf;
@@ -1307,7 +1330,7 @@ impl MntrsFs {
         })
     }
 
-    fn stat_op(&self, path: &str) -> Option<(FileType, u64, Option<SystemTime>)> {
+    fn stat_op(&self, path: &str) -> Option<FileStat> {
         // vfs_refresh (issue #210): skip the attr_cache and
         // always fetch fresh backend metadata. The inodes
         // entry is unchanged — locally-written files still
@@ -1318,7 +1341,11 @@ impl MntrsFs {
         {
             let (kind, size, mtime, ts) = entry.value();
             if ts.elapsed() < self.stat_cache_ttl {
-                return Some((*kind, *size, *mtime));
+                return Some(FileStat {
+                    kind: *kind,
+                    size: *size,
+                    mtime: *mtime,
+                });
             }
         }
         let result = rt().block_on(async {
@@ -1335,7 +1362,11 @@ impl MntrsFs {
                     } else {
                         None
                     };
-                    Some((kind, meta.content_length(), mtime))
+                    Some(FileStat {
+                        kind,
+                        size: meta.content_length(),
+                        mtime,
+                    })
                 }
                 Err(_) => {
                     if self.no_implicit_dir {
@@ -1346,13 +1377,17 @@ impl MntrsFs {
                     if let Ok(mut l) = op2.lister(&p2).await
                         && l.next().await.is_some()
                     {
-                        return Some((FileType::Directory, 4096, None));
+                        return Some(FileStat {
+                            kind: FileType::Directory,
+                            size: 4096,
+                            mtime: None,
+                        });
                     }
                     None
                 }
             }
         });
-        if let Some((kind, size, mtime)) = result {
+        if let Some(FileStat { kind, size, mtime }) = result {
             self.attr_cache.insert(
                 path.to_string(),
                 (kind, size, mtime, std::time::Instant::now()),
@@ -1942,7 +1977,12 @@ impl CoreFilesystem for MntrsFs {
         // post-write read see the old length. Lookup is the
         // first call after a `BATCHFORGET`, so it has to be
         // self-consistent with the cache-file state.
-        let (kind, size, mtime) = if let Some((k, s, m)) = self.stat_op(&full_path) {
+        let (kind, size, mtime) = if let Some(FileStat {
+            kind: k,
+            size: s,
+            mtime: m,
+        }) = self.stat_op(&full_path)
+        {
             let cpath = crate::cache_path(&self.cache_dir, &full_path);
             let cache_size = std::fs::metadata(&cpath).map(|m| m.len()).unwrap_or(0);
             (k, s.max(cache_size), m)
@@ -2098,8 +2138,15 @@ impl CoreFilesystem for MntrsFs {
             } else {
                 // Slow path: file was never written locally;
                 // fall through to the backend.
-                let (_, backend_size, backend_mtime) =
-                    self.stat_op(&path).unwrap_or((kind, inodes_size, None));
+                let FileStat {
+                    size: backend_size,
+                    mtime: backend_mtime,
+                    ..
+                } = self.stat_op(&path).unwrap_or(FileStat {
+                    kind,
+                    size: inodes_size,
+                    mtime: None,
+                });
                 let cache_size = std::fs::metadata(crate::cache_path(&self.cache_dir, &path))
                     .map(|m| m.len())
                     .unwrap_or(0);
@@ -5045,7 +5092,7 @@ mod tests {
         fs_off.op = Arc::new(op.clone());
         fs_off.vfs_refresh = false;
         seed_attr_cache(&fs_off, "cached.bin", FileType::RegularFile, 999);
-        let (kind, size, _mtime) = fs_off.stat_op("cached.bin").expect("stat_op off");
+        let FileStat { kind, size, .. } = fs_off.stat_op("cached.bin").expect("stat_op off");
         assert_eq!(
             size, 999,
             "vfs_refresh=false must return the cached size (999), not the backend's 29"
@@ -5058,11 +5105,52 @@ mod tests {
         fs_on.op = Arc::new(op.clone());
         fs_on.vfs_refresh = true;
         seed_attr_cache(&fs_on, "cached.bin", FileType::RegularFile, 999);
-        let (kind, size, _mtime) = fs_on.stat_op("cached.bin").expect("stat_op on");
+        let FileStat { kind, size, .. } = fs_on.stat_op("cached.bin").expect("stat_op on");
         assert_eq!(
             size, 29,
             "vfs_refresh=true must bypass attr_cache and return the backend's size (29)"
         );
         assert_eq!(kind, FileType::RegularFile);
+    }
+
+    /// Issue #224 + [[feedback-tuple-vs-struct]] + #219
+    /// precedent: `FileStat` field semantics are
+    /// self-pinning via named fields. A future 4th field
+    /// (e.g. `atime`, `mode`, `nlink`) is a compile-time
+    /// catch at every construction site (vs the tuple's
+    /// silent 0/None drop), and a reorder is impossible
+    /// at the call site because the struct's named fields
+    /// document themselves.
+    #[test]
+    fn file_stat_fields_pin_semantics() {
+        // A fresh literal must include every field; a
+        // missing field is a compile error here, not a
+        // runtime bug.
+        let stat: FileStat = FileStat {
+            kind: FileType::RegularFile,
+            size: 1024,
+            mtime: Some(std::time::SystemTime::UNIX_EPOCH),
+        };
+        assert_eq!(stat.kind, FileType::RegularFile);
+        assert_eq!(stat.size, 1024);
+        assert_eq!(stat.mtime, Some(std::time::SystemTime::UNIX_EPOCH));
+
+        // `Copy` lets us move the struct freely without
+        // `.clone()` — pinned because `Option<FileStat>`
+        // also relies on it (so does the `.unwrap_or(...)`
+        // fallback in `getattr` slow path, which passes
+        // the fallback by-value into the Option).
+        let copy = stat;
+        assert_eq!(stat, copy, "FileStat should be Copy + Eq");
+
+        // `None` mtime is a valid state (lookup / readdir
+        // on a file we've only ever read remotely).
+        let no_mtime: FileStat = FileStat {
+            kind: FileType::Directory,
+            size: 4096,
+            mtime: None,
+        };
+        assert_eq!(no_mtime.mtime, None);
+        assert_eq!(no_mtime.size, 4096);
     }
 }
