@@ -179,25 +179,27 @@ mntrs mount hdfs-jni://namenode:8020 /mnt/hdfs \
 
 Three-tier cache: **memory → disk → remote**. Block-level (8 MB) indexing. Disk cache survives restarts.
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--vfs-cache-max-size` | 1024 MB | Disk cache upper limit (LRU) |
-| `--vfs-cache-min-free-space` | 100 MB | Min free space before eviction |
-| `--vfs-cache-max-age` | 3600s | Max cache file age (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
-| `--vfs-cache-mode` | `writes` | `off` / `minimal` / `writes` / `full` (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
-| `--vfs-cache-poll-interval` | 60s | Stale-object poll interval (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
-| `--mem-limit` | 256 MB | Memory cache upper limit |
-| `--dir-cache-time` | 10s | Directory listing TTL |
-| `--attr-timeout` | 1s | File attribute TTL (kernel) |
-| `--stat-cache-ttl` | 1s | Stat TTL (mntrs internal) |
-| `--type-cache-ttl` | 1s | File-type cache TTL |
-| `--no-modtime` | false | Disable mtime read/write |
-| `--use-server-modtime` | false | Use server-side mtime (vs local cache) |
-| `--no-implicit-dir` | false | Disable S3 implicit dir fallback |
-| `--direct-io` | false | Bypass kernel page cache, direct FUSE access |
-| `--vfs-handle-caching` | 0s | Keep file handles open after last close for reuse |
-| `--vfs-write-back` | 5s | Max time before dirty file is uploaded |
-| `--write-back-cache` | false | Kernel write-back cache (not supported on all FUSE) |
+| Flag | CLI default | Code fallback | Effective default | Description |
+|------|-------------|---------------|------------------|-------------|
+| `--vfs-cache-max-size` | `0` (off) | none (post-#243) | `0` = no LRU | Disk cache upper limit (LRU) |
+| `--vfs-cache-min-free-space` | `0` (off) | none (post-#243) | `0` = no floor check | Min free space before eviction |
+| `--vfs-cache-max-age` | 3600s | — | 3600s | Max cache file age (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
+| `--vfs-cache-mode` | `writes` | — | `writes` | `off` / `minimal` / `writes` / `full` (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
+| `--vfs-cache-poll-interval` | 60s | — | 60s | Stale-object poll interval (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
+| `--mem-limit` | 256 MB | — | 256 MB | Memory cache upper limit |
+| `--dir-cache-time` | 10s | — | 10s | Directory listing TTL |
+| `--attr-timeout` | 1s | — | 1s | File attribute TTL (kernel) |
+| `--stat-cache-ttl` | 1s | — | 1s | Stat TTL (mntrs internal) |
+| `--type-cache-ttl` | 1s | — | 1s | File-type cache TTL |
+| `--no-modtime` | false | — | false | Disable mtime read/write |
+| `--use-server-modtime` | false | — | false | Use server-side mtime (vs local cache) |
+| `--no-implicit-dir` | false | — | false | Disable S3 implicit dir fallback |
+| `--direct-io` | false | — | false | Bypass kernel page cache, direct FUSE access |
+| `--vfs-handle-caching` | 0s | — | 0s | Keep file handles open after last close for reuse |
+| `--vfs-write-back` | 5s | — | 5s | Max time before dirty file is uploaded |
+| `--write-back-cache` | false | — | false | Kernel write-back cache (not supported on all FUSE) |
+
+> **Issue #243**: `--vfs-cache-max-size` and `--vfs-cache-min-free-space` both have CLI default `0` (= "off") but historically the code path fell back to 1 GiB / 100 MiB when the field was 0. Post-#243.2/3 the `0` value is honored literally (see `src/lib.rs` for the new behavior). If you want a 1 GiB cap, pass `--vfs-cache-max-size 1024` explicitly.
 
 **Disk cache**: write uses file-level cache (`{hash}` hash name), read checks file-level first then block-level (`{hash}_{block}.block`). Recoverable on restart.
 
@@ -205,16 +207,16 @@ Three-tier cache: **memory → disk → remote**. Block-level (8 MB) indexing. D
 
 ## Performance
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--vfs-read-chunk-size` | 0 (auto) | Initial read chunk size |
-| `--vfs-read-chunk-size-limit` | 0 (off) | Chunk doubling ceiling |
-| `--vfs-read-chunk-streams` | 1 | Concurrent read streams (per FUSE read) |
-| `--vfs-read-ahead` | 131072 | Bytes prefetched past EOF |
-| `--async-read` | false | Async reads (FUSE kernel) |
-| `--vfs-fast-fingerprint` | false | Fast change detection (size+mtime) |
-| `--vfs-read-wait` | 20ms | Sequential read wait threshold |
-| `--vfs-write-wait` | 1s | Sequential write wait threshold |
+| Flag | CLI default | Effective default | Description |
+|------|-------------|------------------|-------------|
+| `--vfs-read-chunk-size` | 128 MiB (134217728) | 128 MiB | Initial read chunk size |
+| `--vfs-read-chunk-size-limit` | 0 (off) | 128 MiB (fallback) | Chunk doubling ceiling |
+| `--vfs-read-chunk-streams` | 1 | 1 | Concurrent read streams (per FUSE read) |
+| `--vfs-read-ahead` | 131072 | 131072 | Bytes prefetched past EOF |
+| `--async-read` | false | false | Async reads (FUSE kernel) |
+| `--vfs-fast-fingerprint` | false | false | Fast change detection (size+mtime) |
+| `--vfs-read-wait` | 20ms | 20ms | Sequential read wait threshold |
+| `--vfs-write-wait` | 1s | 1s | Sequential write wait threshold |
 
 **Adaptive chunk reader**: chunk size doubles on sequential reads, resets to 128 KB on seek. Up to 8 MB cap.
 

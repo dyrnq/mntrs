@@ -844,9 +844,10 @@ impl node_server::Node for NodeService {
         // the kernel, sees the FUSE mount on `target_path`,
         // and routes the request to mntrs's
         // CoreFilesystem::statfs() — which returns the
-        // disk_total_size (or 256 MiB fallback) for the
-        // cache disk. That's the right source of truth
-        // for the CSI response; the actual S3 bucket
+        // `disk_total_size` (or the 256 M-blocks ≈ 1 TiB
+        // fallback — see issue #243.4 for the unit note)
+        // for the cache disk. That's the right source of
+        // truth for the CSI response; the actual S3 bucket
         // has no fixed capacity, but the cache disk
         // does, and an empty/full cache is what kubelet
         // most cares about.
