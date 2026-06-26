@@ -418,7 +418,12 @@ pub struct MntrsFs {
     pub(crate) file_perms: u16,
     pub(crate) link_perms: u16,
     pub(crate) direct_io: bool,
-    pub(crate) poll_interval: Duration,
+    // Issue #209: --poll-interval (the legacy alias for
+    // --vfs-cache-poll-interval) is now routed into
+    // `cache_poll_interval` at construction time; this
+    // field is unused. The deprecation warning is emitted
+    // at the cmd/mount.rs boundary so users on old
+    // rclone-style scripts see a clear migration signal.
     pub(crate) cache_max_age: Duration,
     pub(crate) cache_min_free_space: u64,
     pub(crate) exclude_patterns: Vec<String>,
@@ -4659,7 +4664,6 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         file_perms: 0o644,
         link_perms: 0o777,
         direct_io: false,
-        poll_interval: std::time::Duration::from_secs(60),
         cache_max_age: std::time::Duration::from_secs(3600),
         cache_min_free_space: 100 * 1024 * 1024,
         exclude_patterns: vec![],

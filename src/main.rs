@@ -151,9 +151,10 @@ enum Commands {
         /// Disable local caching, read/write directly to remote
         #[arg(long)]
         direct_io: bool,
-        /// Remote polling interval in seconds (default: 60)
-        #[arg(long, default_value = "60")]
-        poll_interval: u64,
+        /// Remote polling interval in seconds (default: 60).
+        /// **Deprecated**: use `--vfs-cache-poll-interval` instead.
+        #[arg(long)]
+        poll_interval: Option<u64>,
         /// Max age of cached files in seconds (default: 3600, 0 to disable)
         #[arg(long, default_value = "3600")]
         vfs_cache_max_age: u64,
