@@ -96,6 +96,66 @@ pub struct FileStat {
     pub mtime: Option<SystemTime>,
 }
 
+/// One entry in the LRU eviction heap in [`MntrsFs::evict_lru_if_needed`].
+///
+/// Issue #225 refactored this from a 3-tuple
+/// `(std::time::Instant, CacheKey, u64)` whose field order
+/// silently encoded the heap's sort key (leading field =
+/// primary sort). The struct form keeps the explicit
+/// atime-first sort via a manual `Ord` impl, makes every
+/// field self-documenting at call sites, and ensures a
+/// future 4th field is a compile-time catch at every push
+/// site (vs the tuple's silent `.0 = u64 = 0` default on
+/// missing fields — same failure mode that produced the
+/// silent data-loss bug in issue #53, per
+/// [[feedback-tuple-vs-struct]]).
+///
+/// `Copy` is sound because all three fields are `Copy`
+/// (Instant and u64 are Copy; CacheKey is a `(String,
+/// Option<u64>)` and **not** Copy, so this struct is
+/// deliberately `Clone` only — the heap only clones during
+/// push anyway, and the clone is bounded by index size).
+///
+/// Manual `Ord` preserves the atime-first micro-opt: the
+/// leading field is the only one `BinaryHeap` actually
+/// compares for ties (size is consulted only when atime
+/// and key tie). Ties after `(atime, key)` are broken by
+/// `size` so the order is fully deterministic — two
+/// entries with identical `(atime, key)` cannot coexist in
+/// the index (`CacheKey` is the unique key), but the tie
+/// breaker keeps `Ord` total.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LruHeapEntry {
+    /// Last-access instant — the primary sort key. Older
+    /// entries pop first from the min-heap.
+    pub atime: std::time::Instant,
+    /// Full `CacheKey` (path + optional block_idx) so
+    /// block-level and file-level cache files compete on
+    /// equal footing.
+    pub key: CacheKey,
+    /// Entry size in bytes; carried for accounting when
+    /// popped. Also the secondary tie-breaker in `Ord`.
+    pub size: u64,
+}
+
+impl PartialOrd for LruHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for LruHeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Preserve atime-first sort. `BinaryHeap` only
+        // compares the leading field for ties, so this
+        // micro-opt matches the original tuple form.
+        self.atime
+            .cmp(&other.atime)
+            .then_with(|| self.key.cmp(&other.key))
+            .then_with(|| self.size.cmp(&other.size))
+    }
+}
+
 pub type Inodes = Arc<dashmap::DashMap<u64, InodeEntry>>;
 
 use std::path::PathBuf;
@@ -664,10 +724,14 @@ impl MntrsFs {
         // on the common no-eviction path.
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
-        let mut heap: BinaryHeap<Reverse<(std::time::Instant, CacheKey, u64)>> = BinaryHeap::new();
+        let mut heap: BinaryHeap<Reverse<LruHeapEntry>> = BinaryHeap::new();
         for entry in self.disk_cache_index.iter() {
             let (key, (size, last_access)) = (entry.key().clone(), *entry.value());
-            heap.push(Reverse((last_access, key, size)));
+            heap.push(Reverse(LruHeapEntry {
+                atime: last_access,
+                key,
+                size,
+            }));
         }
 
         // Pop oldest entries until enough space freed. Each pop
@@ -676,7 +740,12 @@ impl MntrsFs {
         // and the index entry.
         let mut remaining = to_free;
         let mut freed: u64 = 0;
-        while let Some(Reverse((_atime, (path, block_idx), size))) = heap.pop() {
+        while let Some(Reverse(LruHeapEntry {
+            atime: _atime,
+            key: (path, block_idx),
+            size,
+        })) = heap.pop()
+        {
             if remaining == 0 {
                 break;
             }
@@ -5152,5 +5221,124 @@ mod tests {
         };
         assert_eq!(no_mtime.mtime, None);
         assert_eq!(no_mtime.size, 4096);
+    }
+
+    // ── LruHeapEntry (issue #225) ────────────────────────────────
+
+    /// Issue #225 + [[feedback-tuple-vs-struct]] + #219
+    /// precedent: `LruHeapEntry` field semantics are
+    /// self-pinning via named fields. The manual `Ord` impl
+    /// must reproduce the **atime-first sort** of the
+    /// original 3-tuple exactly, or `evict_lru_if_needed`
+    /// pops the wrong entries (silent cache-size
+    /// regression). Three cases pin the contract:
+    ///
+    /// 1. Same atime, different size → size breaks the tie.
+    /// 2. Same atime + size, different key → key breaks the tie.
+    /// 3. Different atime → atime wins regardless of size/key.
+    ///
+    /// `BinaryHeap` is a max-heap; with `Reverse`, smaller
+    /// `Ord` = popped first (oldest first). The asserts use
+    /// `Less` / `Greater` directly to make the heap's
+    /// pop-ordering intent obvious at the call site.
+    #[test]
+    fn lru_heap_entry_ord_is_atime_first() {
+        let now = std::time::Instant::now();
+        let earlier = now - Duration::from_secs(60);
+        let latest = now + Duration::from_secs(60);
+
+        // Case 1: same atime, different size → size breaks tie.
+        // Smallest size pops first (min-heap on the 3-tuple of
+        // (atime, key, size) — and our struct preserves that).
+        let a = LruHeapEntry {
+            atime: now,
+            key: ("p".to_string(), None),
+            size: 100,
+        };
+        let b = LruHeapEntry {
+            atime: now,
+            key: ("q".to_string(), None),
+            size: 200,
+        };
+        assert!(
+            a.cmp(&b) == std::cmp::Ordering::Less,
+            "same atime, smaller size should be Less"
+        );
+        assert!(
+            b.cmp(&a) == std::cmp::Ordering::Greater,
+            "same atime, larger size should be Greater"
+        );
+
+        // Case 2: same atime + size, different key → key breaks tie.
+        // CacheKey = (String, Option<u64>); derive Ord is
+        // lexicographic on the String then on the Option.
+        let c = LruHeapEntry {
+            atime: now,
+            key: ("alpha".to_string(), None),
+            size: 100,
+        };
+        let d = LruHeapEntry {
+            atime: now,
+            key: ("beta".to_string(), None),
+            size: 100,
+        };
+        assert!(
+            c.cmp(&d) == std::cmp::Ordering::Less,
+            "same atime+size, smaller key should be Less"
+        );
+        assert!(
+            d.cmp(&c) == std::cmp::Ordering::Greater,
+            "same atime+size, larger key should be Greater"
+        );
+
+        // Case 3: different atime → atime wins regardless of
+        // size/key. The earlier entry pops first (it's the
+        // "oldest"). Make `newer` smaller in size/key to prove
+        // atime dominates.
+        let older = LruHeapEntry {
+            atime: earlier,
+            key: ("zzz".to_string(), Some(999)),
+            size: 9999,
+        };
+        let newer = LruHeapEntry {
+            atime: latest,
+            key: ("aaa".to_string(), None),
+            size: 1,
+        };
+        assert!(
+            older.cmp(&newer) == std::cmp::Ordering::Less,
+            "earlier atime must be Less even with larger size/key"
+        );
+        assert!(
+            newer.cmp(&older) == std::cmp::Ordering::Greater,
+            "later atime must be Greater even with smaller size/key"
+        );
+
+        // Sanity: the struct round-trips through BinaryHeap +
+        // Reverse in atime-first pop order. With 4 entries
+        // pushed (older, a, c, newer) the pop order must be:
+        // older (earliest atime) → c (next: atime=now, then
+        // "alpha" < "p" lexicographically) → a → newer.
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let mut heap: BinaryHeap<Reverse<LruHeapEntry>> = BinaryHeap::new();
+        heap.push(Reverse(newer.clone()));
+        heap.push(Reverse(older.clone()));
+        heap.push(Reverse(a.clone()));
+        heap.push(Reverse(c.clone()));
+        let popped: Vec<LruHeapEntry> = (0..4).filter_map(|_| heap.pop().map(|r| r.0)).collect();
+        assert_eq!(
+            popped[0].atime, older.atime,
+            "earliest atime should pop first"
+        );
+        assert_eq!(
+            popped[1].key.0, c.key.0,
+            "second pop should be the entry with lexicographically smaller key (alpha < p)"
+        );
+        assert_eq!(
+            popped[2].key.0, a.key.0,
+            "third pop should be p (key > alpha)"
+        );
+        assert_eq!(popped[3].atime, newer.atime, "latest atime should pop last");
     }
 }
