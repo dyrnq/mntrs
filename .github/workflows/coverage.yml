@@ -30,9 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v3
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: Swatinem/rust-cache@v2
 
       - name: Install deps
         # libfuse3-dev + fuse3 (matches the build job in ci.yml).

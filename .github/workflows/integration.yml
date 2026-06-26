@@ -40,9 +40,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v3
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: Swatinem/rust-cache@v2
 
       # Note: the action installs libfuse3-dev + fuse3 + protobuf-compiler.
       # This matches the prior "Install deps" step for mount-tests (which
@@ -262,9 +260,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v3
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: Swatinem/rust-cache@v2
 
       # build-mntrs-release installs libfuse3-dev + fuse3 + protobuf-compiler
       # + extra_deps. The krb5-user dep is what the kerberos test needs.
@@ -369,9 +365,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v3
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: Swatinem/rust-cache@v2
 
       - uses: ./.github/actions/build-mntrs-release
 
@@ -401,9 +395,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v3
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: Swatinem/rust-cache@v2
 
       - uses: ./.github/actions/build-mntrs-release
 
@@ -443,9 +435,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v3
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: Swatinem/rust-cache@v2
 
       # Add $HOME/go/bin to GITHUB_PATH so the `go install github.com/minio/mc`
       # below puts `mc` on PATH for the rest of the job. The original

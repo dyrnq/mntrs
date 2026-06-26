@@ -44,9 +44,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v3
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: Swatinem/rust-cache@v2
 
       - name: Install FUSE
         run: bash tests/e2e/common/install-linux-deps.sh standard "" no no
