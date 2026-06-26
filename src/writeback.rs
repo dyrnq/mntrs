@@ -55,13 +55,49 @@ type DiskCacheIndex = std::sync::Arc<dashmap::DashMap<crate::CacheKey, (u64, std
 /// durability window on `close()` instead of the uniform
 /// 5s `write_back_delay`.
 ///
-/// Pass `Duration::MAX` for the 5th element to opt back into
-/// the spawn-time `delay` fallback (used by tests that want
-/// to keep the old uniform-delay behavior).
-pub type Task = (u64, String, PathBuf, u32, Duration);
+/// Pass `per_task_delay = Duration::MAX` to opt back into the
+/// spawn-time `delay` fallback (used by tests that want to
+/// keep the old uniform-delay behavior).
+///
+/// Issue #219: was a 5-tuple `(u64, String, PathBuf, u32,
+/// Duration)` whose field order was easy to swap silently at
+/// enqueue sites; the struct form makes every field
+/// self-documenting and ensures future field additions are a
+/// compile-time catch at every call site (vs the tuple's
+/// silent `.0 = u64 = 0` default).
+///
+/// Lifecycle: a fresh `WritebackTask` is enqueued by the
+/// write/flush/release/recovery paths with `retry_cycle = 0`
+/// and a `per_task_delay` derived from
+/// `per_task_writeback_delay(ino)` (issue #202). The worker's
+/// exhaustion path re-enqueues with `retry_cycle += 1` and
+/// `per_task_delay = REENQUEUE_COOLDOWN`.
+#[derive(Debug, Clone)]
+pub struct WritebackTask {
+    /// FUSE inode. Use `INO_RECOVERY_SENTINEL` for tasks
+    /// that have no live inode mapping (e.g. crash recovery
+    /// at startup).
+    pub ino: u64,
+    /// Backend path the upload targets.
+    pub remote_path: String,
+    /// On-disk cache file path (the source of bytes for the
+    /// upload). `.dirty` sidecar lives next to it.
+    pub cache_path: PathBuf,
+    /// 0 = fresh enqueue — honors `per_task_delay`.
+    /// 1 or higher = re-enqueue — always uses
+    /// `REENQUEUE_COOLDOWN`, the `per_task_delay` field
+    /// is ignored. Capped at `MAX_REENQUEUE_CYCLES`
+    /// which is 10.
+    pub retry_cycle: u32,
+    /// Delay before the worker's first attempt for
+    /// `retry_cycle == 0`. Ignored for `retry_cycle >= 1`.
+    /// `Duration::MAX` opts into the spawn-time `delay`
+    /// fallback for uniform-delay tests.
+    pub per_task_delay: Duration,
+}
 
 /// The shared sender used by FUSE threads to enqueue writeback work.
-pub type Sender = tokio::sync::mpsc::UnboundedSender<Task>;
+pub type Sender = tokio::sync::mpsc::UnboundedSender<WritebackTask>;
 
 /// Global counter of pending writeback tasks.
 static PENDING_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -126,7 +162,7 @@ pub fn spawn(
     writeback_pending: Arc<dashmap::DashSet<String>>,
     delay: Duration,
 ) -> (Sender, tokio::task::JoinHandle<()>) {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Task>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WritebackTask>();
     // Clone for the upload task's re-enqueue path
     // (issue #53). The original `tx` is also
     // returned to the caller for FUSE-thread
@@ -136,7 +172,7 @@ pub fn spawn(
     let tx_for_worker = tx.clone();
 
     let handle = crate::rt().spawn(async move {
-        let mut queue: DelayQueue<Task> = DelayQueue::new();
+        let mut queue: DelayQueue<WritebackTask> = DelayQueue::new();
 
         loop {
             // Drain channel into queue
@@ -150,19 +186,19 @@ pub fn spawn(
                 // longer cooldown slot.
                 //
                 // Issue #202: cycle=0 uses the per-task
-                // delay (task.4). cycle>=1 always uses
+                // delay (task.per_task_delay). cycle>=1 always uses
                 // REENQUEUE_COOLDOWN regardless of the
                 // per-task intent — a failing small file
                 // gets one immediate shot, then backs off
-                // for 60s. Duration::MAX in task.4 opts
+                // for 60s. Duration::MAX in task.per_task_delay opts
                 // back into the spawn-time `delay` for
                 // tests that want uniform-delay behavior.
-                let cycle = task.3;
+                let cycle = task.retry_cycle;
                 let enqueue_at = if cycle == 0 {
-                    let per_task = if task.4 == Duration::MAX {
+                    let per_task = if task.per_task_delay == Duration::MAX {
                         delay
                     } else {
-                        task.4
+                        task.per_task_delay
                     };
                     tokio::time::Instant::now() + per_task
                 } else {
@@ -175,12 +211,12 @@ pub fn spawn(
                 match rx.recv().await {
                     Some(task) => {
                         PENDING_COUNT.fetch_add(1, Ordering::Relaxed);
-                        let cycle = task.3;
+                        let cycle = task.retry_cycle;
                         let enqueue_at = if cycle == 0 {
-                            let per_task = if task.4 == Duration::MAX {
+                            let per_task = if task.per_task_delay == Duration::MAX {
                                 delay
                             } else {
-                                task.4
+                                task.per_task_delay
                             };
                             tokio::time::Instant::now() + per_task
                         } else {
@@ -196,8 +232,8 @@ pub fn spawn(
             // Wait for next expired entry
             if let Some(expired) = queue.next().await {
                 let task = expired.into_inner();
-                let _p = task.1.clone();
-                let data: bytes::Bytes = match std::fs::read(&task.2) {
+                let _p = task.remote_path.clone();
+                let data: bytes::Bytes = match std::fs::read(&task.cache_path) {
                     Ok(d) => d.into(),
                     Err(_) => {
                         // Issue #53: cache file vanished (e.g.
@@ -207,15 +243,15 @@ pub fn spawn(
                         // failed with a confusing error and
                         // the .dirty sidecar would linger.
                         PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
-                        let _ = std::fs::remove_file(task.2.with_extension("dirty"));
+                        let _ = std::fs::remove_file(task.cache_path.with_extension("dirty"));
                         continue;
                     }
                 };
                 let op = op.clone();
-                let remote = task.1;
-                let ino = task.0;
-                let cache_path = task.2;
-                let cycle = task.3;
+                let remote = task.remote_path;
+                let ino = task.ino;
+                let cache_path = task.cache_path;
+                let cycle = task.retry_cycle;
                 // Upload in a separate task so DelayQueue keeps ticking.
                 static UPLOAD_SEM: std::sync::LazyLock<Semaphore> =
                     std::sync::LazyLock::new(|| Semaphore::new(4));
@@ -439,14 +475,19 @@ pub fn spawn(
                     //
                     // Issue #202: forward REENQUEUE_COOLDOWN
                     // explicitly. The cycle>=1 branch in the
-                    // worker ignores task.4, so this is
+                    // worker ignores task.per_task_delay, so this is
                     // documentation, not behavior — but it
                     // makes the retry path self-consistent.
                     // Forwarding `Duration::ZERO` here would
                     // re-immediate the upload on a flapping
                     // backend, defeating the cooldown.
-                    let _ =
-                        tx_clone.send((ino, remote, cache_path, next_cycle, REENQUEUE_COOLDOWN));
+                    let _ = tx_clone.send(WritebackTask {
+                        ino,
+                        remote_path: remote,
+                        cache_path,
+                        retry_cycle: next_cycle,
+                        per_task_delay: REENQUEUE_COOLDOWN,
+                    });
                     // PENDING_COUNT stays the same —
                     // the task is still in flight,
                     // just moved from the delay queue
@@ -483,34 +524,41 @@ mod tests {
         assert_eq!(REENQUEUE_COOLDOWN, Duration::from_secs(60));
     }
 
-    /// Issue #53 + #202: Task tuple shape is now 5 elements
-    /// (ino, remote, cache_path, cycle, per_task_delay). Pin
-    /// the arity so an accidental refactor that drops a
-    /// field trips CI before reaching production and
-    /// re-introducing the silent data-loss bug. The 5th
-    /// field (per_task_delay) is what enables small-file
-    /// immediate upload (issue #138) — cycle=0 honors it,
-    /// cycle>=1 always uses REENQUEUE_COOLDOWN.
+    /// Issue #53 + #202 + #219: `WritebackTask` field
+    /// semantics are now self-pinning via named fields.
+    /// Was `task_tuple_has_cycle_field` pinning tuple arity
+    /// (5); the struct form makes a missing or reordered
+    /// field a compile error at every enqueue site, not a
+    /// runtime bug. This test pins field identity (each
+    /// field carries its own value into the next task) so
+    /// a reorder still trips CI, while the struct literal
+    /// in the test enforces all 5 fields exist.
     #[test]
-    fn task_tuple_has_cycle_field() {
-        let task: Task = (
-            42,
-            "/remote/path".to_string(),
-            PathBuf::from("/cache/path"),
-            0,
-            Duration::from_secs(5),
-        );
-        assert_eq!(task.0, 42);
-        assert_eq!(task.1, "/remote/path");
-        assert_eq!(task.2, PathBuf::from("/cache/path"));
-        assert_eq!(task.3, 0);
-        assert_eq!(task.4, Duration::from_secs(5));
+    fn writeback_task_fields_pin_semantics() {
+        let task: WritebackTask = WritebackTask {
+            ino: 42,
+            remote_path: "/remote/path".to_string(),
+            cache_path: PathBuf::from("/cache/path"),
+            retry_cycle: 0,
+            per_task_delay: Duration::from_secs(5),
+        };
+        assert_eq!(task.ino, 42);
+        assert_eq!(task.remote_path, "/remote/path");
+        assert_eq!(task.cache_path, PathBuf::from("/cache/path"));
+        assert_eq!(task.retry_cycle, 0);
+        assert_eq!(task.per_task_delay, Duration::from_secs(5));
         // Cycle count advances on re-enqueue and the
         // re-enqueue path forwards REENQUEUE_COOLDOWN
         // explicitly (not the original per-task delay).
-        let retried: Task = (task.0, task.1, task.2, task.3 + 1, REENQUEUE_COOLDOWN);
-        assert_eq!(retried.3, 1);
-        assert_eq!(retried.4, REENQUEUE_COOLDOWN);
+        let retried = WritebackTask {
+            ino: task.ino,
+            remote_path: task.remote_path.clone(),
+            cache_path: task.cache_path.clone(),
+            retry_cycle: task.retry_cycle + 1,
+            per_task_delay: REENQUEUE_COOLDOWN,
+        };
+        assert_eq!(retried.retry_cycle, 1);
+        assert_eq!(retried.per_task_delay, REENQUEUE_COOLDOWN);
     }
 
     /// Issue #202: per_task_delay=Duration::MAX opts back
