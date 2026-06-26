@@ -116,8 +116,12 @@ enum Commands {
         #[arg(long, default_value = "1048576")]
         writeback_immediate_threshold: u64,
         /// VFS cache mode: off, writes, full (default: off, matches rclone).
-        /// **No effect in mntrs** — see docs/vfs-cache-flags.md for the
-        /// four-knob composition that maps to "no cache" intent.
+        /// **No effect in mntrs** — this is a **deprecation alias** for
+        /// the four-knob composition `--attr-cache-ttl 0
+        /// --dir-cache-ttl 0 --cache-max-size 0 --writeback-immediate`
+        /// (Interpretation 1, user-signed-off canonical 2026-06-26).
+        /// See docs/vfs-cache-flags.md for the decision matrix and
+        /// why Interpretations 2/3 were rejected.
         #[arg(long, default_value = "off")]
         vfs_cache_mode: String,
         /// Read-ahead size in bytes (default: 0 = off, matches rclone).
