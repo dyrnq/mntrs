@@ -115,10 +115,14 @@ enum Commands {
         /// Default: 1048576 (1 MiB).
         #[arg(long, default_value = "1048576")]
         writeback_immediate_threshold: u64,
-        /// VFS cache mode: off, writes, full (default: off, matches rclone)
+        /// VFS cache mode: off, writes, full (default: off, matches rclone).
+        /// **No effect in mntrs** — see docs/vfs-cache-flags.md for the
+        /// four-knob composition that maps to "no cache" intent.
         #[arg(long, default_value = "off")]
         vfs_cache_mode: String,
-        /// Read-ahead size in bytes (default: 0 = off, matches rclone)
+        /// Read-ahead size in bytes (default: 0 = off, matches rclone).
+        /// **No effect in mntrs** — use `--vfs-prefetch-threshold` /
+        /// `--vfs-prefetch-queue-mb` instead. See docs/vfs-cache-flags.md.
         #[arg(long, default_value = "0")]
         vfs_read_ahead: u64,
         /// Read chunk size in bytes (default: 128MiB, matches rclone)
@@ -155,7 +159,9 @@ enum Commands {
         /// **Deprecated**: use `--vfs-cache-poll-interval` instead.
         #[arg(long)]
         poll_interval: Option<u64>,
-        /// Max age of cached files in seconds (default: 3600, 0 to disable)
+        /// Max age of cached files in seconds (default: 3600, 0 to disable).
+        /// **No effect in mntrs** — TTLs are per-layer (`--attr-cache-ttl`,
+        /// `--dir-cache-ttl`). See docs/vfs-cache-flags.md.
         #[arg(long, default_value = "3600")]
         vfs_cache_max_age: u64,
         /// Minimum free disk space before triggering cache eviction (MB, default: 0 = off, matches rclone)
@@ -230,7 +236,9 @@ enum Commands {
         /// partially read.
         #[arg(long, default_value = "64")]
         vfs_prefetch_queue_mb: u64,
-        /// Use fast fingerprint (size+mtime) instead of checksums
+        /// Use fast fingerprint (size+mtime) instead of checksums.
+        /// **No effect in mntrs** — use `--hash-filter K/N` instead.
+        /// See docs/vfs-cache-flags.md.
         #[arg(long)]
         vfs_fast_fingerprint: bool,
         /// Use async reads (don't wait for full read before replying to kernel)
@@ -239,7 +247,9 @@ enum Commands {
         /// Refresh directory cache on mount
         #[arg(long)]
         vfs_refresh: bool,
-        /// Case-insensitive file name matching
+        /// Case-insensitive file name matching.
+        /// **No effect in mntrs** — case sensitivity is governed by the
+        /// platform filesystem. See docs/vfs-cache-flags.md.
         #[arg(long)]
         vfs_case_insensitive: bool,
         #[arg(long)]
@@ -247,7 +257,9 @@ enum Commands {
         /// Block Unicode normalization duplicates (NFC/NFD)
         #[arg(long)]
         vfs_block_norm_dupes: bool,
-        /// Translate symlinks
+        /// Translate symlinks.
+        /// **No effect in mntrs** — symlink support is governed by
+        /// `--link-perms`. See docs/vfs-cache-flags.md.
         #[arg(long)]
         vfs_links: bool,
         /// Use file size for used space in statfs
@@ -383,6 +395,45 @@ fn main() -> anyhow::Result<()> {
             vfs_disk_space_total_size,
             ..
         } => {
+            // Sprint 8 (#229): consolidated warn for rclone-compat
+            // shadow flags. clap defaults are applied, so we
+            // check non-default values to detect "user explicitly
+            // set this." One line per mount, not nine.
+            let mut shadow = Vec::new();
+            if vfs_cache_mode != "off" {
+                shadow.push("--vfs-cache-mode");
+            }
+            if vfs_cache_max_age != 3600 {
+                shadow.push("--vfs-cache-max-age");
+            }
+            if vfs_read_ahead != 0 {
+                shadow.push("--vfs-read-ahead");
+            }
+            if vfs_fast_fingerprint {
+                shadow.push("--vfs-fast-fingerprint");
+            }
+            if vfs_case_insensitive {
+                shadow.push("--vfs-case-insensitive");
+            }
+            if vfs_links {
+                shadow.push("--vfs-links");
+            }
+            if vfs_used_is_size {
+                shadow.push("--vfs-used-is-size");
+            }
+            if vfs_metadata_extension.is_some() {
+                shadow.push("--vfs-metadata-extension");
+            }
+            if !shadow.is_empty() {
+                tracing::warn!(
+                    "{}",
+                    format!(
+                        "mount: rclone-compat shadow flag(s) have no effect in mntrs (see docs/vfs-cache-flags.md): {}",
+                        shadow.join(", ")
+                    )
+                );
+            }
+
             let mut opts = HashMap::new();
             for kv in &opt {
                 match kv.split_once('=') {
