@@ -289,6 +289,13 @@ enum Commands {
         /// Total disk space to report in statfs (TB, default: 0 = off, matches rclone)
         #[arg(long, default_value = "0")]
         vfs_disk_space_total_size: u64,
+        /// Issue #257: when the backend read fails (network/auth/
+        /// timeout), fall back to a partial on-disk cache file
+        /// instead of returning EIO. Off by default — opt-in.
+        /// Useful for read-heavy workloads that can tolerate
+        /// stale data during backend outages.
+        #[arg(long, default_value = "false")]
+        vfs_read_stale_on_backend_error: bool,
     },
     /// Unmount a mounted directory (use "all" to unmount all)
     Unmount { target: String },
@@ -397,6 +404,7 @@ fn main() -> anyhow::Result<()> {
             vfs_cache_poll_interval,
             vfs_handle_caching,
             vfs_disk_space_total_size,
+            vfs_read_stale_on_backend_error,
             ..
         } => {
             // Sprint 8 (#229): consolidated warn for rclone-compat
@@ -528,6 +536,7 @@ fn main() -> anyhow::Result<()> {
                 vfs_cache_poll_interval,
                 vfs_handle_caching,
                 vfs_disk_space_total_size,
+                vfs_read_stale_on_backend_error,
             )?;
         }
         Commands::Unmount { target } => {
