@@ -4592,6 +4592,28 @@ impl CoreFilesystem for MntrsFs {
 
     fn statfs(&self, _ino: u64) -> std::io::Result<CoreVolumeStat> {
         let bs = 4096u32;
+        // Issue #243.4: `total` is always expressed in 4-KiB
+        // blocks (the FUSE block_size returned to the kernel
+        // and forwarded by CSI's `node_get_volume_stats` to
+        // K8s as `total_bytes = total * block_size`).
+        //
+        //   - `disk_total_size > 0`:  caller-set value in BYTES
+        //     (see `cmd/mount.rs:827` — the CLI takes TB and
+        //     multiplies by 1024^4 to get bytes). We divide
+        //     by `bs` to get blocks, matching the unit
+        //     expected by the kernel/CSI.
+        //   - fallback `256 * 1024 * 1024`:  also expressed in
+        //     blocks, NOT bytes. 256M blocks × 4 KiB = 1 TiB
+        //     of total space.
+        //
+        // The fallback was originally written without a
+        // unit annotation (PR #99 left the ambiguity
+        // documented but unresolved). The CSI plugin
+        // (`csi/mntrs-csi/src/main.rs:847`) consumes this
+        // value directly, so the 1-TiB default is load-
+        // bearing for csi-integration tests that assert a
+        // non-zero K8s capacity. Do NOT change the number
+        // without re-running csi-integration.
         let total = if self.disk_total_size > 0 {
             self.disk_total_size / bs as u64
         } else {
@@ -4821,7 +4843,18 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         attr_ttl: std::time::Duration::from_secs(1),
         stat_cache_ttl: std::time::Duration::from_secs(10),
         volname: "test".into(),
-        cache_max_size: 1024 * 1024 * 1024,
+        // Issue #243.2: pre-#243 this was 1 GiB. The 1 GiB
+        // default contradicted the CLI `--vfs-cache-max-size`
+        // default of `0` (= "off, no LRU cap"). The contradiction
+        // only mattered for tests that *implicitly* relied on the
+        // 1 GiB to drive eviction — those tests already use the
+        // `new_test_fs_evict` helper which sets a per-test
+        // `cache_max_size` explicitly. Tests that don't care
+        // about LRU now skip the eviction path entirely (which
+        // is also faster — L707 returns early when both caps
+        // are zero). See issue #255 for the matching test
+        // coverage and #252 for the rationale.
+        cache_max_size: 0,
         write_back_delay: std::time::Duration::from_secs(1),
         // Issue #202: 0 disables immediate upload for tests,
         // preserving pre-#202 timing assumptions. Individual
@@ -4843,7 +4876,21 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         link_perms: 0o777,
         direct_io: false,
         cache_max_age: std::time::Duration::from_secs(3600),
-        cache_min_free_space: 100 * 1024 * 1024,
+        // Issue #243.3: pre-#243 this was 100 MiB. The 100
+        // MiB default contradicted the CLI
+        // `--vfs-cache-min-free-space` default of `0` (=
+        // "off, no floor check"). The contradiction only
+        // mattered for tests that *implicitly* relied on
+        // the 100 MiB to drive ENOSPC paths — those
+        // already use `new_test_fs_evict` which sets the
+        // value explicitly (or 0 for tests that don't
+        // care). The L727 free-space probe is now
+        // short-circuited when this is 0 (L707 + L727
+        // combined), so writes no longer pay a statvfs
+        // syscall on the no-floor path. See #255 for
+        // matching test coverage and #253 for the
+        // rationale.
+        cache_min_free_space: 0,
         exclude_patterns: vec![],
         include_patterns: vec![],
         max_size: None,
@@ -5049,6 +5096,117 @@ mod tests {
                 .contains_key(&("big.bin".to_string(), None)),
             "file-level entry should survive"
         );
+    }
+
+    // ── issue #243.5: default-zero behavior pins ──────────────
+
+    /// Issue #243.2: `new_test_fs()` now defaults to
+    /// `cache_max_size = 0`, matching the CLI
+    /// `--vfs-cache-max-size` default. This pins the
+    /// post-#243 default so a future regression that
+    /// re-introduces the 1 GiB fallback trips CI.
+    #[test]
+    fn default_cache_max_size_is_zero() {
+        let dir = scratch_dir("default-cache-max");
+        let op = opendal::Operator::new(opendal::services::Memory::default())
+            .unwrap()
+            .finish();
+        let fs = new_test_fs(op, dir);
+        assert_eq!(
+            fs.cache_max_size, 0,
+            "post-#243.2 new_test_fs default must be 0 (= CLI --vfs-cache-max-size 0 = off)"
+        );
+    }
+
+    /// Issue #243.3: `new_test_fs()` now defaults to
+    /// `cache_min_free_space = 0`, matching the CLI
+    /// `--vfs-cache-min-free-space` default. Pins the
+    /// post-#243 default.
+    #[test]
+    fn default_cache_min_free_space_is_zero() {
+        let dir = scratch_dir("default-cache-min");
+        let op = opendal::Operator::new(opendal::services::Memory::default())
+            .unwrap()
+            .finish();
+        let fs = new_test_fs(op, dir);
+        assert_eq!(
+            fs.cache_min_free_space, 0,
+            "post-#243.3 new_test_fs default must be 0 (= CLI --vfs-cache-min-free-space 0 = off)"
+        );
+    }
+
+    /// Issue #243.2: when both `cache_max_size` and
+    /// `cache_min_free_space` are 0, `evict_lru_if_needed`
+    /// must short-circuit at L707 and return without
+    /// touching `disk_cache_index`. Pins the no-op
+    /// behavior so a future change that drops the
+    /// short-circuit (and re-introduces the
+    /// "always-statvfs" or "always-iterate" path) trips
+    /// CI.
+    #[test]
+    fn cache_caps_zero_means_evict_lru_is_noop() {
+        let dir = scratch_dir("both-zero-noop");
+        // new_test_fs post-#243 gives both caps = 0.
+        let op = opendal::Operator::new(opendal::services::Memory::default())
+            .unwrap()
+            .finish();
+        let fs = new_test_fs(op, dir);
+        assert_eq!(fs.cache_max_size, 0);
+        assert_eq!(fs.cache_min_free_space, 0);
+        // Fill the index well past any historical fallback
+        // (1 GiB / 100 MiB). If the L707 guard ever
+        // regresses, eviction would kick in.
+        let now = Instant::now();
+        for i in 0..32 {
+            fs.disk_cache_index.insert(
+                (format!("f{i}.bin"), None),
+                (4 * 1024 * 1024, now), // 4 MiB each = 128 MiB total
+            );
+        }
+        let pre_len = fs.disk_cache_index.len();
+        let pre_total: u64 = fs.disk_cache_index.iter().map(|e| e.value().0).sum();
+        fs.evict_lru_if_needed();
+        assert_eq!(
+            fs.disk_cache_index.len(),
+            pre_len,
+            "with both caps = 0, evict_lru_if_needed must not touch disk_cache_index"
+        );
+        assert_eq!(
+            pre_total,
+            fs.disk_cache_index.iter().map(|e| e.value().0).sum::<u64>(),
+            "no entry sizes should change"
+        );
+    }
+
+    /// Issue #243.4: `disk_total_size` fallback is
+    /// 256 MiB **blocks** (i.e. 1 TiB total bytes when
+    /// multiplied by `block_size`). The 1-TiB value
+    /// is load-bearing for CSI's `node_get_volume_stats`
+    /// (csi/mntrs-csi/src/main.rs:843). This pin locks
+    /// the fallback block count so a future change
+    /// can't silently break the CSI assumption.
+    #[test]
+    fn disk_total_size_fallback_blocks_constant() {
+        let dir = scratch_dir("dt-fallback");
+        let op = opendal::Operator::new(opendal::services::Memory::default())
+            .unwrap()
+            .finish();
+        let fs = new_test_fs(op, dir);
+        assert_eq!(
+            fs.disk_total_size, 0,
+            "new_test_fs must not set disk_total_size"
+        );
+        let v = fs.statfs(1).expect("statfs");
+        // The fallback `256 * 1024 * 1024` is in
+        // 4-KiB blocks, so `total_blocks` should be
+        // exactly that. 1 TiB = 256 * 1024 * 1024
+        // blocks * 4096 bytes/block.
+        assert_eq!(
+            v.total_blocks,
+            256 * 1024 * 1024,
+            "statfs total_blocks fallback must be 256 M blocks = 1 TiB (see issue #243.4)"
+        );
+        assert_eq!(v.block_size as u64, 4096);
     }
 
     // ── statfs (issue #99) ─────────────────────────────────────
