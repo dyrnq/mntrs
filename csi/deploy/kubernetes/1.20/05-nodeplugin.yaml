@@ -76,6 +76,22 @@ spec:
                   fieldPath: spec.nodeName
             - name: CSI_ENDPOINT
               value: unix://plugin/csi.sock
+            # Issue #234 (痛点 1): CSI mode writes the FUSE
+            # cache under $MNTRS_CACHE_DIR/<volume_id>. Pre-fix
+            # this was unset → csi-mntrs fell back to
+            # /tmp/mntrs-csi-cache/<mountpoint>/, which on a
+            # daemonset meant all PVCs across all pods on the
+            # node shared one directory (no per-PVC isolation,
+            # tmpfs pressure, lost on node reboot). The
+            # hostPath-backed /var/lib/mntrs-cache gives each
+            # node a stable cache root that survives pod
+            # reschedule (痛点 3 partial) and stays out of the
+            # container rootfs. Opt-in: existing deployments
+            # without this env var still work — csi-mntrs
+            # (csi/mntrs-csi/src/main.rs:474) only switches
+            # cache_dir if MNTRS_CACHE_DIR is set.
+            - name: MNTRS_CACHE_DIR
+              value: /var/lib/mntrs-cache
           imagePullPolicy: Always
           # exec /bin/sh probe is OK here: the mntrs image is alpine:3.21 +
           # fuse3-libs, which has /bin/sh. The probe is a weak "socket file
@@ -97,6 +113,8 @@ spec:
             - name: pods-mount-dir
               mountPath: /var/lib/kubelet/pods
               mountPropagation: Bidirectional
+            - name: cache-dir
+              mountPath: /var/lib/mntrs-cache
       volumes:
         - name: plugin-dir
           hostPath:
@@ -109,4 +127,8 @@ spec:
         - name: registration-dir
           hostPath:
             path: /var/lib/kubelet/plugins_registry
+            type: DirectoryOrCreate
+        - name: cache-dir
+          hostPath:
+            path: /var/lib/mntrs-cache
             type: DirectoryOrCreate
