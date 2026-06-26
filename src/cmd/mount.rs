@@ -328,39 +328,40 @@ pub fn mount_internal(
         "dashmap",                // mem_cache_impl (default)
         0,                        // mem_cache_metrics_interval_secs (off)
         5,                        // vfs_write_back
-        "off",                    // vfs_cache_mode
-        0,                        // vfs_read_ahead (off)
-        128 * 1024 * 1024,        // vfs_read_chunk_size (128MiB)
-        false,                    // default_permissions
-        None,                     // uid
-        None,                     // gid
-        None,                     // umask
-        None,                     // dir_perms
-        None,                     // file_perms
-        None,                     // link_perms
-        false,                    // allow_non_empty
+        1024 * 1024, // writeback_immediate_threshold (1 MiB) — #202: small files skip the 5s delay queue
+        "off",       // vfs_cache_mode
+        0,           // vfs_read_ahead (off)
+        128 * 1024 * 1024, // vfs_read_chunk_size (128MiB)
+        false,       // default_permissions
+        None,        // uid
+        None,        // gid
+        None,        // umask
+        None,        // dir_perms
+        None,        // file_perms
+        None,        // link_perms
+        false,       // allow_non_empty
         Some(cache_dir.as_str()), // cache_dir (CSI isolated)
-        false,                    // direct_io
-        60,                       // poll_interval
-        3600,                     // vfs_cache_max_age
-        0,                        // vfs_cache_min_free_space (off)
-        vec![],                   // exclude
-        vec![],                   // include
-        None,                     // max_size
-        None,                     // min_size
-        None,                     // max_depth
-        false,                    // ignore_case
-        false,                    // no_modtime
-        false,                    // use_server_modtime
-        false,                    // no_checksum
-        false,                    // no_seek
-        false,                    // links
-        false,                    // noapple_double
-        false,                    // noapple_xattr,
-        None,                     // hash_filter
-        false,                    // mount_case_insensitive
-        131072,                   // max_read_ahead
-        0,                        // vfs_read_chunk_size_limit
+        false,       // direct_io
+        60,          // poll_interval
+        3600,        // vfs_cache_max_age
+        0,           // vfs_cache_min_free_space (off)
+        vec![],      // exclude
+        vec![],      // include
+        None,        // max_size
+        None,        // min_size
+        None,        // max_depth
+        false,       // ignore_case
+        false,       // no_modtime
+        false,       // use_server_modtime
+        false,       // no_checksum
+        false,       // no_seek
+        false,       // links
+        false,       // noapple_double
+        false,       // noapple_xattr,
+        None,        // hash_filter
+        false,       // mount_case_insensitive
+        131072,      // max_read_ahead
+        0,           // vfs_read_chunk_size_limit
         // Issue #31: bump default chunk_streams from 0
         // (serial) to 4. rclone's default
         // --vfs-read-chunk-streams is 4; the bench
@@ -563,6 +564,10 @@ pub fn mount(
     // log filter away.
     mem_cache_metrics_interval_secs: u64,
     vfs_write_back: u64,
+    // Issue #202: files below this size (bytes) upload
+    // immediately on flush/release. `0` disables immediate
+    // upload. Default 1 MiB.
+    writeback_immediate_threshold: u64,
     vfs_cache_mode: &str,
     vfs_read_ahead: u64,
     vfs_read_chunk_size: u64,
@@ -738,6 +743,12 @@ pub fn mount(
         volname: volname.to_string(),
         cache_max_size: vfs_cache_max_size * 1024 * 1024,
         write_back_delay: std::time::Duration::from_secs(vfs_write_back),
+        // Issue #202: small files skip the 5s delay queue.
+        // The per_task_writeback_delay helper at lib.rs:900
+        // uses inodes.size vs this threshold to decide
+        // Duration::ZERO (immediate) vs write_back_delay
+        // (5s batch). 0 disables the fast path entirely.
+        writeback_immediate_threshold,
         cache_mode: vfs_cache_mode.to_string(),
         read_ahead: vfs_read_ahead,
         read_chunk_size: vfs_read_chunk_size,
