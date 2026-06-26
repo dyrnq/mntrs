@@ -33,6 +33,15 @@ pub(crate) use disk_write_pool::{
 };
 pub use disk_write_pool::{init_disk_write_pool, set_opendal_sync_op};
 
+// Re-export fuser::FileType so integration tests (and external users
+// that build a custom `InodeEntry` via the public API) don't need to
+// add a direct `fuser` dependency just to name a file kind. Gated on
+// Unix because `fuser` is a Linux/macOS dep only — on Windows the
+// local `pub enum FileType` stub below is the canonical
+// `mntrs::FileType` (see windows clippy run 28210714048).
+#[cfg(unix)]
+pub use fuser::FileType;
+
 /// Shared inode table type for writeback callback.
 pub const CACHE_BLOCK_SIZE: u64 = 8 * 1024 * 1024;
 
@@ -77,7 +86,7 @@ use std::time::{Duration, SystemTime};
 // dynamically through the trait object.
 
 #[cfg(unix)]
-use fuser::{FileAttr, FileType, INodeNo};
+use fuser::{FileAttr, INodeNo};
 
 #[cfg(not(unix))]
 /// Stub type for non-Unix platforms — mirrors fuser::FileType variants used in shared state.
@@ -203,7 +212,7 @@ static NEXT_INO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// recognizes this value and skips the
 /// inodes-entry mtime update — the next `stat()` from
 /// user space will refresh mtime from the remote.
-pub(crate) const INO_RECOVERY_SENTINEL: u64 = 0;
+pub const INO_RECOVERY_SENTINEL: u64 = 0;
 static NEXT_HANDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 // DIR_CACHE_TTL now comes from MntrsFs.dir_cache_ttl field
 
