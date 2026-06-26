@@ -21,7 +21,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install deps
         run: bash tests/e2e/common/install-linux-deps.sh standard "" yes no
@@ -94,7 +96,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install deps
         run: bash tests/e2e/common/install-linux-deps.sh standard "" yes no
