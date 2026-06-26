@@ -122,7 +122,7 @@ flag). This field is a leftover; the "no modtime"
 behavior is already covered by `no_modtime` (the
 non-prefixed alias at L184 of main.rs).
 
-## `vfs-cache-mode` semantics (current best interpretation)
+## `vfs-cache-mode` semantics (canonical: Interpretation 1)
 
 The user-facing question "what does `--vfs-cache-mode=off`
 mean in mntrs?" has three reasonable interpretations,
@@ -130,13 +130,14 @@ documented in [#230](../../issues/230):
 
 | Interpretation | Use case | Risk |
 |---|---|---|
-| 1. Read-through only (recommended) | Latency-sensitive S3 | Low |
-| 2. No local write at all | Streaming workloads | High — recovery path breaks |
+| 1. Read-through only (**canonical**) | Latency-sensitive S3 | Low |
+| 2. No local write at all | Streaming workloads | 🔴 High — recovery path breaks |
 | 3. No disk, but keep mem | tmpfs-style | Medium |
 
-**Interpretation 1 (read-through only)** is the current
-best interpretation. To compose "no cache" semantics from
-existing mntrs knobs:
+**Interpretation 1 (read-through only)** is the
+**user-confirmed canonical semantic** (signed off
+2026-06-26). It composes "no cache" from existing
+mntrs knobs:
 
 ```bash
 mntrs mount s3://bucket /mnt \
@@ -148,14 +149,45 @@ mntrs mount s3://bucket /mnt \
 ```
 
 That's four existing knobs that compose into the
-"minimal caching" semantic — no new flag is needed.
-The `--vfs-cache-mode=off` flag becomes a deprecation
-alias pointing to this four-knob combination.
+"minimal caching" semantic — **no new code, no new
+flag**. The `--vfs-cache-mode=off` flag is a
+**deprecation alias** that points users to this
+four-knob combination (Q4 = option A).
 
-This is the **current recommended interpretation**;
-the user has not yet signed off on which interpretation
-is canonical. See [#230](../../issues/230) for the
-decision matrix and open questions.
+### Why not Interpretation 2
+
+Interpretation 2 (no local write at all) was rejected
+on silent-data-loss risk: the `.dirty` sidecar
+recovery path in `mount_internal` would still find
+files left over from a previous mount under a
+different mode, and silently skip them. The recovery
+loop at `src/cmd/mount.rs:76` only runs on mount
+startup; if `cache_mode=2` is set, the loop is
+correctly bypassed, but the leftover sidecars from
+mode=1 mounts persist on disk and never upload. This
+is the kind of silent-failure mode
+[[`feedback-re-evaluate-risk-vs-issue`](../../)]
+explicitly warns against.
+
+### Why not Interpretation 3
+
+Interpretation 3 (no disk, keep mem) is workload-
+dependent and offers no clear win — `mem_cache` is
+already bounded by `--mem-limit`, and large working
+sets churn the L1 (evict on pressure, refill from
+backend) without the multi-tier knob to hint "hot"
+vs "cold" (candidate #2 in [#231](../../issues/231),
+DEFER status).
+
+### Q3 — per-mount vs CLI flag
+
+The CLI flag stays as the user-facing entry point.
+Per-mount / per-volume overrides (e.g. CSI mode
+where one tenant wants no-cache and another wants
+full-cache on the same backend) are achieved by
+the CSI driver setting the four underlying knobs
+directly in `mount_internal` — no new mechanism
+needed.
 
 ## Operational impact
 
