@@ -1,0 +1,56 @@
+# Stress / stability tests (issue #143).
+#
+# Runs nightly at 04:00 UTC and on manual dispatch. Uses memory://
+# backend (no S3/HDFS deps) so it works on any Linux runner.
+#
+# ci-smoke.sh overrides keep total runtime ~5 min; the same scripts
+# run with default sizes in tests/stress/run-all.sh for operator soak.
+name: stress-nightly
+
+on:
+  schedule:
+    # 04:00 UTC daily. Off-the-hour to spread CI load.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: "Space-separated scenarios (default: all)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: stress-smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FUSE prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev fuse3
+          if ! grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null; then
+              echo 'user_allow_other' | sudo tee -a /etc/fuse.conf >/dev/null
+          fi
+
+      - name: Build mntrs
+        run: cargo build --bin mntrs --verbose
+
+      - name: Run stress suite
+        run: |
+          set -euo pipefail
+          bash tests/stress/ci-smoke.sh ${{ inputs.scenarios }}
+
+      - name: Upload scratch logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-scratch-${{ github.run_id }}
+          path: |
+            /tmp/mntrs-stress/**
+          if-no-files-found: ignore
+          retention-days: 7
