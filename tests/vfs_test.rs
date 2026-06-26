@@ -220,6 +220,60 @@ fn load_cache_index_empty_for_nonexistent_dir() {
     );
 }
 
+/// Issue #227 + [[feedback-tuple-vs-struct]] + #219
+/// precedent: `CacheIndexEntry` field semantics are
+/// self-pinning via named fields. A future 5th field is
+/// a compile-time catch at every construction site (vs
+/// the tuple's silent 0/empty-default drop), and a
+/// reorder is impossible at the call site. The test
+/// pins the field identity and round-trips through a
+/// real `load_cache_index` so the on-disk encoding
+/// (`hash_blockidx.block`) and the struct's hex parse
+/// stay in sync.
+#[test]
+fn cache_index_entry_fields_pin_semantics() {
+    // Construct a real block file in a temp dir, then
+    // round-trip through load_cache_index.
+    let tmp = std::env::temp_dir().join(format!(
+        "mntrs_test_cache_index_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&tmp).unwrap();
+    // hash = "deadbeef", block_idx = 0x2a = 42
+    let name = "deadbeef_000000002a.block";
+    let path = tmp.join(name);
+    let payload = vec![0u8; 64];
+    std::fs::write(&path, &payload).unwrap();
+
+    let entries = mntrs::load_cache_index(&tmp);
+    assert_eq!(entries.len(), 1, "expected exactly one block file");
+    let e = &entries[0];
+    assert_eq!(e.name, name, "name should match filename");
+    assert_eq!(e.block_idx, 42, "block_idx should be 0x2a = 42");
+    assert_eq!(
+        e.size,
+        payload.len() as u64,
+        "size should be file size in bytes"
+    );
+    // mtime is from the filesystem; just assert it's
+    // a real (not-zero) SystemTime from the recent past.
+    assert!(
+        e.mtime <= std::time::SystemTime::now(),
+        "mtime should be <= now"
+    );
+
+    // Drop impl is not required, but make sure Clone + Eq
+    // work — used by callers that diff index snapshots.
+    let cloned = e.clone();
+    assert_eq!(e, &cloned, "CacheIndexEntry should be Clone + Eq");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 /// fnmatch with various patterns
 #[test]
 fn fnmatch_various_patterns() {

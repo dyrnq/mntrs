@@ -22,7 +22,7 @@ pub mod writeback;
 // Re-export everything from util so existing `crate::` paths are unaffected.
 pub use util::*;
 // Re-export block_format public items.
-pub use block_format::load_cache_index;
+pub use block_format::{CacheIndexEntry, load_cache_index};
 // Re-export block_format pub(crate) items within crate.
 pub(crate) use block_format::{
     BLOCK_OVERHEAD, drop_block_cache_for_path, remove_block_cache_files,
