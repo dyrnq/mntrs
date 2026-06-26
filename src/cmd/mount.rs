@@ -1198,19 +1198,29 @@ pub fn mount(
         }
     }
 
+    // #245 BUG-1: declare `host` at function scope, not in an
+    // inner `{}` block. The `{}` form dropped `host` at the
+    // closing brace — `FileSystemHost`'s `Drop` impl calls
+    // FspFileSystemRemoveMountPoint + FspIoqStop, so the
+    // WinFSP volume was torn down before the keep-alive
+    // loop (also dead-coded by the cfg nesting that
+    // produced #245) could even run. Hoisting the
+    // initializer to function scope means `host` lives
+    // until `mount_internal` returns, which is when the
+    // WinFSP-level unmount should happen.
     #[cfg(windows)]
-    {
+    let host: winfsp::host::FileSystemHost<_, winfsp::host::FineGuard> = {
         use crate::core_fs::winfsp::WinFspAdapter;
         use std::sync::Arc;
         let adapter = WinFspAdapter::new(Arc::new(fs));
         let mut vol_params = winfsp::host::VolumeParams::default();
         vol_params.filesystem_name(volname);
-        let mut host: winfsp::host::FileSystemHost<_, winfsp::host::FineGuard> =
-            winfsp::host::FileSystemHost::new(vol_params, adapter)
-                .map_err(|e| anyhow::anyhow!("FileSystemHost::new: {e}"))?;
+        let mut host = winfsp::host::FileSystemHost::new(vol_params, adapter)
+            .map_err(|e| anyhow::anyhow!("FileSystemHost::new: {e}"))?;
         host.mount(mountpoint)
             .map_err(|e| anyhow::anyhow!("host.mount: {e}"))?;
-    }
+        host
+    };
 
     // Daemon-wait: signal mount readiness before entering daemon loop.
     // rclone-style: --daemon --daemon-wait means "fork, mount, signal, stay alive".
@@ -1319,16 +1329,30 @@ pub fn mount(
             }
             // Signal the watcher thread to exit (it loops on SHUTDOWN_REQUESTED)
             SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
-            remove_mount(mountpoint);
-        }
-
-        #[cfg(windows)]
-        loop {
-            // spawn_mount2 on WinFSP returns once the mount is registered;
-            // keep the process alive until unmount/shutdown is requested.
-            std::thread::sleep(std::time::Duration::from_secs(3600));
         }
     }
+
+    // #245 BUG-1: Windows keep-alive. Was previously nested
+    // inside the `#[cfg(not(windows))]` block above (where
+    // the inner `#[cfg(windows)]` loop was unreachable). With
+    // `host` now hoisted to function scope (see the `let
+    // mut host` block near the top of mount_internal), this
+    // loop keeps the WinFSP process alive until
+    // SHUTDOWN_REQUESTED is set — the signal handler sets
+    // it, and the new BUG-2 IPC path (separate issue) will
+    // also set it from the unmount command. On break, `host`
+    // is dropped at function return, which triggers
+    // FspFileSystemRemoveMountPoint + FspIoqStop in the
+    // winfsp crate's Drop impl.
+    #[cfg(windows)]
+    while !SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    // mounts.txt cleanup — applies to all platforms. Was
+    // previously nested inside the Unix keep-alive block, so
+    // Windows never cleaned up its mounts.txt entry.
+    remove_mount(mountpoint);
 
     Ok(())
 }
