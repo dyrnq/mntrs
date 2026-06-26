@@ -342,7 +342,7 @@ pub fn mount_internal(
         false,       // allow_non_empty
         Some(cache_dir.as_str()), // cache_dir (CSI isolated)
         false,       // direct_io
-        60,          // poll_interval
+        Some(60),    // poll_interval (CSI: fixed 60s, no deprecation warning)
         3600,        // vfs_cache_max_age
         0,           // vfs_cache_min_free_space (off)
         vec![],      // exclude
@@ -581,7 +581,7 @@ pub fn mount(
     allow_non_empty: bool,
     cache_dir: Option<&str>,
     direct_io: bool,
-    poll_interval: u64,
+    poll_interval: Option<u64>,
     vfs_cache_max_age: u64,
     vfs_cache_min_free_space: u64,
     exclude: Vec<String>,
@@ -620,6 +620,14 @@ pub fn mount(
     vfs_handle_caching: u64,
     vfs_disk_space_total_size: u64,
 ) -> Result<()> {
+    // Issue #209: --poll-interval is the legacy rclone alias
+    // for --vfs-cache-poll-interval. When the user explicitly
+    // sets it (Some), emit a one-time deprecation warning.
+    // Default (None) is silent — no behavior change for users
+    // who never touched the legacy flag.
+    if poll_interval.is_some() {
+        tracing::warn!("--poll-interval is deprecated; use --vfs-cache-poll-interval instead");
+    }
     // Issue #62: elapsed_ms checkpoints at every major
     // mount() step. At `tracing::debug!` so they are
     // silent under the default INFO filter — turn them
@@ -782,7 +790,12 @@ pub fn mount(
         file_perms: file_perms.unwrap_or(0o666) as u16,
         link_perms: link_perms.unwrap_or(0o777) as u16,
         direct_io,
-        poll_interval: std::time::Duration::from_secs(poll_interval.max(1)),
+        // Issue #209: --poll-interval is deprecated; route the
+        // legacy value into `cache_poll_interval` and warn the
+        // user. None (unset) means use --vfs-cache-poll-interval.
+        cache_poll_interval: std::time::Duration::from_secs(
+            poll_interval.unwrap_or(vfs_cache_poll_interval).max(1),
+        ),
         cache_max_age: std::time::Duration::from_secs(vfs_cache_max_age),
         cache_min_free_space: vfs_cache_min_free_space * 1024 * 1024,
         exclude_patterns: exclude,
@@ -808,7 +821,8 @@ pub fn mount(
         block_norm_dupes: vfs_block_norm_dupes,
         write_wait: std::time::Duration::from_secs(vfs_write_wait),
         read_wait: std::time::Duration::from_secs(vfs_read_wait),
-        cache_poll_interval: std::time::Duration::from_secs(vfs_cache_poll_interval),
+        // Issue #209: cache_poll_interval is set above (line 786-789)
+        // to also accept the legacy --poll-interval value.
         handle_caching: std::time::Duration::from_secs(vfs_handle_caching),
         disk_total_size: vfs_disk_space_total_size * 1024 * 1024 * 1024 * 1024, // TB to bytes
         writeback_sender: std::sync::OnceLock::new(),
