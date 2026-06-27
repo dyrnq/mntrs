@@ -95,3 +95,41 @@ hdfs-native = { git = "https://github.com/dyrnq/hdfs-native.git", rev = "419cd0e
 name = "mntrs"
 path = "src/main.rs"
 
+# Platform-organized integration tests. Cargo does NOT auto-discover
+# nested `tests/<dir>/*.rs` files (verified empirically on rustc 1.96.0);
+# each test target needs an explicit `[[test]]` entry with a unique
+# `name`. The file path under `tests/{csi,platform/<os>}/` advertises
+# which subsystem / OS the test targets — primary signal is the path,
+# the `#![cfg]` header inside each file is defense-in-depth.
+#
+# Layout:
+#   tests/csi/                       — CSI tests. CSI is Linux-only
+#                                      at the design level (the
+#                                      `csi/mntrs-csi` sub-crate is
+#                                      `cfg(not(windows))`-gated at
+#                                      the dep level), so the files
+#                                      are gated with
+#                                      `#![cfg(target_os = "linux")]`
+#                                      at the top of each.
+#   tests/platform/linux/*.rs        — Other Linux-only tests.
+#   tests/platform/windows/*.rs      — Windows-specific tests.
+[[test]]
+name = "csi_integration_test"
+path = "tests/csi/csi_integration_test.rs"
+
+[[test]]
+name = "csi_mount_internal_test"
+path = "tests/csi/csi_mount_internal_test.rs"
+
+[[test]]
+name = "csi_full_integration_test"
+path = "tests/csi/csi_full_integration_test.rs"
+
+[[test]]
+name = "platform_linux_fuse_integration_test"
+path = "tests/platform/linux/fuse_integration_test.rs"
+
+[[test]]
+name = "platform_windows_winfsp_integration_test"
+path = "tests/platform/windows/winfsp_integration_test.rs"
+
