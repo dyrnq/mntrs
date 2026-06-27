@@ -1096,14 +1096,57 @@ fn parse_volume_context(
     Ok((storage, read_only, opts))
 }
 
+/// Resolve the CSI socket path with three precedence levels.
+///
+/// Precedence (highest first):
+/// 1. `--endpoint=unix:///full/path.sock` (full explicit, current behavior)
+/// 2. `--socket-dir=/path` (binds to `<socket-dir>/mntrs-csi.sock`)
+/// 3. Default: `/run/csi/mntrs-csi.sock` (kubelet standard scan path;
+//    persists across reboots, not tmpfs, safe for multi-node daemonset)
+///
+/// Issue #261.1: prior default `/tmp/csi.sock` was broken on K8s 1.25+
+/// ReadOnlyRootFilesystem + tmpfs-on-reboot (kubelet lost the driver
+/// after every node restart).
+fn resolve_socket_path(endpoint: &str, socket_dir: Option<&str>) -> String {
+    // Explicit --endpoint always wins.
+    let stripped = endpoint
+        .strip_prefix("unix://")
+        .or_else(|| endpoint.strip_prefix("unix:"));
+    if let Some(p) = stripped {
+        // If the user passed a bare filename (no '/'), they're using
+        // shorthand and we should join with socket_dir if provided.
+        if !p.contains('/') {
+            let dir = socket_dir.unwrap_or("/run/csi");
+            return format!("{}/{}", dir.trim_end_matches('/'), p);
+        }
+        return p.to_string();
+    }
+    // No scheme prefix — treat the whole string as a path.
+    if endpoint.contains('/') {
+        return endpoint.to_string();
+    }
+    // Bare filename, no scheme: join with socket_dir or default.
+    let dir = socket_dir.unwrap_or("/run/csi");
+    format!("{}/{}", dir.trim_end_matches('/'), endpoint)
+}
+
 #[derive(Parser)]
 #[command(name = "mntrs-csi", about = "Kubernetes CSI driver for mntrs")]
 struct Cli {
     #[arg(long, default_value = "mntrs-csi-node")]
     node_id: String,
 
-    #[arg(long, default_value = "unix:///tmp/csi.sock")]
+    /// CSI gRPC endpoint (e.g. `unix:///run/csi/mntrs-csi.sock`).
+    /// Default: `/run/csi/mntrs-csi.sock` — kubelet standard scan path,
+    /// persists across reboots (not tmpfs).
+    #[arg(long, default_value = "unix:///run/csi/mntrs-csi.sock")]
     endpoint: String,
+
+    /// Directory for the CSI socket when `--endpoint` is a bare filename.
+    /// Falls back to `/run/csi` if unset. Also reads `MNTRS_CSI_SOCKET_DIR`
+    /// env var (CLI flag overrides env).
+    #[arg(long)]
+    socket_dir: Option<String>,
 }
 
 #[tokio::main]
@@ -1112,12 +1155,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let node_id = cli.node_id;
 
-    let socket_path = cli
-        .endpoint
-        .strip_prefix("unix://")
-        .or_else(|| cli.endpoint.strip_prefix("unix:"))
-        .unwrap_or(&cli.endpoint)
-        .to_string();
+    let socket_dir_env = std::env::var("MNTRS_CSI_SOCKET_DIR").ok();
+    let socket_path = resolve_socket_path(
+        &cli.endpoint,
+        cli.socket_dir.as_deref().or(socket_dir_env.as_deref()),
+    );
 
     let _ = std::fs::remove_file(&socket_path);
     let listener = tokio::net::UnixListener::bind(&socket_path)?;
@@ -1321,5 +1363,74 @@ s3fs /a/pvc-3/s3mount fuse s3fs rw 0 0
         assert!(is_mountpoint_in("/a/pvc-2/globalmount", mounts));
         assert!(!is_mountpoint_in("/a/pvc-2", mounts));
         assert!(!is_mountpoint_in("/a/pvc-2/globalmount/extra", mounts));
+    }
+
+    // Issue #261.1: resolve_socket_path precedence tests.
+    use super::resolve_socket_path;
+
+    #[test]
+    fn resolve_socket_full_endpoint_wins() {
+        // Explicit unix://path.sock always wins, even with --socket-dir set.
+        assert_eq!(
+            resolve_socket_path("unix:///var/run/foo.sock", Some("/tmp")),
+            "/var/run/foo.sock"
+        );
+    }
+
+    #[test]
+    fn resolve_socket_unix_prefix_no_path() {
+        // "unix:foo.sock" — bare filename with unix: prefix, no '/'.
+        // Joins with socket_dir.
+        assert_eq!(
+            resolve_socket_path("unix:foo.sock", Some("/run/csi")),
+            "/run/csi/foo.sock"
+        );
+    }
+
+    #[test]
+    fn resolve_socket_bare_filename_with_socket_dir() {
+        // Bare "mntrs-csi.sock" + --socket-dir=/plugin → /plugin/mntrs-csi.sock
+        // (matches K8s emptyDir mountpoint convention)
+        assert_eq!(
+            resolve_socket_path("mntrs-csi.sock", Some("/plugin")),
+            "/plugin/mntrs-csi.sock"
+        );
+    }
+
+    #[test]
+    fn resolve_socket_bare_filename_default_dir() {
+        // Bare filename, no socket_dir → /run/csi/  (new default after #261.1)
+        assert_eq!(
+            resolve_socket_path("mntrs-csi.sock", None),
+            "/run/csi/mntrs-csi.sock"
+        );
+    }
+
+    #[test]
+    fn resolve_socket_full_default_no_socket_dir() {
+        // CLI default with no socket_dir override → /run/csi/mntrs-csi.sock
+        // (regression guard for #261.1)
+        assert_eq!(
+            resolve_socket_path("unix:///run/csi/mntrs-csi.sock", None),
+            "/run/csi/mntrs-csi.sock"
+        );
+    }
+
+    #[test]
+    fn resolve_socket_socket_dir_trailing_slash() {
+        // Trailing slash on --socket-dir should be normalized away.
+        assert_eq!(
+            resolve_socket_path("foo.sock", Some("/var/run/csi/")),
+            "/var/run/csi/foo.sock"
+        );
+    }
+
+    #[test]
+    fn resolve_socket_no_scheme_contains_slash() {
+        // No scheme prefix, contains '/' → treat as plain path.
+        assert_eq!(
+            resolve_socket_path("/run/csi/foo.sock", None),
+            "/run/csi/foo.sock"
+        );
     }
 }
