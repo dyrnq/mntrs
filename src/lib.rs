@@ -766,6 +766,19 @@ impl MntrsFs {
         // We need to free at least the larger of the two deltas.
         let to_free = size_limit.max(need_free.unwrap_or(0));
         if to_free == 0 {
+            // Issue #268.3 O8: surface the common no-op
+            // path at debug. Pre-fix the early return was
+            // silent; under heavy write workloads the
+            // operator couldn't see "eviction pipeline
+            // ran and decided no work needed" vs "eviction
+            // pipeline never ran". debug because this is
+            // the common path under steady-state operation.
+            tracing::debug!(
+                cache_max_size = self.cache_max_size,
+                cache_min_free_space = self.cache_min_free_space,
+                total,
+                "evict_lru_if_needed: no work needed"
+            );
             return;
         }
 
@@ -826,10 +839,20 @@ impl MntrsFs {
             // for the same reason — surface it in the log
             // rather than papering over with a now-removed
             // `out_of_space` gate that nothing read.
+            //
+            // Issue #268.3 O8: this is the "evict failed
+            // but still returned Ok" silent case. The FUSE
+            // write path already replied Ok to the kernel
+            // before this point — a partial truncation
+            // leaves the cache file slightly larger than
+            // the logical size, which the read path
+            // tolerates, but operators need to know "your
+            // cache is full and we couldn't shrink it".
             tracing::warn!(
                 freed,
                 to_free,
-                "mntrs evict_lru_if_needed: cache under target after draining index"
+                "evict_lru_if_needed: cache under target after draining index; \
+                 cache file may be truncated"
             );
         }
     }

@@ -210,7 +210,15 @@ impl DiskWriteJob {
                 // if it still fails.
                 if let Err(e) = Self::do_write(&mut f, &self.remote_path, self.offset, &self.data) {
                     if e.kind() == std::io::ErrorKind::StorageFull {
-                        tracing::warn!(
+                        // Issue #268.3 O8: surface first ENOSPC at
+                        // info level. Pre-fix this was warn — and
+                        // it's expected under sustained writes that
+                        // fill the cache, so it should not be in the
+                        // "warning" bucket. Info shows the operator
+                        // the cache eviction pipeline fired; if the
+                        // retry below also fails, that stays at
+                        // warn.
+                        tracing::info!(
                             path = %self.remote_path,
                             "disk cache write hit ENOSPC; retrying once (issue #39)"
                         );
@@ -259,7 +267,15 @@ impl DiskWriteJob {
                 // still helps future writes.
                 if let Err(e) = Self::do_write(&mut f, &self.remote_path, self.offset, &self.data) {
                     if e.kind() == std::io::ErrorKind::StorageFull {
-                        tracing::warn!(
+                        // Issue #268.3 O8: surface first ENOSPC at
+                        // info level. Pre-fix this was warn — and
+                        // it's expected under sustained writes that
+                        // fill the cache, so it should not be in the
+                        // "warning" bucket. Info shows the operator
+                        // the cache eviction pipeline fired; if the
+                        // retry below also fails, that stays at
+                        // warn.
+                        tracing::info!(
                             path = %self.remote_path,
                             "disk cache write (no-fd) hit ENOSPC; retrying once (issue #39)"
                         );

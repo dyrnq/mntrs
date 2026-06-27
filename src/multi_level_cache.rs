@@ -105,6 +105,11 @@ impl MultiLevelCache {
             return Some(data);
         }
         self.metrics.record_cache_miss("l1");
+        // Issue #268.3 O7: L1 miss trace. trace-level —
+        // hot path, default INFO must not show it. Operators
+        // enabling `RUST_LOG=mntrs=trace` see "cold L1,
+        // checking L2" for every block.
+        tracing::trace!(path, ino, block_idx, "MLC: L1 miss");
 
         // L2: on-disk block cache
         if let Some(data) = self.l2.get_block(path, ino, block_idx) {
@@ -114,6 +119,12 @@ impl MultiLevelCache {
             return Some(data);
         }
         self.metrics.record_cache_miss("l2");
+        // Issue #268.3 O7: full-miss debug. The caller
+        // will now fetch from remote (L3); debug-level
+        // because full misses are rarer than L1 misses
+        // and operators want to see "this block has
+        // never been cached".
+        tracing::debug!(path, ino, block_idx, "MLC: full miss → remote fetch");
 
         None
     }

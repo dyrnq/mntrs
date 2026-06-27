@@ -293,6 +293,9 @@ impl MemCache for MokaMemCache {
     }
 
     fn invalidate_ino(&self, ino: u64) {
+        // Issue #268.3 O6: same per-invalidate trace as
+        // DashMapMemCache — see that impl for context.
+        tracing::debug!(ino, "mem_cache: invalidate all blocks");
         // moka 0.12's `sync::Cache` doesn't expose a
         // predicate-based bulk invalidate (the `invalidate_entries_if`
         // method exists but is gated behind the `future`
@@ -476,6 +479,8 @@ impl MemCache for DashMapMemCache {
         // the writer forever.
         if self.mem_limit > 0 {
             let deadline = Instant::now() + self.back_pressure_deadline;
+            let mut evictions_this_put: u64 = 0;
+            let mut evicted_bytes_this_put: u64 = 0;
             loop {
                 if self.used.load(Ordering::Relaxed) + size <= self.mem_limit {
                     break;
@@ -489,14 +494,45 @@ impl MemCache for DashMapMemCache {
                         if let Some((_, removed)) = self.inner.remove(&v) {
                             self.used.fetch_sub(removed.len() as u64, Ordering::Relaxed);
                             self.evictions.fetch_add(1, Ordering::Relaxed);
+                            evictions_this_put += 1;
+                            evicted_bytes_this_put += removed.len() as u64;
                         }
                     }
                     None => break, // empty cache but limit still exceeded — nothing to evict
                 }
                 if Instant::now() >= deadline {
+                    // Issue #268.3 O6: log deadline-exceeded
+                    // evictions. Pre-fix the back-pressure
+                    // deadline bail-out was silent — operators
+                    // couldn't see "writer hit mem_limit and
+                    // gave up". Info-level since this is
+                    // expected under sustained over-pressure,
+                    // not an error.
+                    tracing::info!(
+                        ino,
+                        block_idx,
+                        evictions = evictions_this_put,
+                        evicted_bytes = evicted_bytes_this_put,
+                        "mem_cache: LRU eviction deadline exceeded; cache over limit"
+                    );
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(50));
+            }
+            // Issue #268.3 O6: surface per-put LRU
+            // evictions. Single info per put (not per
+            // victim) — keeps the hot path cheap while
+            // letting operators grep for "mem_cache: LRU
+            // eviction" to see which file sizes cause
+            // the most churn.
+            if evictions_this_put > 0 {
+                tracing::info!(
+                    ino,
+                    block_idx,
+                    evictions = evictions_this_put,
+                    evicted_bytes = evicted_bytes_this_put,
+                    "mem_cache: LRU eviction"
+                );
             }
         }
 
@@ -538,6 +574,14 @@ impl MemCache for DashMapMemCache {
     }
 
     fn invalidate_ino(&self, ino: u64) {
+        // Issue #268.3 O6: surface per-invalidate call.
+        // Pre-fix this was 0 tracing; under heavy write
+        // workloads the L1 mem_cache was a black box —
+        // operators couldn't tell whether invalidations were
+        // firing on the expected schedule. debug level
+        // (not info) because every small write invalidates
+        // many inos.
+        tracing::debug!(ino, "mem_cache: invalidate all blocks");
         // O(K) via the per-ino reverse index (see `by_ino`).
         // Without it this was a full O(N) scan of `inner` +
         // `order`, which costs ~5ms at N=1000 cached entries
@@ -669,6 +713,9 @@ impl MemCache for FoyerMemCache {
     }
 
     fn invalidate_ino(&self, ino: u64) {
+        // Issue #268.3 O6: same per-invalidate trace as
+        // the other two impls.
+        tracing::debug!(ino, "mem_cache: invalidate all blocks");
         if let Some((_, keys)) = self.by_ino.remove(&ino) {
             for k in keys {
                 self.inner.remove(&k);
