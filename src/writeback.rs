@@ -174,10 +174,32 @@ pub fn spawn(
     let handle = crate::rt().spawn(async move {
         let mut queue: DelayQueue<WritebackTask> = DelayQueue::new();
 
+        // Issue #268.1 O3: separate task for the 30-second
+        // queue-depth tick. Operators rely on this to
+        // detect silent backlog accumulation — without it
+        // the only "is the daemon alive?" probe is `ps`,
+        // which can't see queue length. Independent task
+        // because `queue.len()` needs `&mut queue` which
+        // the worker already owns.
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                tracing::info!(
+                    pending = PENDING_COUNT.load(Ordering::Relaxed),
+                    "writeback queue tick"
+                );
+            }
+        });
+
         loop {
             // Drain channel into queue
             while let Ok(task) = rx.try_recv() {
                 PENDING_COUNT.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    path = %task.remote_path,
+                    cycle = task.retry_cycle,
+                    "writeback: enqueued"
+                );
                 // Issue #53: preserve the retry-cycle count.
                 // A fresh enqueue from flush/release has
                 // count=0; a re-enqueue from the upload
@@ -222,9 +244,26 @@ pub fn spawn(
                         } else {
                             tokio::time::Instant::now() + REENQUEUE_COOLDOWN
                         };
+                        tracing::debug!(
+                            path = %task.remote_path,
+                            cycle,
+                            "writeback: enqueued (idle-wake)"
+                        );
                         queue.insert_at(task, enqueue_at);
                     }
-                    None => break,
+                    None => {
+                        // Issue #268.1 O1: worker exit.
+                        // Pre-fix this `break` was silent;
+                        // operators had no signal that the
+                        // upload pipeline died. Channel close
+                        // happens only when every Sender is
+                        // dropped — i.e. all FUSE threads
+                        // unmounted — so this is a normal
+                        // shutdown path; log it as info rather
+                        // than error to avoid alarm.
+                        tracing::info!("writeback: channel disconnected, worker exiting");
+                        break;
+                    }
                 }
                 continue;
             }
@@ -233,16 +272,30 @@ pub fn spawn(
             if let Some(expired) = queue.next().await {
                 let task = expired.into_inner();
                 let _p = task.remote_path.clone();
+                tracing::debug!(
+                    path = %task.remote_path,
+                    cycle = task.retry_cycle,
+                    "writeback: dequeued for upload"
+                );
                 let data: bytes::Bytes = match std::fs::read(&task.cache_path) {
                     Ok(d) => d.into(),
                     Err(_) => {
-                        // Issue #53: cache file vanished (e.g.
-                        // evicted by LRU) — drop the task
-                        // cleanly. Without this, the
+                        // Issue #53 + #268.1 O1: cache file
+                        // vanished (e.g. evicted by LRU
+                        // between enqueue and dequeue) — drop
+                        // the task cleanly. Without this, the
                         // pre-fix code would have read
                         // failed with a confusing error and
                         // the .dirty sidecar would linger.
+                        // Log at info so operators can
+                        // distinguish "LRU evicted before
+                        // upload" from "filesystem gone".
                         PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
+                        tracing::info!(
+                            path = %task.cache_path.display(),
+                            cycle = task.retry_cycle,
+                            "writeback: cache file vanished (LRU evicted?); dropping task"
+                        );
                         let _ = std::fs::remove_file(task.cache_path.with_extension("dirty"));
                         continue;
                     }
@@ -398,13 +451,37 @@ pub fn spawn(
                                 return;
                             }
                             Ok(Err(e)) if attempt < 4 => {
+                                let backoff_secs = 1u64 << attempt;
+                                tracing::warn!(
+                                    path = %remote,
+                                    attempt,
+                                    backoff_secs,
+                                    next_attempt_secs = backoff_secs,
+                                    error = %e,
+                                    "writeback: retry after backoff"
+                                );
                                 last_err = Some(e);
-                                tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+                                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                             }
                             Ok(Err(e)) => {
+                                tracing::error!(
+                                    path = %remote,
+                                    total_attempts = 5,
+                                    error = %e,
+                                    "writeback: all attempts exhausted; enqueuing retry cycle"
+                                );
                                 last_err = Some(e);
                             }
                             Err(_elapsed) => {
+                                // Issue #268.1 O2: timeout is
+                                // distinct from a backend
+                                // error — log at warn so a
+                                // 120s hang shows up.
+                                tracing::warn!(
+                                    path = %remote,
+                                    attempt,
+                                    "writeback: upload timed out after 120s"
+                                );
                                 last_err = Some(opendal::Error::new(
                                     opendal::ErrorKind::Unexpected,
                                     format!(
@@ -496,6 +573,12 @@ pub fn spawn(
             }
         }
     });
+
+    // Issue #268.1 O1: confirm the worker actually
+    // started. Pre-fix `spawn()` returned silently;
+    // a failed `crate::rt().spawn` (e.g. runtime not
+    // initialized in a test path) was invisible.
+    tracing::info!(delay_secs = delay.as_secs(), "writeback worker started");
 
     (tx, handle)
 }
