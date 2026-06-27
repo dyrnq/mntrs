@@ -1,9 +1,13 @@
 use anyhow::Result;
 
 pub fn systemd() -> Result<()> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let service_dir = format!("{}/.config/systemd/user", home);
-    let service_file = format!("{}/mntrs-mount@.service", service_dir);
+    // Issue #261.4: use XDG config helper. If XDG_CONFIG_HOME/HOME
+    // both unset, fail with a clear error instead of writing to /tmp
+    // (which would silently collide across users/pods).
+    let config_dir =
+        crate::util::config_dir().map_err(|e| anyhow::anyhow!("systemd install failed: {e}"))?;
+    let service_dir = config_dir.join("systemd").join("user");
+    let service_file = service_dir.join("mntrs-mount@.service");
 
     let template = r#"[Unit]
 Description=mntrs FUSE mount for %i
@@ -28,7 +32,10 @@ WantedBy=default.target
     std::fs::create_dir_all(&service_dir)?;
     std::fs::write(&service_file, template)?;
 
-    println!("Wrote systemd user service template: {service_file}");
+    println!(
+        "Wrote systemd user service template: {}",
+        service_file.display()
+    );
     println!();
     println!("Usage:");
     println!("  systemctl --user daemon-reload");

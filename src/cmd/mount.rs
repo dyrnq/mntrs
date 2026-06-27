@@ -33,9 +33,29 @@ where
     // rt.block_on(f)
 }
 
+/// Issue #261.4: pub so `unmount.rs` can target the same path.
+pub fn mounts_db_path() -> String {
+    // Use XDG helper. If HOME is unset (containers, CI runners,
+    // fresh daemon) we surface a clear error to the caller instead
+    // of silently writing to /tmp.
+    match crate::util::data_dir() {
+        Ok(dir) => dir
+            .join("mntrs")
+            .join("mounts.txt")
+            .to_string_lossy()
+            .to_string(),
+        Err(e) => {
+            tracing::warn!(error=%e, "mounts_db_path: cannot determine data dir; falling back to legacy /tmp path");
+            // Last-resort fallback for backward compat with pre-#261.4
+            // deployments; warn loudly so the operator sees it.
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            format!("{}/.local/share/mntrs/mounts.txt", home)
+        }
+    }
+}
+
 fn mounts_db() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    format!("{}/.local/share/mntrs/mounts.txt", home)
+    mounts_db_path()
 }
 
 pub struct MountInfo {

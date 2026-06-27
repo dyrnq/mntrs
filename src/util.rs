@@ -7,6 +7,70 @@
 
 use std::path::{Path, PathBuf};
 
+/// Issue #261.4: XDG Base Directory Specification helpers.
+/// Three functions used by `mount`, `unmount`, `install` to derive
+/// standard per-user paths consistently. Behavior:
+/// - `data_dir()` honors `$XDG_DATA_HOME` or falls back to
+///   `$HOME/.local/share`. **Errors** if HOME is unset (was
+///   silently falling back to `/tmp` — the bug we're fixing).
+/// - `config_dir()` honors `$XDG_CONFIG_HOME` or falls back to
+///   `$HOME/.config`. Same HOME-unset error behavior.
+/// - `runtime_dir()` honors `$XDG_RUNTIME_DIR` only. The XDG
+///   spec requires it (typically `/run/user/<uid>`); there is
+///   no HOME fallback. Errors if unset — falling back to `/tmp`
+///   here would re-introduce the multi-user collision bug.
+///
+/// Errors return `anyhow::Result` because callers want user-
+/// visible error messages, not panic-on-None.
+pub fn data_dir() -> anyhow::Result<PathBuf> {
+    if let Ok(v) = std::env::var("XDG_DATA_HOME")
+        && !v.is_empty()
+    {
+        return Ok(PathBuf::from(v));
+    }
+    let home = std::env::var("HOME").map_err(|_| {
+        anyhow::anyhow!(
+            "cannot determine data directory: $XDG_DATA_HOME and $HOME are both unset. \
+             Set $XDG_DATA_HOME (or $HOME) to a writable user-owned path."
+        )
+    })?;
+    Ok(PathBuf::from(home).join(".local").join("share"))
+}
+
+/// $XDG_CONFIG_HOME or $HOME/.config. Errors if HOME unset.
+pub fn config_dir() -> anyhow::Result<PathBuf> {
+    if let Ok(v) = std::env::var("XDG_CONFIG_HOME")
+        && !v.is_empty()
+    {
+        return Ok(PathBuf::from(v));
+    }
+    let home = std::env::var("HOME").map_err(|_| {
+        anyhow::anyhow!(
+            "cannot determine config directory: $XDG_CONFIG_HOME and $HOME are both unset. \
+             Set $XDG_CONFIG_HOME (or $HOME) to a writable user-owned path."
+        )
+    })?;
+    Ok(PathBuf::from(home).join(".config"))
+}
+
+/// $XDG_RUNTIME_DIR only (no HOME fallback per XDG spec).
+/// Errors if unset — runtime state cannot go to /tmp (collision risk).
+pub fn runtime_dir() -> anyhow::Result<PathBuf> {
+    let v = std::env::var("XDG_RUNTIME_DIR").map_err(|_| {
+        anyhow::anyhow!(
+            "cannot determine runtime directory: $XDG_RUNTIME_DIR is unset. \
+             XDG spec requires it; if running outside a desktop session, \
+             set XDG_RUNTIME_DIR=/run/user/$(id -u)."
+        )
+    })?;
+    if v.is_empty() {
+        return Err(anyhow::anyhow!(
+            "$XDG_RUNTIME_DIR is set to empty string — refusing to use it"
+        ));
+    }
+    Ok(PathBuf::from(v))
+}
+
 // ── Path hashing ────────────────────────────────────────────────────
 
 pub fn path_hash(path: &str) -> u64 {
@@ -320,8 +384,19 @@ pub fn install_panic_logger() {
         if let Ok(path) = std::env::var("MNTRS_PANIC_LOG") {
             let _ = std::fs::write(&path, &report);
         } else {
-            let default_path = format!("/tmp/mntrs-panic.{}.log", std::process::id());
-            let _ = std::fs::write(default_path, &report);
+            // Issue #261.4: prefer $XDG_RUNTIME_DIR (XDG spec) or
+            // $TMPDIR (BSD/macOS convention), fall back to
+            // std::env::temp_dir() (Rust stdlib — typically
+            // /tmp on Linux but respects TMPDIR override).
+            // No more bare /tmp hardcode that would collide across
+            // users/pods and disappear on tmpfs reboot.
+            let default_dir = std::env::var("XDG_RUNTIME_DIR")
+                .ok()
+                .or_else(|| std::env::var("TMPDIR").ok())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let default_path = default_dir.join(format!("mntrs-panic.{}.log", std::process::id()));
+            let _ = std::fs::write(&default_path, &report);
         }
         prev(info);
     }));
@@ -657,5 +732,124 @@ mod tests {
     fn path_hash_shorter_than_u64_max() {
         let h = path_hash("test");
         assert!(h < (1u64 << 63));
+    }
+
+    // ── XDG helpers (Issue #261.4) ───────────────────────────────
+
+    /// `data_dir()` honors `$XDG_DATA_HOME` when set, even if HOME
+    /// is also set (env precedence).
+    #[test]
+    fn data_dir_xdg_data_home_wins() {
+        // SAFETY: tests run serially in cargo; setting a unique value
+        // here doesn't collide with other tests.
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", "/custom/data");
+            std::env::set_var("HOME", "/home/test");
+        }
+        let dir = data_dir().unwrap();
+        assert_eq!(dir, PathBuf::from("/custom/data"));
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+    }
+
+    /// `data_dir()` falls back to `$HOME/.local/share` when
+    /// `$XDG_DATA_HOME` is unset.
+    #[test]
+    fn data_dir_home_fallback() {
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::set_var("HOME", "/home/test");
+        }
+        let dir = data_dir().unwrap();
+        assert_eq!(dir, PathBuf::from("/home/test/.local/share"));
+    }
+
+    /// `data_dir()` errors when both XDG_DATA_HOME and HOME are
+    /// unset — the bug fix: was silently falling back to /tmp.
+    #[test]
+    fn data_dir_no_env_errors() {
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("HOME");
+        }
+        let err = data_dir().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("XDG_DATA_HOME") && msg.contains("HOME"),
+            "expected error to mention both vars, got: {msg}"
+        );
+    }
+
+    /// Empty XDG_DATA_HOME is treated as unset (XDG spec edge case).
+    #[test]
+    fn data_dir_empty_xdg_falls_back() {
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", "");
+            std::env::set_var("HOME", "/home/test");
+        }
+        let dir = data_dir().unwrap();
+        assert_eq!(dir, PathBuf::from("/home/test/.local/share"));
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+    }
+
+    /// `config_dir()` mirrors data_dir but for XDG_CONFIG_HOME.
+    #[test]
+    fn config_dir_xdg_config_home_wins() {
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", "/custom/config");
+            std::env::set_var("HOME", "/home/test");
+        }
+        let dir = config_dir().unwrap();
+        assert_eq!(dir, PathBuf::from("/custom/config"));
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+    }
+
+    #[test]
+    fn config_dir_home_fallback() {
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::set_var("HOME", "/home/test");
+        }
+        let dir = config_dir().unwrap();
+        assert_eq!(dir, PathBuf::from("/home/test/.config"));
+    }
+
+    /// `runtime_dir()` has NO HOME fallback per XDG spec.
+    /// Errors if unset — the fix.
+    #[test]
+    fn runtime_dir_errors_without_xdg() {
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+            std::env::set_var("HOME", "/home/test");
+        }
+        let err = runtime_dir().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("XDG_RUNTIME_DIR"),
+            "expected error to mention XDG_RUNTIME_DIR, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn runtime_dir_xdg_set() {
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
+        }
+        let dir = runtime_dir().unwrap();
+        assert_eq!(dir, PathBuf::from("/run/user/1000"));
+    }
+
+    #[test]
+    fn runtime_dir_empty_errors() {
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", "");
+        }
+        let err = runtime_dir().unwrap_err();
+        assert!(format!("{err}").contains("empty"));
     }
 }
