@@ -133,6 +133,16 @@ impl MemoryLimiter {
     /// against `label`. Saturating — going
     /// below 0 is a no-op (caller bug; a stale
     /// release is harmless).
+    ///
+    /// **Pairing requirement** (issue #118): `release` must be
+    /// called only after a successful `try_reserve` of the same
+    /// `(label, n)`. If the caller does
+    /// `try_reserve(...)` → `Err` → `release(label, n)`, the
+    /// per-label allocation will drift negative (saturating to
+    /// 0) and the global `used` counter will under-report actual
+    /// usage. Both are silent — there is no runtime error.
+    /// Callers that may or may not have reserved should use
+    /// `release_if_reserved` (see below).
     pub fn release(&self, label: &'static str, n: u64) {
         self.used
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -140,6 +150,52 @@ impl MemoryLimiter {
             })
             .ok();
         self.record(label, -(n as i64));
+    }
+
+    /// Release `n` bytes against `label`, but only if at least
+    /// `n` bytes are currently allocated to `label`. Returns
+    /// `true` if the release happened, `false` if the per-label
+    /// allocation was below `n` (caller never reserved, or
+    /// already released).
+    ///
+    /// Use this when the caller pattern is
+    /// `try_reserve(...) → match { Ok → ...; Err → ... }` and
+    /// may or may not have reserved. Avoids the
+    /// `try_reserve → Err → release` under-count trap of
+    /// `release()` (issue #118).
+    pub fn release_if_reserved(&self, label: &'static str, n: u64) -> bool {
+        // Look up the existing allocation (do NOT create one —
+        // creating an empty entry here would mean the snapshot
+        // shows a label that was never reserved).
+        let Some(alloc) = self.by_label.get(label).map(|e| e.value().clone()) else {
+            return false;
+        };
+        // CAS the per-label counter: only proceed if current
+        // usage is >= n (we have a matching reservation). The
+        // global `used` and the per-label Allocation are
+        // updated together on success.
+        let released = alloc
+            .bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                if current < n {
+                    None // reservation not held
+                } else {
+                    Some(current - n)
+                }
+            })
+            .is_ok();
+        if released {
+            self.used
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_sub(n))
+                })
+                .ok();
+            // No call to `record()` here — the per-label counter
+            // is the source of truth, updated atomically above.
+            // The negative-`delta` branch in `record` is
+            // unreachable from this path.
+        }
+        released
     }
 
     /// Update the per-label Allocation. Positive
@@ -262,5 +318,65 @@ mod tests {
         assert!(s.contains("\"mem_used\":300"));
         assert!(s.contains("\"a\":100"));
         assert!(s.contains("\"b\":200"));
+    }
+
+    // Issue #118: `try_reserve → Err → release` under-counts the
+    // per-label allocation. `release_if_reserved` is the safe
+    // alternative for the "may or may not have reserved" caller
+    // pattern.
+    #[test]
+    fn release_if_reserved_does_nothing_when_unreserved() {
+        let l = MemoryLimiter::new(1000);
+        // No try_reserve for "x". A naive `release("x", 50)` would
+        // decrement the per-label counter below zero (saturating to
+        // 0) and the global `used` counter by 50. `release_if_reserved`
+        // must do nothing.
+        let released = l.release_if_reserved("x", 50);
+        assert!(!released, "should not release without a reservation");
+        assert_eq!(l.used(), 0);
+        let s = l.snapshot_json();
+        assert!(!s.contains("\"x\":"));
+    }
+
+    #[test]
+    fn release_if_reserved_releases_after_reserve() {
+        let l = MemoryLimiter::new(1000);
+        l.try_reserve("x", 50).unwrap();
+        assert_eq!(l.used(), 50);
+        assert!(l.release_if_reserved("x", 50));
+        assert_eq!(l.used(), 0);
+    }
+
+    #[test]
+    fn release_if_reserved_partial_does_nothing() {
+        // Trying to release more than is reserved: must no-op
+        // (the caller has a smaller reservation than they think).
+        let l = MemoryLimiter::new(1000);
+        l.try_reserve("x", 50).unwrap();
+        assert!(!l.release_if_reserved("x", 100));
+        assert_eq!(l.used(), 50);
+    }
+
+    // Issue #118: bare `release` after failed `try_reserve` is the
+    // historical anti-pattern. Test documents the existing
+    // behavior so future refactors don't accidentally fix it
+    // (callers may rely on the saturating_sub staying at zero).
+    #[test]
+    fn release_after_failed_reserve_underflows_used() {
+        let l = MemoryLimiter::new(100);
+        // Reserve 60 of 100.
+        assert!(l.try_reserve("a", 60).is_ok());
+        // Another try_reserve fails (60 + 50 > 100). The
+        // per-label counter for "a" is still 60 — no record
+        // happens on the Err path.
+        assert!(l.try_reserve("a", 50).is_err());
+        assert_eq!(l.used(), 60);
+        // If the caller now calls bare `release("a", 50)` (the
+        // anti-pattern), global `used` goes 60 → 10 (saturating).
+        // Per-label "a" goes 60 → 10. This is the silent
+        // under-count — the test pins the existing behavior
+        // rather than asserting what the right thing to do is.
+        l.release("a", 50);
+        assert_eq!(l.used(), 10);
     }
 }
