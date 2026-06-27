@@ -17,9 +17,10 @@ pub fn unmount(target: &str) -> Result<()> {
                 tracing::debug!(error=%e, mountpoint, "unmount all skip failed");
             }
         }
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        if let Err(e) = fs::remove_file(format!("{}/.local/share/mntrs/mounts.txt", home)) {
-            tracing::debug!(error=%e, "unmount all db remove failed");
+        // Issue #261.4: same path as mount.rs uses for the db.
+        let db = crate::cmd::mount::mounts_db_path();
+        if let Err(e) = fs::remove_file(&db) {
+            tracing::debug!(error=%e, db, "unmount all db remove failed");
         }
         return Ok(());
     }
@@ -38,8 +39,7 @@ pub fn unmount(target: &str) -> Result<()> {
     fuse_unmount(&mountpoint)?;
 
     // remove from db
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let db = format!("{}/.local/share/mntrs/mounts.txt", home);
+    let db = crate::cmd::mount::mounts_db_path();
     if let Ok(content) = fs::read_to_string(&db) {
         let filtered: Vec<&str> = content
             .lines()
