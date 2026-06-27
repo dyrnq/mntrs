@@ -180,6 +180,14 @@ fn remove_mount(mountpoint: &str) {
 static CLEANUP_MP: OnceLock<String> = OnceLock::new();
 static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+/// Issue #261.2: maps mountpoint → the actual cache dir the mount
+/// used (which may come from `opts["cache-dir"]` when CSI sets it,
+/// or fall back to `/tmp/mntrs-csi-cache/<slug>` for CLI mounts).
+/// `unmount_internal` queries this map so its cleanup targets the
+/// same path the mount wrote to — previously it always derived
+/// the `/tmp/...` slug, missing CSI's `MNTRS_CACHE_DIR` paths.
+static MOUNT_CACHE_DIR: std::sync::LazyLock<std::sync::Mutex<HashMap<String, String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 /// Distinguishes "shutdown was triggered by SIGINT/SIGTERM" (the
 /// `handler` signal fn) from "shutdown was triggered by the FUSE
 /// session ending" (external `fusermount3 -u`, `umount_and_join`
@@ -271,10 +279,24 @@ pub fn mount_internal(
     opts: &std::collections::HashMap<String, String>,
     read_only: bool,
 ) -> anyhow::Result<()> {
-    // Isolated cache dir per mount (CSI prevents disk leak across volumes)
-    let cache_suffix = mountpoint.replace(['/', ':'], "_");
-    let cache_dir = format!("/tmp/mntrs-csi-cache/{}", cache_suffix);
+    // Issue #261.2: CSI handler passes the operator-configured
+    // MNTRS_CACHE_DIR via `opts["cache-dir"]` (see csi/mntrs-csi/src/main.rs
+    // stage FUSE mount path). Honor it here so cache files land
+    // under the operator-chosen persistent path (K8s ReadOnlyRootFS
+    // + tmpfs-safe). CLI `mntrs mount` doesn't pass the key, so
+    // we fall back to the original /tmp/mntrs-csi-cache/<slug> path
+    // — that path is NOT tmpfs-safe, but CLI users run locally and
+    // choose where to mount.
+    let cache_dir = opts.get("cache-dir").cloned().unwrap_or_else(|| {
+        let suffix = mountpoint.replace(['/', ':'], "_");
+        format!("/tmp/mntrs-csi-cache/{}", suffix)
+    });
     let _ = std::fs::create_dir_all(&cache_dir);
+    // Register mountpoint→cache_dir so unmount_internal can find
+    // the same path during cleanup (Bug 30 follow-up).
+    if let Ok(mut map) = MOUNT_CACHE_DIR.lock() {
+        map.insert(mountpoint.to_string(), cache_dir.clone());
+    }
 
     // Idempotency: if already mounted, return success
     if is_mount_point(mountpoint) {
@@ -407,8 +429,17 @@ pub fn build_operator_sync(storage_url: &str, opts: &HashMap<String, String>) ->
 }
 
 pub fn unmount_internal(mountpoint: &str) -> anyhow::Result<()> {
-    // Phase 0: note cache dir for cleanup after unmount
-    let _cache_dir = cache_dir_for_mount(mountpoint);
+    // Issue #261.2: look up the actual cache_dir the mount used.
+    // Falls back to /tmp/mntrs-csi-cache/<slug> for legacy callers
+    // (e.g. if mount_internal was bypassed or for an old running mount).
+    let _cache_dir = {
+        if let Ok(map) = MOUNT_CACHE_DIR.lock() {
+            map.get(mountpoint).cloned()
+        } else {
+            None
+        }
+    }
+    .unwrap_or_else(|| cache_dir_for_mount(mountpoint));
 
     // Phase 1: writeback drain skipped in CSI path to avoid blocking gRPC server.
     // Writeback continues in background; dirty files will be recovered on next mount.
@@ -440,19 +471,27 @@ pub fn unmount_internal(mountpoint: &str) -> anyhow::Result<()> {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
-                let cache_dir = cache_dir_for_mount(mountpoint);
+                let cache_dir = {
+                    if let Ok(map) = MOUNT_CACHE_DIR.lock() {
+                        map.get(mountpoint).cloned()
+                    } else {
+                        None
+                    }
+                }
+                .unwrap_or_else(|| cache_dir_for_mount(mountpoint));
                 // Bug 30: ENOENT here is the common case
                 // when the mount used a non-default
                 // cache-dir (notably CSI, which sets
                 // cache-dir to {MNTRS_CACHE_DIR}/{volume_id}
                 // and cleans that path itself in
-                // node_unstage_volume). The cache_dir
-                // helper derives a /tmp/mntrs-csi-cache/
-                // <slug> path from the mountpoint that
-                // CSI never used; the remove_dir_all here
-                // then fails with NotFound on every CSI
-                // unmount. Suppress that case so the warn
-                // log only fires for real cleanup
+                // node_unstage_volume). With #261.2 the map
+                // holds the real CSI path so we look there
+                // first; the /tmp helper is only a fallback.
+                // CSI cleans up its own path during
+                // node_unstage_volume — that step still
+                // happens before this code runs, so a NotFound
+                // here is normal. Suppress that case so the
+                // warn log only fires for real cleanup
                 // problems (permissions, EIO).
                 match std::fs::remove_dir_all(&cache_dir) {
                     Ok(()) => {}
@@ -1861,4 +1900,126 @@ async fn build_sftp(url: &url::Url, opts: &HashMap<String, String>) -> Result<Op
     }
     // SFTP uses SSH transport (no TLS layer needed).
     Ok(Operator::new(builder)?.finish())
+}
+
+#[cfg(test)]
+mod tests_261_2 {
+    //! Tests for Issue #261.2: CSI cache-dir propagation.
+    //!
+    //! The helpers here (`cache_dir_for_mount`, `MOUNT_CACHE_DIR` map
+    //! lookup, mountpoint→cache_dir registration) are the wiring that
+    //! makes `mount_internal` honor the CSI-supplied `opts["cache-dir"]`
+    //! and `unmount_internal` clean up the right path.
+    //!
+    //! What we test:
+    //! 1. `cache_dir_for_mount` falls back to `/tmp/mntrs-csi-cache/<slug>`
+    //!    for CLI mounts (unchanged behavior).
+    //! 2. The `MOUNT_CACHE_DIR` map round-trips the mountpoint→cache_dir
+    //!    insertion that `mount_internal` performs.
+    //! 3. The map's lookup-or-helper-fallback logic in `unmount_internal`
+    //!    correctly prefers the map entry over the helper.
+    //!
+    //! We do NOT call `mount_internal`/`unmount_internal` directly here:
+    //! both spawn FUSE sessions / fork threads, which can't run in a
+    //! `cargo test` unit-test harness. The cache-dir plumbing is small
+    //! enough that helper-level tests give us the safety net we need.
+
+    use super::{MOUNT_CACHE_DIR, cache_dir_for_mount};
+
+    /// Sanity: the legacy fallback path is unchanged from pre-#261.2.
+    /// CLI `mntrs mount /a/pvc` still gets `/tmp/mntrs-csi-cache/_a_pvc`.
+    #[test]
+    fn cache_dir_for_mount_cli_fallback_unchanged() {
+        let path = cache_dir_for_mount("/a/pvc-1/globalmount");
+        assert_eq!(path, "/tmp/mntrs-csi-cache/_a_pvc-1_globalmount");
+    }
+
+    /// Mountpoint with drive-letter colon (Windows-path-style mountpoint).
+    /// Replacement turns `:` into `_` so the suffix is fs-safe.
+    #[test]
+    fn cache_dir_for_mount_colon_replaced() {
+        let path = cache_dir_for_mount("C:/mnt");
+        assert_eq!(path, "/tmp/mntrs-csi-cache/C__mnt");
+    }
+
+    /// Issue #261.2 core: register mountpoint→cache_dir in the global
+    /// map and read it back. This mirrors what mount_internal does
+    /// for CSI: `opts["cache-dir"]` value gets registered, then
+    /// unmount_internal looks it up.
+    #[test]
+    fn mount_cache_dir_register_and_lookup() {
+        let mp = "/tmp/test-mount-261-2";
+        let cs = "/var/lib/mntrs/cache/volume-xyz";
+        // Clear any leftover entry from previous tests.
+        if let Ok(mut map) = MOUNT_CACHE_DIR.lock() {
+            map.remove(mp);
+        }
+        // Register (mirrors mount_internal L287-290).
+        if let Ok(mut map) = MOUNT_CACHE_DIR.lock() {
+            map.insert(mp.to_string(), cs.to_string());
+        }
+        // Lookup (mirrors unmount_internal L440-449).
+        let resolved = if let Ok(map) = MOUNT_CACHE_DIR.lock() {
+            map.get(mp).cloned()
+        } else {
+            None
+        }
+        .unwrap_or_else(|| cache_dir_for_mount(mp));
+        assert_eq!(resolved, cs);
+        // Cleanup.
+        if let Ok(mut map) = MOUNT_CACHE_DIR.lock() {
+            map.remove(mp);
+        }
+    }
+
+    /// Lookup miss falls back to the legacy helper. Mounts that bypassed
+    /// mount_internal (or stale maps after a crash) still get a sensible
+    /// cleanup target.
+    #[test]
+    fn mount_cache_dir_miss_falls_back_to_helper() {
+        let mp = "/tmp/never-registered-mountpoint";
+        // Make sure nothing is registered.
+        if let Ok(mut map) = MOUNT_CACHE_DIR.lock() {
+            map.remove(mp);
+        }
+        let resolved = if let Ok(map) = MOUNT_CACHE_DIR.lock() {
+            map.get(mp).cloned()
+        } else {
+            None
+        }
+        .unwrap_or_else(|| cache_dir_for_mount(mp));
+        assert_eq!(resolved, cache_dir_for_mount(mp));
+        assert_eq!(
+            resolved,
+            "/tmp/mntrs-csi-cache/_tmp_never-registered-mountpoint"
+        );
+    }
+
+    /// Map entry wins even if helper would compute a different value.
+    /// Critical: CSI passes a path totally unrelated to mountpoint
+    /// slug, so the helper MUST NOT override the map.
+    #[test]
+    fn mount_cache_dir_entry_wins_over_helper() {
+        let mp = "/mnt/csi/pvc-abc";
+        // Helper would compute: /tmp/mntrs-csi-cache/_mnt_csi_pvc-abc
+        let helper_path = cache_dir_for_mount(mp);
+        assert!(helper_path.starts_with("/tmp/mntrs-csi-cache/"));
+        // CSI registers: /var/lib/mntrs/cache/<encoded_volume_id>
+        let csi_path = "/var/lib/mntrs/cache/_s3_bucket_prefix";
+        if let Ok(mut map) = MOUNT_CACHE_DIR.lock() {
+            map.insert(mp.to_string(), csi_path.to_string());
+        }
+        let resolved = if let Ok(map) = MOUNT_CACHE_DIR.lock() {
+            map.get(mp).cloned()
+        } else {
+            None
+        }
+        .unwrap_or_else(|| cache_dir_for_mount(mp));
+        assert_eq!(resolved, csi_path);
+        assert_ne!(resolved, helper_path);
+        // Cleanup.
+        if let Ok(mut map) = MOUNT_CACHE_DIR.lock() {
+            map.remove(mp);
+        }
+    }
 }
