@@ -512,6 +512,14 @@ fn disk_io_worker_loop(rx: crossbeam_channel::Receiver<DiskWriteJob>) {
     while let Ok(job) = rx.recv() {
         job.execute();
     }
+    // Issue #268.1 O5: surface worker death. Pre-fix
+    // this exit was silent; a thread panic or
+    // graceful channel drop was invisible. After
+    // exit, all cache writes fall through to
+    // submit_disk_write's sync-fallback path — that
+    // path now logs warn (O5 above), so this error
+    // is the upstream cause operators should chase.
+    tracing::error!("disk-IO worker exiting (channel closed)");
 }
 
 // ── Periodic fsync ──────────────────────────────────────────────────
@@ -711,11 +719,28 @@ pub(crate) fn submit_disk_write(job: Option<DiskWriteJob>) {
         // runtime is shutting down (e.g. process exit).
         // Fall back to sync execution in that case.
         if let Err(e) = tx.send(job) {
+            // Issue #268.1 O5: surface channel-closed
+            // fallback. Pre-fix this was silent; the
+            // operator couldn't tell whether the pool
+            // was alive or whether the runtime was
+            // tearing down.
+            tracing::warn!(
+                error = %e,
+                "disk-IO channel closed (runtime shutting down?); executing job synchronously"
+            );
             e.0.execute();
         }
     } else {
-        // Pool not initialized (test path that
-        // bypassed new_test_fs). Run synchronously.
+        // Issue #268.1 O5: pool-not-initialized
+        // fallback. Production mounts always init
+        // the pool; this branch is reachable only
+        // in tests that bypassed new_test_fs.
+        // Pre-fix it was silent — a test author
+        // couldn't tell why the cache write took
+        // the sync path.
+        tracing::warn!(
+            "submit_disk_write: pool not initialized; executing synchronously on caller"
+        );
         job.execute();
     }
 }
