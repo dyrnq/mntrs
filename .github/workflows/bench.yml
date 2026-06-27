@@ -66,7 +66,7 @@ jobs:
 
       - name: Run FUSE integration tests
         if: matrix.mode == 'fuse-integration'
-        run: cargo test --test fuse_integration_test -- --test-threads=1 --nocapture
+        run: cargo test --test platform_linux_fuse_integration_test -- --test-threads=1 --nocapture
 
       - name: Setup rclone
         if: matrix.mode == 'bench-comparison'
