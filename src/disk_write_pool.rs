@@ -67,7 +67,14 @@ static OPENDAL_SYNC_OP: once_cell::sync::OnceCell<opendal::Operator> =
 /// initialization. Safe to call multiple times; only
 /// the first call wins.
 pub fn set_opendal_sync_op(op: opendal::Operator) {
-    let _ = OPENDAL_SYNC_OP.set(op);
+    // Issue #268.4 O15: once_cell silently drops the
+    // second call. Production should init exactly once;
+    // a duplicate indicates two mount paths racing
+    // (re-mount, recovery re-init, test harness leak).
+    // Warn so the operator sees the init race.
+    if OPENDAL_SYNC_OP.set(op).is_err() {
+        tracing::warn!("set_opendal_sync_op: called more than once; only the first op wins");
+    }
 }
 
 // ── DiskWriteJob ────────────────────────────────────────────────────
@@ -702,14 +709,39 @@ fn spawn_fsync_thread() {
                             // tracking entry.
                             DIRTY_CACHE_PATHS.remove(path);
                         }
-                        Err(_) => {
+                        Err(e) => {
                             // Transient open failure
                             // (EACCES, ENOMEM, …):
                             // keep, retry next tick.
+                            //
+                            // Issue #268.4 O17: **debug** not warn —
+                            // the tick runs every
+                            // FSYNC_INTERVAL_SECS (5 s) and a
+                            // persistently failing path would spam
+                            // a warn forever. Operators wanting to
+                            // see transient-failure patterns use
+                            // RUST_LOG=mntrs=debug. The state itself
+                            // is still tracked in DIRTY_CACHE_PATHS
+                            // so durability is preserved.
+                            tracing::debug!(
+                                path = ?path,
+                                error = %e,
+                                "fsync: transient open failure; will retry next tick"
+                            );
                         }
                     }
                 }
             }
+        })
+        .map(|_handle| {
+            // Issue #268.4 O16: mount-time one-shot lifecycle
+            // log. interval + batch cap echo the durability
+            // window for the operator's mental model.
+            tracing::info!(
+                interval_secs = FSYNC_INTERVAL_SECS,
+                max_batch_per_tick = MAX_FSYNC_BATCH_PER_TICK,
+                "disk-IO: fsync thread started"
+            );
         })
         .expect("failed to spawn fsync thread");
 }
