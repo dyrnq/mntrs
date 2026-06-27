@@ -398,6 +398,19 @@ pub fn spawn(
                         };
                         match write_result {
                             Ok(Ok(_)) => {
+                                // Issue #268.4 O14: upload ok lifecycle.
+                                // **debug** not info — sustained writes
+                                // produce one log per task, hot path
+                                // volume. Operators wanting per-upload
+                                // audit use RUST_LOG=mntrs=debug.
+                                tracing::debug!(
+                                    path = %remote,
+                                    bytes = data.len(),
+                                    attempt,
+                                    ino,
+                                    cycle,
+                                    "writeback: upload ok"
+                                );
                                 // Only update mtime — do NOT update file size (v.2).
                                 // The write function tracks the correct logical size
                                 // via inodes. The cache file may be larger than the

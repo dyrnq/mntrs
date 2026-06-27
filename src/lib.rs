@@ -1154,6 +1154,16 @@ impl MntrsFs {
         // (writeback.rs) removes it after a successful upload.
         // Deleting before upload completes would cause data loss if
         // the process crashes again before the upload finishes.
+        //
+        // Issue #268.4 O25: count recovered / skipped / error
+        // for a mount-time summary. Per-task debug logs above
+        // (existing) give per-sidecar detail; this single info
+        // line gives the operator the headline number.
+        let mut recovered_count: u64 = 0;
+        let mut orphan_count: u64 = 0;
+        let mut send_err_count: u64 = 0;
+        let mut read_err_count: u64 = 0;
+        let mut no_sender_count: u64 = 0;
         if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
             for e in entries.flatten() {
                 let p = e.path();
@@ -1163,55 +1173,105 @@ impl MntrsFs {
                         // Orphan sidecar — cache file missing, safe to remove
                         tracing::debug!(sidecar=?p, "removing orphan dirty sidecar");
                         let _ = std::fs::remove_file(&p);
+                        orphan_count += 1;
                         continue;
                     }
-                    if let Ok(remote) = std::fs::read_to_string(&p) {
-                        let remote = remote.trim().to_string();
-                        if let Some(tx) = self.writeback_sender.get() {
-                            tracing::info!(path=%remote, ?cache_path, "recovering dirty writeback");
-                            // Bug 18: use the named sentinel
-                            // INO_RECOVERY_SENTINEL (= 0) instead of
-                            // the bare `0` literal. The writeback
-                            // completion handler explicitly checks
-                            // this value and skips its inodes mtime
-                            // update — without that branch, an
-                            // `entry(0).and_modify(...)` is a silent
-                            // no-op (ino 0 is reserved; see
-                            // NEXT_INO doc), but the silent no-op
-                            // obscured the intent. The sentinel
-                            // makes the contract grep-able + the
-                            // next stat() from user space refreshes
-                            // mtime from the remote anyway.
-                            // Bug 22: send().ok() previously
-                            // swallowed an Err silently. send
-                            // on an UnboundedSender returns
-                            // Err only when the receiver is
-                            // dropped — which here means the
-                            // writeback worker thread died.
-                            // The .dirty sidecar is still on
-                            // disk, so the next mount's
-                            // recovery scan will try again,
-                            // but an operator watching this
-                            // mount needs to know the worker
-                            // is gone NOW. Log at warn.
-                            if let Err(e) = tx.send(WritebackTask {
-                                ino: INO_RECOVERY_SENTINEL,
-                                remote_path: remote,
-                                cache_path: cache_path.clone(),
-                                retry_cycle: 0,                        // fresh enqueue
-                                per_task_delay: self.write_back_delay, // #202: recovery never immediate
-                            }) {
+                    match std::fs::read_to_string(&p) {
+                        Ok(remote) => {
+                            let remote = remote.trim().to_string();
+                            if let Some(tx) = self.writeback_sender.get() {
+                                tracing::info!(path=%remote, ?cache_path, "recovering dirty writeback");
+                                // Bug 18: use the named sentinel
+                                // INO_RECOVERY_SENTINEL (= 0) instead of
+                                // the bare `0` literal. The writeback
+                                // completion handler explicitly checks
+                                // this value and skips its inodes mtime
+                                // update — without that branch, an
+                                // `entry(0).and_modify(...)` is a silent
+                                // no-op (ino 0 is reserved; see
+                                // NEXT_INO doc), but the silent no-op
+                                // obscured the intent. The sentinel
+                                // makes the contract grep-able + the
+                                // next stat() from user space refreshes
+                                // mtime from the remote anyway.
+                                // Bug 22: send().ok() previously
+                                // swallowed an Err silently. send
+                                // on an UnboundedSender returns
+                                // Err only when the receiver is
+                                // dropped — which here means the
+                                // writeback worker thread died.
+                                // The .dirty sidecar is still on
+                                // disk, so the next mount's
+                                // recovery scan will try again,
+                                // but an operator watching this
+                                // mount needs to know the worker
+                                // is gone NOW. Log at warn.
+                                if let Err(e) = tx.send(WritebackTask {
+                                    ino: INO_RECOVERY_SENTINEL,
+                                    remote_path: remote,
+                                    cache_path: cache_path.clone(),
+                                    retry_cycle: 0, // fresh enqueue
+                                    per_task_delay: self.write_back_delay, // #202: recovery never immediate
+                                }) {
+                                    send_err_count += 1;
+                                    tracing::warn!(
+                                        cache_path=?cache_path,
+                                        error=%e,
+                                        "writeback recovery send failed (worker dropped?); \
+                                         .dirty sidecar kept for next-mount retry"
+                                    );
+                                } else {
+                                    recovered_count += 1;
+                                }
+                            } else {
+                                // writeback_sender.get() returned None:
+                                // spawn() was not called yet (race) or
+                                // it was called twice (Bug 22 already
+                                // covers the dropped-receiver case
+                                // above). This branch indicates the
+                                // worker is gone; treat as send_err.
+                                no_sender_count += 1;
                                 tracing::warn!(
                                     cache_path=?cache_path,
-                                    error=%e,
-                                    "writeback recovery send failed (worker dropped?); \
+                                    "writeback recovery: writeback_sender.get() = None; \
                                      .dirty sidecar kept for next-mount retry"
                                 );
                             }
                         }
+                        Err(e) => {
+                            // Couldn't read the sidecar contents.
+                            // The cache file exists but the sidecar
+                            // is unreadable — leave it in place for
+                            // the operator to inspect.
+                            read_err_count += 1;
+                            tracing::warn!(
+                                sidecar=?p,
+                                error=%e,
+                                "writeback recovery: failed to read dirty sidecar contents"
+                            );
+                        }
                     }
                 }
             }
+        }
+        // Issue #268.4 O25: mount-time recovery summary.
+        // Single info line gives operators the headline counts;
+        // per-sidecar detail is at debug level above.
+        if recovered_count + orphan_count + send_err_count + read_err_count + no_sender_count > 0 {
+            tracing::info!(
+                recovered = recovered_count,
+                orphan_sidecars_removed = orphan_count,
+                send_failed = send_err_count,
+                no_sender = no_sender_count,
+                read_failed = read_err_count,
+                cache_dir = %self.cache_dir.display(),
+                "writeback: recovery scan complete"
+            );
+        } else {
+            tracing::debug!(
+                cache_dir = %self.cache_dir.display(),
+                "writeback: recovery scan complete (no dirty sidecars)"
+            );
         }
     }
 
