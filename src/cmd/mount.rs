@@ -529,22 +529,36 @@ pub fn unmount_internal(mountpoint: &str) -> anyhow::Result<()> {
         }
     }
 
-    // Phase 3: fallback — raw fusermount3 unmount
-    if let Err(e) = crate::cmd::unmount::unmount(mountpoint) {
-        tracing::warn!(mountpoint, error=%e, "regular unmount failed, trying lazy");
-        // Phase 4: lazy unmount fallback
-        let _ = std::process::Command::new("fusermount3")
-            .arg("-u")
-            .arg("-z")
-            .arg(mountpoint)
-            .status()
-            .or_else(|_| {
-                std::process::Command::new("fusermount")
-                    .arg("-u")
-                    .arg("-z")
-                    .arg(mountpoint)
-                    .status()
-            });
+    // Phase 3: Windows uses Win32 (handled inside cmd::unmount::unmount
+    // via the cfg(windows) branch — #249). On Windows there's no lazy
+    // fallback: Win32 errors are propagated so the caller sees a
+    // clear `DefineDosDeviceW failed` / `DeleteVolumeMountPointW
+    // failed` instead of the old silent fusermount3 failure.
+    #[cfg(windows)]
+    {
+        crate::cmd::unmount::unmount(mountpoint)?;
+    }
+
+    // Phase 3 + 4 (Unix): first try regular unmount; on failure, fall
+    // back to lazy (-z) fusermount3 / fusermount.
+    #[cfg(not(windows))]
+    {
+        if let Err(e) = crate::cmd::unmount::unmount(mountpoint) {
+            tracing::warn!(mountpoint, error=%e, "regular unmount failed, trying lazy");
+            // Phase 4: lazy unmount fallback
+            let _ = std::process::Command::new("fusermount3")
+                .arg("-u")
+                .arg("-z")
+                .arg(mountpoint)
+                .status()
+                .or_else(|_| {
+                    std::process::Command::new("fusermount")
+                        .arg("-u")
+                        .arg("-z")
+                        .arg(mountpoint)
+                        .status()
+                });
+        }
     }
     // Wait for mount to disappear from /proc/mounts (up to 5s)
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1308,13 +1322,82 @@ pub fn mount(
     let host: winfsp::host::FileSystemHost<_, winfsp::host::FineGuard> = {
         use crate::core_fs::winfsp::WinFspAdapter;
         use std::sync::Arc;
+        tracing::debug!(mountpoint, "mount(windows): constructing WinFspAdapter");
         let adapter = WinFspAdapter::new(Arc::new(fs));
         let mut vol_params = winfsp::host::VolumeParams::default();
-        vol_params.filesystem_name(volname);
-        let mut host = winfsp::host::FileSystemHost::new(vol_params, adapter)
-            .map_err(|e| anyhow::anyhow!("FileSystemHost::new: {e}"))?;
+        // Match rclone's VolumeParams so Explorer shows free/total space
+        // the same way (rclone mount sets --FileSystemName and a 4096-byte
+        // sector; without sector_size Explorer falls back to 512-byte
+        // sectors and the progress bar disappears for our volume).
+        vol_params
+            .filesystem_name(volname)
+            .sector_size(4096)
+            .sectors_per_allocation_unit(1)
+            .max_component_length(255)
+            .volume_creation_time(0)
+            .volume_serial_number(0)
+            // Issue #249 follow-up: enable the Win32 FS
+            // features that cmd.exe / Explorer expect from a
+            // "real" volume. Without these the kernel returns
+            // errors for many user-mode operations — e.g.
+            // cmd's `echo > V:\foo.txt` redirect fails
+            // because the OS rejects an open with
+            // FILE_NON_DIRECTORY_FILE on a volume that
+            // doesn't claim to support streams, or a
+            // write that needs a default ACL on a volume
+            // that doesn't claim persistent ACLs. The
+            // rclone mount uses the same set.
+            .case_preserved_names(true)
+            .case_sensitive_search(false)
+            .unicode_on_disk(true)
+            .persistent_acls(true)
+            .reparse_points(false)
+            .named_streams(false)
+            .extended_attributes(false)
+            .post_cleanup_when_modified_only(true)
+            .flush_and_purge_on_cleanup(false)
+            .pass_query_directory_pattern(true)
+            .pass_query_directory_filename(false);
+        tracing::debug!(
+            mountpoint,
+            volname,
+            "mount(windows): calling FileSystemHost::new"
+        );
+        // Annotate the type as `FileSystemHost<_, FineGuard>` so the
+        // `start_with_threads` call below resolves to the FineGuard impl
+        // (the CoarseGuard impl has the same signature and is also
+        // visible, so unannotated inference fails with E0034).
+        let mut host: winfsp::host::FileSystemHost<_, winfsp::host::FineGuard> =
+            winfsp::host::FileSystemHost::new(vol_params, adapter)
+                .map_err(|e| anyhow::anyhow!("FileSystemHost::new: {e}"))?;
+        tracing::debug!(
+            mountpoint,
+            "mount(windows): FileSystemHost::new returned; calling host.mount"
+        );
         host.mount(mountpoint)
             .map_err(|e| anyhow::anyhow!("host.mount: {e}"))?;
+        tracing::debug!(
+            mountpoint,
+            "mount(windows): host.mount returned; calling host.start"
+        );
+        // Issue #249 follow-up: winfsp 0.13 split the old
+        // `FspFileSystemStart` step into two — `host.mount` calls
+        // `FspFileSystemSetMountPoint` (registers V: with the WinFSP
+        // driver / volume namespace) and `host.start_with_threads(0)`
+        // calls `FspFileSystemStartDispatcher` (spawns the user-mode
+        // dispatcher threads that service Win32 IRPs by calling back
+        // into `FileSystemContext` methods). Pre-fix the mount code
+        // only called `mount()`, so `fsptool lsvol` showed V:
+        // registered but no IRP ever reached a callback — `dir V:\`,
+        // `Test-Path V:\`, `fsutil fsinfo volumeinfo V:` all hung
+        // forever at the kernel side, because the IRP sat in the
+        // volume queue with no one to handle it.
+        host.start_with_threads(0)
+            .map_err(|e| anyhow::anyhow!("host.start: {e}"))?;
+        tracing::debug!(
+            mountpoint,
+            "mount(windows): host.start returned; volume is live and dispatching"
+        );
         host
     };
 
@@ -1441,8 +1524,15 @@ pub fn mount(
     // FspFileSystemRemoveMountPoint + FspIoqStop in the
     // winfsp crate's Drop impl.
     #[cfg(windows)]
-    while !SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
-        std::thread::sleep(std::time::Duration::from_millis(500));
+    {
+        tracing::debug!(mountpoint, "mount(windows): entering keep-alive loop");
+        while !SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        tracing::debug!(
+            mountpoint,
+            "mount(windows): SHUTDOWN_REQUESTED=true, exiting keep-alive loop"
+        );
     }
 
     // mounts.txt cleanup — applies to all platforms. Was
