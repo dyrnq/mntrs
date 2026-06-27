@@ -1527,6 +1527,16 @@ impl MntrsFs {
                         // Idempotent — the dir is already there.
                     }
                     Err(e) => {
+                        // Issue #268.5 O19: mkdir_chain intermediate
+                        // creation failed. Pre-fix the only signal
+                        // was the propagated io::Error::other; the
+                        // intermediate path + backend kind were lost
+                        // in the `?` chain at the call site.
+                        tracing::warn!(
+                            path = %p,
+                            error = %e,
+                            "mkdir_chain: intermediate create_dir failed (will fail mkdir/create/create_excl)"
+                        );
                         return Err(std::io::Error::other(format!(
                             "create_dir({p}) failed: {e}"
                         )));
@@ -4135,6 +4145,11 @@ impl CoreFilesystem for MntrsFs {
         } else {
             format!("{}/{}", parent_path, name)
         };
+        // Issue #268.5 O19: FUSE create entry. Fires on
+        // every `touch` / `O_CREAT` / `cp -r` step.
+        // **debug** not info — high frequency under shell
+        // scripts. Default RUST_LOG=info must stay quiet.
+        tracing::debug!(path = %full_path, "FUSE create entry");
         // Issue #57: ensure the parent directory exists
         // on hierarchical backends (HDFS, local fs,
         // WebHDFS) before issuing the write. Flat-
@@ -4258,6 +4273,11 @@ impl CoreFilesystem for MntrsFs {
         name: &str,
         _mode: u32,
     ) -> std::io::Result<(CoreFileAttr, u64)> {
+        // Issue #268.5 O19: FUSE create_excl entry. Less
+        // common than create() — fires on O_CREAT|O_EXCL
+        // paths (atomic-create workloads). **debug** still,
+        // matching create() level.
+        tracing::debug!(parent = _parent, name, "FUSE create_excl entry");
         if !self.op.info().full_capability().write_with_if_not_exists {
             // Backend doesn't support atomic create — fall back
             // to the regular `create()` (overwrite semantics).
@@ -4299,6 +4319,17 @@ impl CoreFilesystem for MntrsFs {
                 kind,
                 opendal::ErrorKind::AlreadyExists | opendal::ErrorKind::ConditionNotMatch
             ) || format!("{e}").to_lowercase().contains("exists");
+            if already_exists {
+                // Issue #268.5 O19: EEXIST is the EXPECTED
+                // return path of create_excl on race. Default
+                // RUST_LOG=info must not show it (high volume
+                // under atomic-create benchmarks). **debug**
+                // — the fuser adapter still returns EEXIST to
+                // the caller via the std::io::Error.
+                tracing::debug!(path = %full_path, "create_excl: target exists (EEXIST expected)");
+            } else {
+                tracing::warn!(path = %full_path, error = %e, "create_excl: backend write failed");
+            }
             return Err(if already_exists {
                 std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
@@ -4359,6 +4390,11 @@ impl CoreFilesystem for MntrsFs {
         } else {
             format!("{}/{}", parent_path, name)
         };
+        // Issue #268.5 O19: FUSE mkdir entry. **debug**
+        // not info — `cp -r` and tarballs trigger many
+        // mkdirs in a tight loop. Default RUST_LOG=info
+        // must not show per-file mkdir lines.
+        tracing::debug!(path = %full_path, "FUSE mkdir entry");
         // Recursively create the entire path (parents + leaf).
         // Bug A fix: a single create_dir on "a/b/c/" leaves "a/" and
         // "a/b/" un-created on flat-namespace backends, so subsequent
@@ -4391,6 +4427,14 @@ impl CoreFilesystem for MntrsFs {
                 // Either way, mkdir succeeds.
             }
             Err(e) => {
+                // Issue #268.5 O19: mkdir leaf create_dir failure
+                // (Unsupported / AlreadyExists are silent success —
+                // flat-namespace backends auto-create on write).
+                tracing::warn!(
+                    path = %leaf,
+                    error = %e,
+                    "FUSE mkdir: leaf create_dir failed"
+                );
                 return Err(opendal_to_io_error(&e, "mkdir"));
             }
         }
@@ -4495,6 +4539,11 @@ impl CoreFilesystem for MntrsFs {
         } else {
             format!("{}/{}", parent_path, name)
         };
+        // Issue #268.5 O19: FUSE rmdir entry. rmdir fires
+        // per `rm -rf` step; `cp -r` doesn't trigger it
+        // but shell scripts and uninstall hooks do. **debug**
+        // for entries, **warn** for failures.
+        tracing::debug!(path = %full_path, "FUSE rmdir entry");
         let dir_path = format!("{}/", full_path.trim_end_matches('/'));
         let op = self.op.clone();
         let p = dir_path.clone();
@@ -4503,8 +4552,13 @@ impl CoreFilesystem for MntrsFs {
         // return EEXIST ("EEXIST: directory not empty"); the previous
         // blanket EIO left rm -rf in an undefined state on such
         // backends (some pre-check emptyness, some don't).
-        rt().block_on(async move { op.delete(&p).await })
-            .map_err(|e| opendal_to_io_error(&e, "rmdir"))?;
+        if let Err(e) = rt()
+            .block_on(async move { op.delete(&p).await })
+            .map_err(|e| opendal_to_io_error(&e, "rmdir"))
+        {
+            tracing::warn!(path = %dir_path, error = %e, "FUSE rmdir: backend delete failed");
+            return Err(e);
+        }
         // Bug E fix: inodes keyed by NEXT_INO, not path_hash.
         if let Some(ino) = self.find_ino_by_path(&full_path) {
             self.inodes.remove(&ino);
