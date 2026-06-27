@@ -149,6 +149,19 @@ pub(crate) struct DiskWriteJob {
 pub(crate) static PATH_CACHE_GEN: once_cell::sync::Lazy<dashmap::DashMap<String, u64>> =
     once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
+/// Test-only mutex guarding all access to `PATH_CACHE_GEN`.
+///
+/// `PATH_CACHE_GEN` is a per-process static shared across every
+/// test in the binary. The `path_cache_gen_capped` test mutates
+/// the table (clears it, lowers the cap) which races with the
+/// other 69 tests in `core_fs_unit_test`, causing occasional
+/// `append_to_pre_existing_file_after_read` (#128) failures when
+/// an in-flight bump sees a mid-test table state. The fix is to
+/// serialize *all* accesses via this mutex for `#[cfg(test)]`
+/// builds only — prod builds pay no cost.
+#[cfg(test)]
+pub(crate) static PATH_CACHE_GEN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Hard cap on `PATH_CACHE_GEN` entries (issue #161).
 ///
 /// Each entry is `String + u64` ≈ 50 B. At 1M distinct written paths
@@ -180,6 +193,14 @@ pub(crate) fn path_cache_gen_cap_for_test() -> usize {
 
 /// Read the current cache generation for `path` (0 if unseen).
 pub(crate) fn path_cache_gen(path: &str) -> u64 {
+    #[cfg(test)]
+    let _guard = PATH_CACHE_GEN_TEST_LOCK.lock().unwrap();
+    path_cache_gen_locked(path)
+}
+
+/// Internal: read the current cache generation. Caller must hold
+/// `PATH_CACHE_GEN_TEST_LOCK` in test builds.
+fn path_cache_gen_locked(path: &str) -> u64 {
     PATH_CACHE_GEN.get(path).map(|g| *g).unwrap_or(0)
 }
 
@@ -187,6 +208,18 @@ pub(crate) fn path_cache_gen(path: &str) -> u64 {
 /// writes captured against an older gen). Called by the write path's
 /// L2 invalidate.
 pub(crate) fn bump_path_cache_gen(path: &str) {
+    // Test-only serialization: see PATH_CACHE_GEN_TEST_LOCK. The
+    // lock is held across the cap check + insert so the
+    // `path_cache_gen_capped` test cannot tear the table mid-bump
+    // for other parallel tests.
+    #[cfg(test)]
+    let _guard = PATH_CACHE_GEN_TEST_LOCK.lock().unwrap();
+    bump_path_cache_gen_locked(path);
+}
+
+/// Internal: bump the cache generation. Caller must hold
+/// `PATH_CACHE_GEN_TEST_LOCK` in test builds.
+fn bump_path_cache_gen_locked(path: &str) {
     // Fast path: if the entry already exists or we're under the
     // cap, just bump. The cap check uses `.len()` which is O(1)
     // on DashMap.
@@ -983,42 +1016,67 @@ mod tests {
     // drops the whole table on overflow; in-flight pool jobs
     // captured against old gens all skip once (transient
     // cache-miss burst), then the table rebuilds.
+    //
+    // Test isolation: `PATH_CACHE_GEN` is a per-process static
+    // shared across every test in this binary. This test mutates
+    // the cap and clears the table — that races with the other
+    // tests, causing occasional
+    // `append_to_pre_existing_file_after_read` (#128) failures
+    // when an in-flight bump sees a mid-test table state. We
+    // hold `PATH_CACHE_GEN_TEST_LOCK` for the *entire* test body
+    // (not just per-call) to fully serialize against parallel
+    // tests. Cap is restored via a Drop guard so a panic in the
+    // middle still leaves a clean state. Because the lock is
+    // non-reentrant, the test must call the `_locked` variants
+    // directly instead of `bump_path_cache_gen` /
+    // `path_cache_gen` (which would deadlock).
+    struct CapGuard {
+        saved_cap: usize,
+    }
+    impl Drop for CapGuard {
+        fn drop(&mut self) {
+            set_path_cache_gen_cap_for_test(self.saved_cap);
+            PATH_CACHE_GEN.clear();
+        }
+    }
     #[test]
     fn path_cache_gen_capped() {
-        // Start clean.
+        // Hold the global lock for the entire test body. Other
+        // tests reading/bumping PATH_CACHE_GEN will block until
+        // this test finishes, eliminating the data race.
+        let _lock = PATH_CACHE_GEN_TEST_LOCK.lock().unwrap();
+        let _cap_guard = CapGuard {
+            saved_cap: path_cache_gen_cap_for_test(),
+        };
         PATH_CACHE_GEN.clear();
-        // Lower the cap to a value we can actually hit in a test.
-        let saved_cap = path_cache_gen_cap_for_test();
         set_path_cache_gen_cap_for_test(10);
         // Insert 10 distinct paths — at the cap, len == cap, so
         // the next bump triggers the clear path.
         for i in 0..10 {
             let p = format!("/test/path-{}", i);
-            bump_path_cache_gen(&p);
+            bump_path_cache_gen_locked(&p);
         }
         assert_eq!(PATH_CACHE_GEN.len(), 10);
         // The 11th bump triggers the cap-clear path. After
         // clear + re-insert, the table has 1 entry.
-        bump_path_cache_gen("/test/path-overflow");
+        bump_path_cache_gen_locked("/test/path-overflow");
         assert_eq!(PATH_CACHE_GEN.len(), 1);
         // The cleared paths are gone (gen 0 for them).
         for i in 0..10 {
             let p = format!("/test/path-{}", i);
             assert_eq!(
-                path_cache_gen(&p),
+                path_cache_gen_locked(&p),
                 0,
                 "old path gen should reset after clear"
             );
         }
         // The overflow path is recorded as gen 1.
-        assert_eq!(path_cache_gen("/test/path-overflow"), 1);
+        assert_eq!(path_cache_gen_locked("/test/path-overflow"), 1);
         // Bumping the same path under cap → monotonic, no clear.
         for _ in 0..3 {
-            bump_path_cache_gen("/test/path-overflow");
+            bump_path_cache_gen_locked("/test/path-overflow");
         }
-        assert_eq!(path_cache_gen("/test/path-overflow"), 4);
+        assert_eq!(path_cache_gen_locked("/test/path-overflow"), 4);
         assert_eq!(PATH_CACHE_GEN.len(), 1);
-        // Restore the cap so other tests see the production value.
-        set_path_cache_gen_cap_for_test(saved_cap);
     }
 }
