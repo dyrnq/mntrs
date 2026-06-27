@@ -796,6 +796,32 @@ pub fn mount(
         elapsed_ms = _t_mount.elapsed().as_millis() as u64,
         "mount: after mem_cache creation"
     );
+    // Issue #268.2 O13: surface effective config at
+    // startup. Pre-fix operators had to grep --help to
+    // see what defaults were applied; with 50+ knobs
+    // and many XDG/HOME fallbacks, the "what is the
+    // daemon actually doing" question took 10 min to
+    // answer on first incident. One info line at
+    // mount startup answers it immediately.
+    //
+    // Level: info (not debug) so it appears in
+    // RUST_LOG=info. Stripped on `mount --daemon`
+    // for parity with `mntrs mount` foreground output.
+    tracing::info!(
+        storage_url = %storage_url,
+        mountpoint = %mountpoint,
+        volname = %volname,
+        read_only,
+        vfs_cache_max_size,
+        mem_limit_mb = mem_limit / 1024 / 1024,
+        dir_cache_time,
+        attr_timeout,
+        stat_cache_ttl,
+        vfs_write_back,
+        writeback_immediate_threshold,
+        vfs_read_stale_on_backend_error,
+        "mount: starting with effective config"
+    );
     // Issue #128: the L2 block-cache index MUST be the same Arc
     // shared by `MntrsFs.disk_cache_index` (where the read path's
     // step6 inserts block entries) and `MultiLevelCache`'s

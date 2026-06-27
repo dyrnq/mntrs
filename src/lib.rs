@@ -2105,6 +2105,15 @@ impl CoreFilesystem for MntrsFs {
     }
 
     fn access(&self, _ino: u64, _mask: u32) -> std::io::Result<()> {
+        // Issue #268.2 O11: trace-level entry log so
+        // operators can correlate EACCES ("--default-permissions")
+        // with mount state. The default impl is permissive
+        // (always Ok); this log only fires when the kernel
+        // actually calls us (i.e. when default_permissions
+        // or root_squash is in effect). trace level keeps
+        // it out of RUST_LOG=info default — operators
+        // enabling it explicitly know what they want.
+        tracing::trace!(ino = _ino, mask = _mask, "FUSE access entry");
         Ok(())
     }
 
@@ -2493,18 +2502,32 @@ impl CoreFilesystem for MntrsFs {
                             // holds a writable handle; the set_len() call below
                             // is the actual side effect — we don't write any
                             // bytes here, only shrink/grow the file size to
-                            // match the truncate request. The `let _ =`
-                            // discards any IO error (file vanished between
-                            // exists() and open(), permissions, etc.) —
-                            // truncation is best-effort: a partial truncation
-                            // would leave the cache file slightly larger than
-                            // logical size, which the read path already
-                            // tolerates by using the smaller of cache and
-                            // inodes size.
-                            let _ = std::fs::OpenOptions::new()
+                            // match the truncate request.
+                            //
+                            // Issue #268.2 O10: surface truncation
+                            // failures. Pre-fix the `let _ =` was
+                            // silent — if open() or set_len() failed
+                            // (file vanished between exists() and
+                            // open(), EACCES on a readonly cache, FS
+                            // error), the cache file stayed at the old
+                            // size. Read path tolerates a slightly
+                            // larger cache file (uses min of cache
+                            // and inodes size) but not a stale
+                            // over-size for a *truncate-to-smaller*
+                            // case. Warn so operators see "cache may
+                            // be stale" rather than a silent mismatch.
+                            if let Err(e) = std::fs::OpenOptions::new()
                                 .write(true)
                                 .open(&cpath)
-                                .map(|f| f.set_len(s));
+                                .and_then(|f| f.set_len(s))
+                            {
+                                tracing::warn!(
+                                    path = %cpath.display(),
+                                    requested_size = s,
+                                    error = %e,
+                                    "setattr: path-based truncate failed; cache may be stale"
+                                );
+                            }
                         }
                     }
                 } // close if user_initiated_truncate
@@ -3428,13 +3451,29 @@ impl CoreFilesystem for MntrsFs {
                     // SQLite / etcd / RocksDB writes hit S3
                     // before the next flush, not 5s after.
                     let delay = self.per_task_writeback_delay(_ino);
-                    let _ = tx.send(WritebackTask {
+                    // Issue #268.2 O9: symmetry with the
+                    // flush/release handlers at L3733/L3902.
+                    // Pre-fix this `let _ =` was silent —
+                    // worker death silently dropped the
+                    // writeback, and the .dirty sidecar only
+                    // got recovered on next mount. Warn so
+                    // operators can correlate "write returned
+                    // Ok but data didn't upload" with worker
+                    // shutdown.
+                    if let Err(e) = tx.send(WritebackTask {
                         ino: _ino,
                         remote_path: path.clone(),
                         cache_path: cpath,
                         retry_cycle: 0,
                         per_task_delay: delay,
-                    });
+                    }) {
+                        tracing::warn!(
+                            path = %path,
+                            error = %e,
+                            "write: writeback enqueue failed; \
+                             .dirty sidecar will recover on next mount"
+                        );
+                    }
                 }
             }
         }

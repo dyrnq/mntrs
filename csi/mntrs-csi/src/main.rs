@@ -855,8 +855,25 @@ impl node_server::Node for NodeService {
         // Stat errors propagate as Status::internal so
         // kubelet records the cause rather than seeing
         // a silent zero.
-        let stat = rustix::fs::statvfs(target_path.as_str())
-            .map_err(|e| Status::internal(format!("statvfs({target_path}): {e}")))?;
+        //
+        // Issue #268.2 O12: surface statvfs failure on
+        // the daemon side too. Pre-fix only the gRPC
+        // Status::internal was logged (via the
+        // grpc-tonic layer); the daemon process itself
+        // was silent, so a kubelet retry loop showed
+        // "Error: Internal statvfs..." with no
+        // daemon-side breadcrumb to chase. Warn-level
+        // so flapping ENOENT (e.g. mid-unmount) shows
+        // up at default RUST_LOG=info.
+        let stat = rustix::fs::statvfs(target_path.as_str()).map_err(|e| {
+            tracing::warn!(
+                target = %target_path,
+                volume_id = %req.volume_id,
+                error = %e,
+                "node_get_volume_stats: statvfs failed"
+            );
+            Status::internal(format!("statvfs({target_path}): {e}"))
+        })?;
 
         let block_size = stat.f_frsize;
         let total_bytes = stat.f_blocks.saturating_mul(block_size) as i64;
