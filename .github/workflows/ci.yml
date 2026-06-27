@@ -54,7 +54,7 @@ jobs:
         run: |
           tar czf /tmp/target-debug.tar.gz -C target/debug \
             .fingerprint deps build mntrs mntrs-csi \
-            core_fs_unit_test fuse_integration_test \
+            core_fs_unit_test platform_linux_fuse_integration_test \
             libmntrs*.rlib libmntrs*.so libmntrs*.d \
             2>/dev/null || echo "(partial tar — ok for incremental)"
       - name: Upload target/debug
@@ -68,7 +68,7 @@ jobs:
         run: |
           tar czf /tmp/target-release.tar.gz -C target/release \
             .fingerprint deps build mntrs mntrs-csi \
-            hdfs_integration_test core_fs_unit_test fuse_integration_test \
+            hdfs_integration_test core_fs_unit_test platform_linux_fuse_integration_test \
             libmntrs*.rlib libmntrs*.so libmntrs*.d \
             2>/dev/null || echo "(partial tar — ok for incremental)"
       - name: Upload target/release
