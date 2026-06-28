@@ -17,12 +17,22 @@ pub fn unmount(target: &str) -> Result<()> {
         if mounts.is_empty() {
             return Err(anyhow!("no mntrs mounts found"));
         }
+        // Issue #315: collect per-mount errors instead of swallowing
+        // them into tracing::debug!. Pre-fix, a half-failed `unmount
+        // all` (e.g. 1 stale entry + 1 live one) returned Ok(()) —
+        // scripts that piped the output to a state-check thought
+        // everything succeeded and proceeded to remount, hitting
+        // "device busy" downstream. Now: each failure is appended
+        // with its mountpoint + error message, all are eprintln'd at
+        // the end, and the function returns Err if any failed.
+        let mut failures: Vec<String> = Vec::new();
         for m in &mounts {
             let mountpoint = &m.mountpoint;
             eprintln!("unmounting {mountpoint}");
             tracing::debug!(mountpoint, "unmount: 'all' branch -> fuse_unmount");
             if let Err(e) = fuse_unmount(mountpoint) {
-                tracing::debug!(error=%e, mountpoint, "unmount all skip failed");
+                tracing::debug!(error=%e, mountpoint, "unmount all per-mount failed");
+                failures.push(format!("{mountpoint}: {e}"));
             }
         }
         // Issue #261.4: same path as mount.rs uses for the db.
@@ -30,6 +40,21 @@ pub fn unmount(target: &str) -> Result<()> {
         tracing::debug!(db, "unmount: 'all' branch -> remove mounts db");
         if let Err(e) = fs::remove_file(&db) {
             tracing::debug!(error=%e, db, "unmount all db remove failed");
+            // db removal failure is a separate concern from per-mount
+            // failures — surface it as its own message so the user
+            // doesn't think their mounts are still tracked after the
+            // explicit `unmount all` removed them.
+            failures.push(format!("mounts db {db}: {e}"));
+        }
+        if !failures.is_empty() {
+            for f in &failures {
+                eprintln!("error: {f}");
+            }
+            return Err(anyhow!(
+                "unmount all: {} mount(s) failed: {}",
+                failures.len(),
+                failures.join("; ")
+            ));
         }
         return Ok(());
     }
@@ -39,6 +64,19 @@ pub fn unmount(target: &str) -> Result<()> {
     // which blocks on WinFSP's volume ready-handshake (observed in #249 e2e:
     // hangs for ~60s then returns false even when V: is mounted). Detect the
     // drive-letter form FIRST so we never pay that cost.
+    //
+    // Issue #315: idempotent contract — if the target is not a known
+    // mountpoint (drive letter absent, path doesn't exist, and no entry
+    // in the mounts db for the storage URL), treat that as Ok with a
+    // debug log instead of Err. This mirrors the existing in-fuse_unmount
+    // handling for "drive letter already absent" (line 219-221 area) and
+    // the inner ERROR_FILE_NOT_FOUND path on Windows. Scripts can chain
+    // `mntrs unmount X && mount-another X` without first having to verify
+    // X is currently mounted — matches `umount` on Linux / `diskpart
+    // remove` on Windows in spirit (both succeed when the target is
+    // already gone). Pre-fix, `mntrs unmount /nonexistent` returned
+    // Err("mount point '...' does not exist") which broke any `unmount
+    // && remount` script in idempotency-sensitive contexts.
     #[cfg(windows)]
     let mountpoint: String = {
         if is_drive_letter(target) {
@@ -52,7 +90,11 @@ pub fn unmount(target: &str) -> Result<()> {
         } else if let Some(m) = mounts.iter().find(|m| m.storage == target) {
             m.mountpoint.clone()
         } else {
-            return Err(anyhow!("mount point '{}' does not exist", target));
+            tracing::debug!(
+                target,
+                "unmount: target not a drive letter, not on disk, not in mounts db; idempotent Ok"
+            );
+            return Ok(());
         }
     };
     #[cfg(not(windows))]
@@ -62,7 +104,11 @@ pub fn unmount(target: &str) -> Result<()> {
         } else if let Some(m) = mounts.iter().find(|m| m.storage == target) {
             m.mountpoint.clone()
         } else {
-            return Err(anyhow!("mount point '{}' does not exist", target));
+            tracing::debug!(
+                target,
+                "unmount: target not on disk, not in mounts db; idempotent Ok"
+            );
+            return Ok(());
         }
     };
 
@@ -120,9 +166,8 @@ fn fuse_unmount(mountpoint: &str) -> Result<()> {
 ///     backslash required.
 ///
 /// Win32 error codes that mean "already gone" are surfaced as
-/// `tracing::debug!` (signal/exit may have torn it down between our
-/// stat and our API call — not a real failure). `ERROR_ACCESS_DENIED`
-/// (5) is logged as a debug event too: see R1 caveat below.
+/// `tracing::debug!` and Ok (signal/exit may have torn it down
+/// between our stat and our API call — not a real failure).
 ///
 /// **Caveat (R1):** the DOS device is owned by the *mount* process.
 /// `mntrs unmount` from a different process will get
@@ -130,6 +175,16 @@ fn fuse_unmount(mountpoint: &str) -> Result<()> {
 /// cross-process unmount fix (mount process listens for an unmount
 /// signal and calls `FspFileSystemRemoveMountPoint` itself) is
 /// tracked separately.
+///
+/// Issue #315: the R1 access-denied path is now treated as a USER
+/// ERROR rather than silent success. Pre-fix we logged
+/// `tracing::debug!` and returned Ok(()) — scripts that chained
+/// `mntrs unmount V: && mount-another V:` raced silently: the
+/// `&&` branch ran because unmount succeeded, but V: was still
+/// owned by the original mount process, so the second mount failed
+/// downstream with no actionable diagnostic. Now we eprintln! a
+/// warning naming the owning PID (looked up from the mounts db) and
+/// return Err so the script's `&&` short-circuits correctly.
 #[cfg(windows)]
 fn fuse_unmount(mountpoint: &str) -> Result<()> {
     use windows::Win32::Storage::FileSystem::{
@@ -168,21 +223,48 @@ fn fuse_unmount(mountpoint: &str) -> Result<()> {
             Err(e) => {
                 let code = e.code().0;
                 // 2 = ERROR_FILE_NOT_FOUND (drive letter isn't
-                // registered — already gone); 5 / 0x80070005 =
-                // ERROR_ACCESS_DENIED (R1: mount process still owns
-                // the DOS device — caller must stop it before
-                // retrying).
-                if code == 2 || code == 5 || code == (0x80070005_u32 as i32) {
-                    if code == 2 {
-                        tracing::debug!(mountpoint, "drive letter already absent");
+                // registered — already gone — idempotent Ok).
+                if code == 2 {
+                    tracing::debug!(mountpoint, "drive letter already absent");
+                    return Ok(());
+                }
+                // 5 / 0x80070005 = ERROR_ACCESS_DENIED (R1: another
+                // mntrs process owns the DOS device). Surface to the
+                // user as an actionable error rather than silently
+                // succeeding — pre-fix this was tracing::debug! +
+                // Ok(()) which made scripts that chained
+                // `unmount V: && mount-another V:` race silently.
+                if code == 5 || code == (0x80070005_u32 as i32) {
+                    // Look up the owning PID from the mounts db —
+                    // the entry was written by the mount process with
+                    // std::process::id() at record_mount time. Empty
+                    // PID means the writer crashed before capturing
+                    // it (Bug 23 path); fall back to a PID-less
+                    // warning rather than fabricating one.
+                    let owner_pid = crate::cmd::mount::read_mounts()
+                        .iter()
+                        .find(|m| m.mountpoint.eq_ignore_ascii_case(&name))
+                        .map(|m| m.pid.clone())
+                        .unwrap_or_default();
+                    if owner_pid.is_empty() {
+                        eprintln!(
+                            "warning: {mountpoint} is owned by another mntrs process; \
+                             stop it and retry (no PID recorded in mounts db)"
+                        );
                     } else {
-                        tracing::debug!(
-                            mountpoint,
-                            win32_err = code,
-                            "drive letter owned by another process; stop the mntrs mount process and retry"
+                        eprintln!(
+                            "warning: {mountpoint} is owned by another mntrs process (pid {owner_pid}); \
+                             stop it (e.g. `taskkill /F /PID {owner_pid}`) and retry"
                         );
                     }
-                    return Ok(());
+                    return Err(anyhow!(
+                        "{mountpoint} is owned by another mntrs process (pid {})",
+                        if owner_pid.is_empty() {
+                            "<unknown>".to_string()
+                        } else {
+                            owner_pid
+                        }
+                    ));
                 }
                 return Err(anyhow!(
                     "DefineDosDeviceW failed for {mountpoint} (win32 err = {code})"
@@ -274,5 +356,29 @@ mod tests {
         assert!(!is_drive_letter("C:\\mnt\\s3"));
         assert!(!is_drive_letter("X:\\\\"));
         assert!(!is_drive_letter("X:/"));
+    }
+
+    /// #315 idempotent contract: `unmount` on a target that is
+    /// not a drive letter, not on disk, and not in the mounts db
+    /// must return Ok (matches `umount` on Linux / `diskpart remove`
+    /// on Windows). Pre-fix this returned Err("mount point ... does
+    /// not exist"), breaking any `unmount && remount` script.
+    ///
+    /// The unique 39-char prefix `/_mntrs_idem_315_test_unique_X`
+    /// makes the test independent of the developer's real mounts db:
+    /// it's a path that's never a drive letter, never on disk, never
+    /// the storage URL of a real mount, but also unique enough to
+    /// survive a stray leftover from a prior failed test run.
+    #[test]
+    fn unmount_nonexistent_target_is_idempotent_ok() {
+        let target = "Z:\\__mntrs_idem_315_test_unique_unlikely_path__\\foo";
+        // Drive-letter shortcut branch: Z:\foo\... is NOT a drive
+        // letter (it has more than 3 chars), so we fall through to
+        // Path::exists -> mounts.db lookup -> Ok. Verify Ok.
+        let r = super::unmount(target);
+        assert!(
+            r.is_ok(),
+            "expected idempotent Ok for nonexistent target, got: {r:?}"
+        );
     }
 }
