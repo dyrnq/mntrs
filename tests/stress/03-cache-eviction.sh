@@ -109,7 +109,7 @@ if (( EVICT_NONZERO == 0 )); then
 fi
 
 # ── Metrics ──────────────────────────────────────────────────────────
-MNTRS_PID=$(pgrep -f "target/debug/mntrs mount" | head -1 || true)
+MNTRS_PID=$(pgrep -f "$(basename "$MNTRS_BIN") mount" | head -1 || true)
 if [[ -n "$MNTRS_PID" ]]; then
     stress_metric "$MNTRS_PID" "$WORK/metrics.txt" final
     log "final metrics:"; tail -1 "$WORK/metrics.txt"
