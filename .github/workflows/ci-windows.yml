@@ -33,10 +33,20 @@ jobs:
       # unpinned (split into two choco invocations because
       # --version= applies to every package in a single command
       # and 2.1.25156 is not a valid protoc release).
+      #
+      # --params='LongPathSupport=true' enables NTFS Long Paths
+      # (HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\
+      # LongPathsEnabled = 1) so any future sub-test that builds
+      # a >260-char path under ${{ runner.temp }} does not hit
+      # MAX_PATH and return ERROR_FILENAME_EXCED_RANGE. Today's
+      # e2e paths are all well under 260 chars, so this is a
+      # forward-only guard — keeps deep-nested dir-cache tests
+      # future-proof without a separate choco follow-up.
+      # Issue #316a (sub-item 1).
       - name: Install WinFSP + protoc
         shell: pwsh
         run: |
-          choco install -y winfsp --version=2.1.25156
+          choco install -y winfsp --version=2.1.25156 --params='LongPathSupport=true'
           choco install -y protoc
 
       - name: Format check
@@ -70,11 +80,19 @@ jobs:
         shell: pwsh
         run: |
           . tests/e2e/common/mount-test.ps1
+          # Issue #316a: -DispatcherThreads 4 plumbs through to
+          # `mntrs mount --winfsp-dispatcher-threads 4`, which
+          # calls host.start_with_threads(4) instead of the
+          # hardcoded 0 (driver default 8). Sub-test 9 then runs
+          # 3 parallel Get-Content against the same file to
+          # verify a pinned small dispatcher pool still serves
+          # concurrent IRPs correctly.
           Mount-Test -Backend memory `
                      -Storage memory:// `
                      -MountPath V: `
                      -LogPath "${{ runner.temp }}\mntrs-mount-memory.log" `
-                     -Profile release
+                     -Profile release `
+                     -DispatcherThreads 4
 
       - name: Upload mount log (failure)
         if: failure()
