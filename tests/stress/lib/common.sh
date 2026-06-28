@@ -93,7 +93,8 @@ mntrs_mount() {
 
     # Always allow_other so stress scripts run as root or any user.
     # --vfs-cache-mode full: writeback enabled (so tests 04/05 actually exercise upload).
-    # --vfs-write-back 1:    1s cooldown so tests don't have to wait 5s for upload.
+    # --vfs-write-back: overridable via env (default 1s; 05-crash-recovery sets 30).
+    #   Tests must NOT pass --vfs-write-back in "$@" again (clap rejects duplicate).
     "$MNTRS_BIN" mount \
         "memory:///" \
         "$mnt" \
@@ -101,20 +102,32 @@ mntrs_mount() {
         --allow-other \
         --cache-dir "$cache_dir" \
         --vfs-cache-mode full \
-        --vfs-write-back 1 \
+        --vfs-write-back "${STRESS_VFS_WRITE_BACK:-1}" \
         "$@" \
         > "$cache_dir/mount.log" 2>&1 \
         || { cat "$cache_dir/mount.log"; fail "mntrs mount failed for $mnt"; }
 
     # Daemonize may race with FUSE readiness in some kernels.
     # Wait for the mountpoint to actually serve stat() (max 5s).
-    local i
+    local i ready=0
     # shellcheck disable=SC2034  # loop counter
     for i in $(seq 1 50); do
-        if stat -f "$mnt" >/dev/null 2>&1; then return 0; fi
+        if stat -f "$mnt" >/dev/null 2>&1; then ready=1; break; fi
         sleep 0.1
     done
-    fail "mount $mnt never became ready (see $cache_dir/mount.log)"
+    if (( ready == 0 )); then
+        log "mount.log tail after 5s stat timeout:"
+        tail -30 "$cache_dir/mount.log" || true
+        fail "mount $mnt never became ready (see $cache_dir/mount.log)"
+    fi
+    # Even if stat succeeded, the daemon could have died immediately
+    # after the kernel accepted the mount (e.g. FUSE session abort).
+    # Check via pgrep on the basename so we don't depend on build path.
+    if ! pgrep -f "$(basename "$MNTRS_BIN") mount memory" >/dev/null 2>&1; then
+        log "mount.log tail after stat-success-without-daemon:"
+        tail -30 "$cache_dir/mount.log" || true
+        fail "mntrs daemon died after mount (stat succeeded but pid gone)"
+    fi
 }
 
 mntrs_unmount() {
