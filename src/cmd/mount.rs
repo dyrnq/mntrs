@@ -1525,31 +1525,31 @@ pub fn mount(
     // The re-exec'd daemon path skips it entirely (parent closed its w_fd
     // before fork and we already closed ours at line 1370).
     #[cfg(not(windows))]
-    if let Some((r, w)) = wait_pipe {
-        if std::env::var_os("MNTRS_INTERNAL_DAEMON").is_none() {
-            unsafe {
-                rustix::io::close(w);
-            }
-            if daemon_wait {
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(_daemon_timeout);
-                while std::time::Instant::now() < deadline {
-                    let mut pfd = libc::pollfd {
-                        fd: r,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    let ms = (deadline - std::time::Instant::now()).as_millis().min(100) as i32;
-                    if unsafe { libc::poll(&mut pfd, 1, ms) } > 0
-                        && pfd.revents & (libc::POLLIN | libc::POLLHUP) != 0
-                    {
-                        break;
-                    }
+    if let Some((r, w)) = wait_pipe
+        && std::env::var_os("MNTRS_INTERNAL_DAEMON").is_none()
+    {
+        unsafe {
+            rustix::io::close(w);
+        }
+        if daemon_wait {
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(_daemon_timeout);
+            while std::time::Instant::now() < deadline {
+                let mut pfd = libc::pollfd {
+                    fd: r,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ms = (deadline - std::time::Instant::now()).as_millis().min(100) as i32;
+                if unsafe { libc::poll(&mut pfd, 1, ms) } > 0
+                    && pfd.revents & (libc::POLLIN | libc::POLLHUP) != 0
+                {
+                    break;
                 }
             }
-            unsafe {
-                rustix::io::close(r);
-            }
+        }
+        unsafe {
+            rustix::io::close(r);
         }
     }
 
