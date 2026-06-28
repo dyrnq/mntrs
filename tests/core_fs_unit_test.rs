@@ -391,6 +391,20 @@ fn append_to_pre_existing_file_after_read() {
     fs.flush(attr.ino, wh).unwrap();
     fs.release(attr.ino, wh).unwrap();
 
+    // flush + release queue an async writeback to the backend.
+    // read2 must observe the appended content, which requires
+    // either the cache file to still hold it OR the writeback
+    // to have landed. Under heavy parallel test load the shared
+    // writeback worker pool can starve this 5-byte task for
+    // long enough that read2 falls through to the backend and
+    // sees the pre-append bytes. Yield a few times to let the
+    // tokio runtime drain the queue. (The pool uses opendal's
+    // in-memory backend so the upload itself is microseconds;
+    // the only wait is the worker thread picking the task off
+    // the DelayQueue.) 50ms is generous; in practice it lands
+    // in <1ms.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
     // read2 via a fresh read handle: must reflect the append.
     let rd2 = fs.open(attr.ino, 0).unwrap();
     let got = fs.read(attr.ino, rd2, 0, 13).unwrap();

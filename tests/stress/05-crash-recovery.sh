@@ -29,9 +29,10 @@ mkdir -p "$WORK"
 
 # Mount with a 30s write-back delay so we have a wide window to kill
 # the daemon while the upload is still pending. (default 1s would race
-# with the file-creation latency.)
-mntrs_mount "$MNT" "$CACHE" --vfs-write-back 30
-trap 'mntrs_unmount "$MNT" 2>/dev/null || true; pkill -9 -f "target/debug/mntrs mount" 2>/dev/null || true' EXIT
+# with the file-creation latency.) common.sh hardcodes the default to 1;
+# override via env so the option is only specified once (clap rejects dup).
+STRESS_VFS_WRITE_BACK=30 mntrs_mount "$MNT" "$CACHE"
+trap 'mntrs_unmount "$MNT" 2>/dev/null || true; pkill -9 -f "$(basename "$MNTRS_BIN") mount" 2>/dev/null || true' EXIT
 
 # ── Write a file (creates .dirty sidecar immediately) ──────────────
 FNAME="$MNT/recovered.bin"
@@ -53,7 +54,7 @@ EXPECTED_MD5_2=$(md5sum "$MNT/recovered2.bin" | awk '{print $1}')
 
 # ── SIGKILL the mntrs daemon ────────────────────────────────────────
 log "SIGKILL-ing mntrs daemon ..."
-MNTRS_PID=$(pgrep -f "target/debug/mntrs mount memory" | head -1 || true)
+MNTRS_PID=$(pgrep -f "$(basename "$MNTRS_BIN") mount memory" | head -1 || true)
 if [[ -z "$MNTRS_PID" ]]; then
     fail "couldn't find mntrs pid"
 fi
@@ -69,7 +70,7 @@ assert_eq "$DIRTY_AFTER" "$DIRTY_FILES" "all .dirty sidecars survived crash"
 
 # ── Remount and verify the recovery path picked them up ─────────────
 log "remounting to trigger recovery ..."
-mntrs_mount "$MNT" "$CACHE" --vfs-write-back 30
+STRESS_VFS_WRITE_BACK=30 mntrs_mount "$MNT" "$CACHE"
 
 # Allow recovery to upload the dirty files (write-back delay = 30s).
 log "waiting for recovery upload ..."
@@ -99,7 +100,7 @@ assert_eq "$GOT_MD5_1" "$EXPECTED_MD5_1" "recovered.bin md5"
 assert_eq "$GOT_MD5_2" "$EXPECTED_MD5_2" "recovered2.bin md5"
 
 # ── Final metrics ───────────────────────────────────────────────────
-MNTRS_PID=$(pgrep -f "target/debug/mntrs mount" | head -1 || true)
+MNTRS_PID=$(pgrep -f "$(basename "$MNTRS_BIN") mount" | head -1 || true)
 if [[ -n "$MNTRS_PID" ]]; then
     stress_metric "$MNTRS_PID" "$WORK/metrics.txt" final
     log "final metrics:"; tail -1 "$WORK/metrics.txt"

@@ -32,7 +32,7 @@ mkdir -p "$WORK"
 log "scratch: $WORK"
 
 mntrs_mount "$MNT" "$CACHE"
-trap 'mntrs_unmount "$MNT"; tail -50 "$LOG" || true' EXIT
+trap 'mntrs_unmount "$MNT" 2>/dev/null || true; tail -50 "$CACHE/mount.log" 2>/dev/null || true' EXIT
 
 # ── Create files ─────────────────────────────────────────────────────
 log "creating $STRESS_FILES files ..."
@@ -84,7 +84,7 @@ assert_eq "$MD5_COUNT" "$STRESS_FILES" "md5sum line count"
 
 # ── Final metrics ────────────────────────────────────────────────────
 # mntrs daemon PID is the only mntrs process
-MNTRS_PID=$(pgrep -f "target/debug/mntrs mount" | head -1 || true)
+MNTRS_PID=$(pgrep -f "$(basename "$MNTRS_BIN") mount" | head -1 || true)
 if [[ -n "$MNTRS_PID" ]]; then
     stress_metric "$MNTRS_PID" "$WORK/metrics.txt" final
     log "final metrics:"; tail -1 "$WORK/metrics.txt"

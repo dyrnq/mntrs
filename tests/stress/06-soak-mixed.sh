@@ -46,7 +46,7 @@ mntrs_mount "$MNT" "$CACHE" \
     --mem-cache-metrics-interval 5
 trap 'mntrs_unmount "$MNT"' EXIT
 
-MNTRS_PID=$(pgrep -f "target/debug/mntrs mount memory" | head -1 || true)
+MNTRS_PID=$(pgrep -f "$(basename "$MNTRS_BIN") mount memory" | head -1 || true)
 if [[ -z "$MNTRS_PID" ]]; then
     fail "couldn't find mntrs pid"
 fi

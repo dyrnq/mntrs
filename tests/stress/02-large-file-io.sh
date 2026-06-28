@@ -74,7 +74,7 @@ READ_MD5_VAL=$(md5sum "$READBACK" | awk '{print $1}')
 assert_eq "$READ_MD5_VAL" "$SRC_MD5" "read-back md5 matches source"
 
 # ── Metrics ──────────────────────────────────────────────────────────
-MNTRS_PID=$(pgrep -f "target/debug/mntrs mount" | head -1 || true)
+MNTRS_PID=$(pgrep -f "$(basename "$MNTRS_BIN") mount" | head -1 || true)
 if [[ -n "$MNTRS_PID" ]]; then
     stress_metric "$MNTRS_PID" "$WORK/metrics.txt" final
     log "final metrics:"; tail -1 "$WORK/metrics.txt"
