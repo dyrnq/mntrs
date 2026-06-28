@@ -1531,17 +1531,15 @@ pub fn mount(
                 rustix::io::close(w);
             }
             if daemon_wait {
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_secs(_daemon_timeout);
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(_daemon_timeout);
                 while std::time::Instant::now() < deadline {
                     let mut pfd = libc::pollfd {
                         fd: r,
                         events: libc::POLLIN,
                         revents: 0,
                     };
-                    let ms = (deadline - std::time::Instant::now())
-                        .as_millis()
-                        .min(100) as i32;
+                    let ms = (deadline - std::time::Instant::now()).as_millis().min(100) as i32;
                     if unsafe { libc::poll(&mut pfd, 1, ms) } > 0
                         && pfd.revents & (libc::POLLIN | libc::POLLHUP) != 0
                     {
