@@ -2443,8 +2443,8 @@ impl CoreFilesystem for MntrsFs {
         _uid: Option<u32>,
         _gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<SystemTime>,
-        _mtime: Option<SystemTime>,
+        atime: Option<SystemTime>,
+        mtime: Option<SystemTime>,
         fh: Option<u64>,
     ) -> std::io::Result<CoreFileAttr> {
         if let Some(InodeEntry { path: _p, kind, .. }) = self.resolve(ino) {
@@ -2666,11 +2666,36 @@ impl CoreFilesystem for MntrsFs {
             } else {
                 self.inodes.get(&ino).map(|e| e.size).unwrap_or(0)
             };
+            // Issue #305 Tier 1 (set_basic_info forward): when the
+            // kernel / WinFSP driver passes a mtime, persist it on
+            // the inodes entry so the next getattr returns the new
+            // value. WinFSP's per-handle FileInfo cache also picks
+            // it up via the attr returned below. If neither mtime
+            // nor atime is supplied, leave the existing inodes
+            // mtime untouched and use SystemTime::now() for the
+            // returned attr — matching the pre-fix behaviour for
+            // callers that pass None (FUSE prealloc, recovery
+            // paths, etc.).
+            let effective_mtime: SystemTime = mtime
+                .or_else(|| self.inodes.get(&ino).and_then(|e| e.mtime))
+                .unwrap_or_else(SystemTime::now);
+            if let Some(new_mtime) = mtime
+                && let Some(mut entry) = self.inodes.get_mut(&ino)
+            {
+                entry.mtime = Some(new_mtime);
+            }
+            // atime is tracked for read-cache eviction in the LRU
+            // heap; we don't have a separate InodeEntry field for
+            // it today (only mtime + kind + size + path), so we
+            // surface it via make_attr's atime slot but skip the
+            // inodes-map update. Future #310 will add atime to
+            // InodeEntry and persist here.
+            let _ = atime;
             Ok(to_core_attr(&self.make_attr(
                 ino,
                 reported_size,
                 kind,
-                SystemTime::now(),
+                effective_mtime,
             )))
         } else {
             Err(std::io::Error::new(

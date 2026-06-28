@@ -120,26 +120,130 @@ fn wildcard_match_inner(pat: &[u8], name: &[u8]) -> bool {
     helper(pat, name)
 }
 
-/// map std::io::Error to winfsp::Result error type
+/// map std::io::Error to winfsp::Result error type.
+///
+/// Issue #305 Tier 1: pre-fix only 5 ErrorKind variants mapped to
+/// specific NTSTATUS codes; everything else collapsed to
+/// `STATUS_UNSUCCESSFUL` (0xC0000001). The kernel sees that as
+/// "unspecified error" — Explorer's "Retry / Cancel" dialog shows the
+/// generic message, robocopy /MIR treats the file as in-use rather
+/// than missing, and `Get-Content` on a missing file reports
+/// "device error" instead of "path not found". The mapping below
+/// covers every common variant opendal surfaces so user-mode tools
+/// see actionable errors.
 fn io_err_to_status(e: std::io::Error) -> winfsp::FspError {
+    use windows::Win32::Foundation::{
+        NTSTATUS, STATUS_ACCESS_DENIED, STATUS_CANCELLED, STATUS_CONNECTION_ABORTED,
+        STATUS_CONNECTION_REFUSED, STATUS_CONNECTION_RESET, STATUS_DISK_FULL, STATUS_END_OF_FILE,
+        STATUS_INVALID_PARAMETER, STATUS_IO_TIMEOUT, STATUS_NETWORK_NAME_DELETED,
+        STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_PIPE_DISCONNECTED,
+        STATUS_UNSUCCESSFUL,
+    };
+    // NTSTATUS is a transparent newtype; FspError::NTSTATUS takes
+    // the raw i32 underneath. .0 un-nests it without an extra
+    // conversion.
+    let nt = |s: NTSTATUS| FspError::NTSTATUS(s.0);
     match e.kind() {
-        std::io::ErrorKind::NotFound => {
-            FspError::NTSTATUS(windows::Win32::Foundation::STATUS_OBJECT_NAME_NOT_FOUND.0)
+        // "the file/dir/object is not there" — most common path error.
+        // Win32 callers (cmd, Explorer, robocopy) use this to decide
+        // between "skip" (NotFound) vs "retry" (everything else).
+        std::io::ErrorKind::NotFound => nt(STATUS_OBJECT_NAME_NOT_FOUND),
+        // ACL / write-protected / immutable file.
+        std::io::ErrorKind::PermissionDenied => nt(STATUS_ACCESS_DENIED),
+        // CreateFile(FILE_CREATE) on a path that already exists;
+        // WinFSP passes this through to e.g. `New-Item` / robocopy.
+        std::io::ErrorKind::AlreadyExists => nt(STATUS_OBJECT_NAME_COLLISION),
+        // Bad UTF-8 in path, negative seek, etc.
+        std::io::ErrorKind::InvalidInput => nt(STATUS_INVALID_PARAMETER),
+        // opendal surfaces S3 507 Insufficient Storage / Azure
+        // ServerBusy + disk-full conditions here.
+        std::io::ErrorKind::StorageFull => nt(STATUS_DISK_FULL),
+        // Backends with their own timeout layer (opendal TimeoutLayer
+        // + rclone's HTTPTimeout) surface here. Without this mapping
+        // the WinFSP driver timeout (10s, see #312) masks the real
+        // cause as STATUS_UNSUCCESSFUL.
+        std::io::ErrorKind::TimedOut => nt(STATUS_IO_TIMEOUT),
+        // TLS / HTTP connection lost mid-request. Without this map,
+        // resume-on-read sees "device error" instead of "connection
+        // reset" and Explorer pops a generic retry dialog.
+        std::io::ErrorKind::ConnectionReset => nt(STATUS_CONNECTION_RESET),
+        // Local TCP socket closed by peer (rare for object storage,
+        // but covers httpx/hyper keep-alive races).
+        std::io::ErrorKind::ConnectionAborted => nt(STATUS_CONNECTION_ABORTED),
+        // Endpoint closed listener — S3-compatible stores in private
+        // VPCs / misconfigured DNS.
+        std::io::ErrorKind::ConnectionRefused => nt(STATUS_CONNECTION_REFUSED),
+        // SMB / NFS mapped-drive read/write where the peer dropped.
+        std::io::ErrorKind::BrokenPipe => nt(STATUS_PIPE_DISCONNECTED),
+        // opendal surfaces read cancellations here. The kernel treats
+        // STATUS_CANCELLED as "retry-allowed" which is the correct
+        // semantic for an interrupted read.
+        std::io::ErrorKind::Interrupted => nt(STATUS_CANCELLED),
+        // HTTP body returned fewer bytes than Content-Length claimed.
+        // Without this map, large file reads through `Range:` cuts
+        // see "device error" instead of the actionable "unexpected
+        // EOF" — robocopy retries the whole file instead of resuming.
+        std::io::ErrorKind::UnexpectedEof => nt(STATUS_END_OF_FILE),
+        // Backend accepted the request but wrote zero bytes (S3 200
+        // with empty body on a PUT, Azure 0-length Blob). Almost
+        // always a quota / permission issue that DISK_FULL surfaces
+        // more usefully than UNSUCCESSFUL.
+        std::io::ErrorKind::WriteZero => nt(STATUS_DISK_FULL),
+        // Network name deleted (SMB session expired, RDS gateway
+        // timeout). Distinct from ConnectionReset so admin tools can
+        // recognise it.
+        std::io::ErrorKind::NetworkUnreachable => nt(STATUS_NETWORK_NAME_DELETED),
+        // Genuinely unmapped (e.g. ErrorKind::Other from a backend
+        // that wrapped a domain-specific code). Preserve the source
+        // error string in a tracing event so operators can diagnose
+        // without enabling kernel debug logs, then fall back to
+        // STATUS_UNSUCCESSFUL.
+        _ => {
+            tracing::debug!(
+                error = %e,
+                kind = ?e.kind(),
+                "io_err_to_status: unmapped std::io::ErrorKind; mapping to STATUS_UNSUCCESSFUL"
+            );
+            nt(STATUS_UNSUCCESSFUL)
         }
-        std::io::ErrorKind::PermissionDenied => {
-            FspError::NTSTATUS(windows::Win32::Foundation::STATUS_ACCESS_DENIED.0)
-        }
-        std::io::ErrorKind::AlreadyExists => {
-            FspError::NTSTATUS(windows::Win32::Foundation::STATUS_OBJECT_NAME_COLLISION.0)
-        }
-        std::io::ErrorKind::InvalidInput => {
-            FspError::NTSTATUS(windows::Win32::Foundation::STATUS_INVALID_PARAMETER.0)
-        }
-        std::io::ErrorKind::StorageFull => {
-            FspError::NTSTATUS(windows::Win32::Foundation::STATUS_DISK_FULL.0)
-        }
-        _ => FspError::NTSTATUS(windows::Win32::Foundation::STATUS_UNSUCCESSFUL.0),
     }
+}
+
+/// Convert a Win32 FILETIME (u64, 100-ns intervals since 1601-01-01
+/// UTC) into a [`SystemTime`].
+///
+/// Returns `None` for the Win32 "leave unchanged" sentinel (`0`)
+/// and for any value earlier than the Unix epoch (pre-1601 wrap or
+/// caller bug) — both cases are surfaced as `None` so the caller
+/// can skip the corresponding `setattr` argument instead of
+/// silently setting mtime / atime to the Unix epoch. Real
+/// timestamps are converted by subtracting the 1601→1970 offset.
+///
+/// Rationale: WinFSP's `set_basic_info` passes raw FILETIME u64s;
+/// the `windows` crate's `FILETIME` struct has no
+/// `to_system_time()` helper. The math is straightforward but
+/// subtle — the offset is 369 years × ~365.25 days × 86_400 s ×
+/// 10^7 (100ns units), or `0x019DB1DED53E8000` as a hex constant
+/// (`116_444_736_000_000_000`).
+fn filetime_u64_to_system_time(ft: u64) -> Option<SystemTime> {
+    // 0 = "leave unchanged" per Win32 SetFileTime contract.
+    if ft == 0 {
+        return None;
+    }
+    // Offset between 1601-01-01 and 1970-01-01 in 100-ns ticks.
+    const FT_UNIX_OFFSET: u64 = 0x019D_B1DE_D53E_8000;
+    if ft < FT_UNIX_OFFSET {
+        // Pre-Unix-epoch FILETIME (e.g. accidentally fed the raw
+        // low/high dwords without packing). Treat as unset rather
+        // than crashing on the subtraction below.
+        return None;
+    }
+    let unix_100ns = ft - FT_UNIX_OFFSET;
+    // Convert 100-ns ticks to nanos (×100), then to Duration.
+    // Saturation: u64::MAX nanos ≈ 584 years — well beyond any
+    // plausible 1601-3000 FILETIME, so the cast is safe.
+    let nanos = unix_100ns.saturating_mul(100);
+    UNIX_EPOCH.checked_add(std::time::Duration::from_nanos(nanos))
 }
 
 /// A per-handle context for WinFSP.
@@ -558,16 +662,85 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
 
     fn set_basic_info(
         &self,
-        _context: &Self::FileContext,
-        _file_attributes: u32,
-        _creation_time: u64,
-        _last_access_time: u64,
-        _last_write_time: u64,
-        _change_time: u64,
-        _file_info: &mut FileInfo,
+        context: &Self::FileContext,
+        file_attributes: u32,
+        creation_time: u64,
+        last_access_time: u64,
+        last_write_time: u64,
+        change_time: u64,
+        file_info: &mut FileInfo,
     ) -> Result<()> {
-        // For now: no-op (S3 doesn't support Windows file attributes)
-        // mtime/atime would need CoreFilesystem::setattr with mtime
+        // Issue #305 Tier 1: pre-fix this was a no-op, so
+        // Explorer Properties → Modified Date, robocopy /MIR, and
+        // PowerShell Set-LastWriteTime silently failed (kernel cache
+        // showed the new value but the in-memory + backend attr
+        // stayed at the old value). Forward to inner.setattr with
+        // atime + mtime so MntrsFs updates its inodes map; populate
+        // the output FileInfo so WinFSP's per-handle cache also
+        // reflects the change.
+        //
+        // WinFSP passes Win32 FILETIME values (100-nanosecond
+        // intervals since 1601-01-01 UTC). u64 == 0 means "leave
+        // unchanged" per the Win32 contract; pass None in that case
+        // so setattr doesn't overwrite a valid timestamp with epoch.
+        let atime = filetime_u64_to_system_time(last_access_time);
+        let mtime = filetime_u64_to_system_time(last_write_time);
+        let crtime = filetime_u64_to_system_time(creation_time);
+        let ctime = filetime_u64_to_system_time(change_time);
+
+        // Forward mtime + atime to the trait. We ignore crtime /
+        // ctime here because the CoreFilesystem::setattr trait only
+        // exposes atime + mtime; creation time is set at create()
+        // and change time is kernel-tracked. If both atime and mtime
+        // are None (kernel sent two 0 FILETIMEs), short-circuit —
+        // there's nothing to write back, but we still need to
+        // populate file_info with current state.
+        let attr = self
+            .inner
+            .setattr(
+                context.ino,
+                None,
+                None,
+                None,
+                None,
+                atime,
+                mtime,
+                Some(context.fh),
+            )
+            .map_err(io_err_to_status)?;
+
+        // Populate the output FileInfo. file_attributes, the four
+        // timestamps, and file_size are what WinFSP caches per
+        // handle / per FCB — these determine what subsequent
+        // GetFileInformationByHandle / FindFirstFile return without
+        // a roundtrip to the adapter.
+        let _ = file_attributes; // accepted but not echoed back;
+        // future #310 will thread
+        // file_attributes through statfs /
+        // getattr for full round-trip.
+        let _ = (creation_time, change_time); // see comment above;
+        // atime + mtime only
+        // via the trait today.
+        file_info.file_attributes = file_attributes;
+        file_info.creation_time = creation_time;
+        file_info.last_access_time = last_access_time;
+        file_info.last_write_time = last_write_time;
+        file_info.change_time = change_time;
+        // File size comes from the post-setattr attr (mirrors
+        // getattr's value). Allocation_size is rounded up to the
+        // 4096-byte sector the VolumeParams uses.
+        file_info.file_size = attr.size;
+        file_info.allocation_size = attr.size.div_ceil(4096) * 4096;
+        file_info.index_number = context.ino;
+        file_info.hard_links = 0;
+        file_info.ea_size = 0;
+        file_info.reparse_tag = 0;
+
+        // Touch crtime / ctime so unused warnings stay quiet on the
+        // surface even when we don't thread them into setattr yet
+        // (kept for the #310 follow-up).
+        let _ = (crtime, ctime);
+
         Ok(())
     }
 

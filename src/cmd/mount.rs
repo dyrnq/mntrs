@@ -1582,7 +1582,10 @@ pub fn mount(
 
         // The add=false form means "do not add our handler to the
         // chain of handlers" — there's no other handler in this
-        // process. Returns Ok(()) on success.
+        // add=true registers the handler; add=false would
+        // unregister a previously-registered handler by function
+        // pointer, which fails (ERROR_INVALID_PARAMETER 0x80070057)
+        // when called with a handler that was never registered.
         let result = unsafe {
             SetConsoleCtrlHandler(
                 Some(console_ctrl_handler),
@@ -1592,7 +1595,7 @@ pub fn mount(
                 // call SetConsoleCtrlHandler with None, which we
                 // never do — the process exit path is the same as
                 // removing the handler).
-                false,
+                true,
             )
         };
         if let Err(e) = result {
