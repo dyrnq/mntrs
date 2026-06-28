@@ -1510,8 +1510,24 @@ pub fn mount(
     // rclone-style: --daemon --daemon-wait means "fork, mount, signal, stay alive".
     // Without fork, we signal via pipe then enter the keep-alive loop.
     // CSI (daemon=false, daemon_wait=true): signal then return control to caller.
+    //
+    // Issue #286 root cause 3: in the re-exec'd child (MNTRS_INTERNAL_DAEMON=1),
+    // the parent has already transferred both pipe fds to the child and the
+    // child already closed its w_fd copy at line ~1370 (right after
+    // spawn_mount2 returned, to fire parent's POLLHUP). Closing the same fd
+    // again here triggers `rustix::io::close` -> EBADF -> panic
+    // (`assertion failed: !(-4095..0).contains(&(self.raw as isize))` at
+    // rustix 1.1.4 reg.rs:116) -> process exit(101). Also `close(r)` here
+    // races with the parent's poll, sometimes firing POLLHUP prematurely.
+    //
+    // Fix: only run this block when we're NOT the re-exec'd child — i.e. when
+    // the caller is the actual CSI/foreground path that owns its own wait_pipe.
+    // The re-exec'd daemon path skips it entirely (parent closed its w_fd
+    // before fork and we already closed ours at line 1370).
     #[cfg(not(windows))]
-    if let Some((r, w)) = wait_pipe {
+    if let Some((r, w)) = wait_pipe
+        && std::env::var_os("MNTRS_INTERNAL_DAEMON").is_none()
+    {
         unsafe {
             rustix::io::close(w);
         }
