@@ -2969,7 +2969,23 @@ impl CoreFilesystem for MntrsFs {
             for i in 0..n_blks {
                 let s = (i * CACHE_BLOCK_SIZE) as usize;
                 let e = ((i + 1) * CACHE_BLOCK_SIZE) as usize;
-                let slice = data.slice(s..e.min(data.len()));
+                // Issue #334 (sister to #331): skip the trailing
+                // partial block. `part.data` can be < CACHE_BLOCK_SIZE
+                // when BackpressureController shrinks the prefetcher
+                // window to the 128 KiB floor under `--mem-limit`
+                // pressure (prefetcher.rs:303). Without this guard,
+                // a 128 KiB slice would be `mem_cache.put`-ed under
+                // an 8 MiB block-aligned key, poisoning L1/L2 the
+                // same way #331's whole-file `put` did. The short
+                // tail falls through to the read handler's normal
+                // cache-miss path (multi_cache.read_block / remote
+                // fetch) on the next read, so the file is still
+                // correctly served — just without the prefetch
+                // warmup for the last partial block.
+                if e > data.len() {
+                    break;
+                }
+                let slice = data.slice(s..e);
                 self.mem_cache.put(ino, first_blk + i, slice.clone());
                 self.write_block_cached(&path, first_blk + i, &slice);
             }
