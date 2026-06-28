@@ -26,9 +26,18 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # Pin WinFSP to the choco stable we verified locally
+      # (2.1.25156, SxS daily tag may roll forward but major.minor
+      # matches). Without --version the choco default may drift
+      # between runs and silently change behavior. Protoc is left
+      # unpinned (split into two choco invocations because
+      # --version= applies to every package in a single command
+      # and 2.1.25156 is not a valid protoc release).
       - name: Install WinFSP + protoc
         shell: pwsh
-        run: choco install -y winfsp protoc
+        run: |
+          choco install -y winfsp --version=2.1.25156
+          choco install -y protoc
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -49,11 +58,52 @@ jobs:
       - name: Platform tests
         run: cargo test --package mntrs --test platform_test
 
-      # FUSE mount test skipped: GitHub Actions Windows runner cannot
-      # load kernel drivers. WinFSP requires a system reboot after install.
-      # Build + clippy + unit tests still provide good coverage.
-      - name: Check WinFSP availability
+      # WinFSP e2e smoke: spawn `mntrs mount memory:// V:` and exercise
+      # the same 7 effective sub-tests that integration.yml runs for the
+      # Linux FUSE path (mount-test.sh lines 136-211). PowerShell 7
+      # (`shell: pwsh`) is pre-installed at C:\Program Files\PowerShell\7\
+      # on windows-latest; we already use it for the choco install step
+      # above. Mount is left alive on failure so the postmortem step
+      # below can attach the mount log; cleanup is handled in the
+      # `if: always()` step at the end of the job.
+      - name: WinFSP e2e smoke test
+        shell: pwsh
         run: |
-          echo "WinFSP installed but kext not loadable in CI"
-          echo "Mount test skipped — requires kernel driver loading"
-        shell: bash
+          . tests/e2e/common/mount-test.ps1
+          Mount-Test -Backend memory `
+                     -Storage memory:// `
+                     -MountPath V: `
+                     -LogPath "${{ runner.temp }}\mntrs-mount-memory.log" `
+                     -Profile release
+
+      - name: Upload mount log (failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mount-log-windows
+          path: ${{ runner.temp }}\mntrs-mount-memory.log
+
+      # Cleanup hook — always runs. Stops the mntrs.exe left running
+      # by Mount-Test and clears the V: drive. Same-process unmount
+      # only (R1 caveat: src/cmd/unmount.rs:127-132 — cross-process
+      # unmount returns ERROR_ACCESS_DENIED). Killing the mount
+      # process first releases the kernel-side handle, then
+      # `mntrs unmount` clears the leftover DOS device entry. The
+      # step forces exit 0 because the cross-process unmount returns
+      # a non-zero exit code by design (R1) and this is best-effort
+      # teardown, not a quality gate.
+      - name: Cleanup mount (always)
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process mntrs -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
+          $mntrs = Join-Path ${{ github.workspace }} 'target\release\mntrs.exe'
+          if (Test-Path $mntrs) {
+            try { & $mntrs unmount V: 2>&1 | Out-Null } catch { }
+            if (Get-PSDrive V -ErrorAction SilentlyContinue) {
+              Write-Host "V: still mounted after unmount — forcing DefineDosDeviceW clear"
+              try { & $mntrs unmount V: 2>&1 | Out-Null } catch { }
+            }
+          }
+          exit 0
