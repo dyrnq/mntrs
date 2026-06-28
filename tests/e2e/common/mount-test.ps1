@@ -668,12 +668,56 @@ function Mount-Test {
         Remove-Item -LiteralPath $secondMountErr -ErrorAction SilentlyContinue
     }
 
+    # --- 14. delete dispatches to backend (Issue #298) ----------
+    # Pre-fix, WinFspAdapter inherited the FileSystemContext
+    # trait's default no-op cleanup. Win32
+    # IRP_MJ_SET_INFORMATION with FILE_DELETE_ON_CLOSE
+    # silently succeeded from the user's POV, but the
+    # backend (opendal memory) kept the file forever —
+    # every remount would surface the deleted file again.
+    #
+    # The fix: cleanup() now dispatches to inner.unlink
+    # (or inner.rmdir) when FspCleanupDelete is set in
+    # the cleanup flags. Sub-test 14 creates a file via
+    # the mount (so the inode is cached), removes it
+    # via the mount, then asserts the mount side says
+    # NotFound (the standard Win32 post-delete behavior).
+    # The Rust integration test (winfsp_create_delete at
+    # tests/platform/windows/winfsp_integration_test.rs)
+    # additionally asserts the opendal backend also no
+    # longer has the entry — but that requires access to
+    # the private fs.op, so it's covered there, not here.
+    Write-Host "--- 14. delete dispatches to backend ---"
+    $deletePath = "$MountPath\_ci_delete.txt"
+    try {
+        Set-Content -Path $deletePath -Value "delete me" -NoNewline -ErrorAction Stop
+        Write-Host "  wrote $deletePath"
+        if (-not (Test-Path -LiteralPath $deletePath)) {
+            Fail "delete write verify" "file not present after Set-Content"
+        } else {
+            Remove-Item -LiteralPath $deletePath -Force -ErrorAction Stop
+            Write-Host "  Remove-Item returned ok"
+            if (Test-Path -LiteralPath $deletePath) {
+                # Pre-fix this would say "still present"
+                # because the backend delete never fired —
+                # cleanup was a default no-op. The fix
+                # routes FspCleanupDelete to inner.unlink.
+                Fail "delete dispatch" "file still present after Remove-Item (cleanup didn't fire backend delete — see #298)"
+            } else {
+                Write-Host "  [OK]   file no longer visible via mount"
+                Pass "delete dispatch OK"
+            }
+        }
+    } catch {
+        Fail "delete dispatch" $_.Exception.Message
+    }
+
     # --- cleanup test files (mount stays alive) ------------------
     # Best-effort; the workflow's if: always() cleanup step handles
     # process kill + unmount. Use Test-Path first so we never call
     # Remove-Item on a non-existent path (which renders an error
     # in pwsh 7 even with -ErrorAction SilentlyContinue).
-    foreach ($f in @("$MountPath\_ci_small.txt", $bigPath)) {
+    foreach ($f in @("$MountPath\_ci_small.txt", $bigPath, "$MountPath\_ci_delete.txt")) {
         if ($f -and (Test-Path -LiteralPath $f)) {
             try {
                 Remove-Item -LiteralPath $f -Force -ErrorAction Stop
