@@ -98,7 +98,6 @@ fn winfsp_list_directory() {
 }
 
 #[test]
-#[ignore = "TODO(#298): WinFspAdapter::cleanup not implemented — winfsp default no-op means backend delete never happens"]
 fn winfsp_create_delete() {
     let fs = Arc::new(make_memory_fs());
     let guard = mntrs::core_fs::test_helpers::mount_winfsp(fs.clone()).unwrap();
@@ -108,8 +107,24 @@ fn winfsp_create_delete() {
     write_remote(&fs, "delete_me.txt", b"x");
     assert!(std::fs::read(format!("{mp}delete_me.txt")).is_ok());
 
+    // Issue #298: std::fs::remove_file goes through IRP_MJ_SET_INFORMATION
+    // (sets FILE_DELETE_ON_CLOSE) followed by IRP_MJ_CLEANUP. Pre-fix,
+    // WinFspAdapter inherited the FileSystemContext trait's default
+    // no-op cleanup, so the backend (opendal memory) kept the file
+    // indefinitely even though the Win32 handle was closed.
     std::fs::remove_file(format!("{mp}delete_me.txt")).unwrap();
     assert!(std::fs::read(format!("{mp}delete_me.txt")).is_err());
+
+    // Verify the opendal backend also no longer has the entry —
+    // not just the WinFSP side. A regression where only the Win32
+    // view is cleared would still leak at the backend level.
+    let op = fs.op.clone();
+    let still_present =
+        rt_block_on(async move { op.exists("delete_me.txt").await.unwrap_or(true) });
+    assert!(
+        !still_present,
+        "backend still has delete_me.txt after mount-side remove"
+    );
 
     drop(guard);
 }

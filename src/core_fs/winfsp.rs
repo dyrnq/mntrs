@@ -29,6 +29,7 @@ use winfsp::FspError;
 use widestring::U16CStr;
 use windows::Win32::Foundation::{STATUS_INVALID_DEVICE_REQUEST, STATUS_UNSUCCESSFUL};
 use winfsp::Result;
+use winfsp::constants::FspCleanupFlags;
 use winfsp::filesystem::{
     DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, ModificationDescriptor,
     OpenFileInfo, VolumeInfo,
@@ -798,6 +799,150 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                     .map_err(io_err_to_status)
             }),
         )
+    }
+
+    // Issue #298: pre-fix the FileSystemContext trait's
+    // default no-op `cleanup` was inherited, so Win32
+    // DeleteFile / rm dir on a WinFSP volume never reached
+    // the backend — files accumulated forever on the
+    // opendal side, and the in-memory cache thought the
+    // file still existed until process exit. Now we
+    // inspect the cleanup flags and dispatch to
+    // `inner.unlink` / `inner.rmdir` when the kernel asks
+    // for the delete.
+    //
+    // The WinFSP docs (and the trait default) are explicit:
+    // "The file should never be deleted in this function
+    // [set_delete]; instead, set a flag to indicate that
+    // the file is to be deleted later by cleanup." We
+    // follow that contract — `set_delete` is a no-op
+    // (the cleanup-time check below handles the actual
+    // decision based on FspCleanupDelete), and `cleanup`
+    // performs the backend delete.
+    //
+    // Idempotency: the kernel may call cleanup multiple
+    // times for the same handle (e.g. after a failed
+    // IRP_MJ_SET_INFORMATION that requested
+    // FILE_DELETE_ON_CLOSE). A second cleanup sees the
+    // file already gone in the backend — that's a
+    // NotFound on inner.unlink, which we map to Ok
+    // (the desired outcome from the kernel's POV: the
+    // file no longer exists).
+    //
+    // Error mapping: cleanup returns () (the trait
+    // signature is `fn cleanup(...) {}` with no Result).
+    // Errors can only be surfaced via tracing::warn.
+    // The kernel treats a cleanup that doesn't panic
+    // as success — STATUS_UNSUCCESSFUL would have to go
+    // through a panic, which we want to avoid for the
+    // cleanup path. Worst case is a leaked backend file
+    // that the user can `mntrs unmount` and re-create
+    // to clean up.
+    fn cleanup(&self, context: &Self::FileContext, file_name: Option<&U16CStr>, flags: u32) {
+        // Issue #314: panic safety wrapper — `cleanup`
+        // returns `()` (no Result), so we log + swallow
+        // panics instead of mapping to STATUS_UNSUCCESSFUL.
+        swallow_panic(
+            "cleanup",
+            AssertUnwindSafe(|| {
+                // FspCleanupDelete = 0x01 — kernel asked
+                // us to actually remove the file. Without
+                // this flag, cleanup is just "last handle
+                // closed" and no backend action is needed.
+                if !FspCleanupFlags::FspCleanupDelete.is_flagged(flags) {
+                    tracing::trace!(
+                        ino = context.ino,
+                        is_dir = context.is_dir,
+                        flags,
+                        "winfsp::cleanup: no FspCleanupDelete, skipping backend unlink"
+                    );
+                    return;
+                }
+                // file_name is None on volume-cleanup
+                // (rare; only seen on unmount), which
+                // doesn't carry a per-file target.
+                let Some(file_name) = file_name else {
+                    tracing::trace!(
+                        ino = context.ino,
+                        "winfsp::cleanup: no file_name (volume cleanup), skipping"
+                    );
+                    return;
+                };
+                let full_path = file_name.to_string_lossy().replace('\\', "/");
+                // Split into (parent_path, basename).
+                // WinFSP paths look like "/dir/file.txt"
+                // for non-root or "/file.txt" for root.
+                // The basename is what unlink/rmdir want.
+                let (parent_path, basename) = match full_path.rsplit_once('/') {
+                    Some((parent, name)) if !name.is_empty() => {
+                        (parent.to_string(), name.to_string())
+                    }
+                    _ => ("/".to_string(), full_path.clone()),
+                };
+                let parent_ino = self.parent_ino_for(&parent_path).unwrap_or(1);
+                tracing::debug!(
+                    ino = context.ino,
+                    is_dir = context.is_dir,
+                    parent_ino,
+                    basename = %basename,
+                    "winfsp::cleanup: dispatching backend delete"
+                );
+                let result = if context.is_dir {
+                    self.inner.rmdir(parent_ino, &basename)
+                } else {
+                    self.inner.unlink(parent_ino, &basename)
+                };
+                // Map NotFound to Ok for idempotency (see
+                // doc comment above). All other errors
+                // log a warning — we can't surface them
+                // to the kernel because cleanup returns
+                // ().
+                match result {
+                    Ok(()) => tracing::debug!(
+                        ino = context.ino,
+                        basename = %basename,
+                        "winfsp::cleanup: backend delete ok"
+                    ),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        tracing::debug!(
+                            ino = context.ino,
+                            basename = %basename,
+                            "winfsp::cleanup: backend already absent (idempotent)"
+                        );
+                    }
+                    Err(e) => tracing::warn!(
+                        ino = context.ino,
+                        basename = %basename,
+                        error = %e,
+                        "winfsp::cleanup: backend delete failed (file leaked at backend)"
+                    ),
+                }
+            }),
+        );
+    }
+
+    // Issue #298: set_delete is intentionally a no-op.
+    // The actual delete decision is made in `cleanup`
+    // based on FspCleanupDelete. This matches the
+    // WinFSP doc guidance ("set a flag in set_delete;
+    // act on it in cleanup") — except the "flag" we
+    // honour is the kernel-side one WinFSP passes
+    // through in the cleanup flags bitfield, not a
+    // per-handle struct field. Implementing set_delete
+    // would require either per-handle state in
+    // WinFspHandle or a side channel that complicates
+    // the close/release ordering; the cleanup-time
+    // check is the standard idiom for stateless
+    // FUSE/WinFSP adapters.
+    fn set_delete(
+        &self,
+        _context: &Self::FileContext,
+        _file_name: &U16CStr,
+        _delete_file: bool,
+    ) -> Result<()> {
+        // No-op: see doc comment above. The decision is
+        // made in `cleanup` via FspCleanupDelete.
+        Ok(())
     }
 
     fn set_basic_info(
