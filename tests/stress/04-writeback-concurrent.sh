@@ -66,7 +66,7 @@ MD5_FILE="$WORK/written.md5"
 : > "$MD5_FILE"
 
 # Use xargs -P for clean parallelism with output capture
-seq 1 "$STRESS_PARALLEL" | xargs -n1 -P"$STRESS_PARALLEL" -I{} bash -c '
+seq 1 "$STRESS_PARALLEL" | xargs -P"$STRESS_PARALLEL" -I{} bash -c '
     w="$1"
     for f in $(seq 1 '"$STRESS_FILES_PP"'); do
         write_one "$w" "$f"
