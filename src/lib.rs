@@ -3047,7 +3047,24 @@ impl CoreFilesystem for MntrsFs {
                     } else {
                         vec![]
                     };
-                    self.mem_cache.put(ino, offset / CACHE_BLOCK_SIZE, b);
+                    // Issue #331: store only the block-aligned slice
+                    // (≤ CACHE_BLOCK_SIZE bytes) under the
+                    // (ino, block_idx) key, NOT the entire cache file.
+                    // Pre-fix `b` was the whole file, so the next
+                    // read at the same block_idx via `multi_cache.
+                    // read_block` returned the whole file and the
+                    // caller sliced `data[128K..256K]` = data from
+                    // the START of the file, not from offset 8M.
+                    // `Bytes::slice` is O(1) (refcount), no alloc.
+                    let blk_start = (offset / CACHE_BLOCK_SIZE) * CACHE_BLOCK_SIZE;
+                    if blk_start < b.len() as u64 {
+                        let blk_end = ((blk_start + CACHE_BLOCK_SIZE) as usize).min(b.len());
+                        self.mem_cache.put(
+                            ino,
+                            offset / CACHE_BLOCK_SIZE,
+                            b.slice(blk_start as usize..blk_end),
+                        );
+                    }
                     return Ok(result);
                 } else {
                     // Partial cache — warm mem_cache
@@ -3059,8 +3076,21 @@ impl CoreFilesystem for MntrsFs {
                     // because `b` may be needed for
                     // the partial-data path below
                     // (when offset > b.len()).
-                    self.mem_cache
-                        .put(ino, offset / CACHE_BLOCK_SIZE, b.clone());
+                    //
+                    // Issue #331: same block-aligned slice
+                    // treatment as the complete-cache branch
+                    // above — store ≤ CACHE_BLOCK_SIZE bytes
+                    // under (ino, block_idx), not the whole
+                    // (possibly huge) partial cache file.
+                    let blk_start = (offset / CACHE_BLOCK_SIZE) * CACHE_BLOCK_SIZE;
+                    if blk_start < b.len() as u64 {
+                        let blk_end = ((blk_start + CACHE_BLOCK_SIZE) as usize).min(b.len());
+                        self.mem_cache.put(
+                            ino,
+                            offset / CACHE_BLOCK_SIZE,
+                            b.slice(blk_start as usize..blk_end).clone(),
+                        );
+                    }
                     tracing::debug!(
                         path = %path,
                         cache_bytes = b.len(),
