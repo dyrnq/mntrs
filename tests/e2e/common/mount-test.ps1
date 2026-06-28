@@ -447,7 +447,7 @@ function Mount-Test {
                 -PassThru `
                 -RedirectStandardOutput "$outFile.stdout" `
                 -RedirectStandardError "$outFile.stderr" `
-                -NoNewWindow -WindowStyle Hidden
+                -WindowStyle Hidden
             $jobs += [pscustomobject]@{ Idx = $i; Proc = $job; OutFile = $outFile }
             Write-Host "  started concurrent reader $i (pid=$($job.Id))"
         } catch {
