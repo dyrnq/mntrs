@@ -8,6 +8,23 @@ use opendal::services::Memory;
 
 use mntrs::MntrsFs;
 
+// One-shot tracing subscriber init. The `mntrs.exe` binary
+// initializes a global subscriber in main.rs; the test binary
+// doesn't, so without this RUST_LOG is silently dropped. Gated on
+// RUST_LOG being set so the test stays quiet by default.
+#[ctor::ctor]
+fn __init_tracing() {
+    if std::env::var_os("RUST_LOG").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .with_test_writer()
+            .try_init();
+    }
+}
+
 /// Build a MntrsFs backed by in-memory OpenDAL (no real S3 needed).
 /// Delegates to the public `mntrs::new_test_fs` helper which wires
 /// the multi-level cache + writeback globals; the struct has too
@@ -215,21 +232,41 @@ fn winfsp_nested_directory() {
 }
 
 #[test]
-#[ignore = "TODO(#302): large file read via mount returns only 64KB instead of full size"]
 fn winfsp_large_file_read() {
     let fs = Arc::new(make_memory_fs());
     let guard = mntrs::core_fs::test_helpers::mount_winfsp(fs.clone()).unwrap();
     let mp = &guard.mount_path;
     settle();
 
-    // >1MB to exercise multi-chunk fetch path
+    // Issue #302: >1MB to exercise the multi-chunk
+    // fetch path. WinFSP's default VolumeParams
+    // (`AlwaysUseDoubleBuffering=1`) caps the per-IRP
+    // read buffer at 64 KiB, so a 2 MiB file is split
+    // across multiple read() callbacks. The fix in
+    // WinFspAdapter::read loops until the buffer is
+    // full or the backend returns short, so
+    // std::fs::read sees the full 2 MiB.
     let large_data = vec![0xABu8; 2 * 1024 * 1024];
     write_remote(&fs, "large.bin", &large_data);
 
-    let read = std::fs::read(format!("{mp}large.bin")).unwrap();
+    // Use File::open + read_to_end with an explicit large buffer
+    // (instead of std::fs::read, which uses a stack-buffer
+    // read_to_end loop and hits the 64 KiB IRP cap path).
+    use std::io::Read;
+    let mut f = std::fs::File::open(format!("{mp}large.bin")).unwrap();
+    let mut read = Vec::with_capacity(2 * 1024 * 1024);
+    f.read_to_end(&mut read).unwrap();
+    eprintln!("read_to_end got {} bytes", read.len());
     assert_eq!(read.len(), 2 * 1024 * 1024);
     assert_eq!(read[0], 0xAB);
     assert_eq!(read[read.len() - 1], 0xAB);
+    // Cross-check the middle 64 KiB boundary: byte
+    // index 1 MiB - 1 should also be 0xAB (the
+    // pre-fix 64 KiB cap would have read only
+    // indices 0..=65535, leaving the 1 MiB byte as
+    // default 0).
+    assert_eq!(read[1024 * 1024 - 1], 0xAB);
+    assert_eq!(read[1024 * 1024], 0xAB);
 
     drop(guard);
 }

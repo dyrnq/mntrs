@@ -133,3 +133,12 @@ path = "tests/platform/linux/fuse_integration_test.rs"
 name = "platform_windows_winfsp_integration_test"
 path = "tests/platform/windows/winfsp_integration_test.rs"
 
+# Dev-deps for platform tests. `ctor` runs a `#[ctor]` static before
+# each test (lets us init a tracing subscriber so RUST_LOG works in
+# the test binary, which otherwise has no main). `tracing-subscriber`
+# is already a regular dep, but listed here too so test-only filter
+# logic compiles even if the main dep ever moves behind a feature.
+[dev-dependencies]
+ctor = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+

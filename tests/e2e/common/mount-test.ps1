@@ -712,6 +712,17 @@ function Mount-Test {
         Fail "delete dispatch" $_.Exception.Message
     }
 
+    # NOTE: Issue #302 (large file read, 64 KiB WinFSP IRP
+    # cap → adapter returned short) is covered by the Rust
+    # integration test `winfsp_large_file_read` at
+    # tests/platform/windows/winfsp_integration_test.rs,
+    # which writes a 2 MiB file via opendal's `op.write`
+    # (sidesteps the mount-side write path that #332 has
+    # broken) and reads back through the mount. Adding an
+    # e2e step here would either (a) duplicate the Rust
+    # test or (b) hit #332 because WriteAllBytes through
+    # the mount is the broken path. Tracked separately.
+
     # --- cleanup test files (mount stays alive) ------------------
     # Best-effort; the workflow's if: always() cleanup step handles
     # process kill + unmount. Use Test-Path first so we never call
