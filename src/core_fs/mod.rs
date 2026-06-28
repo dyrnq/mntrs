@@ -463,22 +463,83 @@ pub mod test_helpers {
     use crate::core_fs::CoreFilesystem;
     use crate::core_fs::winfsp::WinFspAdapter;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU8, Ordering};
     use winfsp::host::{FileSystemHost, MountPoint};
 
-    /// Mount a CoreFilesystem on a Windows drive letter (auto-assigned).
-    /// Returns the mount handle. Dropping it unmounts.
-    pub fn mount_winfsp<F: CoreFilesystem + 'static>(fs: Arc<F>) -> std::io::Result<MountGuard<F>> {
-        let adapter = WinFspAdapter::new(fs);
-        let mut host = FileSystemHost::new(winfsp::host::VolumeParams::default(), adapter)
-            .map_err(|e| std::io::Error::other(format!("FileSystemHost::new: {e}")))?;
-        host.mount(MountPoint::NextFreeDrive)
-            .map_err(|e| std::io::Error::other(format!("host.mount: {e}")))?;
-        Ok(MountGuard::<F> { host: Some(host) })
+    /// Per-test-binary counter that allocates a distinct drive letter for
+    /// each `mount_winfsp` call. Tests run in parallel by default; sharing
+    /// a single drive would race on the WinFSP volume namespace. Counts
+    /// down from `Z:` so we never collide with real system drives (A-C are
+    /// reserved; D onward is fair game on most systems). The pool is sized
+    /// for the 11 mount-touching platform tests + headroom.
+    ///
+    /// Note: this is per-process. Different test binaries in the same CI
+    /// job get their own counter, which is fine — each binary's
+    /// `cargo test` invocation is a separate process.
+    static NEXT_DRIVE: AtomicU8 = AtomicU8::new(b'Z');
+
+    /// Allocate the next free drive letter from `Z:` downward. Returns
+    /// `None` once the pool is exhausted (caller should error).
+    fn allocate_drive_letter() -> Option<char> {
+        NEXT_DRIVE
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+                if c < b'P' { None } else { Some(c - 1) }
+            })
+            .ok()
+            .map(|b| b as char)
     }
 
-    /// RAII guard that unmounts on drop.
+    /// Mount a CoreFilesystem on a Windows drive letter (auto-assigned
+    /// from a per-process pool). Returns a guard whose `mount_path` is
+    /// the absolute Win32 path of the volume root (e.g. `E:\\`) — tests
+    /// must use this path for I/O, not relative paths, so the operations
+    /// hit the WinFSP driver rather than the test runner's CWD.
+    ///
+    /// Dropping the guard stops the dispatcher and removes the mount.
+    pub fn mount_winfsp<F: CoreFilesystem + 'static>(fs: Arc<F>) -> std::io::Result<MountGuard<F>> {
+        let drive = allocate_drive_letter().ok_or_else(|| {
+            std::io::Error::other("test_helpers::mount_winfsp: drive-letter pool exhausted (Z-P)")
+        })?;
+        let mountpoint = format!("{}:", drive);
+        let adapter = WinFspAdapter::new(fs);
+        // Annotate the type as `FileSystemHost<_, FineGuard>` so the
+        // `start_with_threads` call below resolves to the FineGuard
+        // impl (the CoarseGuard impl has the same signature and is
+        // also visible, so unannotated inference fails with E0034).
+        // Production mount at src/cmd/mount.rs:1370 makes the same
+        // annotation.
+        let mut host: winfsp::host::FileSystemHost<_, winfsp::host::FineGuard> =
+            FileSystemHost::new(winfsp::host::VolumeParams::default(), adapter)
+                .map_err(|e| std::io::Error::other(format!("FileSystemHost::new: {e}")))?;
+        // `host.mount` accepts anything `&M: Into<MountPoint>` — the
+        // &str conversion is provided by the winfsp crate's blanket
+        // `impl<S: AsRef<OsStr>> From<&S> for MountPoint`. Production
+        // mount at src/cmd/mount.rs:1377 uses the same shape.
+        host.mount(&mountpoint)
+            .map_err(|e| std::io::Error::other(format!("host.mount: {e}")))?;
+        // Issue #294: spawn the WinFSP user-mode dispatcher threads that
+        // service Win32 IRPs by calling back into FileSystemContext
+        // methods. Without this, `host.mount()` only registers the
+        // volume with the driver (`FspFileSystemSetMountPoint`) but no
+        // thread consumes the IRP queue, so any I/O to the mount hangs
+        // at the kernel side. Production mount at src/cmd/mount.rs:1395
+        // makes the same call.
+        host.start_with_threads(0)
+            .map_err(|e| std::io::Error::other(format!("host.start: {e}")))?;
+        // Path with trailing backslash — convenient for `format!("{mp}foo")`.
+        let mount_path = format!("{}\\", mountpoint);
+        Ok(MountGuard::<F> {
+            host: Some(host),
+            mount_path,
+        })
+    }
+
+    /// RAII guard that unmounts on drop. `mount_path` is the absolute
+    /// Win32 path of the volume root (e.g. `E:\\`); tests use it to
+    /// build paths that actually go through the WinFSP driver.
     pub struct MountGuard<F: CoreFilesystem + 'static> {
         host: Option<FileSystemHost<WinFspAdapter<F>>>,
+        pub mount_path: String,
     }
 
     impl<F: CoreFilesystem + 'static> Drop for MountGuard<F> {
