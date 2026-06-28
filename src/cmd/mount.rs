@@ -253,10 +253,62 @@ extern "C" fn cleanup() {
 /// Simplified mount entry point for CSI plugin.
 /// Uses defaults for all the FUSE tuning parameters.
 /// Check if a path is already a mount point by checking /proc/mounts.
+///
+/// Issue #305 Tier 1: previous stub always returned `false`, so
+/// `mount_internal`'s idempotency check let a second `mntrs mount ... V:`
+/// proceed and collide with the live volume (WinFSP error
+/// STATUS_OBJECT_NAME_COLLISION 0xC0000035).
+///
+/// Implementation: ask the Win32 DOS device manager whether `path`
+/// resolves to a device. `QueryDosDeviceW` returns:
+/// - non-zero (length of the device target path) iff the drive letter
+///   is mapped to some device — including WinFSP drives (which point
+///   at `\Device\WinFsp.{GUID}\X:` or similar) and network drives,
+/// - 0 with `GetLastError() == ERROR_FILE_NOT_FOUND` (2) for an
+///   unmapped drive letter.
+///
+/// `GetVolumeNameForVolumeMountPointW` was tried first but returns
+/// `ERROR_INVALID_FUNCTION` for WinFSP volumes — they don't register
+/// a real NTFS-style volume GUID, so we can't distinguish "unmounted"
+/// from "WinFSP mount" via that API.
 #[cfg(windows)]
-pub fn is_mount_point(_path: &str) -> bool {
-    // On Windows, WinFSP handles mount point detection internally
-    false
+pub fn is_mount_point(path: &str) -> bool {
+    use windows::Win32::Storage::FileSystem::QueryDosDeviceW;
+
+    // QueryDosDeviceW takes a drive letter WITHOUT the trailing
+    // backslash ("V:", not "V:\\"). Pass through whatever the caller
+    // gave us after stripping a single trailing slash if present.
+    let trimmed = path.strip_suffix('\\').unwrap_or(path);
+
+    // 1024-char buffer covers any plausible device target path
+    // (WinFSP uses "\Device\WinFsp.{GUID}\X:" — ~80 chars; SMB
+    // mapped drives use "\Device\LanmanRedirector\..." — ~60 chars).
+    let mut buf = [0u16; 1024];
+    let wide: Vec<u16> = trimmed.encode_utf16().chain(std::iter::once(0)).collect();
+    let result = unsafe { QueryDosDeviceW(windows::core::PCWSTR(wide.as_ptr()), Some(&mut buf)) };
+
+    // QueryDosDeviceW returns 0 on failure, length (excluding the
+    // null terminator) on success. An empty result string ("")
+    // would be length 0 too but never happens for a real device.
+    if result > 0 {
+        true
+    } else {
+        // Failure: check GetLastError to distinguish unmapped
+        // drive letter (err=2 ERROR_FILE_NOT_FOUND) from
+        // malformed input. Be conservative on unexpected
+        // errors — assume mounted to avoid collisions.
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(2) {
+            false
+        } else {
+            tracing::debug!(
+                path,
+                error = %err,
+                "is_mount_point(windows): QueryDosDeviceW returned unexpected error; treating as mount point"
+            );
+            true
+        }
+    }
 }
 
 ///
@@ -699,6 +751,19 @@ pub fn mount(
     // --vfs-read-stale-on-backend-error.
     vfs_read_stale_on_backend_error: bool,
 ) -> Result<()> {
+    // Issue #305 Tier 1: idempotency check at the CLI entry
+    // point. Previously the public `mount` function skipped this
+    // check entirely, so a second `mntrs mount ... V:` proceeded
+    // all the way to `host.mount(mountpoint)` and collided with
+    // the live volume (Win32 STATUS_OBJECT_NAME_COLLISION 0xC0000035
+    // → "0xD0000035"). The CSI path used `mount_internal` which
+    // already had this check, but it was a no-op on Windows because
+    // `is_mount_point` returned false unconditionally.
+    if is_mount_point(mountpoint) {
+        tracing::info!(mountpoint, "already mounted, skipping");
+        return Ok(());
+    }
+
     // Issue #209: --poll-interval is the legacy rclone alias
     // for --vfs-cache-poll-interval. When the user explicitly
     // sets it (Some), emit a one-time deprecation warning.
@@ -1329,13 +1394,48 @@ pub fn mount(
         // the same way (rclone mount sets --FileSystemName and a 4096-byte
         // sector; without sector_size Explorer falls back to 512-byte
         // sectors and the progress bar disappears for our volume).
+        // Issue #305 Tier 1: give the volume a real creation
+        // time + serial number. fsutil fsinfo volumeinfo V:
+        // reports 1970-01-01 00:00:00 + serial 0 when both are
+        // zero, which Windows treats as "never assigned" — chkdsk,
+        // Defender, and a few installers refuse to touch the
+        // drive. Derive a stable non-zero serial from the
+        // mountpoint path so two V: and W: mounts never collide.
+        let volume_creation_time: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        // Stable hash: sum bytes; cast to u32. Two distinct
+        // mountpoints at the same instant get distinct serials
+        // because the mountpoint bytes are different. Re-mounting
+        // the same mountpoint gets a fresh serial — accepted by
+        // Win32 (the kernel only requires non-zero, not stable).
+        let volume_serial_number: u32 = {
+            let mut h: u32 = 0x811C9DC5; // FNV-1a 32-bit offset basis
+            for b in mountpoint.as_bytes() {
+                h ^= *b as u32;
+                h = h.wrapping_mul(0x01000193); // FNV prime
+            }
+            // Force non-zero even if mountpoint is empty
+            // (defensive — `mountpoint` is always non-empty here).
+            if h == 0 { 1 } else { h }
+        };
         vol_params
             .filesystem_name(volname)
             .sector_size(4096)
             .sectors_per_allocation_unit(1)
             .max_component_length(255)
-            .volume_creation_time(0)
-            .volume_serial_number(0)
+            .volume_creation_time(volume_creation_time)
+            .volume_serial_number(volume_serial_number)
+            // Issue #305 Tier 1: bound the kernel-visible timeout
+            // for hung backends. Driver defaults to 60s for every
+            // IRP — a slow S3 GET freezes the whole V: drive for
+            // the full minute, including unrelated readdir calls
+            // (Explorer Refresh, Get-ChildItem). 10s for FileInfo
+            // and 30s for DirInfo matches rclone's recommended
+            // values and keeps the volume responsive.
+            .file_info_timeout(10_000)
+            .dir_info_timeout(30_000)
             // Issue #249 follow-up: enable the Win32 FS
             // features that cmd.exe / Explorer expect from a
             // "real" volume. Without these the kernel returns
@@ -1354,7 +1454,12 @@ pub fn mount(
             .reparse_points(false)
             .named_streams(false)
             .extended_attributes(false)
-            .post_cleanup_when_modified_only(true)
+            // Issue #305 Tier 1: advertise read-only at the
+            // Win32 layer too, and skip post_cleanup for RO
+            // mounts — there's nothing to clean up since
+            // no writes are happening.
+            .read_only_volume(read_only)
+            .post_cleanup_when_modified_only(!read_only)
             .flush_and_purge_on_cleanup(false)
             .pass_query_directory_pattern(true)
             .pass_query_directory_filename(false);
@@ -1440,6 +1545,73 @@ pub fn mount(
     unsafe {
         libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, handler as *const () as libc::sighandler_t);
+    }
+
+    // Issue #305 Tier 1: route Windows console events through
+    // SHUTDOWN_REQUESTED so the keep-alive loop can drain cleanly.
+    // `libc::signal(SIGINT, ...)` above is a no-op on Windows for
+    // console-attached processes (no SIGINT delivery from Ctrl+C;
+    // SIGTERM is delivered by `taskkill /F` and Task Manager End
+    // Task, which we still want to handle). The Win32 console
+    // subsystem emits CTRL_C_EVENT / CTRL_BREAK_EVENT for keyboard
+    // interrupts, and CTRL_CLOSE_EVENT / CTRL_LOGOFF_EVENT /
+    // CTRL_SHUTDOWN_EVENT for window close + logoff + shutdown —
+    // all of which previously hung the console until the user
+    // closed the window.
+    //
+    // The handler returns TRUE so the OS does NOT terminate the
+    // process; SHUTDOWN_REQUESTED is observed by the keep-alive
+    // loop below, which calls `remove_mount(mountpoint)` and exits
+    // cleanly. We intentionally register the same handler for all
+    // five event types — same code path, same async semantics.
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Console::{
+            CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT,
+            CTRL_SHUTDOWN_EVENT, SetConsoleCtrlHandler,
+        };
+        use windows::core::BOOL;
+
+        unsafe extern "system" fn console_ctrl_handler(_ctrl_type: u32) -> BOOL {
+            SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+            // TRUE = "I handled it; do not terminate me". The
+            // keep-alive loop will observe SHUTDOWN_REQUESTED,
+            // call remove_mount(mountpoint), and exit 0.
+            BOOL(1)
+        }
+
+        // The add=false form means "do not add our handler to the
+        // chain of handlers" — there's no other handler in this
+        // process. Returns Ok(()) on success.
+        let result = unsafe {
+            SetConsoleCtrlHandler(
+                Some(console_ctrl_handler),
+                // SAFETY: the function pointer is `extern "system"`
+                // with the PHANDLER_ROUTINE signature; Windows
+                // stores it until the process exits (or until we
+                // call SetConsoleCtrlHandler with None, which we
+                // never do — the process exit path is the same as
+                // removing the handler).
+                false,
+            )
+        };
+        if let Err(e) = result {
+            tracing::warn!(
+                error = %e,
+                "mount(windows): SetConsoleCtrlHandler failed; Ctrl+C will not be observed by the keep-alive loop. \
+                 The Win32 console subsystem will fall back to terminating the process."
+            );
+        }
+        // Use the event-type constants so they remain referenced
+        // even if the handler above changes signature. (Some
+        // static analysers flag unused constants on Windows builds.)
+        let _ = (
+            CTRL_C_EVENT,
+            CTRL_BREAK_EVENT,
+            CTRL_CLOSE_EVENT,
+            CTRL_LOGOFF_EVENT,
+            CTRL_SHUTDOWN_EVENT,
+        );
     }
 
     // Spawn a watcher thread: when a signal sets SHUTDOWN_REQUESTED,
