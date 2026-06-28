@@ -270,6 +270,109 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression for issue #331. The `populate` API's contract is that
+    /// each `(ino, block_idx)` slot stores the ≤ CACHE_BLOCK_SIZE bytes
+    /// of that specific block, NOT the entire multi-block payload that
+    /// was just fetched. If a future change accidentally stores the
+    /// whole payload under every block index, this test fails.
+    ///
+    /// The actual bug (issue #331) was at `src/lib.rs:3050` in the
+    /// file-level cache path, where the whole 10 MiB cache file was
+    /// `mem_cache.put(ino, offset/CACHE_BLOCK_SIZE, b)`-ed under the
+    /// single block-aligned key. A subsequent read at the same
+    /// block_idx via `multi_cache.read_block` returned the full
+    /// payload, and the read handler sliced it as
+    /// `data[128K..256K]` = data from the start of the file instead
+    /// of the requested block. Fix: `Bytes::slice(blk_start..blk_end)`
+    /// the block-aligned slice before `put`.
+    ///
+    /// This test guards `populate` directly because it's the only
+    /// point in the read path that legitimately touches L1 + L2 for
+    /// a freshly fetched payload — any future change here is the
+    /// likeliest site of a regression.
+    #[test]
+    fn populate_multi_block_stores_per_block_not_whole_payload() {
+        let dir = std::env::temp_dir().join(format!(
+            "mntrs-mlc-test-{}-pop-multi-#331",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let mlc = test_mlc(dir.clone());
+
+        // Two blocks: block 0 = 0xAA * 1024, block 1 = 0xBB * 1024
+        let block0 = Bytes::from(vec![0xAA; 1024]);
+        let block1 = Bytes::from(vec![0xBB; 1024]);
+        let payload = vec![block0.clone(), block1.clone()];
+
+        mlc.populate(
+            "multi.bin",
+            42,
+            0,
+            &payload,
+            AdmissionPolicy::All, // All → both blocks go to L1 + L2
+        );
+
+        // L1: block 0 must be all 0xAA (NOT the whole 2-block payload).
+        let l1_b0 = mlc
+            .l1
+            .get_block("multi.bin", 42, 0)
+            .expect("L1 should have block 0");
+        assert_eq!(
+            l1_b0.len(),
+            1024,
+            "L1 block 0 length must be 1 block (1024 bytes), got {} — \
+             issue #331 regression: whole payload stored under one key",
+            l1_b0.len()
+        );
+        assert!(
+            l1_b0.iter().all(|&b| b == 0xAA),
+            "L1 block 0 must be all 0xAA (block 0 payload), not mixed"
+        );
+
+        // L1: block 1 must be all 0xBB (NOT block 0's data).
+        let l1_b1 = mlc
+            .l1
+            .get_block("multi.bin", 42, 1)
+            .expect("L1 should have block 1");
+        assert_eq!(
+            l1_b1.len(),
+            1024,
+            "L1 block 1 length must be 1 block, got {}",
+            l1_b1.len()
+        );
+        assert!(
+            l1_b1.iter().all(|&b| b == 0xBB),
+            "L1 block 1 must be all 0xBB, not block 0's data"
+        );
+
+        // L2: same invariant — each block stored separately.
+        let l2_b0 = mlc
+            .l2
+            .get_block("multi.bin", 42, 0)
+            .expect("L2 should have block 0");
+        assert_eq!(l2_b0.len(), 1024, "L2 block 0 must be 1 block");
+        let l2_b1 = mlc
+            .l2
+            .get_block("multi.bin", 42, 1)
+            .expect("L2 should have block 1");
+        assert_eq!(l2_b1.len(), 1024, "L2 block 1 must be 1 block");
+
+        // read_block (L1→L2 path): verify the L1 hit returns the
+        // right block, not the concatenated payload.
+        let rb0 = mlc
+            .read_block("multi.bin", 42, 0)
+            .expect("read_block(0) must succeed");
+        assert_eq!(rb0.len(), 1024, "read_block(0) must be 1 block");
+        assert!(rb0.iter().all(|&b| b == 0xAA));
+        let rb1 = mlc
+            .read_block("multi.bin", 42, 1)
+            .expect("read_block(1) must succeed");
+        assert_eq!(rb1.len(), 1024, "read_block(1) must be 1 block");
+        assert!(rb1.iter().all(|&b| b == 0xBB));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Regression for issue #130. Pre-fix, the L2 preheater
     /// scanned the cache dir and inserted `(filename,
     /// Some(block_idx))` keys into `disk_cache_index`, which
