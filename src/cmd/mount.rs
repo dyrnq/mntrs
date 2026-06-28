@@ -484,6 +484,7 @@ pub fn mount_internal(
         0,        // vfs_handle_caching
         0,        // vfs_disk_space_total_size (off)
         false, // vfs_read_stale_on_backend_error (CSI: never stale-on-error; data integrity > uptime)
+        0, // winfsp_dispatcher_threads (CSI: driver default 8; CSI pods don't need pinned count)
     )
 }
 
@@ -750,6 +751,12 @@ pub fn mount(
     // "stale is better than EIO" semantics via
     // --vfs-read-stale-on-backend-error.
     vfs_read_stale_on_backend_error: bool,
+    // Issue #316a (WinFSP audit #305): pinned WinFSP dispatcher
+    // thread count. 0 = driver default 8 (matches pre-fix
+    // hardcoded `start_with_threads(0)`). >0 = user-overridden.
+    // Unix: accepted by clap but ignored here (unix FUSE has its
+    // own dispatcher pool — fuser backend).
+    winfsp_dispatcher_threads: u32,
 ) -> Result<()> {
     // Issue #305 Tier 1: idempotency check at the CLI entry
     // point. Previously the public `mount` function skipped this
@@ -1497,7 +1504,7 @@ pub fn mount(
         // `Test-Path V:\`, `fsutil fsinfo volumeinfo V:` all hung
         // forever at the kernel side, because the IRP sat in the
         // volume queue with no one to handle it.
-        host.start_with_threads(0)
+        host.start_with_threads(winfsp_dispatcher_threads)
             .map_err(|e| anyhow::anyhow!("host.start: {e}"))?;
         tracing::debug!(
             mountpoint,

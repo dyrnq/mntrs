@@ -296,6 +296,18 @@ enum Commands {
         /// stale data during backend outages.
         #[arg(long, default_value = "false")]
         vfs_read_stale_on_backend_error: bool,
+        /// Issue #316a (WinFSP audit #305): number of WinFSP
+        /// dispatcher threads to spawn (`FspFileSystemStartDispatcher`
+        /// arg). 0 = driver default (8). >0 = pin to that count.
+        /// **Windows only** — accepted but ignored on macOS/Linux
+        /// (the unix FUSE backend has its own dispatcher pool).
+        /// Use a small count (2-4) to verify concurrent IRP
+        /// handling during e2e (mount-test.ps1 sub-test 9 runs 3
+        /// parallel `Get-Content` against the same file); bump
+        /// higher only if a slow backend (S3 GET on a cold object)
+        /// blocks other open handles.
+        #[arg(long, default_value = "0")]
+        winfsp_dispatcher_threads: u32,
     },
     /// Unmount a mounted directory (use "all" to unmount all)
     Unmount { target: String },
@@ -405,6 +417,7 @@ fn main() -> anyhow::Result<()> {
             vfs_handle_caching,
             vfs_disk_space_total_size,
             vfs_read_stale_on_backend_error,
+            winfsp_dispatcher_threads,
             ..
         } => {
             // Sprint 8 (#229): consolidated warn for rclone-compat
@@ -537,6 +550,7 @@ fn main() -> anyhow::Result<()> {
                 vfs_handle_caching,
                 vfs_disk_space_total_size,
                 vfs_read_stale_on_backend_error,
+                winfsp_dispatcher_threads,
             )?;
         }
         Commands::Unmount { target } => {
