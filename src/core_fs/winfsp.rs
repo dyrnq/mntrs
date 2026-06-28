@@ -59,6 +59,11 @@ fn core_kind_to_file_attributes(kind: CoreFileType, perm: u16) -> u32 {
 /// Convert CoreFileAttr to WinFSP FileInfo (in place).
 fn core_attr_to_file_info(attr: &CoreFileAttr, file_info: &mut FileInfo) {
     file_info.file_attributes = core_kind_to_file_attributes(attr.kind, attr.perm);
+    tracing::trace!(
+        ino = attr.ino,
+        size = attr.size,
+        "core_attr_to_file_info: setting file_size"
+    );
     file_info.file_size = attr.size;
     file_info.allocation_size = attr.size.next_power_of_two();
     file_info.creation_time = system_time_to_win32(attr.crtime);
@@ -699,6 +704,11 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
             "get_file_info",
             AssertUnwindSafe(|| {
                 let attr = self.inner.getattr(context.ino).map_err(io_err_to_status)?;
+                tracing::trace!(
+                    ino = context.ino,
+                    size = attr.size,
+                    "winfsp::get_file_info: returning"
+                );
                 core_attr_to_file_info(&attr, file_info);
                 Ok(())
             }),
@@ -710,14 +720,79 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         catch_panic(
             "read",
             AssertUnwindSafe(|| {
-                let size = buffer.len() as u32;
-                let data = self
-                    .inner
-                    .read(context.ino, context.fh, offset, size)
-                    .map_err(io_err_to_status)?;
-                let n = data.len().min(buffer.len());
-                buffer[..n].copy_from_slice(&data[..n]);
-                Ok(n as u32)
+                tracing::trace!(
+                    ino = context.ino,
+                    buffer_len = buffer.len(),
+                    offset,
+                    "winfsp::read: entered"
+                );
+                // Issue #302: WinFSP's default `VolumeParams`
+                // sets `AlwaysUseDoubleBuffering=1`, which
+                // caps the per-IRP read buffer at
+                // `FSP_FSCTL_TRANSACT_BATCH_BUFFER_SIZEMIN`
+                // (64 KiB) — see winfsp-sys fsctl.h. The
+                // Windows kernel driver still issues multiple
+                // 64 KiB IRPs for a 2 MiB ReadFile, but our
+                // adapter sees each IRP separately and must
+                // return <= buffer.len() bytes per call.
+                // Pre-fix the code asked inner.read for the
+                // full buffer length in one shot, then
+                // returned whatever the backend gave back —
+                // which on the opendal memory backend capped
+                // at 64 KiB, so a 2 MiB `std::fs::read` on a
+                // 2 MiB file returned only the first 64 KiB.
+                //
+                // Fix: loop, asking inner for the remaining
+                // bytes at increasing offsets, until the
+                // buffer is full or the backend returns
+                // short (EOF). The short read signals EOF
+                // exactly when the kernel expects it, so
+                // `std::fs::read` (which loops on ReadFile
+                // until 0 bytes) terminates correctly. Each
+                // inner.read is bounded by `remaining` so
+                // the backend can return whatever it
+                // physically has without truncating our
+                // state.
+                let mut written = 0usize;
+                let mut cur_offset = offset;
+                while written < buffer.len() {
+                    let remaining = (buffer.len() - written) as u32;
+                    let data = self
+                        .inner
+                        .read(context.ino, context.fh, cur_offset, remaining)
+                        .map_err(io_err_to_status)?;
+                    let n = data.len();
+                    if n == 0 {
+                        // EOF: kernel will see 0 bytes
+                        // returned and stop the ReadFile
+                        // loop in std::fs::read.
+                        break;
+                    }
+                    // data.len() may exceed remaining if
+                    // the backend ignores the size hint
+                    // (e.g. returns the whole file);
+                    // truncate to the buffer slot we have
+                    // left.
+                    let copy = n.min(remaining as usize);
+                    buffer[written..written + copy].copy_from_slice(&data[..copy]);
+                    written += copy;
+                    cur_offset += copy as u64;
+                    // Backend returned less than asked for:
+                    // treat as EOF so we don't loop forever
+                    // on a backend that always returns one
+                    // chunk regardless of `size`.
+                    if n < remaining as usize {
+                        break;
+                    }
+                }
+                tracing::trace!(
+                    ino = context.ino,
+                    buffer_len = buffer.len(),
+                    written,
+                    offset,
+                    "winfsp::read: returning"
+                );
+                Ok(written as u32)
             }),
         )
     }

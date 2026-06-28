@@ -3161,7 +3161,7 @@ impl CoreFilesystem for MntrsFs {
             // time to keep per-fetch memory bounded.
             16 * 1024 * 1024
         };
-        // Issue #10: cap fetch_size by the kernel-requested
+        // Issue #10 + #302: cap fetch_size by the kernel-requested
         // `size` so partial reads (head -c N, tail -c N,
         // dd skip=...) don't pull the whole file from
         // the backend. Pre-fix this was min(user_cap,
@@ -3173,7 +3173,47 @@ impl CoreFilesystem for MntrsFs {
         // single FUSE_READ for the whole file — user_cap
         // (= read_chunk_size) takes the hit there, not
         // `size`.
-        let fetch_size = (size as u64).min(user_cap).min(hard_cap).min(cap);
+        //
+        // #302 (WinFSP 64 KiB IRP cap): WinFSP's default
+        // `VolumeParams` (with `AlwaysUseDoubleBuffering=1`)
+        // caps the per-IRP read buffer at 64 KiB
+        // (`FSP_FSCTL_TRANSACT_BATCH_BUFFER_SIZEMIN`), so a
+        // 2 MiB `cat` issues 32 sequential IRP_MJ_READs each
+        // asking for 65 536 bytes. With the post-#10
+        // `min(size, ...)` fetch_size, every IRP pulls only
+        // 65 536 bytes from the backend AND overwrites the
+        // mem_cache entry for block 0 (the cache key is
+        // `(ino, block_idx)` without an offset-in-block
+        // field, so each subsequent IRP's fetch clobbers
+        // the previous one). End result: the in-memory
+        // cache holds whichever 64 KiB slice the last IRP
+        // fetched, and the caller sees a short read.
+        //
+        // Fix: when offset == 0 and the file fits within
+        // the cold-read hard_cap, fetch the whole file in
+        // one shot instead of the per-IRP slice. The
+        // caller still receives only `size` bytes (the
+        // response is trimmed below), but the cache is
+        // populated correctly so subsequent IRPs at
+        // offset 64 KiB, 128 KiB, ... hit the cache
+        // instead of re-fetching (and overwriting).
+        //
+        // For `head -c N <large-file>` where the file is
+        // bigger than `hard_cap`, the `cap <= hard_cap`
+        // guard is false and the #10 cap stays in effect
+        // — we still only fetch N bytes.
+        let fetch_size = if offset == 0 && cap <= hard_cap {
+            // Whole-file cold read for files that fit in
+            // mem_cache. Same target as the pre-#10 code,
+            // but only on the first read of the file.
+            user_cap.min(hard_cap).min(cap)
+        } else {
+            // Subsequent reads (offset > 0) or huge
+            // files: honor the per-IRP `size` cap so a
+            // `head -c 10K <1 GiB file>` doesn't pull
+            // the entire 1 GiB.
+            (size as u64).min(user_cap).min(hard_cap).min(cap)
+        };
 
         // Parallel fetch: if `read_chunk_streams > 1` and the fetch
         // is large enough to be worth splitting, use OpenDAL's
