@@ -355,7 +355,7 @@ function Mount-Test {
 
     # --- 3. cat pre-existing -------------------------------------
     Write-Host "--- 3. cat pre-existing ---"
-    if (-not [string]::IsNullOrEmpty($PreexistFile)) {
+    if (Should-Skip 3) { Write-Host "  (skipped: -SkipSubTests 3)" } elseif (-not [string]::IsNullOrEmpty($PreexistFile)) {
         try {
             $got = Get-Content -Path "$MountPath/$PreexistFile" -Raw -ErrorAction Stop
             if ($got -eq $ExpectedText) {
@@ -392,7 +392,7 @@ function Mount-Test {
 
     # --- 5. read back --------------------------------------------
     Write-Host "--- 5. read back ---"
-    try {
+    if (Should-Skip 5) { Write-Host "  (skipped: -SkipSubTests 5)" } else { try {
         $got = (Get-Content -Path "$MountPath\_ci_small.txt" -Raw -ErrorAction Stop).TrimEnd("`n")
         $expected = "hello from $Backend"
         if ($got -eq $expected) {
@@ -402,7 +402,7 @@ function Mount-Test {
         }
     } catch {
         Fail "read back" $_.Exception.Message
-    }
+    } }
 
     # --- 6. append + verify --------------------------------------
     Write-Host "--- 6. append + verify ---"
