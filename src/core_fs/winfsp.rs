@@ -804,15 +804,32 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         offset: u64,
         _write_to_eof: bool,
         _constrained_io: bool,
-        _file_info: &mut FileInfo,
+        file_info: &mut FileInfo,
     ) -> Result<u32> {
         // Issue #314: panic safety wrapper — see catch_panic.
         catch_panic(
             "write",
             AssertUnwindSafe(|| {
-                self.inner
+                let written = self
+                    .inner
                     .write(context.ino, context.fh, offset, buffer)
-                    .map_err(io_err_to_status)
+                    .map_err(io_err_to_status)?;
+                // Issue #332: WinFSP contract — the write
+                // callback MUST populate `file_info` (at
+                // minimum `file_size`) before returning. The
+                // kernel reads the new file size from this
+                // buffer to update its FCB; if the field
+                // stays at 0 the kernel treats the IRP as
+                // failed and the user-mode `WriteFile` /
+                // `Set-Content` / `Out-File` / `echo >` all
+                // hang forever at the close side. Pre-fix
+                // we returned Ok(written) without touching
+                // file_info — explaining why New-Item
+                // (no write) succeeded but every API that
+                // actually wrote bytes hung.
+                let post_attr = self.inner.getattr(context.ino).map_err(io_err_to_status)?;
+                core_attr_to_file_info(&post_attr, file_info);
+                Ok(written)
             }),
         )
     }
