@@ -131,7 +131,7 @@ function Mount-Test {
     $script:fail = 0
     # Sub-tests the caller wants to skip. Issue #311: the S3
     # backend e2e step in ci-windows.yml passes
-    # `-SkipSubTests "3,4,5,6,7,12"` because:
+    # `-SkipSubTests "3,4,5,6,7,8,9,12"` because:
     #   3 — pre-existing file not visible on S3 fresh mount
     #       (likely opendal list() consistency; tracked as
     #       follow-up)
@@ -140,6 +140,8 @@ function Mount-Test {
     #       4 is skipped)
     #   6 — append + verify (write IRP hang, #332)
     #   7 — 10M write + read (write IRP hang, #332)
+    #   8 — random seek (depends on sub-test 7's _ci_10m.bin)
+    #   9 — concurrent reads (depends on sub-test 7's _ci_10m.bin)
     #   12 — file lock + rename (backend semantics gap, #327)
     # Sub-test 11 (ACL) is intentionally NOT skipped: it
     # already has `::warning::` + `[WARN]` handling for the
@@ -461,6 +463,7 @@ function Mount-Test {
 
     # --- 8. random seek ------------------------------------------
     Write-Host "--- 8. random seek ---"
+    if (Should-Skip 8) { Write-Host "  (skipped: -SkipSubTests 8)" } else {
     $offsets = @(0, 500, 10000, 50000, 500000, 5000000, 9000000, 9999999)
     foreach ($off in $offsets) {
         try {
@@ -477,6 +480,7 @@ function Mount-Test {
         } catch {
             Fail "seek $off" $_.Exception.Message
         }
+    }
     }
 
     # --- 9. concurrent reads (Issue #316a) ----------------------
@@ -507,6 +511,7 @@ function Mount-Test {
     # Each job appends "PASS i\n" to a per-job file; we then
     # assert all three files contain that line.
     Write-Host "--- 9. concurrent reads ---"
+    if (Should-Skip 9) { Write-Host "  (skipped: -SkipSubTests 9)" } else {
     $concurrentReads = 3
     $deadlineSec = 30
     $jobs = @()
@@ -563,6 +568,7 @@ function Mount-Test {
     }
     if ($allOk) {
         Pass "$concurrentReads concurrent reads OK (dispatcher-threads=$DispatcherThreads)"
+    }
     }
 
     # --- 10. symlink (Issue #316b / follow-up #TBD-symlink) ------
