@@ -107,11 +107,20 @@ jobs:
           $env:MINIO_ROOT_USER     = "minioadmin"
           $env:MINIO_ROOT_PASSWORD = "minioadmin"
           $minioLog = Join-Path $minioDir "minio.log"
+          # Use -WindowStyle Hidden (own process group) rather than
+          # -NoNewWindow. The latter shares the parent pwsh's
+          # console; when the step's `run:` block ends, the
+          # orphaned child gets cleaned up by the runner, so the
+          # next step's mntrs.exe sees "Connection refused" on
+          # localhost:9000. CI run 28346293479 (and earlier)
+          # hit this exact failure mode — every Stat/ List
+          # attempt was met with os error 10061.
           $minioProc = Start-Process -FilePath $minioBin `
               -ArgumentList @('server', $dataDir, '--address', ':9000') `
               -RedirectStandardOutput $minioLog `
               -RedirectStandardError "$minioLog.err" `
-              -PassThru -NoNewWindow
+              -WindowStyle Hidden `
+              -PassThru
           Write-Host "started minio pid=$($minioProc.Id)"
           $ready = $false
           for ($i = 1; $i -le 30; $i++) {
@@ -218,6 +227,31 @@ jobs:
           Get-Content (Join-Path $minioDir "env.txt") | ForEach-Object {
             $parts = $_.Split("=", 2)
             if ($parts.Count -eq 2) { Set-Item -Path "Env:\$($parts[0])" -Value $parts[1] }
+          }
+          # Re-confirm MinIO is up. The previous step's `run:`
+          # block has exited; if MinIO somehow didn't survive
+          # the transition (e.g. the Start-Process child got
+          # cleaned up), we want a clear error before mntrs
+          # burns 5 minutes retrying opendal requests against a
+          # dead port. Belt-and-suspenders: the
+          # `-WindowStyle Hidden` change above is the real fix;
+          # this is the "fail fast" companion.
+          $minioReady = $false
+          for ($i = 1; $i -le 10; $i++) {
+            try {
+              $r = Invoke-WebRequest -Uri "http://localhost:9000/minio/health/live" -UseBasicParsing -TimeoutSec 2
+              if ($r.StatusCode -eq 200) { $minioReady = $true; break }
+            } catch { }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $minioReady) {
+            $minioLog = Join-Path $minioDir "minio.log"
+            $minioErr = "$minioLog.err"
+            Write-Host "::error::MinIO is not reachable on localhost:9000 at the start of the s3 e2e step"
+            if (Test-Path $minioLog) { Write-Host "--- minio stdout (tail) ---"; Get-Content $minioLog -Tail 40 }
+            if (Test-Path $minioErr) { Write-Host "--- minio stderr (tail) ---"; Get-Content $minioErr -Tail 40 }
+            Get-Process minio -ErrorAction SilentlyContinue | Select-Object Id, Name, StartTime | Format-Table | Out-String | Write-Host
+            exit 1
           }
           . tests/e2e/common/mount-test.ps1
           Mount-Test -Backend s3 `
