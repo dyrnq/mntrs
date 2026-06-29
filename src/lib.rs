@@ -1895,14 +1895,17 @@ impl MntrsFs {
             }
             Ok::<_, opendal::Error>(out)
         })?;
-        // Deduplicate by Unicode-normalized name if enabled
+        // Deduplicate by Unicode-normalized name if enabled.
+        // Issue #307: use the shared `util::nfc` helper rather than
+        // an inline `UnicodeNormalization::nfc().collect()` so the
+        // canonical-form behavior lives in one place. The adapter
+        // boundary normalization (winfsp.rs + fuser.rs) ensures
+        // these names are already in NFC, so this dedup is the
+        // safety net for any backend that returns NFD (e.g.
+        // macOS-uploaded keys).
         if self.block_norm_dupes && !result.is_empty() {
             let mut seen = std::collections::HashSet::new();
-            result.retain(|(name, ..)| {
-                use unicode_normalization::UnicodeNormalization;
-                let norm: String = name.nfc().collect::<String>();
-                seen.insert(norm)
-            });
+            result.retain(|(name, ..)| seen.insert(crate::util::nfc(name)));
         }
         // Store entries individually (like rclone DirEntry per name).
         // Only cache on success — caching an empty Vec from an error
