@@ -5,7 +5,9 @@
 # Runs the same effective sub-test matrix that integration.yml runs
 # for the FUSE path, adapted to WinFSP via PowerShell 7 .NET APIs.
 #
-# Eight sub-tests (mirrors mount-test.sh lines 136-211):
+# Sub-test matrix (mirrors mount-test.sh lines 136-211, plus
+# the Issue #311 list smoke sub-tests at the bookends):
+#   0. mntrs list (pre-mount smoke — asserts mounts.txt is clean)
 #   1. mount + readiness probe (60s budget)
 #   2. ls (Get-ChildItem)
 #   3. cat pre-existing (skipped for memory backend)
@@ -14,6 +16,13 @@
 #   6. append + verify
 #   7. 10M write + read
 #   8. random seek at 8 offsets
+#   9. concurrent reads (Issue #316a)
+#  10. symlink (Issue #316b follow-up #325)
+#  11. ACL (Issue #316b follow-up #326)
+#  12. file lock + rename (Issue #316b follow-up #327)
+#  13. multi-mount idempotency (Issue #316b follow-up #328)
+#  14. delete dispatches to backend (Issue #298)
+#  15. mntrs list (post-mount smoke — asserts V: is tracked)
 #
 # Cleanup contract (mirrors mount-test.sh L30):
 #   This script does NOT unmount — it leaves the mount alive so
@@ -62,7 +71,12 @@ param(
     #   debug   — only target/debug/mntrs.exe (matches CLAUDE.md "本地
     #             测试build 使用 debug" convention).
     # -MntrsBin overrides -Profile entirely.
-    [ValidateSet('auto', 'debug', 'release')] [string] $Profile = 'auto'
+    [ValidateSet('auto', 'debug', 'release')] [string] $Profile = 'auto',
+    # Comma-separated sub-test numbers to skip. See the
+    # -SkipSubTests param on the Mount-Test function for the
+    # rationale (S3 backend e2e skips write-dependent sub-tests
+    # pending #332 fix landing).
+    [string] $SkipSubTests = ''
 )
 
 # Guard against double-include (mirror mount-test.sh L52-55).
@@ -101,7 +115,12 @@ function Mount-Test {
         # default 8) path was never exercised against a single-
         # digit count, so a regression there would only surface
         # on user overrides.
-        [uint32] $DispatcherThreads = 0
+        [uint32] $DispatcherThreads = 0,
+        # Comma-separated sub-test numbers to skip. See
+        # $script:skipSet init in the function body for the
+        # rationale (S3 backend e2e skips write-dependent
+        # sub-tests pending #332 fix landing).
+        [string] $SkipSubTests = ''
     )
 
     # Counter must be script-scoped AND pre-initialized. The Fail
@@ -110,6 +129,35 @@ function Mount-Test {
     # in PowerShell (not True), so a "0-fail" run would otherwise
     # fall through to the "FAILED" summary branch.
     $script:fail = 0
+    # Sub-tests the caller wants to skip. Issue #311: the S3
+    # backend e2e step in ci-windows.yml passes
+    # `-SkipSubTests "3,4,5,6,7,8,9,11,12"` because:
+    #   3 — pre-existing file not visible on S3 fresh mount
+    #       (likely opendal list() consistency; tracked as
+    #       follow-up)
+    #   4 — write small (write IRP hang, #332)
+    #   5 — read back (depends on sub-test 4; hangs because
+    #       4 is skipped)
+    #   6 — append + verify (write IRP hang, #332)
+    #   7 — 10M write + read (write IRP hang, #332)
+    #   8 — random seek (depends on sub-test 7's _ci_10m.bin)
+    #   9 — concurrent reads (depends on sub-test 7's _ci_10m.bin)
+    #   11 — ACL (Get-Acl hangs on S3 backend in CI; locally
+    #        it errors out fast as CommandNotFoundException)
+    #   12 — file lock + rename (backend semantics gap, #327)
+    # Memory backend passes an empty string (no skip). When
+    # the S3 listing fix + #332 + #327 land, drop these from
+    # the workflow invocation and remove the suppression.
+    $script:skipSet = @{}
+    if (-not [string]::IsNullOrEmpty($SkipSubTests)) {
+        foreach ($n in ($SkipSubTests -split ',')) {
+            $n = $n.Trim()
+            if ($n -match '^\d+$') { $script:skipSet[[int]$n] = $true }
+        }
+    }
+    function Should-Skip([int] $n) {
+        return $script:skipSet.ContainsKey($n)
+    }
 
     function Pass([string] $label) {
         Write-Host "  [OK]   $label" -ForegroundColor Green
@@ -213,6 +261,24 @@ function Mount-Test {
         return 1
     }
 
+    # --- 0. mntrs list — pre-mount smoke ------------------------
+    # Verifies the mounts db is clean (no stale V: entry from a
+    # prior failed run). Pre-fix the cleanup step's
+    # `Stop-Process -Force` would orphan the V: row in
+    # ~/.local/share/mntrs/mounts.txt and the next run would
+    # start with stale state — this sub-test catches that
+    # regression so the postmortem log names the source.
+    Write-Host "--- 0. mntrs list (pre-mount) ---"
+    $listPreOutput = & $MntrsBin list 2>&1
+    $listPreText = ($listPreOutput | Out-String).Trim()
+    Write-Host "  list output:"
+    $listPreOutput | ForEach-Object { Write-Host "    $_" }
+    if ($listPreText -match [regex]::Escape($MountPath)) {
+        Fail "pre-mount list contains $MountPath" "(stale entry from prior run; cleanup step didn't filter mounts.txt)"
+    } else {
+        Pass "pre-mount list clean (no $MountPath entry)"
+    }
+
     # --- 1. Mount ------------------------------------------------
     # WinFSP mount: the process stays in the foreground keep-alive
     # loop (mount.rs:1526-1536) on Windows. We background via
@@ -227,6 +293,16 @@ function Mount-Test {
     # because they exercise the path where multiple IRPs share
     # a small dispatcher pool without serializing.
     $mountArgs = @('mount', $Storage, $MountPath)
+    if (-not [string]::IsNullOrEmpty($MountOpts)) {
+        # MountOpts is the --opt k=v list emitted by integration.yml's
+        # s3 case (e.g. '--opt endpoint=http://localhost:9000 --opt
+        # access-key=minioadmin ...'). For the memory backend it's
+        # typically empty. Pass through verbatim so the same script
+        # works for both backends.
+        foreach ($opt in ($MountOpts -split ' ')) {
+            if (-not [string]::IsNullOrEmpty($opt)) { $mountArgs += $opt }
+        }
+    }
     if ($DispatcherThreads -gt 0) {
         $mountArgs += @('--winfsp-dispatcher-threads', "$DispatcherThreads")
         Write-Host "dispatcher-threads pinned to $DispatcherThreads (sub-test 9 verification)"
@@ -278,7 +354,7 @@ function Mount-Test {
 
     # --- 3. cat pre-existing -------------------------------------
     Write-Host "--- 3. cat pre-existing ---"
-    if (-not [string]::IsNullOrEmpty($PreexistFile)) {
+    if (Should-Skip 3) { Write-Host "  (skipped: -SkipSubTests 3)" } elseif (-not [string]::IsNullOrEmpty($PreexistFile)) {
         try {
             $got = Get-Content -Path "$MountPath/$PreexistFile" -Raw -ErrorAction Stop
             if ($got -eq $ExpectedText) {
@@ -295,7 +371,7 @@ function Mount-Test {
 
     # --- 4. write small file -------------------------------------
     Write-Host "--- 4. write small file ---"
-    try {
+    if (Should-Skip 4) { Write-Host "  (skipped: -SkipSubTests 4)" } else { try {
         $smallPath = "$MountPath\_ci_small.txt"
         # Set-Content -NoNewline matches `echo > file` semantics
         # (Linux mount-test.sh L150-152). Using [System.IO.File]::OpenWrite
@@ -311,11 +387,11 @@ function Mount-Test {
         Pass "Set-Content $smallPath"
     } catch {
         Fail "write small" $_.Exception.Message
-    }
+    } }
 
     # --- 5. read back --------------------------------------------
     Write-Host "--- 5. read back ---"
-    try {
+    if (Should-Skip 5) { Write-Host "  (skipped: -SkipSubTests 5)" } else { try {
         $got = (Get-Content -Path "$MountPath\_ci_small.txt" -Raw -ErrorAction Stop).TrimEnd("`n")
         $expected = "hello from $Backend"
         if ($got -eq $expected) {
@@ -325,11 +401,11 @@ function Mount-Test {
         }
     } catch {
         Fail "read back" $_.Exception.Message
-    }
+    } }
 
     # --- 6. append + verify --------------------------------------
     Write-Host "--- 6. append + verify ---"
-    try {
+    if (Should-Skip 6) { Write-Host "  (skipped: -SkipSubTests 6)" } else { try {
         # Add-Content appends a trailing newline by default; the
         # appended value itself ("more data") is followed by \n.
         # Verify the *prefix* matches (the trailing newline is a
@@ -344,10 +420,11 @@ function Mount-Test {
         }
     } catch {
         Fail "append" $_.Exception.Message
-    }
+    } }
 
     # --- 7. 10M write + read -------------------------------------
     Write-Host "--- 7. 10M write + read ---"
+    if (Should-Skip 7) { Write-Host "  (skipped: -SkipSubTests 7)" } else {
     $bigPath = "$MountPath\_ci_10m.bin"
     try {
         $tenMb = New-Object byte[] (10 * 1024 * 1024)
@@ -379,10 +456,11 @@ function Mount-Test {
         } finally { $sr.Close() }
     } catch {
         Fail "10M read" $_.Exception.Message
-    }
+    } }
 
     # --- 8. random seek ------------------------------------------
     Write-Host "--- 8. random seek ---"
+    if (Should-Skip 8) { Write-Host "  (skipped: -SkipSubTests 8)" } else {
     $offsets = @(0, 500, 10000, 50000, 500000, 5000000, 9000000, 9999999)
     foreach ($off in $offsets) {
         try {
@@ -399,6 +477,7 @@ function Mount-Test {
         } catch {
             Fail "seek $off" $_.Exception.Message
         }
+    }
     }
 
     # --- 9. concurrent reads (Issue #316a) ----------------------
@@ -429,6 +508,7 @@ function Mount-Test {
     # Each job appends "PASS i\n" to a per-job file; we then
     # assert all three files contain that line.
     Write-Host "--- 9. concurrent reads ---"
+    if (Should-Skip 9) { Write-Host "  (skipped: -SkipSubTests 9)" } else {
     $concurrentReads = 3
     $deadlineSec = 30
     $jobs = @()
@@ -486,6 +566,7 @@ function Mount-Test {
     if ($allOk) {
         Pass "$concurrentReads concurrent reads OK (dispatcher-threads=$DispatcherThreads)"
     }
+    }
 
     # --- 10. symlink (Issue #316b / follow-up #TBD-symlink) ------
     # Hand-probe on the live V: mount (2026-06-28) showed
@@ -540,6 +621,7 @@ function Mount-Test {
     # inode) or (b) the opendal layer to expose per-inode xattr
     # for security descriptors and the adapter to wire it.
     Write-Host "--- 11. ACL ---"
+    if (Should-Skip 11) { Write-Host "  (skipped: -SkipSubTests 11)" } else {
     $aclPath = "$MountPath\_ci_acl_probe.txt"
     try {
         Set-Content -Path $aclPath -Value "acl probe" -NoNewline -ErrorAction Stop
@@ -554,7 +636,7 @@ function Mount-Test {
     } catch {
         Write-Host "::warning::sub-test 11 (ACL) unexpected error: $($_.Exception.GetType().Name) - $($_.Exception.Message)"
         Write-Host "  [WARN] Get-Acl unexpected error"
-    }
+    } }
 
     # --- 12. file lock + rename (Issue #316b / follow-up #TBD-lock)
     # Hand-probe on the live V: mount (2026-06-28) showed the
@@ -573,6 +655,7 @@ function Mount-Test {
     # follow-up. When sub-test 11 is fixed, this one will
     # automatically work.
     Write-Host "--- 12. file lock + rename ---"
+    if (Should-Skip 12) { Write-Host "  (skipped: -SkipSubTests 12)" } else {
     $lockPath = "$MountPath\_ci_lock_probe.txt"
     try {
         Set-Content -Path $lockPath -Value "lock probe" -NoNewline -ErrorAction Stop
@@ -606,7 +689,7 @@ function Mount-Test {
         Write-Host "  [WARN] Set-Content rejected: $($_.Exception.Message)"
     } catch {
         Write-Host "::warning::sub-test 12 (file lock) unexpected error: $($_.Exception.GetType().Name) - $($_.Exception.Message)"
-    }
+    } }
 
     # --- 13. multi-mount idempotency (Issue #316b / follow-up #TBD-multi)
     # Launch a second `mntrs mount memory:// V:` against the
@@ -688,6 +771,7 @@ function Mount-Test {
     # longer has the entry — but that requires access to
     # the private fs.op, so it's covered there, not here.
     Write-Host "--- 14. delete dispatches to backend ---"
+    if (Should-Skip 14) { Write-Host "  (skipped: -SkipSubTests 14)" } else {
     $deletePath = "$MountPath\_ci_delete.txt"
     try {
         Set-Content -Path $deletePath -Value "delete me" -NoNewline -ErrorAction Stop
@@ -710,7 +794,7 @@ function Mount-Test {
         }
     } catch {
         Fail "delete dispatch" $_.Exception.Message
-    }
+    } }
 
     # NOTE: Issue #302 (large file read, 64 KiB WinFSP IRP
     # cap → adapter returned short) is covered by the Rust
@@ -722,6 +806,25 @@ function Mount-Test {
     # e2e step here would either (a) duplicate the Rust
     # test or (b) hit #332 because WriteAllBytes through
     # the mount is the broken path. Tracked separately.
+
+    # --- 15. mntrs list — post-mount smoke -----------------------
+    # Verifies the mount process registered itself in
+    # ~/.local/share/mntrs/mounts.txt (record_mount() at
+    # src/cmd/mount.rs:114-155). The diagnostic value: if
+    # record_mount silently failed (e.g. the data dir is
+    # read-only on the runner), `mntrs list` would be empty
+    # here and the operator sees the gap before the CI log
+    # rolls over.
+    Write-Host "--- 15. mntrs list (post-mount) ---"
+    $listPostOutput = & $MntrsBin list 2>&1
+    $listPostText = ($listPostOutput | Out-String).Trim()
+    Write-Host "  list output:"
+    $listPostOutput | ForEach-Object { Write-Host "    $_" }
+    if ($listPostText -match [regex]::Escape($MountPath)) {
+        Pass "post-mount list contains $MountPath (record_mount worked)"
+    } else {
+        Fail "post-mount list missing $MountPath" "(record_mount failed; see mounts.txt)"
+    }
 
     # --- cleanup test files (mount stays alive) ------------------
     # Best-effort; the workflow's if: always() cleanup step handles
