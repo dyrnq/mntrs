@@ -2257,6 +2257,52 @@ impl CoreFilesystem for MntrsFs {
         {
             let cpath = crate::cache_path(&self.cache_dir, &full_path);
             let cache_size = std::fs::metadata(&cpath).map(|m| m.len()).unwrap_or(0);
+            // Issue #301: detect a stale dir_cache via a successful
+            // lookup whose name is not in the parent's listing. A
+            // file created out-of-band (opendal write_remote from a
+            // sibling process, or any path that bypasses the mount's
+            // create/mkdir → cache_add_entry chain) lands on the
+            // backend but does not update our dir_cache. The next
+            // readdir would then miss the entry. Invalidate the
+            // parent's cache here so the next readdir refetches the
+            // full backend listing.
+            //
+            // Cold-cache case (dir_cache has no entry for the
+            // parent) is left untouched: the lookup is the first
+            // thing to mention this name, so the cache is already
+            // "fresh enough" — there is nothing to invalidate. This
+            // matches the issue body's option 3 ("lookup should
+            // populate the dir_cache for parents as a side effect")
+            // adapted to the cheaper invalidate-on-miss variant.
+            //
+            // We use `full_path` (the canonical backend path) rather
+            // than `name` (the per-adapter arg, which is a basename
+            // from FUSE and a full path from WinFSP) so the
+            // parent/basename split is uniform across adapters.
+            let parent_dir_of_full = std::path::Path::new(&full_path)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let basename = std::path::Path::new(&full_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if !basename.is_empty() {
+                let parent_canon = canonicalize_list_path(&parent_dir_of_full);
+                let stale = self
+                    .dir_cache
+                    .get(&parent_canon)
+                    .map(|entry| !entry.value().1.contains_key(&basename))
+                    .unwrap_or(false);
+                if stale {
+                    tracing::debug!(
+                        parent = %parent_dir_of_full,
+                        name = %basename,
+                        "lookup: invalidating stale parent dir_cache (issue #301)"
+                    );
+                    self.dir_cache.remove(&parent_canon);
+                }
+            }
             (k, s.max(cache_size), m)
         } else {
             // HDFS implicit-directory fix: when `stat_op` returns NotFound

@@ -251,7 +251,6 @@ fn winfsp_statfs_reports_volume() {
 }
 
 #[test]
-#[ignore = "TODO(#301): nested directory created via backend not visible in mount readdir (stale dir_cache)"]
 fn winfsp_nested_directory() {
     let fs = Arc::new(make_memory_fs());
     let guard = mntrs::core_fs::test_helpers::mount_winfsp(fs.clone()).unwrap();
