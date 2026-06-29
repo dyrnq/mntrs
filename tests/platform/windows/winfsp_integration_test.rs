@@ -7,6 +7,7 @@ use opendal::Operator;
 use opendal::services::Memory;
 
 use mntrs::MntrsFs;
+use mntrs::core_fs::CoreFilesystem;
 
 // One-shot tracing subscriber init. The `mntrs.exe` binary
 // initializes a global subscriber in main.rs; the test binary
@@ -361,10 +362,177 @@ fn winfsp_write_large_file() {
 }
 
 // ============================================================
-// 通用 mount_internal 参数测试 (non-Windows specific)
+// Issue #306 regression tests: readdir_with_attrs (N+1 RTT + marker paging)
 // ============================================================
 
-/// mount_internal with various backend schemes
+/// Issue #306: readdir_with_attrs must return the entry's
+/// real `size` (not the synthesized zero) so Explorer
+/// shows "N bytes" instead of "0 bytes" without a follow-up
+/// `get_file_info` click. Pre-fix, the WinFSP adapter built
+/// a `CoreFileAttr { size: 0, mtime: UNIX_EPOCH, ... }`
+/// for every entry; post-fix it pulls real attrs from the
+/// dir_cache snapshot via `batch_lookup_from_dir_cache`.
+///
+/// The test calls `readdir_with_attrs` directly through
+/// `MntrsFs` (no WinFSP dispatcher needed). The WinFSP
+/// adapter's only contract is that it forwards `(ino, fh,
+/// marker)` to this method; the bug fix lives at the trait
+/// method override, which is what we exercise here.
+#[test]
+fn winfsp_readdir_real_attrs() {
+    use std::time::SystemTime;
+
+    let fs = make_memory_fs();
+
+    // Write 100 files with sizes 1..=100 bytes so each
+    // entry has a distinct, easy-to-verify size.
+    for i in 1..=100u64 {
+        let name = format!("f_{:03}.txt", i);
+        let body = vec![b'A'; i as usize];
+        write_remote(&fs, &name, &body);
+    }
+
+    // opendir pins the per-fh snapshot (lib.rs:2754).
+    let dir_fh = <MntrsFs as CoreFilesystem>::opendir(&fs, 1).expect("opendir root");
+    let pages = <MntrsFs as CoreFilesystem>::readdir_with_attrs(&fs, 1, dir_fh, "")
+        .expect("readdir_with_attrs");
+
+    // Expect 100 file entries plus the synthesized "." /
+    // ".." (readdir_materialise prepends them at
+    // lib.rs:1007-1018).
+    assert!(
+        pages.len() >= 100,
+        "expected >= 100 entries (got {})",
+        pages.len()
+    );
+
+    // For each `f_NNN.txt` entry the size must equal N (the
+    // real body size), NOT 0 (the pre-fix synthesized
+    // value).
+    let mut seen_sizes: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for (entry, attr) in &pages {
+        if entry.name == "." || entry.name == ".." {
+            continue;
+        }
+        seen_sizes.insert(entry.name.clone(), attr.size);
+    }
+    for i in 1..=100u64 {
+        let name = format!("f_{:03}.txt", i);
+        let got = seen_sizes
+            .get(&name)
+            .copied()
+            .unwrap_or_else(|| panic!("entry {name} missing from readdir_with_attrs result"));
+        assert_eq!(
+            got, i,
+            "entry {name}: expected size={i}, got {got} (pre-fix would be 0)"
+        );
+    }
+
+    // mtime check: skip if no entry has a real mtime (some
+    // backends like opendal memory don't populate
+    // last_modified; if every entry has mtime=epoch the
+    // attr is honestly reflecting the backend, not the
+    // pre-fix synthesized zero). The size assertion above
+    // is the real win — the rest is a soft check.
+    let real_mtimes = pages
+        .iter()
+        .filter(|(e, _)| e.name != "." && e.name != "..")
+        .filter(|(_, a)| a.mtime != SystemTime::UNIX_EPOCH)
+        .count();
+    if real_mtimes > 0 {
+        eprintln!("{real_mtimes}/100 entries have non-epoch mtime");
+    } else {
+        eprintln!("backend does not populate last_modified — size check above is the real win");
+    }
+
+    // Cleanup: drop the per-fh snapshot so the test_helpers
+    // drop on the WinFspAdapter doesn't leak it (we never
+    // mounted, but be tidy).
+    let _ = <MntrsFs as CoreFilesystem>::releasedir(&fs, 1, dir_fh);
+}
+
+/// Issue #306: readdir_with_attrs must slice the per-fh
+/// snapshot by marker so each page only contains entries
+/// strictly greater than the marker. Pre-fix the WinFSP
+/// adapter re-materialised the full Vec on every page
+/// (`inner.readdir(ino, fh, 0, 0)`), which (a) wasted work
+/// and (b) made the listing sensitive to concurrent
+/// dir_cache invalidations between pages.
+///
+/// Post-fix: each call returns only the next slice, and
+/// walking the directory by feeding back the last entry's
+/// name as the next marker must visit every entry exactly
+/// once with no duplicates.
+#[test]
+fn winfsp_readdir_marker_paging() {
+    use std::collections::HashSet;
+
+    let fs = make_memory_fs();
+
+    // Create 100 small files.
+    for i in 0..100u64 {
+        let name = format!("p_{:03}.bin", i);
+        write_remote(&fs, &name, b"x");
+    }
+
+    let dir_fh = <MntrsFs as CoreFilesystem>::opendir(&fs, 1).expect("opendir root");
+
+    // Walk: each call passes the last delivered name as
+    // the next marker. Empty marker = first page. The
+    // returned slice must be non-empty until the dir is
+    // exhausted.
+    let mut marker = String::new();
+    let mut collected: Vec<String> = Vec::new();
+    let mut page_count = 0usize;
+    loop {
+        let page = <MntrsFs as CoreFilesystem>::readdir_with_attrs(&fs, 1, dir_fh, &marker)
+            .expect("readdir_with_attrs page");
+        if page.is_empty() {
+            break;
+        }
+        page_count += 1;
+        // Sanity: every entry's name must be strictly >
+        // the marker (WinFSP marker semantics).
+        for (entry, _attr) in &page {
+            assert!(
+                entry.name.as_str() > marker.as_str(),
+                "entry {} not > marker {:?} (page {})",
+                entry.name,
+                marker,
+                page_count
+            );
+        }
+        marker = page.last().unwrap().0.name.clone();
+        collected.extend(page.into_iter().map(|(e, _)| e.name));
+        // Safety bound: never loop more than N+1 times.
+        assert!(page_count <= 200, "paging did not terminate in 200 pages");
+    }
+
+    // No duplicates.
+    let unique: HashSet<&String> = collected.iter().collect();
+    assert_eq!(
+        unique.len(),
+        collected.len(),
+        "marker paging produced duplicates: {:?}",
+        collected
+    );
+
+    // Every file we wrote must show up exactly once.
+    for i in 0..100u64 {
+        let name = format!("p_{:03}.bin", i);
+        assert_eq!(
+            collected.iter().filter(|n| n.as_str() == name).count(),
+            1,
+            "{name} not visited exactly once across pages"
+        );
+    }
+
+    let _ = <MntrsFs as CoreFilesystem>::releasedir(&fs, 1, dir_fh);
+}
+
+// ============================================================
+// 通用 mount_internal 参数测试 (non-Windows specific)
+// ============================================================
 #[test]
 fn test_generic_mount_internal_schemes() {
     let tmp = std::env::temp_dir().join(format!("mntrs-gen-mount-{}", std::process::id()));
