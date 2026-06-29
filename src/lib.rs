@@ -2810,6 +2810,73 @@ impl CoreFilesystem for MntrsFs {
         Ok(())
     }
 
+    /// Issue #306: readdir_with_attrs serves attrs in the
+    /// same call as the entries, so the WinFSP adapter can
+    /// populate the DirInfo with real size/mtime without
+    /// triggering a follow-up `get_file_info` IRP per entry.
+    ///
+    /// Marker slicing: WinFSP delivers entries in lex order
+    /// and calls back with the last delivered name as the
+    /// marker for the next page. `partition_point` returns
+    /// the first index whose name is strictly > marker,
+    /// which is exactly "start of next page" semantics.
+    /// Empty marker = first page (returns everything).
+    ///
+    /// No backend RTT in the common case: `list_op` already
+    /// populated `dir_cache` with `(name -> DirEntryCacheValue)`
+    /// during `opendir`, and `batch_lookup_from_dir_cache`
+    /// serves attrs from that snapshot directly.
+    fn readdir_with_attrs(
+        &self,
+        ino: u64,
+        fh: u64,
+        marker: &str,
+    ) -> std::io::Result<Vec<(CoreDirEntry, CoreFileAttr)>> {
+        // Slice the per-fh snapshot by marker. Clone the
+        // Vec out of the DashMap so the shard lock is
+        // released before the (potentially expensive)
+        // batch_lookup below — concurrent ops on
+        // dir_listers should not block on attr lookups.
+        let entries = self
+            .dir_listers
+            .get(&fh)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("readdir_with_attrs(ino={ino}, fh={fh}): unknown dir-lister handle"),
+                )
+            })?
+            .value()
+            .clone();
+        let cut = if marker.is_empty() {
+            0
+        } else {
+            entries.partition_point(|e| e.name.as_str() <= marker)
+        };
+        let page: Vec<CoreDirEntry> = entries[cut..].to_vec();
+        drop(entries);
+
+        // Batch-fetch attrs from dir_cache snapshot
+        // (lib.rs::batch_lookup_from_dir_cache). Cold-
+        // cache fallback inside the helper already does the
+        // per-name trait lookup, so a missing entry doesn't
+        // crash.
+        let names: Vec<&str> = page.iter().map(|e| e.name.as_str()).collect();
+        let attrs = self.batch_lookup_from_dir_cache(ino, &names);
+
+        let mut out = Vec::with_capacity(page.len());
+        for (e, attr_res) in page.into_iter().zip(attrs) {
+            if let Ok(attr) = attr_res {
+                out.push((e, attr));
+            }
+            // Skip Err: a name in the lister that disappeared
+            // from dir_cache between opendir and
+            // readdir_with_attrs (race with concurrent unlink)
+            // is exactly what the winfsp layer should drop.
+        }
+        Ok(out)
+    }
+
     fn open(&self, ino: u64, _flags: u32) -> std::io::Result<u64> {
         let path = self.resolve(ino).map(|e| e.path).unwrap_or_default();
         let fh = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

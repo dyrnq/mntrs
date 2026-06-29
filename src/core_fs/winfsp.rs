@@ -1354,119 +1354,45 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                     return Err(STATUS_INVALID_DEVICE_REQUEST.into());
                 }
 
-                // Materialise the full entry list. `inner.readdir`
-                // with `offset=0` returns the full Vec (issue #23
-                // per-fh snapshot is already populated by
-                // `opendir(dir_fh)` in the open path).
-                let entries = self
+                // Issue #306: readdir_with_attrs serves entries
+                // + attrs in one call, sliced by marker against
+                // the per-fh snapshot pinned by opendir. Two
+                // perf wins:
+                //   * No backend RTT per entry — attrs come
+                //     from the dir_cache snapshot that opendir
+                //     populated via list_op.
+                //   * O(page-size) per call instead of O(N) —
+                //     partition_point slices the snapshot by
+                //     marker instead of re-materialising the
+                //     full Vec on each WinFSP page.
+                //
+                // Convert the WinFSP marker (null-terminated
+                // UTF-16) to a String once. `inner_as_cstr()`
+                // returns `Option<&U16CStr>` (None on the
+                // first call where there's no marker).
+                let marker_str = marker
+                    .inner_as_cstr()
+                    .map(|m| m.to_string_lossy())
+                    .unwrap_or_default();
+                let entries_with_attrs = self
                     .inner
-                    .readdir(context.ino, context.dir_fh, 0, 0)
+                    .readdir_with_attrs(context.ino, context.dir_fh, &marker_str)
                     .map_err(io_err_to_status)?;
                 tracing::debug!(
                     ino = context.ino,
                     dir_fh = context.dir_fh,
-                    entry_count = entries.len(),
+                    marker = %marker_str,
+                    entry_count = entries_with_attrs.len(),
                     "winfsp::read_directory: got entries"
                 );
 
-                // Convert marker (last delivered entry name) into
-                // something we can compare against `entry.name`.
-                // `marker.inner_as_cstr()` returns
-                // `Option<&U16CStr>` (null-terminated UTF-16) when
-                // a marker is set.
-                let marker_u16: Option<Vec<u16>> =
-                    marker.inner_as_cstr().map(|m| m.as_slice().to_vec());
-                let marker_dbg = marker_u16
-                    .as_ref()
-                    .map(|m| String::from_utf16_lossy(m))
-                    .unwrap_or_else(|| "<none>".to_string());
-                tracing::debug!(marker = %marker_dbg, "winfsp::read_directory: marker state");
-
                 let mut cursor: u32 = 0;
-                for entry in &entries {
-                    let name_u16: Vec<u16> = entry
-                        .name
-                        .encode_utf16()
-                        .chain(std::iter::once(0))
-                        .collect();
-
-                    // Build a minimal CoreFileAttr for this
-                    // entry — the trait's readdir returns
-                    // `(ino, kind, name)` only, not the full
-                    // attr, so we synthesize one with the
-                    // available fields. Size/mtime are zeroed
-                    // (Explorer shows them as blank for readdir
-                    // entries until the kernel follows up with
-                    // getattr on each entry; that's the
-                    // pre-existing readdirplus optimization on
-                    // the FUSE side — Win32's FindNextFile
-                    // works the same way).
-                    let attr = crate::core_fs::CoreFileAttr {
-                        ino: entry.ino,
-                        kind: entry.kind,
-                        perm: 0o777,
-                        size: 0,
-                        blksize: 4096,
-                        blocks: 0,
-                        crtime: std::time::SystemTime::UNIX_EPOCH,
-                        mtime: std::time::SystemTime::UNIX_EPOCH,
-                        ctime: std::time::SystemTime::UNIX_EPOCH,
-                        atime: std::time::SystemTime::UNIX_EPOCH,
-                        nlink: 1,
-                        uid: 0,
-                        gid: 0,
-                        rdev: 0,
-                        flags: 0,
-                    };
-
-                    // Skip entries <= marker (WinFSP marker is
-                    // exclusive: entries strictly greater than
-                    // marker are returned).
-                    if let Some(m) = &marker_u16 {
-                        // Compare u16 slices lexicographically.
-                        // BUG FIX: both `name_u16` and `m` are
-                        // null-terminated, but they come from
-                        // different sources — `name_u16` is
-                        // built from Rust's `encode_utf16().chain(0u16)`
-                        // (always includes trailing NUL), while
-                        // `m` is `U16CStr::as_slice()` which
-                        // ALSO includes the trailing NUL
-                        // (U16CStr's slice is the data up to
-                        // but NOT including the terminating NUL
-                        // in many APIs — but inner_as_cstr() in
-                        // winfsp 0.13 returns `&U16CStr` whose
-                        // `as_slice()` excludes the NUL).
-                        // The mismatch was causing our lex
-                        // comparison to fail to suppress entries
-                        // already delivered: e.g. when marker is
-                        // "." (slice = [0x2E]) and name_u16 is
-                        // [0x2E, 0x00], the trailing NUL on
-                        // name_u16 made it "greater than" the
-                        // marker lexically, so the entry got
-                        // re-sent on every read_directory call.
-                        // The result was an infinite re-delivery
-                        // loop. Strip trailing NULs from BOTH
-                        // sides before comparing so the comparison
-                        // is on the actual entry names.
-                        let name_no_nul: &[u16] = if name_u16.last() == Some(&0) {
-                            &name_u16[..name_u16.len() - 1]
-                        } else {
-                            &name_u16[..]
-                        };
-                        let marker_no_nul: &[u16] = if m.last() == Some(&0) {
-                            &m[..m.len() - 1]
-                        } else {
-                            &m[..]
-                        };
-                        if name_no_nul <= marker_no_nul {
-                            continue;
-                        }
-                    }
-
-                    // Pattern filter (simple substring / wildcard).
-                    // Skip for now if pattern present and doesn't
-                    // match — `*.txt` becomes "ends with .txt";
-                    // any other wildcard is treated as no-match
+                for (entry, attr) in &entries_with_attrs {
+                    // Pattern filter (simple substring /
+                    // wildcard). Skip for now if pattern
+                    // present and doesn't match — `*.txt`
+                    // becomes "ends with .txt"; any other
+                    // wildcard is treated as no-match
                     // (Win32's dir *.txt is the common case).
                     if let Some(pat) = pattern {
                         let pat_str = pat.to_string_lossy();
@@ -1475,28 +1401,42 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                         }
                     }
 
+                    let name_u16: Vec<u16> = entry
+                        .name
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .collect();
+
                     // Build the high-level DirInfo<255> wrapper
-                    // (size, FileInfo, padding, file_name). The
-                    // wrapper handles the trailing-NUL bookkeeping
-                    // and computes Size correctly so
-                    // FspFileSystemAddDirInfo's overflow check
-                    // works.
+                    // (size, FileInfo, padding, file_name).
+                    // `core_attr_to_file_info` now copies the
+                    // entry's REAL size + mtime from `attr`
+                    // (pre-fix it zeroed both, which made
+                    // Explorer show "0 bytes / unknown date"
+                    // until each entry was individually
+                    // clicked). The wrapper handles the
+                    // trailing-NUL bookkeeping and computes
+                    // Size correctly so
+                    // FspFileSystemAddDirInfo's overflow
+                    // check works.
                     let mut di = DirInfo::<255>::new();
-                    core_attr_to_file_info(&attr, di.file_info_mut());
-                    // set_name_raw takes a &[u16] WITHOUT trailing
-                    // NUL and calls set_size() with byte_len. Use
-                    // it instead of poking name_buffer / set_size
-                    // directly (those are on the private
-                    // WideNameInfoInternal trait). Returns
-                    // FspError directly — propagate with `?` (the
-                    // function already returns winfsp::Result).
+                    core_attr_to_file_info(attr, di.file_info_mut());
+                    // set_name_raw takes a &[u16] WITHOUT
+                    // trailing NUL and calls set_size() with
+                    // byte_len. Use it instead of poking
+                    // name_buffer / set_size directly (those
+                    // are on the private WideNameInfoInternal
+                    // trait). Returns FspError directly —
+                    // propagate with `?` (the function already
+                    // returns winfsp::Result).
                     di.set_name_raw(name_u16.as_slice())?;
 
-                    // Try to add this entry. FspFileSystemAddDirInfo
-                    // returns FALSE when the buffer can't fit
-                    // another entry — we stop and report what we
-                    // packed so far (WinFSP will call back with
-                    // the same marker to fetch the next page).
+                    // Try to add this entry.
+                    // FspFileSystemAddDirInfo returns FALSE
+                    // when the buffer can't fit another entry
+                    // — we stop and report what we packed so
+                    // far (WinFSP will call back with the
+                    // same marker to fetch the next page).
                     let added = unsafe {
                         FspFileSystemAddDirInfo(
                             (&mut di as *mut DirInfo<255>).cast(),

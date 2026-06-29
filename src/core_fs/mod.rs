@@ -189,6 +189,54 @@ pub trait CoreFilesystem: Send + Sync {
         Ok(())
     }
 
+    /// Read directory entries with their attrs in one call.
+    ///
+    /// Issue #306: WinFSP's `read_directory` callback wants
+    /// `(entry, attr)` pairs so it can populate the DirInfo
+    /// with the entry's real size/mtime without a per-entry
+    /// follow-up `get_file_info` IRP. FUSE's readdir doesn't
+    /// need this — fuser's readdirplus already provides the
+    /// same batch via `lookup_many` / `MntrsFs`'s
+    /// `batch_lookup_from_dir_cache` overrides. The default
+    /// impl here lets any external test fake keep compiling
+    /// without overriding.
+    ///
+    /// `marker` semantics: returns entries with name strictly
+    /// greater than marker (matches WinFSP's marker model).
+    /// Empty marker = first page.
+    ///
+    /// Default: falls back to `readdir(ino, fh, 0, 0)` then
+    /// `getattr(entry.ino)` per entry sequentially. Slow
+    /// (N RTTs in the worst case) but correct. `MntrsFs`
+    /// overrides to serve attrs from the `dir_cache`
+    /// snapshot, avoiding the RTTs entirely for the common
+    /// case.
+    fn readdir_with_attrs(
+        &self,
+        ino: u64,
+        fh: u64,
+        marker: &str,
+    ) -> std::io::Result<Vec<(CoreDirEntry, CoreFileAttr)>> {
+        let entries = self.readdir(ino, fh, 0, 0)?;
+        let mut out = Vec::with_capacity(entries.len());
+        for e in entries {
+            if !marker.is_empty() && e.name.as_str() <= marker {
+                continue;
+            }
+            // Skip entries whose attrs disappear between
+            // readdir and getattr (race with concurrent
+            // unlink). The pre-fix winfsp behavior of
+            // emitting a zero-attr entry would be worse:
+            // Explorer shows "0 bytes / unknown date"
+            // instead of just dropping the row.
+            match self.getattr(e.ino) {
+                Ok(attr) => out.push((e, attr)),
+                Err(_) => continue,
+            }
+        }
+        Ok(out)
+    }
+
     /// Open a file (return a handle id).
     fn open(&self, ino: u64, _flags: u32) -> std::io::Result<u64>;
 
