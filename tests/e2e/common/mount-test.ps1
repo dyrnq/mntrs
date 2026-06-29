@@ -771,6 +771,7 @@ function Mount-Test {
     # longer has the entry — but that requires access to
     # the private fs.op, so it's covered there, not here.
     Write-Host "--- 14. delete dispatches to backend ---"
+    if (Should-Skip 14) { Write-Host "  (skipped: -SkipSubTests 14)" } else {
     $deletePath = "$MountPath\_ci_delete.txt"
     try {
         Set-Content -Path $deletePath -Value "delete me" -NoNewline -ErrorAction Stop
@@ -793,7 +794,7 @@ function Mount-Test {
         }
     } catch {
         Fail "delete dispatch" $_.Exception.Message
-    }
+    } }
 
     # NOTE: Issue #302 (large file read, 64 KiB WinFSP IRP
     # cap → adapter returned short) is covered by the Rust

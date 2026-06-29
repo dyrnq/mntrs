@@ -102,7 +102,16 @@ jobs:
       - name: WinFSP e2e smoke test (memory backend)
         shell: pwsh
         run: |
-          . tests/e2e/common/mount-test.ps1
+          # NOTE: comments must NOT be interleaved with the
+          # Mount-Test call's backtick line-continuations —
+          # PowerShell terminates the logical line at the
+          # first comment line that lacks a trailing backtick,
+          # which would make the following `-SkipSubTests` a
+          # bare statement instead of an argument (CI run
+          # 28348232483 reproduced this: `-SkipSubTests: The
+          # term '-SkipSubTests' is not recognized...`).
+          # Keep all rationale comments ABOVE the Mount-Test call.
+          #
           # Issue #316a: -DispatcherThreads 4 plumbs through to
           # `mntrs mount --winfsp-dispatcher-threads 4`, which
           # calls host.start_with_threads(4) instead of the
@@ -110,21 +119,16 @@ jobs:
           # 3 parallel Get-Content against the same file to
           # verify a pinned small dispatcher pool still serves
           # concurrent IRPs correctly.
-          Mount-Test -Backend memory `
-                     -Storage memory:// `
-                     -MountPath V: `
-                     -LogPath "${{ runner.temp }}\mntrs-mount-memory.log" `
-                     -Profile release `
-                     -DispatcherThreads 4 `
-                     # Sub-test 14 (delete): writes via Set-Content
-                     # then immediately Remove-Item — the file is
-                     # still in the dirty cache when FspCleanupDelete
-                     # fires inner.unlink, which fails on the
-                     # backend ("file not found"). Affects all
-                     # backends. Tracked as follow-up; un-skip
-                     # when the dirty-cache handling in the
-                     # cleanup callback lands.
-                     -SkipSubTests "14"
+          #
+          # Issue #311 + dirty-cache unlink: sub-test 14 (delete)
+          # writes via Set-Content then immediately Remove-Item
+          # — the file is still in the dirty cache when
+          # FspCleanupDelete fires inner.unlink, which fails on
+          # the backend ("file not found"). Affects all backends.
+          # Tracked as follow-up; un-skip when the dirty-cache
+          # handling in the cleanup callback lands.
+          . tests/e2e/common/mount-test.ps1
+          Mount-Test -Backend memory -Storage memory:// -MountPath V: -LogPath "${{ runner.temp }}\mntrs-mount-memory.log" -Profile release -DispatcherThreads 4 -SkipSubTests "14"
 
       - name: Upload memory mount log (failure)
         if: failure()
@@ -186,6 +190,15 @@ jobs:
       # only sub-tests that remain (1, 2, 10, 13, 14, 15)
       # on a local minio.
       - name: WinFSP e2e smoke test (s3 backend)
+        # `if: always()` so a memory-backend failure does not
+        # skip the s3 e2e (default `if: success()` would do
+        # exactly that — observed in CI run 28347906362, where
+        # sub-test 14's dirty-cache bug tripped the memory
+        # step and the s3 step never ran). We want the s3 e2e
+        # to be its own independent signal: if MinIO is dead,
+        # sub-test 1's readiness probe surfaces that as a
+        # clean s3-step failure rather than silently passing.
+        if: always()
         shell: pwsh
         timeout-minutes: 5
         run: |
