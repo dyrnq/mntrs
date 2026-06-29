@@ -76,81 +76,28 @@ jobs:
       # above. Mount is left alive on failure so the postmortem step
       # below can attach the mount log; cleanup is handled in the
       # `if: always()` step at the end of the job.
-      # Issue #311: S3 backend e2e. Starts a local MinIO server
-      # (downloaded as a single-binary minio.exe) on port 9000,
-      # creates the test bucket with mc.exe, seeds a pre-existing
-      # file, and hands the endpoints to the S3 e2e step below.
+      #
+      # Issue #311: S3 backend e2e. The MinIO server start is
+      # INLINED into the s3 e2e step below rather than living in
+      # a separate `Start MinIO server` step. Reason: the GH
+      # Actions runner on Windows terminates the entire process
+      # tree (pwrshell.exe + all descendants) when a step
+      # boundary is crossed, regardless of Start-Process flags
+      # like -WindowStyle Hidden. CI runs 28346293479,
+      # 28346788886 both died here — the MinIO child was killed
+      # at step-end and the next step's mntrs.exe saw
+      # "Connection refused" on localhost:9000 for the entire
+      # 5-minute step. Inlining keeps MinIO in the same
+      # process tree as mntrs for the lifetime of the s3 e2e
+      # step; the cleanup step's Get-Process minio kill then
+      # tears it down deterministically.
       #
       # Why not the GH Actions services:matrix container shape
       # that integration.yml uses for Linux? windows-latest is a
       # Windows VM runner (not Linux with Docker), so the
       # `services:` block is unavailable. Single-binary minio.exe
       # + mc.exe is the same content with one extra Start-Process
-      # per side.
-      - name: Start MinIO server (s3 e2e)
-        shell: pwsh
-        run: |
-          $minioDir = Join-Path ${{ runner.temp }} "mntrs-minio"
-          New-Item -ItemType Directory -Force -Path $minioDir | Out-Null
-          $minioBin = Join-Path $minioDir "minio.exe"
-          $mcBin    = Join-Path $minioDir "mc.exe"
-          $dataDir  = Join-Path $minioDir "data"
-          New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
-          if (-not (Test-Path $minioBin)) {
-            Write-Host "Downloading minio.exe..."
-            Invoke-WebRequest -Uri "https://dl.min.io/server/minio/release/windows-amd64/minio.exe" -OutFile $minioBin -UseBasicParsing
-          }
-          if (-not (Test-Path $mcBin)) {
-            Write-Host "Downloading mc.exe..."
-            Invoke-WebRequest -Uri "https://dl.min.io/client/mc/release/windows-amd64/mc.exe" -OutFile $mcBin -UseBasicParsing
-          }
-          $env:MINIO_ROOT_USER     = "minioadmin"
-          $env:MINIO_ROOT_PASSWORD = "minioadmin"
-          $minioLog = Join-Path $minioDir "minio.log"
-          # Use -WindowStyle Hidden (own process group) rather than
-          # -NoNewWindow. The latter shares the parent pwsh's
-          # console; when the step's `run:` block ends, the
-          # orphaned child gets cleaned up by the runner, so the
-          # next step's mntrs.exe sees "Connection refused" on
-          # localhost:9000. CI run 28346293479 (and earlier)
-          # hit this exact failure mode — every Stat/ List
-          # attempt was met with os error 10061.
-          $minioProc = Start-Process -FilePath $minioBin `
-              -ArgumentList @('server', $dataDir, '--address', ':9000') `
-              -RedirectStandardOutput $minioLog `
-              -RedirectStandardError "$minioLog.err" `
-              -WindowStyle Hidden `
-              -PassThru
-          Write-Host "started minio pid=$($minioProc.Id)"
-          $ready = $false
-          for ($i = 1; $i -le 30; $i++) {
-            try {
-              $r = Invoke-WebRequest -Uri "http://localhost:9000/minio/health/live" -UseBasicParsing -TimeoutSec 2
-              if ($r.StatusCode -eq 200) { $ready = $true; break }
-            } catch { }
-            Start-Sleep -Seconds 1
-          }
-          if (-not $ready) {
-            Write-Host "::error::MinIO did not become ready in 30s"
-            if (Test-Path $minioLog) { Get-Content $minioLog -Tail 40 }
-            exit 1
-          }
-          Write-Host "MinIO ready"
-          & $mcBin alias set ci http://localhost:9000 minioadmin minioadmin 2>&1 | Out-Null
-          & $mcBin mb ci/ci-bucket 2>&1 | Out-Null
-          $seedPath = Join-Path $minioDir "s3-test.txt"
-          Set-Content -LiteralPath $seedPath -Value "hello s3`n" -NoNewline
-          & $mcBin cp $seedPath "ci/ci-bucket/s3-test.txt" 2>&1 | Out-Null
-          Write-Host "seeded s3://ci-bucket/s3-test.txt"
-          # Persist paths for the s3 e2e + cleanup steps. We avoid
-          # $GITHUB_ENV because that requires special GITHUB_ENV
-          # file write semantics; a plain text file is simpler
-          # and read with a one-liner in the next step.
-          Set-Content -LiteralPath (Join-Path $minioDir "env.txt") -Value @(
-              "MINIO_BIN=$minioBin"
-              "MC_BIN=$mcBin"
-              "MINIO_DATA=$dataDir"
-          )
+      # per side, just colocated with the test that needs it.
 
       - name: WinFSP e2e smoke test (memory backend)
         shell: pwsh
@@ -223,21 +170,33 @@ jobs:
         shell: pwsh
         timeout-minutes: 5
         run: |
+          # --- Start MinIO (inlined; see comment above) ----------
           $minioDir = Join-Path ${{ runner.temp }} "mntrs-minio"
-          Get-Content (Join-Path $minioDir "env.txt") | ForEach-Object {
-            $parts = $_.Split("=", 2)
-            if ($parts.Count -eq 2) { Set-Item -Path "Env:\$($parts[0])" -Value $parts[1] }
+          New-Item -ItemType Directory -Force -Path $minioDir | Out-Null
+          $minioBin = Join-Path $minioDir "minio.exe"
+          $mcBin    = Join-Path $minioDir "mc.exe"
+          $dataDir  = Join-Path $minioDir "data"
+          New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+          if (-not (Test-Path $minioBin)) {
+            Write-Host "Downloading minio.exe..."
+            Invoke-WebRequest -Uri "https://dl.min.io/server/minio/release/windows-amd64/minio.exe" -OutFile $minioBin -UseBasicParsing
           }
-          # Re-confirm MinIO is up. The previous step's `run:`
-          # block has exited; if MinIO somehow didn't survive
-          # the transition (e.g. the Start-Process child got
-          # cleaned up), we want a clear error before mntrs
-          # burns 5 minutes retrying opendal requests against a
-          # dead port. Belt-and-suspenders: the
-          # `-WindowStyle Hidden` change above is the real fix;
-          # this is the "fail fast" companion.
+          if (-not (Test-Path $mcBin)) {
+            Write-Host "Downloading mc.exe..."
+            Invoke-WebRequest -Uri "https://dl.min.io/client/mc/release/windows-amd64/mc.exe" -OutFile $mcBin -UseBasicParsing
+          }
+          $env:MINIO_ROOT_USER     = "minioadmin"
+          $env:MINIO_ROOT_PASSWORD = "minioadmin"
+          $minioLog = Join-Path $minioDir "minio.log"
+          $minioProc = Start-Process -FilePath $minioBin `
+              -ArgumentList @('server', $dataDir, '--address', ':9000') `
+              -RedirectStandardOutput $minioLog `
+              -RedirectStandardError "$minioLog.err" `
+              -WindowStyle Hidden `
+              -PassThru
+          Write-Host "started minio pid=$($minioProc.Id)"
           $minioReady = $false
-          for ($i = 1; $i -le 10; $i++) {
+          for ($i = 1; $i -le 30; $i++) {
             try {
               $r = Invoke-WebRequest -Uri "http://localhost:9000/minio/health/live" -UseBasicParsing -TimeoutSec 2
               if ($r.StatusCode -eq 200) { $minioReady = $true; break }
@@ -245,25 +204,39 @@ jobs:
             Start-Sleep -Seconds 1
           }
           if (-not $minioReady) {
-            $minioLog = Join-Path $minioDir "minio.log"
-            $minioErr = "$minioLog.err"
-            Write-Host "::error::MinIO is not reachable on localhost:9000 at the start of the s3 e2e step"
-            if (Test-Path $minioLog) { Write-Host "--- minio stdout (tail) ---"; Get-Content $minioLog -Tail 40 }
-            if (Test-Path $minioErr) { Write-Host "--- minio stderr (tail) ---"; Get-Content $minioErr -Tail 40 }
-            Get-Process minio -ErrorAction SilentlyContinue | Select-Object Id, Name, StartTime | Format-Table | Out-String | Write-Host
+            Write-Host "::error::MinIO did not become ready in 30s"
+            if (Test-Path $minioLog) { Get-Content $minioLog -Tail 40 }
+            if (Test-Path "$minioLog.err") { Get-Content "$minioLog.err" -Tail 40 }
             exit 1
           }
+          Write-Host "MinIO ready"
+          & $mcBin alias set ci http://localhost:9000 minioadmin minioadmin 2>&1 | Out-Null
+          & $mcBin mb ci/ci-bucket 2>&1 | Out-Null
+          $seedPath = Join-Path $minioDir "s3-test.txt"
+          Set-Content -LiteralPath $seedPath -Value "hello s3`n" -NoNewline
+          & $mcBin cp $seedPath "ci/ci-bucket/s3-test.txt" 2>&1 | Out-Null
+          Write-Host "seeded s3://ci-bucket/s3-test.txt"
+          # --- Run the s3 e2e (MinIO stays alive in this step) ---
           . tests/e2e/common/mount-test.ps1
-          Mount-Test -Backend s3 `
-                     -Storage s3://ci-bucket `
-                     -MountPath W: `
-                     -LogPath "${{ runner.temp }}\mntrs-mount-s3.log" `
-                     -Profile release `
-                     -DispatcherThreads 4 `
-                     -MountOpts "--opt endpoint=http://localhost:9000 --opt access-key=minioadmin --opt secret-key=minioadmin --opt region=us-east-1" `
-                     -PreexistFile "s3-test.txt" `
-                     -ExpectedText "hello s3" `
-                     -SkipSubTests "3,4,5,6,7,8,9,11,12"
+          $s3Result = Mount-Test -Backend s3 `
+                                -Storage s3://ci-bucket `
+                                -MountPath W: `
+                                -LogPath "${{ runner.temp }}\mntrs-mount-s3.log" `
+                                -Profile release `
+                                -DispatcherThreads 4 `
+                                -MountOpts "--opt endpoint=http://localhost:9000 --opt access-key=minioadmin --opt secret-key=minioadmin --opt region=us-east-1" `
+                                -PreexistFile "s3-test.txt" `
+                                -ExpectedText "hello s3" `
+                                -SkipSubTests "3,4,5,6,7,8,9,11,12"
+          # --- Teardown: stop MinIO so the cleanup step's
+          # Get-Process minio is a no-op (or only catches the
+          # rare zombie). Don't `exit` here — let the
+          # workflow's `if: always()` cleanup step run.
+          if ($null -ne $minioProc -and -not $minioProc.HasExited) {
+            try { Stop-Process -Id $minioProc.Id -Force -ErrorAction Stop } catch { }
+          }
+          Get-Process minio -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          if ($s3Result -ne 0) { exit $s3Result }
 
       - name: Upload s3 mount log (failure)
         if: failure()
