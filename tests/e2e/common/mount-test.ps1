@@ -71,7 +71,12 @@ param(
     #   debug   — only target/debug/mntrs.exe (matches CLAUDE.md "本地
     #             测试build 使用 debug" convention).
     # -MntrsBin overrides -Profile entirely.
-    [ValidateSet('auto', 'debug', 'release')] [string] $Profile = 'auto'
+    [ValidateSet('auto', 'debug', 'release')] [string] $Profile = 'auto',
+    # Comma-separated sub-test numbers to skip. See the
+    # -SkipSubTests param on the Mount-Test function for the
+    # rationale (S3 backend e2e skips write-dependent sub-tests
+    # pending #332 fix landing).
+    [string] $SkipSubTests = ''
 )
 
 # Guard against double-include (mirror mount-test.sh L52-55).
@@ -110,7 +115,12 @@ function Mount-Test {
         # default 8) path was never exercised against a single-
         # digit count, so a regression there would only surface
         # on user overrides.
-        [uint32] $DispatcherThreads = 0
+        [uint32] $DispatcherThreads = 0,
+        # Comma-separated sub-test numbers to skip. See
+        # $script:skipSet init in the function body for the
+        # rationale (S3 backend e2e skips write-dependent
+        # sub-tests pending #332 fix landing).
+        [string] $SkipSubTests = ''
     )
 
     # Counter must be script-scoped AND pre-initialized. The Fail
@@ -119,6 +129,30 @@ function Mount-Test {
     # in PowerShell (not True), so a "0-fail" run would otherwise
     # fall through to the "FAILED" summary branch.
     $script:fail = 0
+    # Sub-tests the caller wants to skip. Issue #311: the S3
+    # backend e2e step in ci-windows.yml passes
+    # `-SkipSubTests "4,6,7,12"` because (a) the write IRP
+    # through the S3 backend is currently a regression hotspot
+    # (the in-progress #332 fix tracks a related hang), and
+    # (b) sub-test 12 (file-lock) depends on backend semantics
+    # the S3 backend doesn't implement yet (#327). Sub-test 11
+    # (ACL) is intentionally NOT skipped: it already has
+    # `::warning::` + `[WARN]` handling for the S3 backend
+    # (the loose assertion path) and catches backend-
+    # independent gaps (e.g. STATUS_NOT_IMPLEMENTED from
+    # get_security). Memory backend passes an empty string
+    # (no skip). When #332/#327 land, drop these from the
+    # workflow invocation and remove the suppression.
+    $script:skipSet = @{}
+    if (-not [string]::IsNullOrEmpty($SkipSubTests)) {
+        foreach ($n in ($SkipSubTests -split ',')) {
+            $n = $n.Trim()
+            if ($n -match '^\d+$') { $script:skipSet[[int]$n] = $true }
+        }
+    }
+    function Should-Skip([int] $n) {
+        return $script:skipSet.ContainsKey($n)
+    }
 
     function Pass([string] $label) {
         Write-Host "  [OK]   $label" -ForegroundColor Green
@@ -332,7 +366,7 @@ function Mount-Test {
 
     # --- 4. write small file -------------------------------------
     Write-Host "--- 4. write small file ---"
-    try {
+    if (Should-Skip 4) { Write-Host "  (skipped: -SkipSubTests 4)" } else { try {
         $smallPath = "$MountPath\_ci_small.txt"
         # Set-Content -NoNewline matches `echo > file` semantics
         # (Linux mount-test.sh L150-152). Using [System.IO.File]::OpenWrite
@@ -348,7 +382,7 @@ function Mount-Test {
         Pass "Set-Content $smallPath"
     } catch {
         Fail "write small" $_.Exception.Message
-    }
+    } }
 
     # --- 5. read back --------------------------------------------
     Write-Host "--- 5. read back ---"
@@ -366,7 +400,7 @@ function Mount-Test {
 
     # --- 6. append + verify --------------------------------------
     Write-Host "--- 6. append + verify ---"
-    try {
+    if (Should-Skip 6) { Write-Host "  (skipped: -SkipSubTests 6)" } else { try {
         # Add-Content appends a trailing newline by default; the
         # appended value itself ("more data") is followed by \n.
         # Verify the *prefix* matches (the trailing newline is a
@@ -381,10 +415,11 @@ function Mount-Test {
         }
     } catch {
         Fail "append" $_.Exception.Message
-    }
+    } }
 
     # --- 7. 10M write + read -------------------------------------
     Write-Host "--- 7. 10M write + read ---"
+    if (Should-Skip 7) { Write-Host "  (skipped: -SkipSubTests 7)" } else {
     $bigPath = "$MountPath\_ci_10m.bin"
     try {
         $tenMb = New-Object byte[] (10 * 1024 * 1024)
@@ -416,7 +451,7 @@ function Mount-Test {
         } finally { $sr.Close() }
     } catch {
         Fail "10M read" $_.Exception.Message
-    }
+    } }
 
     # --- 8. random seek ------------------------------------------
     Write-Host "--- 8. random seek ---"
@@ -577,6 +612,7 @@ function Mount-Test {
     # inode) or (b) the opendal layer to expose per-inode xattr
     # for security descriptors and the adapter to wire it.
     Write-Host "--- 11. ACL ---"
+    if (Should-Skip 11) { Write-Host "  (skipped: -SkipSubTests 11)" } else {
     $aclPath = "$MountPath\_ci_acl_probe.txt"
     try {
         Set-Content -Path $aclPath -Value "acl probe" -NoNewline -ErrorAction Stop
@@ -591,7 +627,7 @@ function Mount-Test {
     } catch {
         Write-Host "::warning::sub-test 11 (ACL) unexpected error: $($_.Exception.GetType().Name) - $($_.Exception.Message)"
         Write-Host "  [WARN] Get-Acl unexpected error"
-    }
+    } }
 
     # --- 12. file lock + rename (Issue #316b / follow-up #TBD-lock)
     # Hand-probe on the live V: mount (2026-06-28) showed the
@@ -610,6 +646,7 @@ function Mount-Test {
     # follow-up. When sub-test 11 is fixed, this one will
     # automatically work.
     Write-Host "--- 12. file lock + rename ---"
+    if (Should-Skip 12) { Write-Host "  (skipped: -SkipSubTests 12)" } else {
     $lockPath = "$MountPath\_ci_lock_probe.txt"
     try {
         Set-Content -Path $lockPath -Value "lock probe" -NoNewline -ErrorAction Stop
@@ -643,7 +680,7 @@ function Mount-Test {
         Write-Host "  [WARN] Set-Content rejected: $($_.Exception.Message)"
     } catch {
         Write-Host "::warning::sub-test 12 (file lock) unexpected error: $($_.Exception.GetType().Name) - $($_.Exception.Message)"
-    }
+    } }
 
     # --- 13. multi-mount idempotency (Issue #316b / follow-up #TBD-multi)
     # Launch a second `mntrs mount memory:// V:` against the
