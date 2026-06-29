@@ -303,6 +303,58 @@ pub trait CoreFilesystem: Send + Sync {
     fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str)
     -> std::io::Result<()>;
 
+    /// Rename by explicit absolute paths.
+    ///
+    /// Issue #78: WinFSP's `get_security_by_name` → `rename` flow
+    /// can fire on a path whose parent directory has not been
+    /// `lookup`'d (no ino in the in-memory cache), so the
+    /// `(parent, name, ...)` tuple produced by walking
+    /// `inner.lookup` falls back to `(root_ino=1, name)` and
+    /// `lib.rs::rename` issues `op.rename("name", "newname")` at
+    /// the wrong level — the real src is `/subdir/name`.
+    ///
+    /// Adapters that have full path info available (WinFSP passes
+    /// `\subdir\file` into the `rename` callback) call this
+    /// method instead of `rename` so the backend op gets the
+    /// correct absolute src and dst. The default implementation
+    /// splits each path on the last `/`, resolves the parent via
+    /// `lookup` (falling back to `parent=1` like the pre-#78
+    /// code), and forwards to `rename(parent, name, newparent,
+    /// newname)` — preserves existing behavior for adapters that
+    /// don't have full paths (FUSE) and for tests that don't
+    /// override.
+    fn rename_paths(&self, src_path: &str, dst_path: &str) -> std::io::Result<()> {
+        let split_last = |p: &str| -> (u64, String) {
+            match p.rsplit_once('/') {
+                Some((parent, name)) if !name.is_empty() => {
+                    // Walk parent via lookup. Falls back to 1
+                    // (root) when any component misses; same
+                    // pre-#78 behavior so the default impl is
+                    // a no-op upgrade.
+                    let trimmed = parent.trim_matches('/');
+                    if trimmed.is_empty() {
+                        return (1, name.to_string());
+                    }
+                    let mut cur = 1u64;
+                    for c in trimmed.split('/') {
+                        if c.is_empty() {
+                            continue;
+                        }
+                        match self.lookup(cur, c) {
+                            Ok(a) => cur = a.ino,
+                            Err(_) => return (1, name.to_string()),
+                        }
+                    }
+                    (cur, name.to_string())
+                }
+                _ => (1, p.to_string()),
+            }
+        };
+        let (sp, sn) = split_last(src_path);
+        let (dp, dn) = split_last(dst_path);
+        self.rename(sp, &sn, dp, &dn)
+    }
+
     /// Read the target of a symbolic link.
     ///
     /// Bug 17: pre-fix this method did not exist on the trait,

@@ -4700,249 +4700,27 @@ impl CoreFilesystem for MntrsFs {
         } else {
             format!("{}/{}", newparent_path, newname)
         };
-        let op = self.op.clone();
-        let src_clone = src.clone();
-        let dst_clone = dst.clone();
-        // Atomic rename — model: "copy-then-delete with rollback on
-        // failure":
-        //   1. Try server-side rename. If it returns Unsupported
-        //      (opendal: backends like memory://, webhdfs that
-        //      don't expose rename), fall through to copy+delete.
-        //      Any other error: do NOT touch local state and
-        //      return Ok(()) so the next read sees the unchanged
-        //      src (no silent data loss).
-        //   2. In the copy+delete fallback, if copy fails, do NOT
-        //      delete src. If copy succeeds, delete src; if delete
-        //      fails, log loudly but proceed (dst is already
-        //      visible on the backend; preserving dst is more
-        //      important than enforcing atomicity).
-        //
-        // Pre-delete of dst was removed (issue #17). On S3, the
-        // copy step in `op.rename` uses PUT with overwrite semantics,
-        // so a pre-delete is a wasted round-trip. On hierarchical
-        // backends (HDFS, etc.) `op.rename` is atomic. On the
-        // Unsupported fallback path, op.write to dst overwrites the
-        // existing key (opendal's `Writer` is overwrite on S3 / GCS
-        // / OSS / COS / OBS); for the rare backend where op.write
-        // is create-only (memory, some WebHDFS deployments), the
-        // copy may return AlreadyExists which the fallback treats as
-        // a hard error — that's the same behavior as before this
-        // change, except now we don't pay the cost of the
-        // unconditional pre-delete.
-        // Issue #197: the block_on closure returns Result<bool, io::Error>.
-        //   Ok(true)  — backend confirmed the rename, or the copy+delete
-        //                fallback completed. Migrate cache + inodes.
-        //   Ok(false) — fallback failed for a non-source-missing reason
-        //                (transient backend error). Preserve the existing
-        //                "don't lose data on a transient" semantics by
-        //                returning Ok(()) to FUSE.
-        //   Err(NotFound) — the source itself is missing. POSIX rename
-        //                requires ENOENT, so propagate. Issue #192's fix
-        //                (return Ok(())) was a POSIX violation; this
-        //                restores the correct semantics.
-        let backend_result: Result<bool, std::io::Error> = rt().block_on(async move {
-            match op.rename(&src_clone, &dst_clone).await {
-                Ok(()) => Ok(true),
-                Err(e) if e.kind() == opendal::ErrorKind::Unsupported => {
-                    tracing::debug!(
-                        path = %src_clone, error = %e,
-                        "backend does not support server-side rename; falling back to op.copy + op.delete"
-                    );
-                    // Two-stage copy fallback for backends that
-                    // don't implement server-side rename (memory://,
-                    // some webhdfs deployments).
-                    //
-                    // Stage 1: try opendal's op.copy. It uses the
-                    // operator's reader, so for the memory backend
-                    // it reads the in-process BTreeMap (no cache-
-                    // flush dependency) and for S3/HDFS it reads
-                    // from the remote. This is the preferred path
-                    // because it doesn't depend on the local cache
-                    // file being on disk.
-                    //
-                    // Stage 2: if op.copy also returns Unsupported
-                    // (memory:// doesn't implement copy either —
-                    // only `write` + `delete`), fall back to
-                    // reading the local cache file + op.write to
-                    // dst + op.delete src. The cache file is the
-                    // most-recent write the user issued; if the
-                    // FUSE write hasn't hit disk yet (the page
-                    // cache still holds the dirty data), the
-                    // fallback's `std::fs::read` may return 0
-                    // bytes. For the memory backend this isn't an
-                    // issue because memory writes go straight to the
-                    // backend (no cache-flush dependency); for
-                    // S3/HDFS the only caller is a freshly-written
-                    // file where the page cache holds the data —
-                    // see the pre-fix failure analysis below.
-                    // Two-stage copy: try op.copy first; on
-                    // Unsupported fall back to cache-file +
-                    // op.write. The unused-binding on the stage-1
-                    // result is intentional — we only need to
-                    // know success/failure, not the metadata.
-                    let stage1: Result<opendal::Metadata, opendal::Error> =
-                        op.copy(&src_clone, &dst_clone).await;
-                    let copy_result: Result<bool, std::io::Error> = match stage1 {
-                        Ok(_meta) => {
-                            tracing::debug!(src = %src_clone, dst = %dst_clone, "rename fallback: op.copy ok");
-                            Ok(true)
-                        }
-                        Err(copy_err) if copy_err.kind() == opendal::ErrorKind::Unsupported => {
-                            // Stage 2: cache file + op.write.
-                            // The memory backend's `op.copy` is
-                            // also Unsupported (it only has
-                            // write/delete), so fall through to
-                            // the old read-cache-and-write path.
-                            tracing::debug!(
-                                src = %src_clone, dst = %dst_clone,
-                                "op.copy unsupported too; falling back to cache-file read + op.write"
-                            );
-                            let cpath_src =
-                                crate::cache_path(&self.cache_dir, &src_clone);
-                            let bytes = match std::fs::read(&cpath_src) {
-                                Ok(b) => b,
-                                Err(read_err)
-                                    if read_err.kind()
-                                        == std::io::ErrorKind::NotFound =>
-                                {
-                                    // Issue #197: source is missing.
-                                    // POSIX rename(non-existent, dst)
-                                    // requires ENOENT. Return Err so
-                                    // fn rename propagates to FUSE
-                                    // instead of silently succeeding.
-                                    return Err(std::io::Error::new(
-                                        std::io::ErrorKind::NotFound,
-                                        format!("rename source not found: {}", src_clone),
-                                    ));
-                                }
-                                Err(read_err) => {
-                                    tracing::error!(
-                                        path = %cpath_src.display(), error = %read_err,
-                                        "rename fallback stage-2: read cache file failed, keeping source intact"
-                                    );
-                                    return Ok(false);
-                                }
-                            };
-                            match op.write(&dst_clone, bytes).await {
-                                Ok(_meta) => {
-                                    tracing::debug!(src = %src_clone, dst = %dst_clone, "rename fallback stage-2: op.write ok");
-                                    Ok(true)
-                                }
-                                Err(write_err) => {
-                                    tracing::error!(
-                                        src = %src_clone, dst = %dst_clone, error = %write_err,
-                                        "rename fallback stage-2: op.write failed, keeping source intact"
-                                    );
-                                    Ok(false)
-                                }
-                            }
-                        }
-                        Err(copy_err) => {
-                            tracing::error!(
-                                src = %src_clone, dst = %dst_clone, error = %copy_err,
-                                "rename fallback: op.copy failed, keeping source intact"
-                            );
-                            Ok(false)
-                        }
-                    };
-                    let del_res = op.delete(&src_clone).await;
-                    if let Err(del_err) = &del_res {
-                        tracing::warn!(
-                            src = %src_clone, dst = %dst_clone, error = %del_err,
-                            "rename fallback: copy ok, delete failed — both visible"
-                        );
-                    } else {
-                        tracing::debug!(src = %src_clone, "rename fallback: delete src ok");
-                    }
-                    copy_result
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        path = %src_clone, error = %e,
-                        "server-side rename failed with non-Unsupported error; not falling back"
-                    );
-                    Ok(false)
-                }
-            }
-        });
-        match backend_result {
-            Ok(true) => {}
-            Ok(false) => return Ok(()),
-            Err(io_err) => return Err(io_err),
-        }
-        // Migrate cache file
-        let cpath_src = crate::cache_path(&self.cache_dir, &src);
-        let cpath_dst = crate::cache_path(&self.cache_dir, &dst);
-        if cpath_src.exists() && !cpath_dst.exists() {
-            if let Some(parent) = cpath_dst.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::rename(&cpath_src, &cpath_dst);
-        } else {
-            let _ = std::fs::remove_file(&cpath_src);
-        }
-        // Migrate inodes src -> dst. The inodes map is keyed by
-        // the NEXT_INO counter (alloc_ino), not by path_hash —
-        // so the FUSE kernel, which already knows the ino for
-        // the source file, will keep using that same ino for
-        // the destination after rename. All we need to do is
-        // change the entry's `path` field from src to dst; the
-        // ino stays the same. This avoids the previous
-        // implementation's mistake of inserting at path_hash
-        // (which is a different number from the counter) and
-        // leaving the FUSE kernel with a stale ino->path map.
-        // Stat phase 2: switch from the linear iter-find
-        // to the reverse-map fast path. `find_ino_by_path`
-        // returns the canonical NEXT_INO-minted ino so
-        // the in-place inodes update below is safe.
-        let src_ino = self.find_ino_by_path(&src);
-        if let Some(src_ino) = src_ino {
-            // In-place path update. Size/mtime/ino are unchanged.
-            self.inodes.entry(src_ino).and_modify(|v| {
-                v.path = dst.clone();
-            });
-            // Reverse map: drop the old path entry,
-            // insert the new one pointing at the same
-            // ino. Both ops are independent DashMap
-            // calls — between them, a concurrent
-            // find_ino_by_path("dst") might briefly
-            // miss; the fallback scan there self-heals.
-            self.path_to_ino.remove(&src);
-            self.path_to_ino.insert(dst.to_string(), src_ino);
-        }
+        // Issue #78: the cache-walk used to derive `src`/`dst`
+        // here loses fidelity when the source parent was never
+        // `lookup`'d (opendal-only writes). Adapters that have
+        // the full path (WinFSP) call `rename_paths` directly
+        // with the correct paths; the default trait impl of
+        // `rename_paths` routes FUSE calls back through here.
+        self.do_rename(src, dst)
+    }
 
-        if let Some(entry) = self.attr_cache.get(&src).map(|e| *e.value()) {
-            self.attr_cache.insert(dst.to_string(), entry);
-        }
-        self.attr_cache.remove(&src);
-        // Drop the .dirty sidecar for src so the next mount's
-        // recovery scan (common_init_wb) doesn't re-upload the
-        // pre-rename cache content to the now-orphan src path.
-        // Without this, recovery would `op.write(src, cache_data)`
-        // and resurrect the source on the backend after the rename
-        // already deleted it (the same race the in-process
-        // writeback task hit, see writeback.rs).
-        let cpath_src = crate::cache_path(&self.cache_dir, &src);
-        let _ = std::fs::remove_file(cpath_src.with_extension("dirty"));
-        self.invalidate_dir_cache(&src);
-        self.invalidate_dir_cache(&dst);
-        // Invalidate the PARENT dir's listing cache too —
-        // otherwise the next readdir on the parent returns the
-        // stale listing (with the now-renamed src still present,
-        // and missing the freshly-created dst). invalidate_dir_cache
-        // only removes keys exactly matching the path or prefixed
-        // with `path/`, so a top-level file's rename never reaches
-        // the root cache slot ("") unless we do this explicitly.
-        // This is the actual root cause of CI run #27492796860
-        // `memory-stress-loop` reporting `rename src still exists`
-        // — see issue #18.
-        if let Some(parent_src) = std::path::Path::new(&src).parent().and_then(|p| p.to_str()) {
-            self.invalidate_dir_cache(parent_src);
-        }
-        if let Some(parent_dst) = std::path::Path::new(&dst).parent().and_then(|p| p.to_str()) {
-            self.invalidate_dir_cache(parent_dst);
-        }
-        Ok(())
+    /// Issue #78: rename with explicit absolute paths.
+    ///
+    /// WinFSP's rename callback receives the full path of both
+    /// the source and the destination. The (parent, name)
+    /// signature on `rename` is FUSE-shaped — the parent ino
+    /// can only be translated to a path by walking
+    /// `self.lookup`, which misses when the source was created
+    /// directly via the opendal backend (no prior mount-side
+    /// lookup, no inode cached). This override skips the walk
+    /// and uses the paths the adapter already has.
+    fn rename_paths(&self, src_path: &str, dst_path: &str) -> std::io::Result<()> {
+        self.do_rename(src_path.to_string(), dst_path.to_string())
     }
 
     fn statfs(&self, _ino: u64) -> std::io::Result<CoreVolumeStat> {
@@ -5193,6 +4971,279 @@ impl MntrsFs {
                 }
             }
         }
+    }
+}
+
+impl MntrsFs {
+    /// Issue #78: shared rename body — backend op + cache/inode
+    /// migration. Inherent method (not on the trait) so both the
+    /// (parent, name) `rename` trait method and the absolute-path
+    /// `rename_paths` trait method can call into the same logic
+    /// without inheriting each other's visibility or signature
+    /// constraints.
+    ///
+    /// `src` and `dst` are absolute backend paths (e.g.
+    /// `"subdir/old.txt"`); the `rename` trait method derives
+    /// them by walking `self.resolve(_parent)` and `name`, and
+    /// `rename_paths` accepts them directly from the adapter
+    /// (WinFSP's callback already provides them).
+    fn do_rename(&self, src: String, dst: String) -> std::io::Result<()> {
+        let op = self.op.clone();
+        let src_clone = src.clone();
+        let dst_clone = dst.clone();
+        // Atomic rename — model: "copy-then-delete with rollback on
+        // failure":
+        //   1. Try server-side rename. If it returns Unsupported
+        //      (opendal: backends like memory://, webhdfs that
+        //      don't expose rename), fall through to copy+delete.
+        //      Any other error: do NOT touch local state and
+        //      return Ok(()) so the next read sees the unchanged
+        //      src (no silent data loss).
+        //   2. In the copy+delete fallback, if copy fails, do NOT
+        //      delete src. If copy succeeds, delete src; if delete
+        //      fails, log loudly but proceed (dst is already
+        //      visible on the backend; preserving dst is more
+        //      important than enforcing atomicity).
+        //
+        // Pre-delete of dst was removed (issue #17). On S3, the
+        // copy step in `op.rename` uses PUT with overwrite semantics,
+        // so a pre-delete is a wasted round-trip. On hierarchical
+        // backends (HDFS, etc.) `op.rename` is atomic. On the
+        // Unsupported fallback path, op.write to dst overwrites the
+        // existing key (opendal's `Writer` is overwrite on S3 / GCS
+        // / OSS / COS / OBS); for the rare backend where op.write
+        // is create-only (memory, some WebHDFS deployments), the
+        // copy may return AlreadyExists which the fallback treats as
+        // a hard error — that's the same behavior as before this
+        // change, except now we don't pay the cost of the
+        // unconditional pre-delete.
+        // Issue #197: the block_on closure returns Result<bool, io::Error>.
+        //   Ok(true)  — backend confirmed the rename, or the copy+delete
+        //                fallback completed. Migrate cache + inodes.
+        //   Ok(false) — fallback failed for a non-source-missing reason
+        //                (transient backend error). Preserve the existing
+        //                "don't lose data on a transient" semantics by
+        //                returning Ok(()) to FUSE.
+        //   Err(NotFound) — the source itself is missing. POSIX rename
+        //                requires ENOENT, so propagate. Issue #192's fix
+        //                (return Ok(())) was a POSIX violation; this
+        //                restores the correct semantics.
+        let backend_result: Result<bool, std::io::Error> = rt().block_on(async move {
+            match op.rename(&src_clone, &dst_clone).await {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == opendal::ErrorKind::Unsupported => {
+                    tracing::debug!(
+                        path = %src_clone, error = %e,
+                        "backend does not support server-side rename; falling back to op.copy + op.delete"
+                    );
+                    // Two-stage copy fallback for backends that
+                    // don't implement server-side rename (memory://,
+                    // some webhdfs deployments).
+                    //
+                    // Stage 1: try opendal's op.copy. It uses the
+                    // operator's reader, so for the memory backend
+                    // it reads the in-process BTreeMap (no cache-
+                    // flush dependency) and for S3/HDFS it reads
+                    // from the remote. This is the preferred path
+                    // because it doesn't depend on the local cache
+                    // file being on disk.
+                    //
+                    // Stage 2: if op.copy also returns Unsupported
+                    // (memory:// doesn't implement copy either —
+                    // only `write` + `delete`), fall back to
+                    // reading the local cache file + op.write to
+                    // dst + op.delete src. The cache file is the
+                    // most-recent write the user issued; if the
+                    // FUSE write hasn't hit disk yet (the page
+                    // cache still holds the dirty data), the
+                    // fallback's `std::fs::read` may return 0
+                    // bytes. For the memory backend this isn't an
+                    // issue because memory writes go straight to the
+                    // backend (no cache-flush dependency); for
+                    // S3/HDFS the only caller is a freshly-written
+                    // file where the page cache holds the data —
+                    // see the pre-fix failure analysis below.
+                    // Two-stage copy: try op.copy first; on
+                    // Unsupported fall back to cache-file +
+                    // op.write. The unused-binding on the stage-1
+                    // result is intentional — we only need to
+                    // know success/failure, not the metadata.
+                    let stage1: Result<opendal::Metadata, opendal::Error> =
+                        op.copy(&src_clone, &dst_clone).await;
+                    let copy_result: Result<bool, std::io::Error> = match stage1 {
+                        Ok(_meta) => {
+                            tracing::debug!(src = %src_clone, dst = %dst_clone, "rename fallback: op.copy ok");
+                            Ok(true)
+                        }
+                        Err(copy_err) if copy_err.kind() == opendal::ErrorKind::Unsupported => {
+                            // Stage 2: op.read + op.write.
+                            // The memory backend's `op.copy` is
+                            // also Unsupported (it only has
+                            // write/delete/read), so the only
+                            // way to "rename" is read the bytes
+                            // from the backend, write them to
+                            // dst, then delete src.
+                            //
+                            // Issue #78 regression: pre-fix this
+                            // stage read the local cache file
+                            // (`std::fs::read(cache_path)`), which
+                            // only works for files the user
+                            // wrote via the mount. For files
+                            // created directly via the opendal
+                            // backend (the #78 case), the cache
+                            // file doesn't exist and the read
+                            // returns NotFound — the rename
+                            // silently turned into a no-op.
+                            // Reading from the backend instead
+                            // works for both code paths.
+                            tracing::debug!(
+                                src = %src_clone, dst = %dst_clone,
+                                "op.copy unsupported too; falling back to op.read + op.write"
+                            );
+                            let bytes = match op.read(&src_clone).await {
+                                Ok(b) => b.to_vec(),
+                                Err(read_err)
+                                    if read_err.kind()
+                                        == opendal::ErrorKind::NotFound =>
+                                {
+                                    // Issue #197: source is missing.
+                                    // POSIX rename(non-existent, dst)
+                                    // requires ENOENT. Return Err so
+                                    // fn rename propagates to FUSE
+                                    // instead of silently succeeding.
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::NotFound,
+                                        format!("rename source not found: {}", src_clone),
+                                    ));
+                                }
+                                Err(read_err) => {
+                                    tracing::error!(
+                                        src = %src_clone, error = %read_err,
+                                        "rename fallback stage-2: op.read failed, keeping source intact"
+                                    );
+                                    return Ok(false);
+                                }
+                            };
+                            match op.write(&dst_clone, bytes).await {
+                                Ok(_meta) => {
+                                    tracing::debug!(src = %src_clone, dst = %dst_clone, "rename fallback stage-2: op.write ok");
+                                    Ok(true)
+                                }
+                                Err(write_err) => {
+                                    tracing::error!(
+                                        src = %src_clone, dst = %dst_clone, error = %write_err,
+                                        "rename fallback stage-2: op.write failed, keeping source intact"
+                                    );
+                                    Ok(false)
+                                }
+                            }
+                        }
+                        Err(copy_err) => {
+                            tracing::error!(
+                                src = %src_clone, dst = %dst_clone, error = %copy_err,
+                                "rename fallback: op.copy failed, keeping source intact"
+                            );
+                            Ok(false)
+                        }
+                    };
+                    let del_res = op.delete(&src_clone).await;
+                    if let Err(del_err) = &del_res {
+                        tracing::warn!(
+                            src = %src_clone, dst = %dst_clone, error = %del_err,
+                            "rename fallback: copy ok, delete failed — both visible"
+                        );
+                    } else {
+                        tracing::debug!(src = %src_clone, "rename fallback: delete src ok");
+                    }
+                    copy_result
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %src_clone, error = %e,
+                        "server-side rename failed with non-Unsupported error; not falling back"
+                    );
+                    Ok(false)
+                }
+            }
+        });
+        match backend_result {
+            Ok(true) => {}
+            Ok(false) => return Ok(()),
+            Err(io_err) => return Err(io_err),
+        }
+        // Migrate cache file
+        let cpath_src = crate::cache_path(&self.cache_dir, &src);
+        let cpath_dst = crate::cache_path(&self.cache_dir, &dst);
+        if cpath_src.exists() && !cpath_dst.exists() {
+            if let Some(parent) = cpath_dst.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::rename(&cpath_src, &cpath_dst);
+        } else {
+            let _ = std::fs::remove_file(&cpath_src);
+        }
+        // Migrate inodes src -> dst. The inodes map is keyed by
+        // the NEXT_INO counter (alloc_ino), not by path_hash —
+        // so the FUSE kernel, which already knows the ino for
+        // the source file, will keep using that same ino for
+        // the destination after rename. All we need to do is
+        // change the entry's `path` field from src to dst; the
+        // ino stays the same. This avoids the previous
+        // implementation's mistake of inserting at path_hash
+        // (which is a different number from the counter) and
+        // leaving the FUSE kernel with a stale ino->path map.
+        // Stat phase 2: switch from the linear iter-find
+        // to the reverse-map fast path. `find_ino_by_path`
+        // returns the canonical NEXT_INO-minted ino so
+        // the in-place inodes update below is safe.
+        let src_ino = self.find_ino_by_path(&src);
+        if let Some(src_ino) = src_ino {
+            // In-place path update. Size/mtime/ino are unchanged.
+            self.inodes.entry(src_ino).and_modify(|v| {
+                v.path = dst.clone();
+            });
+            // Reverse map: drop the old path entry,
+            // insert the new one pointing at the same
+            // ino. Both ops are independent DashMap
+            // calls — between them, a concurrent
+            // find_ino_by_path("dst") might briefly
+            // miss; the fallback scan there self-heals.
+            self.path_to_ino.remove(&src);
+            self.path_to_ino.insert(dst.to_string(), src_ino);
+        }
+
+        if let Some(entry) = self.attr_cache.get(&src).map(|e| *e.value()) {
+            self.attr_cache.insert(dst.to_string(), entry);
+        }
+        self.attr_cache.remove(&src);
+        // Drop the .dirty sidecar for src so the next mount's
+        // recovery scan (common_init_wb) doesn't re-upload the
+        // pre-rename cache content to the now-orphan src path.
+        // Without this, recovery would `op.write(src, cache_data)`
+        // and resurrect the source on the backend after the rename
+        // already deleted it (the same race the in-process
+        // writeback task hit, see writeback.rs).
+        let cpath_src = crate::cache_path(&self.cache_dir, &src);
+        let _ = std::fs::remove_file(cpath_src.with_extension("dirty"));
+        self.invalidate_dir_cache(&src);
+        self.invalidate_dir_cache(&dst);
+        // Invalidate the PARENT dir's listing cache too —
+        // otherwise the next readdir on the parent returns the
+        // stale listing (with the now-renamed src still present,
+        // and missing the freshly-created dst). invalidate_dir_cache
+        // only removes keys exactly matching the path or prefixed
+        // with `path/`, so a top-level file's rename never reaches
+        // the root cache slot ("") unless we do this explicitly.
+        // This is the actual root cause of CI run #27492796860
+        // `memory-stress-loop` reporting `rename src still exists`
+        // — see issue #18.
+        if let Some(parent_src) = std::path::Path::new(&src).parent().and_then(|p| p.to_str()) {
+            self.invalidate_dir_cache(parent_src);
+        }
+        if let Some(parent_dst) = std::path::Path::new(&dst).parent().and_then(|p| p.to_str()) {
+            self.invalidate_dir_cache(parent_dst);
+        }
+        Ok(())
     }
 }
 

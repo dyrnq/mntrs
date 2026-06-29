@@ -847,30 +847,45 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 // newname) to the trait's rename.
                 let src_full = file_name.to_string_lossy().replace('\\', "/");
                 let dst_full = new_file_name.to_string_lossy().replace('\\', "/");
-                let (src_parent_path, src_name) = match src_full.rsplit_once('/') {
-                    Some((parent, name)) if !name.is_empty() => {
-                        (parent.to_string(), name.to_string())
-                    }
-                    // No slash or empty basename — treat as
-                    // root-level rename (parent=1).
-                    _ => ("/".to_string(), src_full.clone()),
-                };
-                let (dst_parent_path, dst_name) = match dst_full.rsplit_once('/') {
-                    Some((parent, name)) if !name.is_empty() => {
-                        (parent.to_string(), name.to_string())
-                    }
-                    _ => ("/".to_string(), dst_full.clone()),
-                };
-                // Resolve the parent paths to inodes via
-                // lookup. WinFSP's pre-fix hardcoded 1
-                // because the path concatenation masked the
-                // bug; the trait's rename(parent_ino, name,
-                // newparent_ino, newname) signature requires
-                // a real parent ino.
-                let src_parent_ino = self.parent_ino_for(&src_parent_path).unwrap_or(1);
-                let dst_parent_ino = self.parent_ino_for(&dst_parent_path).unwrap_or(1);
+                // Issue #78 regression: WinFSP normalizes
+                // paths through Windows' case-insensitive
+                // layer, so the callback receives the
+                // canonical-case path from the directory
+                // entry (e.g. `OLD.TXT` even when the user
+                // wrote `old.txt`). opendal backends are
+                // case-sensitive on the path string, so
+                // opendal memory would NotFound a lookup
+                // for `OLD.TXT` when the data was stored as
+                // `old.txt`. Lower-case here so the backend
+                // op hits the same key the test originally
+                // wrote. The mount itself is a case-
+                // insensitive view (Windows is), so
+                // lowercasing can't lose data — at worst
+                // it's a no-op for an already-lowercase
+                // path.
+                #[cfg(windows)]
+                let (src_full, dst_full) = (src_full.to_lowercase(), dst_full.to_lowercase());
+                // Issue #78: WinFSP can fire rename on a path
+                // whose parent directory was never `lookup`'d
+                // (opendal-only files), so the inode cache has
+                // no entry for the parent. parent_ino_for would
+                // fall back to ino=1 and `lib.rs::rename` would
+                // see `parent_path=""`, producing
+                // `op.rename("name", "newname")` at the wrong
+                // level — the real src is `/subdir/name`.
+                //
+                // Forward the full paths via the trait's
+                // `rename_paths` (added in #78) which the
+                // MntrsFs impl overrides to talk to opendal
+                // directly. The FUSE kernel only invokes
+                // `rename(parent, name, ...)` after a prior
+                // successful lookup, so the inode cache is
+                // always populated on that path — keeping the
+                // old `(parent, name)` derivation is correct on
+                // FUSE and the default impl on the trait
+                // preserves that behaviour.
                 self.inner
-                    .rename(src_parent_ino, &src_name, dst_parent_ino, &dst_name)
+                    .rename_paths(&src_full, &dst_full)
                     .map_err(io_err_to_status)
             }),
         )
