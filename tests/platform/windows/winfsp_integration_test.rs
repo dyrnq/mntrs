@@ -211,7 +211,6 @@ fn winfsp_rename_opendal_only_source() {
 }
 
 #[test]
-#[ignore = "TODO(#300): set_file_size via mount truncates to zeros (loses original content)"]
 fn winfsp_setattr_truncate() {
     let fs = Arc::new(make_memory_fs());
     let guard = mntrs::core_fs::test_helpers::mount_winfsp(fs.clone()).unwrap();

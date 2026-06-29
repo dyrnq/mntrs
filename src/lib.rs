@@ -2806,6 +2806,16 @@ impl CoreFilesystem for MntrsFs {
         // flags before calling open()).
         let is_write = (_flags & 0x3) != 0;
         if is_write {
+            // Issue #300: if the cache file does not exist
+            // locally but the backend has the file, fetch
+            // the backend content first so a subsequent
+            // user-initiated `set_len(n)` truncates a
+            // populated cache (preserves the first `n`
+            // bytes) rather than zero-filling a freshly
+            // created 0-byte cache. The helper is a no-op
+            // when the cache file already exists or the
+            // backend has no file at this path.
+            self.populate_cache_from_backend(&path);
             let cpath = crate::cache_path(&self.cache_dir, &path);
             if let Some(parent) = cpath.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -5004,6 +5014,97 @@ impl MntrsFs {
                 }
             }
         }
+    }
+
+    /// Issue #300: when opening a file for write whose
+    /// local cache file does not exist but the backend
+    /// has the file, populate the cache with the
+    /// backend content before opening the fd.
+    ///
+    /// Why this matters: the FUSE `open` write branch
+    /// uses `OpenOptions::create(true).truncate(false)`
+    /// so it opens a pre-existing cache file if one
+    /// exists, otherwise it creates a fresh 0-byte
+    /// file. A subsequent user-initiated `set_len(n)`
+    /// (e.g. via Win32 `SetEndOfFile` from PowerShell
+    /// `Set-Content`, `Out-File`, `[IO.File]::WriteAllText`,
+    /// cmd `echo >`, or POSIX `ftruncate(2)` on an
+    /// existing file) then **zero-fills** the new
+    /// 0-byte cache to exactly `n` bytes, discarding
+    /// the original backend content. The user observes
+    /// zeros where the original bytes should be.
+    ///
+    /// This helper does a single `op.read(&path)` and
+    /// `std::fs::write(&cpath, bytes)` before the fd
+    /// is opened, so the cache file already contains
+    /// the backend bytes when the user's `set_len`
+    /// truncates.
+    ///
+    /// No-op when the cache file already exists (the
+    /// caller is opening an already-cached file) or
+    /// when the backend has no file at this path (a
+    /// normal `open(O_CREAT)` on a brand-new file —
+    /// the cache file gets created empty as today).
+    ///
+    /// On backend read failure (other than NotFound,
+    /// which means the file genuinely doesn't exist
+    /// yet), we log + fall through to a 0-byte cache
+    /// rather than failing the `open()`. This matches
+    /// the pre-#300 behaviour for the "backend gone"
+    /// case: the user gets a 0-byte file they can write
+    /// to, rather than an `open` error.
+    ///
+    /// Idempotent: subsequent `open()` calls on the
+    /// same file early-return via the `cpath.exists()`
+    /// check, so there's no extra cost for repeated
+    /// opens.
+    ///
+    /// `inodes.size` is NOT touched here — `lookup()`
+    /// / `getattr()` already populated it from the
+    /// backend via `op.stat()`. The subsequent
+    /// `setattr(size=...)` path updates both
+    /// `inodes.size` and the cache fd correctly.
+    fn populate_cache_from_backend(&self, path: &str) {
+        let cpath = crate::cache_path(&self.cache_dir, path);
+        if cpath.exists() {
+            return;
+        }
+        if let Some(parent) = cpath.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let op = self.op.clone();
+        let p = path.to_string();
+        let fetched: Option<Vec<u8>> = rt().block_on(async move {
+            match op.read(&p).await {
+                Ok(b) => Some(b.to_vec()),
+                Err(e) if e.kind() == opendal::ErrorKind::NotFound => None,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %p,
+                        error = %e,
+                        "populate_cache_from_backend: read failed; \
+                         falling through to 0-byte cache"
+                    );
+                    None
+                }
+            }
+        });
+        let Some(bytes) = fetched else { return };
+        if let Err(e) = std::fs::write(&cpath, &bytes) {
+            tracing::warn!(
+                path = %cpath.display(),
+                bytes = bytes.len(),
+                error = %e,
+                "populate_cache_from_backend: cache write failed; \
+                 falling through to 0-byte cache"
+            );
+            return;
+        }
+        tracing::debug!(
+            path = %path,
+            bytes = bytes.len(),
+            "populate_cache_from_backend: populated cache from backend"
+        );
     }
 }
 
