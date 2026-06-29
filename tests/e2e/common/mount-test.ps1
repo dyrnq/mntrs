@@ -131,7 +131,7 @@ function Mount-Test {
     $script:fail = 0
     # Sub-tests the caller wants to skip. Issue #311: the S3
     # backend e2e step in ci-windows.yml passes
-    # `-SkipSubTests "3,4,5,6,7,8,9,12"` because:
+    # `-SkipSubTests "3,4,5,6,7,8,9,11,12"` because:
     #   3 — pre-existing file not visible on S3 fresh mount
     #       (likely opendal list() consistency; tracked as
     #       follow-up)
@@ -142,15 +142,12 @@ function Mount-Test {
     #   7 — 10M write + read (write IRP hang, #332)
     #   8 — random seek (depends on sub-test 7's _ci_10m.bin)
     #   9 — concurrent reads (depends on sub-test 7's _ci_10m.bin)
+    #   11 — ACL (Get-Acl hangs on S3 backend in CI; locally
+    #        it errors out fast as CommandNotFoundException)
     #   12 — file lock + rename (backend semantics gap, #327)
-    # Sub-test 11 (ACL) is intentionally NOT skipped: it
-    # already has `::warning::` + `[WARN]` handling for the
-    # S3 backend (the loose assertion path) and catches
-    # backend-independent gaps (e.g. STATUS_NOT_IMPLEMENTED
-    # from get_security). Memory backend passes an empty
-    # string (no skip). When the S3 listing fix + #332 + #327
-    # land, drop these from the workflow invocation and
-    # remove the suppression.
+    # Memory backend passes an empty string (no skip). When
+    # the S3 listing fix + #332 + #327 land, drop these from
+    # the workflow invocation and remove the suppression.
     $script:skipSet = @{}
     if (-not [string]::IsNullOrEmpty($SkipSubTests)) {
         foreach ($n in ($SkipSubTests -split ',')) {
