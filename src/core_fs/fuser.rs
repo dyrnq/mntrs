@@ -143,7 +143,10 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let name = name.to_string_lossy();
+        // Issue #307: NFC-normalize the kernel-supplied name so
+        // a file uploaded via macOS HFS+/APFS (NFD) and read
+        // here via Linux VFS (NFC) hits the same backend key.
+        let name = crate::util::nfc(&name.to_string_lossy());
         // Issue #47: metrics (lookup)
         let metrics = crate::metrics::global();
         let start = std::time::Instant::now();
@@ -461,7 +464,8 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        let name = name.to_string_lossy();
+        // Issue #307: NFC-normalize (see lookup for rationale).
+        let name = crate::util::nfc(&name.to_string_lossy());
         // Issue #160: thread O_EXCL through to the
         // implementation. libc::O_EXCL is 0o200 on Linux/macOS
         // and 0x40000000 on Windows — we use the bitmask
@@ -678,7 +682,8 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        let name = name.to_string_lossy();
+        // Issue #307: NFC-normalize (see lookup for rationale).
+        let name = crate::util::nfc(&name.to_string_lossy());
         match self.inner.mkdir(parent.into(), &name) {
             Ok(attr) => {
                 let fattr = from_core_attr(&attr);
@@ -689,7 +694,8 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
     }
 
     fn rmdir(&self, _req: &Request, _parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let name = name.to_string_lossy();
+        // Issue #307: NFC-normalize (see lookup for rationale).
+        let name = crate::util::nfc(&name.to_string_lossy());
         match self.inner.rmdir(_parent.into(), &name) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(io_err_to_fuse_errno(e)),
@@ -706,8 +712,9 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         _flags: fuser::RenameFlags,
         reply: ReplyEmpty,
     ) {
-        let name = name.to_string_lossy();
-        let newname = newname.to_string_lossy();
+        // Issue #307: NFC-normalize both names (see lookup).
+        let name = crate::util::nfc(&name.to_string_lossy());
+        let newname = crate::util::nfc(&newname.to_string_lossy());
         match self
             .inner
             .rename(_parent.into(), &name, _newparent.into(), &newname)
@@ -762,7 +769,8 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
     }
 
     fn unlink(&self, _req: &Request, _parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let name = name.to_string_lossy();
+        // Issue #307: NFC-normalize (see lookup for rationale).
+        let name = crate::util::nfc(&name.to_string_lossy());
         match self.inner.unlink(_parent.into(), &name) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(io_err_to_fuse_errno(e)),
@@ -799,7 +807,8 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         target: &std::path::Path,
         reply: ReplyEntry,
     ) {
-        let name = name.to_string_lossy();
+        // Issue #307: NFC-normalize (see lookup for rationale).
+        let name = crate::util::nfc(&name.to_string_lossy());
         match self.inner.symlink(parent.into(), &name, target) {
             Ok(attr) => {
                 let fattr = from_core_attr(&attr);
@@ -827,7 +836,8 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        let name = newname.to_string_lossy();
+        // Issue #307: NFC-normalize (see lookup for rationale).
+        let name = crate::util::nfc(&newname.to_string_lossy());
         match self.inner.link(ino.into(), newparent.into(), &name) {
             Ok(attr) => {
                 let fattr = from_core_attr(&attr);

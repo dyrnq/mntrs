@@ -339,6 +339,125 @@ fn winfsp_unicode_filename() {
     drop(guard);
 }
 
+// ============================================================
+// Issue #307 regression tests: Unicode NFC normalization on
+// adapter entry points. The "café" literal in each test is
+// NFC (precomposed é, U+00E9) — exactly what the Win32 layer
+// hands to WinFSP via `RtlNormalizeString`. The fix ensures
+// every kernel-supplied name is NFC-normalized at the
+// callback boundary (get_security_by_name / open / create /
+// rename / cleanup), so the trait methods always see NFC and
+// the backend gets NFC keys consistently. The strong
+// correctness proof lives in the `nfc_*` unit tests in
+// src/util.rs; these are end-to-end contract tests that the
+// helper integrates cleanly with the WinFSP dispatcher and
+// the in-memory opendal backend.
+// ============================================================
+
+/// Issue #307: write an NFC-named file through the WinFSP
+/// mount (exercising the `create` callback's NFC normalize
+/// step) and read it back (exercising `get_security_by_name`,
+/// `open`, and `read`). Pre-fix the Win32 layer would send
+/// the raw UTF-16 path to the adapter; the adapter now
+/// NFC-normalizes before the trait lookup, so the backend
+/// sees a stable canonical key.
+///
+/// We deliberately don't also assert `read_dir` visibility
+/// here: the dir_listers snapshot (issue #23) is taken at
+/// `opendir` time, BEFORE the mount-side `create` finishes,
+/// so the just-created file won't appear in a follow-up
+/// readdir. That's a pre-existing limitation unrelated to
+/// #307; the helper's unit tests cover the canonicalization
+/// correctness directly.
+#[test]
+fn winfsp_nfc_create_and_read() {
+    let fs = Arc::new(make_memory_fs());
+    let guard = mntrs::core_fs::test_helpers::mount_winfsp(fs.clone()).unwrap();
+    let mp = &guard.mount_path;
+    settle();
+
+    // "café.txt" — NFC (precomposed é, U+00E9).
+    let name = "café.txt";
+    std::fs::write(format!("{mp}{name}"), b"x").unwrap();
+    let read = std::fs::read_to_string(format!("{mp}{name}")).unwrap();
+    assert_eq!(read, "x");
+
+    drop(guard);
+}
+
+/// Issue #307: rename an NFC-named file through the WinFSP
+/// mount (exercising the `rename` callback's normalize step
+/// on both `file_name` and `new_file_name`). Pre-fix the
+/// adapter didn't normalize the rename arguments; now both
+/// names are NFC before `rename_paths` resolves parent inos.
+#[test]
+fn winfsp_nfc_rename() {
+    let fs = Arc::new(make_memory_fs());
+    let guard = mntrs::core_fs::test_helpers::mount_winfsp(fs.clone()).unwrap();
+    let mp = &guard.mount_path;
+    settle();
+
+    let src = "café_a.txt";
+    let dst = "café_b.txt";
+    std::fs::write(format!("{mp}{src}"), b"hello").unwrap();
+    std::fs::rename(format!("{mp}{src}"), format!("{mp}{dst}")).unwrap();
+
+    // src gone, dst present with same content.
+    assert!(!std::path::Path::new(&format!("{mp}{src}")).exists());
+    let read = std::fs::read_to_string(format!("{mp}{dst}")).unwrap();
+    assert_eq!(read, "hello");
+
+    drop(guard);
+}
+
+/// Issue #307: create + delete an NFC-named file through the
+/// WinFSP mount (exercising the `cleanup` callback's NFC
+/// normalize step). Pre-fix the basename passed to
+/// `inner.unlink` could be a different Unicode form than the
+/// `create` callback used, causing a NotFound on the backend
+/// delete. Post-fix both ends agree on NFC.
+///
+/// Note: the post-delete assertion goes through the backend
+/// (`op.exists`) rather than `std::fs::read` / `Path::exists`,
+/// because the WinFSP cleanup callback (IRP_MJ_CLEANUP) fires
+/// on the dispatcher thread (issue #294) — the same racy shape
+/// as the existing `winfsp_create_delete` test at L119. Polling
+/// the backend directly gives a deterministic answer.
+#[test]
+fn winfsp_nfc_delete() {
+    let fs = Arc::new(make_memory_fs());
+    let guard = mntrs::core_fs::test_helpers::mount_winfsp(fs.clone()).unwrap();
+    let mp = &guard.mount_path;
+    settle();
+
+    let name = "café_to_delete.txt";
+    std::fs::write(format!("{mp}{name}"), b"bye").unwrap();
+    assert!(std::path::Path::new(&format!("{mp}{name}")).exists());
+    std::fs::remove_file(format!("{mp}{name}")).unwrap();
+    settle();
+
+    // Backend-side check: poll until the cleanup callback fires
+    // and the in-memory opendal op no longer sees the entry.
+    // Bounded retry because the dispatcher may be busy.
+    let mut backend_gone = false;
+    for _ in 0..20 {
+        let op = fs.op.clone();
+        let still_present =
+            rt_block_on(async move { op.exists("café_to_delete.txt").await.unwrap_or(true) });
+        if !still_present {
+            backend_gone = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        backend_gone,
+        "backend still has {name} after mount-side remove (cleanup callback never fired)"
+    );
+
+    drop(guard);
+}
+
 #[test]
 fn winfsp_write_large_file() {
     let fs = Arc::new(make_memory_fs());
