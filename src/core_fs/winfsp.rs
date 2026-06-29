@@ -442,7 +442,13 @@ impl<F: CoreFilesystem + 'static> WinFspAdapter<F> {
             if component.is_empty() {
                 continue;
             }
-            match self.inner.lookup(current_parent, component) {
+            // Issue #307: NFC-normalize each parent component
+            // defensively. Current callers (cleanup) already
+            // pass NFC post-fix, so this is a no-op today;
+            // future callers that bypass cleanup's normalize
+            // step stay correct.
+            let component = crate::util::nfc(component);
+            match self.inner.lookup(current_parent, &component) {
                 Ok(attr) => current_parent = attr.ino,
                 Err(_) => return None,
             }
@@ -464,7 +470,10 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         catch_panic(
             "get_security_by_name",
             AssertUnwindSafe(|| {
-                let name = file_name.to_string_lossy();
+                // Issue #307: NFC-normalize the kernel-supplied
+                // name so cross-adapter lookups (macOS FUSE uploads
+                // NFD, WinFSP queries NFC) hit the same backend key.
+                let name = crate::util::nfc(&file_name.to_string_lossy());
                 tracing::debug!(name = %name, "winfsp::get_security_by_name: entered");
                 let path = name.replace('\\', "/");
                 let parent = 1u64; // root
@@ -507,7 +516,9 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         catch_panic(
             "open",
             AssertUnwindSafe(|| {
-                let name = file_name.to_string_lossy();
+                // Issue #307: NFC-normalize the kernel-supplied
+                // name (see get_security_by_name for rationale).
+                let name = crate::util::nfc(&file_name.to_string_lossy());
                 tracing::debug!(name = %name, "winfsp::open: entered");
                 let path = name.replace('\\', "/");
                 let attr = self.inner.lookup(1, &path).map_err(|e| {
@@ -604,7 +615,9 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         catch_panic(
             "create",
             AssertUnwindSafe(|| {
-                let name = file_name.to_string_lossy();
+                // Issue #307: NFC-normalize the kernel-supplied
+                // name (see get_security_by_name for rationale).
+                let name = crate::util::nfc(&file_name.to_string_lossy());
                 tracing::debug!(name = %name, ?create_options, file_attributes, "winfsp::create: entered");
                 // Win32 create_options bits (matches
                 // windows::Win32::Storage::FileSystem):
@@ -862,8 +875,12 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 // full src path, look up its ino, and pass
                 // (parent_ino, basename, newparent_ino,
                 // newname) to the trait's rename.
-                let src_full = file_name.to_string_lossy().replace('\\', "/");
-                let dst_full = new_file_name.to_string_lossy().replace('\\', "/");
+                // Issue #307: NFC-normalize both names so a macOS
+                // FUSE upload (NFD) and a WinFSP rename (NFC) hit
+                // the same backend key.
+                let src_full = crate::util::nfc(&file_name.to_string_lossy()).replace('\\', "/");
+                let dst_full =
+                    crate::util::nfc(&new_file_name.to_string_lossy()).replace('\\', "/");
                 // Issue #78 regression: WinFSP normalizes
                 // paths through Windows' case-insensitive
                 // layer, so the callback receives the
@@ -975,7 +992,9 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                     );
                     return;
                 };
-                let full_path = file_name.to_string_lossy().replace('\\', "/");
+                // Issue #307: NFC-normalize the kernel-supplied
+                // name (see get_security_by_name for rationale).
+                let full_path = crate::util::nfc(&file_name.to_string_lossy()).replace('\\', "/");
                 // Split into (parent_path, basename).
                 // WinFSP paths look like "/dir/file.txt"
                 // for non-root or "/file.txt" for root.
