@@ -131,18 +131,24 @@ function Mount-Test {
     $script:fail = 0
     # Sub-tests the caller wants to skip. Issue #311: the S3
     # backend e2e step in ci-windows.yml passes
-    # `-SkipSubTests "4,6,7,12"` because (a) the write IRP
-    # through the S3 backend is currently a regression hotspot
-    # (the in-progress #332 fix tracks a related hang), and
-    # (b) sub-test 12 (file-lock) depends on backend semantics
-    # the S3 backend doesn't implement yet (#327). Sub-test 11
-    # (ACL) is intentionally NOT skipped: it already has
-    # `::warning::` + `[WARN]` handling for the S3 backend
-    # (the loose assertion path) and catches backend-
-    # independent gaps (e.g. STATUS_NOT_IMPLEMENTED from
-    # get_security). Memory backend passes an empty string
-    # (no skip). When #332/#327 land, drop these from the
-    # workflow invocation and remove the suppression.
+    # `-SkipSubTests "3,4,5,6,7,12"` because:
+    #   3 — pre-existing file not visible on S3 fresh mount
+    #       (likely opendal list() consistency; tracked as
+    #       follow-up)
+    #   4 — write small (write IRP hang, #332)
+    #   5 — read back (depends on sub-test 4; hangs because
+    #       4 is skipped)
+    #   6 — append + verify (write IRP hang, #332)
+    #   7 — 10M write + read (write IRP hang, #332)
+    #   12 — file lock + rename (backend semantics gap, #327)
+    # Sub-test 11 (ACL) is intentionally NOT skipped: it
+    # already has `::warning::` + `[WARN]` handling for the
+    # S3 backend (the loose assertion path) and catches
+    # backend-independent gaps (e.g. STATUS_NOT_IMPLEMENTED
+    # from get_security). Memory backend passes an empty
+    # string (no skip). When the S3 listing fix + #332 + #327
+    # land, drop these from the workflow invocation and
+    # remove the suppression.
     $script:skipSet = @{}
     if (-not [string]::IsNullOrEmpty($SkipSubTests)) {
         foreach ($n in ($SkipSubTests -split ',')) {
