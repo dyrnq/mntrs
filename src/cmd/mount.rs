@@ -1510,6 +1510,16 @@ pub fn mount(
             mountpoint,
             "mount(windows): host.start returned; volume is live and dispatching"
         );
+        // Issue #311: the FUSER path (mount.rs:1266+ block) calls
+        // record_mount on Unix. The WinFSP path above is its own
+        // cfg(windows) block and never reaches the Unix
+        // record_mount site, so on Windows the mounts.txt entry
+        // was never written. That broke `mntrs list` (always
+        // empty) and the cross-process `mntrs unmount V:`
+        // owning-PID lookup at unmount.rs:244-247. Add the call
+        // here, immediately after the volume is live, so a
+        // stale-DOS-device crash leaves a discoverable record.
+        record_mount(storage_url, mountpoint, read_only);
         host
     };
 

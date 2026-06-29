@@ -5,7 +5,9 @@
 # Runs the same effective sub-test matrix that integration.yml runs
 # for the FUSE path, adapted to WinFSP via PowerShell 7 .NET APIs.
 #
-# Eight sub-tests (mirrors mount-test.sh lines 136-211):
+# Sub-test matrix (mirrors mount-test.sh lines 136-211, plus
+# the Issue #311 list smoke sub-tests at the bookends):
+#   0. mntrs list (pre-mount smoke — asserts mounts.txt is clean)
 #   1. mount + readiness probe (60s budget)
 #   2. ls (Get-ChildItem)
 #   3. cat pre-existing (skipped for memory backend)
@@ -14,6 +16,13 @@
 #   6. append + verify
 #   7. 10M write + read
 #   8. random seek at 8 offsets
+#   9. concurrent reads (Issue #316a)
+#  10. symlink (Issue #316b follow-up #325)
+#  11. ACL (Issue #316b follow-up #326)
+#  12. file lock + rename (Issue #316b follow-up #327)
+#  13. multi-mount idempotency (Issue #316b follow-up #328)
+#  14. delete dispatches to backend (Issue #298)
+#  15. mntrs list (post-mount smoke — asserts V: is tracked)
 #
 # Cleanup contract (mirrors mount-test.sh L30):
 #   This script does NOT unmount — it leaves the mount alive so
@@ -213,6 +222,24 @@ function Mount-Test {
         return 1
     }
 
+    # --- 0. mntrs list — pre-mount smoke ------------------------
+    # Verifies the mounts db is clean (no stale V: entry from a
+    # prior failed run). Pre-fix the cleanup step's
+    # `Stop-Process -Force` would orphan the V: row in
+    # ~/.local/share/mntrs/mounts.txt and the next run would
+    # start with stale state — this sub-test catches that
+    # regression so the postmortem log names the source.
+    Write-Host "--- 0. mntrs list (pre-mount) ---"
+    $listPreOutput = & $MntrsBin list 2>&1
+    $listPreText = ($listPreOutput | Out-String).Trim()
+    Write-Host "  list output:"
+    $listPreOutput | ForEach-Object { Write-Host "    $_" }
+    if ($listPreText -match [regex]::Escape($MountPath)) {
+        Fail "pre-mount list contains $MountPath" "(stale entry from prior run; cleanup step didn't filter mounts.txt)"
+    } else {
+        Pass "pre-mount list clean (no $MountPath entry)"
+    }
+
     # --- 1. Mount ------------------------------------------------
     # WinFSP mount: the process stays in the foreground keep-alive
     # loop (mount.rs:1526-1536) on Windows. We background via
@@ -227,6 +254,16 @@ function Mount-Test {
     # because they exercise the path where multiple IRPs share
     # a small dispatcher pool without serializing.
     $mountArgs = @('mount', $Storage, $MountPath)
+    if (-not [string]::IsNullOrEmpty($MountOpts)) {
+        # MountOpts is the --opt k=v list emitted by integration.yml's
+        # s3 case (e.g. '--opt endpoint=http://localhost:9000 --opt
+        # access-key=minioadmin ...'). For the memory backend it's
+        # typically empty. Pass through verbatim so the same script
+        # works for both backends.
+        foreach ($opt in ($MountOpts -split ' ')) {
+            if (-not [string]::IsNullOrEmpty($opt)) { $mountArgs += $opt }
+        }
+    }
     if ($DispatcherThreads -gt 0) {
         $mountArgs += @('--winfsp-dispatcher-threads', "$DispatcherThreads")
         Write-Host "dispatcher-threads pinned to $DispatcherThreads (sub-test 9 verification)"
@@ -722,6 +759,25 @@ function Mount-Test {
     # e2e step here would either (a) duplicate the Rust
     # test or (b) hit #332 because WriteAllBytes through
     # the mount is the broken path. Tracked separately.
+
+    # --- 15. mntrs list — post-mount smoke -----------------------
+    # Verifies the mount process registered itself in
+    # ~/.local/share/mntrs/mounts.txt (record_mount() at
+    # src/cmd/mount.rs:114-155). The diagnostic value: if
+    # record_mount silently failed (e.g. the data dir is
+    # read-only on the runner), `mntrs list` would be empty
+    # here and the operator sees the gap before the CI log
+    # rolls over.
+    Write-Host "--- 15. mntrs list (post-mount) ---"
+    $listPostOutput = & $MntrsBin list 2>&1
+    $listPostText = ($listPostOutput | Out-String).Trim()
+    Write-Host "  list output:"
+    $listPostOutput | ForEach-Object { Write-Host "    $_" }
+    if ($listPostText -match [regex]::Escape($MountPath)) {
+        Pass "post-mount list contains $MountPath (record_mount worked)"
+    } else {
+        Fail "post-mount list missing $MountPath" "(record_mount failed; see mounts.txt)"
+    }
 
     # --- cleanup test files (mount stays alive) ------------------
     # Best-effort; the workflow's if: always() cleanup step handles

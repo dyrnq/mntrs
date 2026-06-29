@@ -76,7 +76,74 @@ jobs:
       # above. Mount is left alive on failure so the postmortem step
       # below can attach the mount log; cleanup is handled in the
       # `if: always()` step at the end of the job.
-      - name: WinFSP e2e smoke test
+      # Issue #311: S3 backend e2e. Starts a local MinIO server
+      # (downloaded as a single-binary minio.exe) on port 9000,
+      # creates the test bucket with mc.exe, seeds a pre-existing
+      # file, and hands the endpoints to the S3 e2e step below.
+      #
+      # Why not the GH Actions services:matrix container shape
+      # that integration.yml uses for Linux? windows-latest is a
+      # Windows VM runner (not Linux with Docker), so the
+      # `services:` block is unavailable. Single-binary minio.exe
+      # + mc.exe is the same content with one extra Start-Process
+      # per side.
+      - name: Start MinIO server (s3 e2e)
+        shell: pwsh
+        run: |
+          $minioDir = Join-Path ${{ runner.temp }} "mntrs-minio"
+          New-Item -ItemType Directory -Force -Path $minioDir | Out-Null
+          $minioBin = Join-Path $minioDir "minio.exe"
+          $mcBin    = Join-Path $minioDir "mc.exe"
+          $dataDir  = Join-Path $minioDir "data"
+          New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+          if (-not (Test-Path $minioBin)) {
+            Write-Host "Downloading minio.exe..."
+            Invoke-WebRequest -Uri "https://dl.min.io/server/minio/release/windows-amd64/minio.exe" -OutFile $minioBin -UseBasicParsing
+          }
+          if (-not (Test-Path $mcBin)) {
+            Write-Host "Downloading mc.exe..."
+            Invoke-WebRequest -Uri "https://dl.min.io/client/mc/release/windows-amd64/mc.exe" -OutFile $mcBin -UseBasicParsing
+          }
+          $env:MINIO_ROOT_USER     = "minioadmin"
+          $env:MINIO_ROOT_PASSWORD = "minioadmin"
+          $minioLog = Join-Path $minioDir "minio.log"
+          $minioProc = Start-Process -FilePath $minioBin `
+              -ArgumentList @('server', $dataDir, '--address', ':9000') `
+              -RedirectStandardOutput $minioLog `
+              -RedirectStandardError "$minioLog.err" `
+              -PassThru -NoNewWindow
+          Write-Host "started minio pid=$($minioProc.Id)"
+          $ready = $false
+          for ($i = 1; $i -le 30; $i++) {
+            try {
+              $r = Invoke-WebRequest -Uri "http://localhost:9000/minio/health/live" -UseBasicParsing -TimeoutSec 2
+              if ($r.StatusCode -eq 200) { $ready = $true; break }
+            } catch { }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $ready) {
+            Write-Host "::error::MinIO did not become ready in 30s"
+            if (Test-Path $minioLog) { Get-Content $minioLog -Tail 40 }
+            exit 1
+          }
+          Write-Host "MinIO ready"
+          & $mcBin alias set ci http://localhost:9000 minioadmin minioadmin 2>&1 | Out-Null
+          & $mcBin mb ci/ci-bucket 2>&1 | Out-Null
+          $seedPath = Join-Path $minioDir "s3-test.txt"
+          Set-Content -LiteralPath $seedPath -Value "hello s3`n" -NoNewline
+          & $mcBin cp $seedPath "ci/ci-bucket/s3-test.txt" 2>&1 | Out-Null
+          Write-Host "seeded s3://ci-bucket/s3-test.txt"
+          # Persist paths for the s3 e2e + cleanup steps. We avoid
+          # $GITHUB_ENV because that requires special GITHUB_ENV
+          # file write semantics; a plain text file is simpler
+          # and read with a one-liner in the next step.
+          Set-Content -LiteralPath (Join-Path $minioDir "env.txt") -Value @(
+              "MINIO_BIN=$minioBin"
+              "MC_BIN=$mcBin"
+              "MINIO_DATA=$dataDir"
+          )
+
+      - name: WinFSP e2e smoke test (memory backend)
         shell: pwsh
         run: |
           . tests/e2e/common/mount-test.ps1
@@ -94,34 +161,132 @@ jobs:
                      -Profile release `
                      -DispatcherThreads 4
 
-      - name: Upload mount log (failure)
+      - name: Upload memory mount log (failure)
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: mount-log-windows
           path: ${{ runner.temp }}\mntrs-mount-memory.log
 
+      # S3 backend e2e. Mirrors the memory e2e above but mounts
+      # s3://ci-bucket on W: (different drive letter so both
+      # volumes can be live for the postmortem log upload if
+      # the second step fails). The --opt k=v list is the same
+      # shape integration.yml uses for the Linux s3 matrix
+      # entry — mntrs's main.rs:24-26 parses --opt KEY=VAL
+      # into a HashMap that mount.rs:1876-1895 wires into the
+      # opendal S3 builder.
+      #
+      # Sub-test 3 (cat pre-existing) is populated by the seed
+      # file in the MinIO setup step.
+      - name: WinFSP e2e smoke test (s3 backend)
+        shell: pwsh
+        run: |
+          $minioDir = Join-Path ${{ runner.temp }} "mntrs-minio"
+          Get-Content (Join-Path $minioDir "env.txt") | ForEach-Object {
+            $parts = $_.Split("=", 2)
+            if ($parts.Count -eq 2) { Set-Item -Path "Env:\$($parts[0])" -Value $parts[1] }
+          }
+          . tests/e2e/common/mount-test.ps1
+          Mount-Test -Backend s3 `
+                     -Storage s3://ci-bucket `
+                     -MountPath W: `
+                     -LogPath "${{ runner.temp }}\mntrs-mount-s3.log" `
+                     -Profile release `
+                     -DispatcherThreads 4 `
+                     -MountOpts "--opt endpoint=http://localhost:9000 --opt access-key=minioadmin --opt secret-key=minioadmin --opt region=us-east-1" `
+                     -PreexistFile "s3-test.txt" `
+                     -ExpectedText "hello s3"
+
+      - name: Upload s3 mount log (failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mount-log-windows-s3
+          path: ${{ runner.temp }}\mntrs-mount-s3.log
+
       # Cleanup hook — always runs. Stops the mntrs.exe left running
-      # by Mount-Test and clears the V: drive. Same-process unmount
-      # only (R1 caveat: src/cmd/unmount.rs:127-132 — cross-process
-      # unmount returns ERROR_ACCESS_DENIED). Killing the mount
-      # process first releases the kernel-side handle, then
-      # `mntrs unmount` clears the leftover DOS device entry. The
-      # step forces exit 0 because the cross-process unmount returns
-      # a non-zero exit code by design (R1) and this is best-effort
-      # teardown, not a quality gate.
+      # by Mount-Test, clears both V: and W: drives, removes the
+      # ~/.local/share/mntrs/mounts.txt entries that record_mount()
+      # wrote on the (now-dead) mount processes, and tears down the
+      # MinIO server started for the s3 e2e.
+      #
+      # mounts.db note (Issue #311): the cross-process
+      # `mntrs unmount X:` in this script is the R1 caveat
+      # documented at src/cmd/unmount.rs:172-177 — it returns
+      # ERROR_ACCESS_DENIED because the DOS device is owned by the
+      # (now-killed) mount process. We kill the process FIRST so
+      # the kernel-side handle is released, then call
+      # `mntrs unmount X:` which now hits the idempotent
+      # ERROR_FILE_NOT_FOUND path (line 224-230 of unmount.rs) and
+      # proceeds to filter mounts.txt (line 117-127). So the
+      # belt-and-suspenders below is only needed when the second
+      # `mntrs unmount` short-circuits at line 92-97 (e.g. the
+      # runner's HOME is on a network share that returns
+      # ERROR_FILE_NOT_FOUND before mounts.txt is reachable, or
+      # someone changes the unmount contract). Cheap, no-op if the
+      # db is already clean.
       - name: Cleanup mount (always)
         if: always()
         shell: pwsh
         run: |
+          # Stop the MinIO server first so its port 9000 is
+          # released before any later step (e.g. integration
+          # with csi-e2e in a follow-up) tries to rebind.
+          Get-Process minio -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          # Kill the mount processes — releases the kernel-side
+          # DOS device handle. Stop-Process -Force is SIGKILL-style
+          # on Windows, so the in-process cleanup() (which would
+          # normally call remove_mount) does NOT run. The mounts.txt
+          # V:/W: entries therefore outlive the processes.
           Get-Process mntrs -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           Start-Sleep -Seconds 2
           $mntrs = Join-Path ${{ github.workspace }} 'target\release\mntrs.exe'
-          if (Test-Path $mntrs) {
-            try { & $mntrs unmount V: 2>&1 | Out-Null } catch { }
-            if (Get-PSDrive V -ErrorAction SilentlyContinue) {
-              Write-Host "V: still mounted after unmount — forcing DefineDosDeviceW clear"
-              try { & $mntrs unmount V: 2>&1 | Out-Null } catch { }
+          # Two mountpoints: V: (memory e2e) and W: (s3 e2e). Same
+          # for-loop logic as the original V:-only step — generalize
+          # to a list now that we run two backends.
+          foreach ($mp in @('V:', 'W:')) {
+            if (Test-Path $mntrs) {
+              try { & $mntrs unmount $mp 2>&1 | Out-Null } catch { }
+              if (Get-PSDrive $mp.TrimEnd(':') -ErrorAction SilentlyContinue) {
+                Write-Host "$mp still mounted after unmount — forcing DefineDosDeviceW clear"
+                try { & $mntrs unmount $mp 2>&1 | Out-Null } catch { }
+              }
             }
+          }
+          # Belt-and-suspenders: explicitly filter V: and W: out
+          # of mounts.txt. The contract: lines are NUL-separated
+          # `${storage}\0${mountpoint}\0${pid}\0${user}\0${ro}\0${backend}`
+          # (mount.rs:147). We re-implement the read/filter/write
+          # here in PowerShell because the Rust binary's `unmount`
+          # command is no longer reliable in this cross-process
+          # scenario (see the comment block above).
+          $mountsDb = Join-Path $env:USERPROFILE '.local\share\mntrs\mounts.txt'
+          $driveLetters = @('V:', 'W:')
+          if (Test-Path $mountsDb) {
+            try {
+              $lines = Get-Content -LiteralPath $mountsDb -ErrorAction Stop
+              $kept = @()
+              foreach ($l in $lines) {
+                $parts = $l -split "`0"
+                if ($parts.Count -lt 2) { $kept += $l; continue }
+                if ($driveLetters -notcontains $parts[1]) { $kept += $l }
+              }
+              if ($kept.Count -eq 0) {
+                Remove-Item -LiteralPath $mountsDb -Force -ErrorAction Stop
+                Write-Host "mounts.txt: empty after filter; removed"
+              } else {
+                Set-Content -LiteralPath $mountsDb -Value ($kept -join "`n") -NoNewline -ErrorAction Stop
+                Write-Host "mounts.txt: filtered CI mountpoints (kept $($kept.Count) other row(s))"
+              }
+            } catch {
+              Write-Host "::warning::mounts.txt cleanup failed: $($_.Exception.Message)"
+            }
+          }
+          # Remove the MinIO data dir + binaries so the next run
+          # starts from a clean state. Best-effort: ignore errors.
+          $minioDir = Join-Path ${{ runner.temp }} "mntrs-minio"
+          if (Test-Path $minioDir) {
+            try { Remove-Item -LiteralPath $minioDir -Recurse -Force -ErrorAction Stop } catch { }
           }
           exit 0
