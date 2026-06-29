@@ -147,7 +147,6 @@ fn winfsp_create_delete() {
 }
 
 #[test]
-#[ignore = "TODO(#299): rename fails when source file was created via opendal backend (no ino in cache)"]
 fn winfsp_rename_file() {
     let fs = Arc::new(make_memory_fs());
     let guard = mntrs::core_fs::test_helpers::mount_winfsp(fs.clone()).unwrap();
@@ -159,6 +158,54 @@ fn winfsp_rename_file() {
     let read = std::fs::read_to_string(format!("{mp}new.txt")).unwrap_or_default();
     assert_eq!(read, "rename me");
     assert!(std::fs::read(format!("{mp}old.txt")).is_err());
+
+    drop(guard);
+}
+
+/// Issue #78 regression: rename a file inside a subdirectory
+/// whose parent was created via the opendal backend (no prior
+/// mount-side lookup, no inode cached for the parent). Pre-fix,
+/// `lib.rs::rename` derived the src path by walking
+/// `self.resolve(_parent)` which returned `(root_ino, name)` —
+/// the backend rename hit the wrong level and the file was not
+/// moved. With `rename_paths` (WinFSP supplies the full paths
+/// directly) the op.rename gets the correct `subdir/old.txt`.
+#[test]
+fn winfsp_rename_opendal_only_source() {
+    let fs = Arc::new(make_memory_fs());
+    let guard = mntrs::core_fs::test_helpers::mount_winfsp(fs.clone()).unwrap();
+    let mp = &guard.mount_path;
+    settle();
+
+    // Create the source via opendal — no mount-side touch, so
+    // the subdir has no ino in the cache.
+    write_remote(&fs, "subdir/old.txt", b"nested");
+    // Touch the parent via mount so it shows up in readdir
+    // (the rename itself shouldn't depend on this, but it
+    // mirrors realistic use: a process writes to opendal,
+    // another process renames via the mount).
+    std::fs::create_dir_all(format!("{mp}subdir")).unwrap();
+    settle();
+
+    // The actual rename — this is the failing call pre-#78.
+    std::fs::rename(
+        format!("{mp}subdir\\old.txt"),
+        format!("{mp}subdir\\new.txt"),
+    )
+    .unwrap();
+
+    // The new name should be readable with the original content.
+    let read = std::fs::read_to_string(format!("{mp}subdir\\new.txt")).unwrap_or_default();
+    assert_eq!(read, "nested");
+    // The old name should be gone (both via mount and via backend).
+    assert!(std::fs::read(format!("{mp}subdir\\old.txt")).is_err());
+
+    let op = fs.op.clone();
+    let op2 = op.clone();
+    let dst_exists = rt_block_on(async move { op.exists("subdir/new.txt").await.unwrap_or(false) });
+    let src_exists = rt_block_on(async move { op2.exists("subdir/old.txt").await.unwrap_or(true) });
+    assert!(dst_exists, "backend missing subdir/new.txt after rename");
+    assert!(!src_exists, "backend still has subdir/old.txt after rename");
 
     drop(guard);
 }
