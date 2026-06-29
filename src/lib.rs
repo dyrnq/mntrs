@@ -3332,31 +3332,31 @@ impl CoreFilesystem for MntrsFs {
         // re-fetch from remote. Bytes::slice is zero-copy.
         let first_blk = offset / CACHE_BLOCK_SIZE;
         let n_blks = (b.len() as u64).div_ceil(CACHE_BLOCK_SIZE);
+        // Issue #337 (refined): only skip the trailing partial
+        // block if there is MORE file content past this read —
+        // i.e. the read ended mid-block and a future read of the
+        // same block_idx would otherwise L1-hit the tiny slice
+        // and read garbage for the missing tail.
+        //
+        // If this read consumed the rest of the file
+        // (`offset + b.len() >= actual_size`) the partial IS
+        // the whole truth for that block — keep it (matches
+        // pre-fix `e.min(b.len())` behavior, which is the
+        // fast path for small files: a 1 MiB file's first read
+        // populates L1 with the whole 1 MiB and subsequent
+        // reads L1-hit, no remote re-fetch).
+        let read_reached_eof = offset + b.len() as u64 >= actual_size;
         for i in 0..n_blks {
             let s = (i * CACHE_BLOCK_SIZE) as usize;
             let e = ((i + 1) * CACHE_BLOCK_SIZE) as usize;
-            // Issue #337 (sister to #331 and #334): skip the
-            // trailing partial block. `b.len()` can be <
-            // CACHE_BLOCK_SIZE when a 128 KiB FUSE read IRP
-            // falls through from every prior branch (block
-            // cache, prefetch, file-level cache) — typical
-            // for the second-and-later re-read of a 128 KiB
-            // window after mem-pressure dropped the
-            // prefetcher's window to the 128 KiB floor. Without
-            // this guard, a 128 KiB slice would be
-            // `mem_cache.put`-ed under an 8 MiB block-aligned
-            // key, poisoning L1 exactly the way #331's whole-
-            // file `put` did and the way #334 already fixed on
-            // the prefetch pop path. The short tail falls
-            // through to a normal cache-miss + remote re-fetch
-            // on the next read, so the file is still
-            // correctly served — just without the L1 warmup
-            // for the last partial block (same trade-off as
-            // #334).
-            if e > b.len() {
+            if e > b.len() && !read_reached_eof {
+                // Poison guard: tiny slice at non-block-aligned
+                // end, more file content past it. Skip and let
+                // a future full-block read populate cleanly.
                 break;
             }
-            self.mem_cache.put(ino, first_blk + i, b.slice(s..e));
+            let end = e.min(b.len());
+            self.mem_cache.put(ino, first_blk + i, b.slice(s..end));
         }
         // Also populate block-level disk cache so subsequent reads
         // of the same range hit the fast path on disk (rclone's
@@ -3415,22 +3415,20 @@ impl CoreFilesystem for MntrsFs {
             for i in 0..n_blks {
                 let s = (i * CACHE_BLOCK_SIZE) as usize;
                 let e = ((i + 1) * CACHE_BLOCK_SIZE) as usize;
-                // Issue #337 (L2 side — same anti-pattern
-                // as the L1 populate above and as #334's
-                // guard on the prefetch pop path). If we
-                // wrote a sub-8 MiB slice as a block cache
-                // file, the next read of the same block_idx
-                // would L2-hit and return the partial bytes
-                // — the L1 guard above is useless if L2
-                // separately poisons the same block. Also
-                // skip the corresponding `disk_cache_index`
-                // insert so the LRU sweeper doesn't claim
-                // a (8 MiB + BLOCK_OVERHEAD) sized entry
-                // that doesn't exist on disk.
-                if e > b.len() {
+                // Issue #337 (L2 side — same refined guard
+                // as the L1 populate above). If we wrote a
+                // sub-8 MiB slice as a block cache file at
+                // non-end-of-file, the next read of the same
+                // block_idx would L2-hit and return the
+                // partial bytes — same poisoning the L1 guard
+                // prevents. When the read consumed the rest
+                // of the file, the partial IS the whole
+                // block, so keep it (small-file fast path).
+                if e > b.len() && !read_reached_eof {
                     break;
                 }
-                let slice = b.slice(s..e).to_vec();
+                let end = e.min(b.len());
+                let slice = b.slice(s..end).to_vec();
                 let block_idx = first_blk + i;
                 let written_size = (slice.len() + BLOCK_OVERHEAD) as u64;
                 submit_block_cache_write(&cache_dir, &path, block_idx, slice);
