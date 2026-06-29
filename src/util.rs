@@ -217,6 +217,32 @@ pub(crate) fn canonicalize_list_path(raw: &str) -> String {
     }
 }
 
+// ── Unicode NFC normalization (Issue #307) ─────────────────────────
+
+/// Canonicalize a file-name to NFC (Unicode precomposed form).
+/// Idempotent: NFC of NFC is NFC. Cheap on pure-ASCII input
+/// (the `unicode-normalization` crate's fast path skips the
+/// per-char pass when the input contains no combining marks).
+///
+/// Why: macOS HFS+/APFS uses NFD (decomposed: `e` + U+0301
+/// combining acute) while Windows / Linux use NFC (precomposed:
+/// `é` U+00E9). Object stores preserve whatever the uploader
+/// sent, so cross-OS access (`macOS FUSE → S3 → WinFSP mount`
+/// or vice versa) misses the backend lookup if the adapter
+/// doesn't normalize to a canonical form. We pick NFC because
+/// it's what NTFS stores internally and what Linux's VFS layer
+/// hands to FUSE.
+///
+/// Scope: called from `core_fs::winfsp.rs` and `core_fs::fuser.rs`
+/// at every callback that decodes a kernel-supplied `file_name`.
+/// This ensures the trait methods always see NFC names; the
+/// existing `block_norm_dupes`-side NFC usage in `list_op` then
+/// has consistent keys to dedup against.
+pub fn nfc(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    s.nfc().collect()
+}
+
 // ── Mkdir chain builder ─────────────────────────────────────────────
 
 /// Build the list of intermediate-directory paths that `mkdir_chain`
@@ -851,5 +877,56 @@ mod tests {
         }
         let err = runtime_dir().unwrap_err();
         assert!(format!("{err}").contains("empty"));
+    }
+
+    // ── nfc (Issue #307) ─────────────────────────────────────────────
+
+    /// Pure ASCII is unchanged by NFC normalization.
+    #[test]
+    fn nfc_ascii_unchanged() {
+        assert_eq!(nfc("hello.txt"), "hello.txt");
+        assert_eq!(nfc("foo/bar/baz"), "foo/bar/baz");
+    }
+
+    /// Input already in NFC passes through unchanged.
+    #[test]
+    fn nfc_nfc_pass_through() {
+        // "café.txt" — the source literal is NFC (precomposed é, U+00E9).
+        let nfc_in = "café.txt";
+        assert_eq!(nfc(nfc_in), "café.txt");
+    }
+
+    /// Input in NFD is decomposed via `.nfd()` and then re-composed
+    /// by `nfc()` back to the canonical NFC form. This is the exact
+    /// round-trip the WinFSP / FUSE adapters perform at every
+    /// callback entry point.
+    #[test]
+    fn nfc_nfd_to_nfc() {
+        use unicode_normalization::UnicodeNormalization as _;
+        // Construct NFD explicitly: e (U+0065) + combining acute (U+0301).
+        let nfd: String = "café.txt".nfd().collect();
+        assert_eq!(nfd, "cafe\u{0301}.txt");
+        assert_eq!(nfc(&nfd), "café.txt");
+    }
+
+    /// `nfc(nfc(x)) == nfc(x)` — the operation must be idempotent so
+    /// that adapter callers don't accidentally double-normalize or
+    /// pay the cost twice on already-canonical input.
+    #[test]
+    fn nfc_idempotent() {
+        use unicode_normalization::UnicodeNormalization as _;
+        let once = nfc("café.txt");
+        let twice = nfc(&once);
+        assert_eq!(once, twice);
+        let nfd: String = "café.txt".nfd().collect();
+        let once = nfc(&nfd);
+        let twice = nfc(&once);
+        assert_eq!(once, twice);
+    }
+
+    /// Empty input is a no-op.
+    #[test]
+    fn nfc_empty() {
+        assert_eq!(nfc(""), "");
     }
 }
