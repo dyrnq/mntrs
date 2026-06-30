@@ -28,7 +28,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use winfsp::FspError;
 
 use widestring::U16CStr;
-use windows::Win32::Foundation::{STATUS_INVALID_DEVICE_REQUEST, STATUS_UNSUCCESSFUL};
+use windows::Win32::Foundation::{
+    STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_DEVICE_REQUEST, STATUS_UNSUCCESSFUL,
+};
 use winfsp::Result;
 use winfsp::constants::FspCleanupFlags;
 use winfsp::filesystem::{
@@ -81,6 +83,141 @@ const USER_FILE_ATTR_PASSTHROUGH: u32 = FILE_ATTRIBUTE_READONLY
     | FILE_ATTRIBUTE_TEMPORARY
     | FILE_ATTRIBUTE_OFFLINE
     | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
+
+// Issue #308: synthesize a fixed SECURITY_DESCRIPTOR for
+// `get_security` / `set_security`. The kernel
+// (and any user-mode tool that calls
+// `GetFileSecurity` / `Get-Acl` / `icacls`) requires a
+// real SD to render the Security tab; without it the
+// adapter returns STATUS_INVALID_DEVICE_REQUEST and
+// Explorer shows an empty Security tab, `icacls`
+// fails, and EDR/Defender ACL scans misreport the
+// mount.
+//
+// The SD is a self-relative SECURITY_DESCRIPTOR with:
+//   - Owner = Everyone (S-1-1-0)
+//   - Group = Everyone (S-1-1-0)
+//   - DACL  = one ACCESS_ALLOWED_ACE for Everyone
+//     granting STANDARD_RIGHTS_REQUIRED |
+//     SPECIFIC_RIGHTS_ALL (full access)
+//   - no SACL
+//
+// The `0x001F01FF` mask for files maps to
+// `STANDARD_RIGHTS_REQUIRED | FILE_GENERIC_READ |
+// FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE` via
+// the standard Win32 generic-mapping table. For
+// directories we add `FILE_LIST_DIRECTORY` (0x00000001)
+// and `FILE_TRAVERSE` (0x00000020) which the generic
+// mapping omits — `FILE_GENERIC_EXECUTE` doesn't
+// include list/traverse for directories under some
+// Win32 APIs.
+//
+// We hand-construct the bytes rather than calling
+// `InitializeSecurityDescriptor` + `SetSecurityDescriptorDacl` +
+// `MakeSelfRelativeSD` because the resulting SD is
+// fully deterministic (every byte is computed, no
+// heap allocation for the SID), and we need a
+// self-relative SD to hand back to the kernel (the
+// API-only path produces an absolute SD that needs
+// an extra conversion step). The static layout
+// matches what the Win32 APIs would produce.
+
+/// Access mask granted to `Everyone` for files
+/// (full control minus some rarely-used privileges).
+/// Equivalent to `STANDARD_RIGHTS_REQUIRED |
+/// FILE_GENERIC_READ | FILE_GENERIC_WRITE |
+/// FILE_GENERIC_EXECUTE`.
+const FILE_ACCESS_MASK_FULL: u32 = 0x001F_01FF;
+
+/// Access mask granted to `Everyone` for directories.
+/// `FILE_ACCESS_MASK_FULL | FILE_LIST_DIRECTORY (0x01) |
+/// FILE_TRAVERSE (0x20)` so Explorer Properties can
+/// list/read the directory contents.
+const DIR_ACCESS_MASK_FULL: u32 = FILE_ACCESS_MASK_FULL | 0x0000_0021;
+
+/// Build a 72-byte self-relative SECURITY_DESCRIPTOR
+/// granting `Everyone` full access. Layout (offsets
+/// from the SD base):
+///
+///   0..20   SECURITY_DESCRIPTOR header
+///  20..28   DACL header (8 bytes)
+///  28..48   ACE: 4 header + 4 mask + 12 SID (S-1-1-0)
+///  48..60   Owner SID (S-1-1-0, 12 bytes)
+///  60..72   Group SID (S-1-1-0, 12 bytes)
+///
+/// Total: 20 + 8 + 20 + 12 + 12 = 72 bytes. A
+/// self-relative SD has no external pointers — every
+/// offset is relative to the SD base — so the bytes
+/// can be copied verbatim into the kernel's SD
+/// buffer.
+fn synthesize_self_relative_sd(is_dir: bool) -> [u8; 72] {
+    let mask: u32 = if is_dir {
+        DIR_ACCESS_MASK_FULL
+    } else {
+        FILE_ACCESS_MASK_FULL
+    };
+
+    let mut sd = [0u8; 72];
+
+    // SECURITY_DESCRIPTOR header (20 bytes).
+    //   Revision   = 1
+    //   Sbz1       = 0
+    //   Control    = SE_SELF_RELATIVE (0x8000) | SE_DACL_PRESENT (0x0004)
+    //   Owner      = offset 48
+    //   Group      = offset 60
+    //   Sacl       = 0
+    //   Dacl       = offset 20
+    sd[0] = 1;
+    sd[1] = 0;
+    sd[2..4].copy_from_slice(&(0x8000u16 | 0x0004).to_le_bytes());
+    sd[4..8].copy_from_slice(&48u32.to_le_bytes());
+    sd[8..12].copy_from_slice(&60u32.to_le_bytes());
+    sd[12..16].copy_from_slice(&0u32.to_le_bytes());
+    sd[16..20].copy_from_slice(&20u32.to_le_bytes());
+
+    // DACL header (8 bytes) at offset 20.
+    //   AclRevision = 2 (ACL_REVISION)
+    //   Sbz1        = 0
+    //   AclSize     = 28 (header 8 + ACE 20)
+    //   AceCount    = 1
+    //   Sbz2        = 0
+    sd[20] = 2;
+    sd[21] = 0;
+    sd[22..24].copy_from_slice(&28u16.to_le_bytes());
+    sd[24..26].copy_from_slice(&1u16.to_le_bytes());
+    sd[26..28].copy_from_slice(&0u16.to_le_bytes());
+
+    // ACCESS_ALLOWED_ACE (20 bytes) at offset 28.
+    //   AceType  = 0 (ACCESS_ALLOWED_ACE_TYPE)
+    //   AceFlags = 0
+    //   AceSize  = 20 (4 header + 4 mask + 12 SID)
+    //   Mask     = full access bits
+    //   SID      = S-1-1-0 at offset 36
+    sd[28] = 0;
+    sd[29] = 0;
+    sd[30..32].copy_from_slice(&20u16.to_le_bytes());
+    sd[32..36].copy_from_slice(&mask.to_le_bytes());
+
+    // DACL ACE's SID (S-1-1-0, 12 bytes) at offset 36.
+    sd[36] = 1; // Revision
+    sd[37] = 1; // SubAuthorityCount
+    sd[38..44].copy_from_slice(&[0, 0, 0, 0, 0, 1]); // IdentifierAuthority (WORLD)
+    sd[44..48].copy_from_slice(&0u32.to_le_bytes()); // SubAuthority[0]
+
+    // Owner SID (S-1-1-0, 12 bytes) at offset 48.
+    sd[48] = 1;
+    sd[49] = 1;
+    sd[50..56].copy_from_slice(&[0, 0, 0, 0, 0, 1]);
+    sd[56..60].copy_from_slice(&0u32.to_le_bytes());
+
+    // Group SID (S-1-1-0, 12 bytes) at offset 60.
+    sd[60] = 1;
+    sd[61] = 1;
+    sd[62..68].copy_from_slice(&[0, 0, 0, 0, 0, 1]);
+    sd[68..72].copy_from_slice(&0u32.to_le_bytes());
+
+    sd
+}
 
 use super::{CoreFileAttr, CoreFileType, CoreFilesystem, CoreVolumeStat};
 
@@ -473,6 +610,27 @@ pub struct WinFspAdapter<F: CoreFilesystem + 'static> {
     /// the inner.statfs(1) call which is 200 ms+ on S3; the
     /// cache keeps Explorer Refresh snappy.
     volume_info_cache: Mutex<Option<(Instant, CoreVolumeStat)>>,
+    /// Issue #308: when `true`, `get_security` returns
+    /// a synthesized 72-byte self-relative SD (one
+    /// ACCESS_ALLOWED_ACE for `Everyone` with full
+    /// access) and `set_security` logs+accepts. When
+    /// `false`, both return STATUS_INVALID_DEVICE_REQUEST
+    /// (pre-#308 behaviour). Default `true` — the
+    /// volume's `persistent_acls(true)` flag
+    /// (mount.rs:1460) means the kernel will always
+    /// call these handlers, and returning
+    /// INVALID_DEVICE_REQUEST breaks Explorer
+    /// Properties → Security, `icacls`, and EDR/Defender
+    /// ACL scans.
+    acl_enabled: bool,
+    /// Issue #308: pre-built SDs for files and
+    /// directories. The kernel calls `get_security` on
+    /// every Explorer Refresh and every Properties
+    /// dialog; synthesizing the SD on every call would
+    /// be wasteful. The SDs are tiny (72 bytes) and
+    /// read-only after construction.
+    file_security_descriptor: [u8; 72],
+    dir_security_descriptor: [u8; 72],
 }
 
 impl<F: CoreFilesystem + 'static> WinFspAdapter<F> {
@@ -481,7 +639,24 @@ impl<F: CoreFilesystem + 'static> WinFspAdapter<F> {
             inner,
             getattr_cache: Mutex::new(HashMap::new()),
             volume_info_cache: Mutex::new(None),
+            acl_enabled: true,
+            file_security_descriptor: synthesize_self_relative_sd(false),
+            dir_security_descriptor: synthesize_self_relative_sd(true),
         }
+    }
+
+    /// Issue #308: enable or disable the synthetic
+    /// ACL. When disabled, `get_security` returns
+    /// STATUS_INVALID_DEVICE_REQUEST (the pre-#308
+    /// default), matching the kernel's fallback for
+    /// file systems that don't support ACLs. Most
+    /// users will want ACLs enabled; the opt-out is
+    /// for users who prefer Explorer to skip the
+    /// Security tab (and the EDR/Defender ACL
+    /// scans) entirely.
+    pub fn with_acl_enabled(mut self, enabled: bool) -> Self {
+        self.acl_enabled = enabled;
+        self
     }
 
     /// Issue #310: drop a single inode's cached `attr`
@@ -1413,29 +1588,107 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
 
     fn get_security(
         &self,
-        _context: &Self::FileContext,
-        _security_descriptor: Option<&mut [c_void]>,
+        context: &Self::FileContext,
+        security_descriptor: Option<&mut [c_void]>,
     ) -> Result<u64> {
-        // Issue #314: panic safety wrapper — see catch_panic.
-        // Body is a one-line error return; wrapping it costs
-        // nothing and keeps the panic-safety contract uniform
-        // across the adapter's public surface.
+        // Issue #308: synthesize a fixed SD when ACLs
+        // are enabled (default). When `acl_enabled =
+        // false` the pre-#308 behaviour is preserved
+        // (STATUS_INVALID_DEVICE_REQUEST) so the kernel
+        // falls back to the default descriptor.
+        //
+        // `context.is_dir` selects between the file and
+        // directory SDs; the only difference is the
+        // access mask (directories get
+        // FILE_LIST_DIRECTORY | FILE_TRAVERSE in
+        // addition to the standard generic bits).
+        //
+        // WinFSP's two-call protocol:
+        //   1. First call: caller passes `None` for
+        //      `security_descriptor` to ask "how big is
+        //      it?" -- we return the total size (72).
+        //   2. Second call: caller passes a buffer of
+        //      the advertised size -- we copy the SD
+        //      bytes in and return the size again.
         catch_panic(
             "get_security",
-            AssertUnwindSafe(|| Err(STATUS_INVALID_DEVICE_REQUEST.into())),
+            AssertUnwindSafe(|| {
+                if !self.acl_enabled {
+                    return Err(STATUS_INVALID_DEVICE_REQUEST.into());
+                }
+                let sd: &[u8; 72] = if context.is_dir {
+                    &self.dir_security_descriptor
+                } else {
+                    &self.file_security_descriptor
+                };
+                let sd_len = sd.len() as u64;
+                if let Some(buf) = security_descriptor {
+                    if buf.len() < sd.len() {
+                        return Err(STATUS_BUFFER_TOO_SMALL.into());
+                    }
+                    // SAFETY: `buf` is the kernel-provided
+                    // SD buffer of at least `sd.len()`
+                    // bytes (checked above). WinFSP
+                    // guarantees the buffer is valid for
+                    // the duration of this call.
+                    let dst = unsafe {
+                        std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, sd.len())
+                    };
+                    dst.copy_from_slice(sd);
+                    tracing::trace!(
+                        ino = context.ino,
+                        is_dir = context.is_dir,
+                        sz = sd_len,
+                        "winfsp::get_security: returned synthetic SD"
+                    );
+                } else {
+                    tracing::trace!(
+                        ino = context.ino,
+                        is_dir = context.is_dir,
+                        sz = sd_len,
+                        "winfsp::get_security: size query"
+                    );
+                }
+                Ok(sd_len)
+            }),
         )
     }
 
     fn set_security(
         &self,
-        _context: &Self::FileContext,
-        _security_information: u32,
+        context: &Self::FileContext,
+        security_information: u32,
         _modification_descriptor: ModificationDescriptor,
     ) -> Result<()> {
-        // Issue #314: panic safety wrapper — see catch_panic.
+        // Issue #308: when ACLs are enabled, accept
+        // the change (log at debug) -- the backend
+        // has no ACL persistence, so the change would
+        // be invisible to subsequent `get_security`
+        // calls anyway (we always return the
+        // synthesized SD). Returning Ok rather than
+        // an error matches the Win32 contract that a
+        // successful SetSecurity returns
+        // STATUS_SUCCESS; rejecting the change would
+        // break tools that try to "fix" permissions
+        // via `icacls /grant`.
+        //
+        // When ACLs are disabled, return
+        // STATUS_INVALID_DEVICE_REQUEST (pre-#308
+        // behaviour).
         catch_panic(
             "set_security",
-            AssertUnwindSafe(|| Err(STATUS_INVALID_DEVICE_REQUEST.into())),
+            AssertUnwindSafe(|| {
+                if !self.acl_enabled {
+                    return Err(STATUS_INVALID_DEVICE_REQUEST.into());
+                }
+                tracing::debug!(
+                    ino = context.ino,
+                    is_dir = context.is_dir,
+                    security_information,
+                    "winfsp::set_security: accepted (not persisted; SD is always synthesized)"
+                );
+                Ok(())
+            }),
         )
     }
 
@@ -1848,5 +2101,141 @@ mod tests {
         let custom_payload: Box<dyn std::any::Any + Send> = Box::new(42i32);
         let msg = panic_message(&custom_payload);
         assert_eq!(msg, "<non-string panic payload>");
+    }
+
+    // Issue #308: the synthesized SD must be a
+    // well-formed self-relative SECURITY_DESCRIPTOR.
+    // The kernel parses it on every Explorer Refresh
+    // and every Properties dialog; a malformed SD
+    // would surface as STATUS_INVALID_SECURITY_DESCR
+    // in user-mode tools.
+    //
+    // These tests verify the byte layout directly
+    // (rather than parsing the SD via the Win32 APIs
+    // and comparing), so they catch field-offset
+    // regressions in `synthesize_self_relative_sd`
+    // without depending on the ACL parser.
+
+    /// SD header fields must be well-formed:
+    /// Revision=1, Control=SE_SELF_RELATIVE|SE_DACL_PRESENT,
+    /// and the Owner/Group/Dacl offsets must point
+    /// to SIDs/DACLs within the 72-byte buffer.
+    #[test]
+    fn synthesize_self_relative_sd_header_is_well_formed() {
+        for &is_dir in &[false, true] {
+            let sd = synthesize_self_relative_sd(is_dir);
+            assert_eq!(sd[0], 1, "SD Revision must be 1");
+            assert_eq!(sd[1], 0, "Sbz1 must be 0");
+            let control = u16::from_le_bytes([sd[2], sd[3]]);
+            assert_eq!(
+                control, 0x8004,
+                "Control must be SE_SELF_RELATIVE | SE_DACL_PRESENT"
+            );
+            let owner_off = u32::from_le_bytes([sd[4], sd[5], sd[6], sd[7]]) as usize;
+            let group_off = u32::from_le_bytes([sd[8], sd[9], sd[10], sd[11]]) as usize;
+            let sacl_off = u32::from_le_bytes([sd[12], sd[13], sd[14], sd[15]]) as usize;
+            let dacl_off = u32::from_le_bytes([sd[16], sd[17], sd[18], sd[19]]) as usize;
+            assert_eq!(sacl_off, 0, "Sacl must be 0 (no SACL)");
+            assert_eq!(dacl_off, 20, "Dacl must be at offset 20");
+            assert_eq!(owner_off, 48, "Owner must be at offset 48");
+            assert_eq!(group_off, 60, "Group must be at offset 60");
+            // Owner/Group/DACL must be within the 72-byte buffer.
+            assert!(dacl_off + 28 <= sd.len(), "DACL must fit in buffer");
+            assert!(owner_off + 12 <= sd.len(), "Owner SID must fit in buffer");
+            assert!(group_off + 12 <= sd.len(), "Group SID must fit in buffer");
+        }
+    }
+
+    /// The DACL must contain exactly one
+    /// ACCESS_ALLOWED_ACE for Everyone (S-1-1-0)
+    /// granting full access. The ACE's Mask must be
+    /// either `FILE_ACCESS_MASK_FULL` (files) or
+    /// `DIR_ACCESS_MASK_FULL` (directories), which
+    /// differ only in the FILE_LIST_DIRECTORY |
+    /// FILE_TRAVERSE bits.
+    #[test]
+    fn synthesize_self_relative_sd_dacl_grants_everyone_full_access() {
+        let file_sd = synthesize_self_relative_sd(false);
+        let dir_sd = synthesize_self_relative_sd(true);
+
+        // AclRevision=2, AclSize=28, AceCount=1, Sbz2=0.
+        assert_eq!(file_sd[20], 2, "DACL AclRevision must be 2");
+        assert_eq!(
+            u16::from_le_bytes([file_sd[22], file_sd[23]]),
+            28,
+            "DACL AclSize must be 28"
+        );
+        assert_eq!(
+            u16::from_le_bytes([file_sd[24], file_sd[25]]),
+            1,
+            "DACL AceCount must be 1"
+        );
+        assert_eq!(
+            u16::from_le_bytes([file_sd[26], file_sd[27]]),
+            0,
+            "DACL Sbz2 must be 0"
+        );
+
+        // ACE header: AceType=0 (ACCESS_ALLOWED_ACE_TYPE), AceFlags=0, AceSize=20.
+        assert_eq!(
+            file_sd[28], 0,
+            "ACE AceType must be 0 (ACCESS_ALLOWED_ACE_TYPE)"
+        );
+        assert_eq!(file_sd[29], 0, "ACE AceFlags must be 0");
+        assert_eq!(
+            u16::from_le_bytes([file_sd[30], file_sd[31]]),
+            20,
+            "ACE AceSize must be 20"
+        );
+
+        // ACE Mask: file = FILE_ACCESS_MASK_FULL, dir = FILE_ACCESS_MASK_FULL | 0x21.
+        let file_mask = u32::from_le_bytes([file_sd[32], file_sd[33], file_sd[34], file_sd[35]]);
+        let dir_mask = u32::from_le_bytes([dir_sd[32], dir_sd[33], dir_sd[34], dir_sd[35]]);
+        assert_eq!(file_mask, FILE_ACCESS_MASK_FULL, "file ACE mask");
+        assert_eq!(dir_mask, DIR_ACCESS_MASK_FULL, "dir ACE mask");
+        // DIR must add FILE_LIST_DIRECTORY | FILE_TRAVERSE (0x21) over file.
+        assert_eq!(
+            dir_mask,
+            file_mask | 0x21,
+            "dir mask must equal file mask plus FILE_LIST_DIRECTORY | FILE_TRAVERSE"
+        );
+
+        // ACE SID: Everyone (S-1-1-0).
+        assert_eq!(file_sd[36], 1, "SID Revision must be 1");
+        assert_eq!(file_sd[37], 1, "SID SubAuthorityCount must be 1");
+        assert_eq!(
+            &file_sd[38..44],
+            &[0, 0, 0, 0, 0, 1],
+            "SID IdentifierAuthority must be SECURITY_WORLD_SID_AUTHORITY"
+        );
+        assert_eq!(
+            u32::from_le_bytes([file_sd[44], file_sd[45], file_sd[46], file_sd[47]]),
+            0,
+            "SID SubAuthority[0] must be 0 (SECURITY_WORLD_RID)"
+        );
+    }
+
+    /// Owner and Group SIDs must both be Everyone
+    /// (S-1-1-0) at offsets 48 and 60 respectively.
+    /// 12 bytes per SID.
+    #[test]
+    fn synthesize_self_relative_sd_owner_and_group_are_everyone() {
+        let sd = synthesize_self_relative_sd(false);
+        let everyone = |sd: &[u8], off: usize| {
+            assert_eq!(sd[off], 1, "SID Revision");
+            assert_eq!(sd[off + 1], 1, "SID SubAuthorityCount");
+            assert_eq!(
+                &sd[off + 2..off + 8],
+                &[0, 0, 0, 0, 0, 1],
+                "SID IdentifierAuthority"
+            );
+            assert_eq!(
+                u32::from_le_bytes([sd[off + 8], sd[off + 9], sd[off + 10], sd[off + 11]]),
+                0,
+                "SID SubAuthority[0]"
+            );
+        };
+        everyone(&sd, 48);
+        everyone(&sd, 60);
     }
 }
