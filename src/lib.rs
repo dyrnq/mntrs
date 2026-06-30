@@ -2286,6 +2286,10 @@ impl CoreFilesystem for MntrsFs {
             let ino = if let Some(existing) = self.path_to_ino.get(&full_path) {
                 *existing
             } else {
+                tracing::warn!(
+                    path = %full_path,
+                    "Issue #325 debug: symlink path_to_ino MISS, allocating fresh ino"
+                );
                 let new_ino = self.alloc_ino(
                     &full_path,
                     FileType::Symlink,
@@ -2297,7 +2301,6 @@ impl CoreFilesystem for MntrsFs {
             tracing::warn!(
                 path = %full_path,
                 ino,
-                had_existing = self.path_to_ino.get(&full_path).is_some(),
                 pti_size = self.path_to_ino.len(),
                 inodes_size = self.inodes.len(),
                 "Issue #325 debug: symlink lookup resolved"
