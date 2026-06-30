@@ -1605,8 +1605,20 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 // resolve the canonical form).
                 let total_data = 12u16 + path_byte_len * 2;
                 let total_size = 8u16 + total_data;
+                // WinFSP may first call this with `buffer.len()
+                // == 0` to size-query the reparse data. Return
+                // STATUS_SUCCESS + total_size without filling
+                // so the kernel knows the size and re-issues
+                // the call with a sufficiently large buffer.
                 if buffer.len() < total_size as usize {
-                    return Err(FspError::from(STATUS_BUFFER_TOO_SMALL));
+                    tracing::debug!(
+                        name = %name,
+                        ino,
+                        total_size,
+                        buffer_len = buffer.len(),
+                        "winfsp::get_reparse_point: size-query mode, returning total_size without filling"
+                    );
+                    return Ok(total_size as u64);
                 }
                 // ReparseTag = IO_REPARSE_TAG_SYMLINK
                 let buf = &mut buffer[..total_size as usize];
@@ -1805,8 +1817,36 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 let path_byte_len = (target_wide.len() * 2) as u16;
                 let total_data = 12u16 + path_byte_len * 2;
                 let total_size = 8u16 + total_data;
+                // WinFSP's `FspFileSystemFindReparsePoint` calls
+                // this callback twice per probed component: once
+                // with `Buffer = NULL` (size-query mode — just
+                // asking "is this a reparse point?") and once
+                // with a real buffer to fetch the data. The
+                // size-query call passes through here with
+                // `buffer.len() == 0`; we still need to return
+                // STATUS_SUCCESS + `total_size` so the resolver
+                // treats the path as a reparse hit. Pre-fix we
+                // returned STATUS_BUFFER_TOO_SMALL when the
+                // buffer was too small, which made the resolver
+                // skip this component and return None — the
+                // WinFSP get_security_by_name wrapper then
+                // fell through to the regular lookup path with
+                // no FILE_ATTRIBUTE_REPARSE_POINT bit, and the
+                // kernel opened the placeholder as a regular
+                // file. Status code:
+                //   - `buffer.len() < total_size`: return Ok(total_size)
+                //     so the resolver sees a reparse hit and we
+                //     don't fill the data (no buffer to fill).
+                //   - `buffer.len() >= total_size`: fill and return.
                 if buffer.len() < total_size as usize {
-                    return Err(FspError::from(STATUS_BUFFER_TOO_SMALL));
+                    tracing::info!(
+                        path = %path,
+                        ino,
+                        total_size,
+                        buffer_len = buffer.len(),
+                        "winfsp::get_reparse_point_by_name: size-query mode, returning total_size without filling"
+                    );
+                    return Ok(total_size as u64);
                 }
                 let buf = &mut buffer[..total_size as usize];
                 buf[0..4].copy_from_slice(&0xA000_000Cu32.to_le_bytes());
