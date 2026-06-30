@@ -64,27 +64,31 @@ jobs:
         # test binary transitively links
         # `winfsp-x64.dll` (via the `winfsp` crate's
         # FFI imports). The DLL is installed by the
-        # choco step above at
-        # `C:\Program Files\WinFSP\bin\`, but the
-        # MSI installer's system-PATH update does
-        # NOT propagate to the current PowerShell
-        # session (or to subsequent `run:` steps,
-        # which spawn fresh shells). The binary
-        # then fails to start with
-        # STATUS_DLL_NOT_FOUND on freshly-provisioned
+        # choco step above. On freshly-provisioned
         # runner VMs where the choco step is a real
-        # install (not a no-op cache hit).
+        # install (not a no-op cache hit), the
+        # installer's system-PATH update does NOT
+        # propagate to subsequent `run:` steps
+        # (each spawns a fresh shell). The binary
+        # then fails to start with
+        # STATUS_DLL_NOT_FOUND.
         #
-        # Force-add the winfsp bin directory to
-        # PATH for this step so the DLL search hits.
-        # Subsequent steps (Platform tests, e2e
-        # smoke) use the same shell / env so the
-        # fix carries forward.
+        # Locate the winfsp-x64.dll anywhere under
+        # `C:\Program Files\WinFSP` and add its
+        # directory to PATH for this step. The
+        # choco install may place it under a
+        # versioned subdir (e.g.
+        # `C:\Program Files\WinFSP\bin\2.1.25156\`)
+        # so we use a recursive search rather than
+        # a fixed path.
         shell: pwsh
         run: |
-          $winfspBin = 'C:\Program Files\WinFSP\bin'
-          if (Test-Path $winfspBin) {
-            $env:PATH = "$winfspBin;$env:PATH"
+          $dll = Get-ChildItem -Path 'C:\Program Files\WinFSP' -Recurse -Filter 'winfsp-x64.dll' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($dll) {
+            $env:PATH = "$($dll.DirectoryName);$env:PATH"
+            Write-Host "Found winfsp-x64.dll at: $($dll.FullName)"
+          } else {
+            Write-Host "WARNING: winfsp-x64.dll not found under C:\Program Files\WinFSP"
           }
           cargo test --lib --package mntrs
 
