@@ -590,6 +590,15 @@ function Mount-Test {
     $symlinkTarget = "$MountPath\_ci_small.txt"
     if (Should-Skip 10) { Write-Host "  (skipped: -SkipSubTests 10)" } else {
     try {
+        # Step 0 — clean any leftover from a prior failed run.
+        # The s3 backend persists across remounts, so a previous
+        # run's `_ci_symlink.txt` would still be there and Step 1's
+        # `New-Item ... -ErrorAction Stop` would fail with
+        # "path already exists". Memory backend is fresh each run,
+        # so this is a no-op there.
+        if (Test-Path -LiteralPath $symlinkPath) {
+            Remove-Item -LiteralPath $symlinkPath -Force -ErrorAction SilentlyContinue
+        }
         # Step 1 — create the link.
         New-Item -ItemType SymbolicLink -Path $symlinkPath -Target $symlinkTarget -ErrorAction Stop | Out-Null
         Write-Host "  [OK]   symlink created (target=$symlinkTarget)"

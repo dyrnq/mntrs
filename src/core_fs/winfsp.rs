@@ -731,7 +731,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         &self,
         file_name: &U16CStr,
         _security_descriptor: Option<&mut [c_void]>,
-        _reparse_point_resolver: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
+        reparse_point_resolver: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> Result<FileSecurity> {
         // Issue #314: panic safety wrapper — see catch_panic.
         catch_panic(
@@ -741,8 +741,33 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 // name so cross-adapter lookups (macOS FUSE uploads
                 // NFD, WinFSP queries NFC) hit the same backend key.
                 let name = crate::util::nfc(&file_name.to_string_lossy());
-                tracing::debug!(name = %name, "winfsp::get_security_by_name: entered");
+                tracing::info!(name = %name, "winfsp::get_security_by_name: entered");
                 let path = name.replace('\\', "/");
+                // Issue #325: if the kernel-supplied path IS a
+                // reparse point (a symlink), invoke the resolver.
+                // WinFSP will call `get_reparse_point_by_name`
+                // internally; if that returns a REPARSE_DATA_BUFFER
+                // we mirror its FileSecurity here. Returning
+                // `reparse: true` causes WinFSP to surface
+                // STATUS_REPARSE to the kernel, which then re-issues
+                // the open on the resolved SubstituteName
+                // (`\??\V:\_ci_small.txt`) — that's the path that
+                // `Get-Content V:\_ci_symlink.txt` actually needs to
+                // land on to read the file. Pre-fix we ignored the
+                // resolver and always returned `reparse: false`, so
+                // WinFSP opened our placeholder as if it were a
+                // regular 0-byte file and `Get-Content` got
+                // ERROR_PATH_NOT_FOUND for `V:\_ci_symlink.txt`
+                // (the kernel's pre-open stat couldn't tell it was
+                // following a symlink).
+                if let Some(security) = reparse_point_resolver(file_name) {
+                    tracing::info!(
+                        name = %name,
+                        attributes = security.attributes,
+                        "winfsp::get_security_by_name: reparse resolved, surfacing STATUS_REPARSE"
+                    );
+                    return Ok(security);
+                }
                 let parent = 1u64; // root
                 // Issue #249 follow-up: WinFSP's pre-open stat uses
                 // the `attributes` field here to decide whether the
@@ -794,14 +819,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 })?;
                 let is_dir = attr.kind == CoreFileType::Directory;
                 let ino = attr.ino;
-                tracing::info!(
-                    name = %name,
-                    ino,
-                    is_dir,
-                    kind = ?attr.kind,
-                    file_attrs = core_kind_to_file_attributes(attr.kind, attr.perm),
-                    "winfsp::open: lookup ok"
-                );
+                tracing::debug!(name = %name, ino, is_dir, "winfsp::open: lookup ok");
                 // Bug 11: actually call CoreFilesystem::open so
                 // the per-handle FileHandleState (cache_fd for
                 // writes, prefetcher for reads) gets populated.
@@ -1479,7 +1497,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
             AssertUnwindSafe(|| {
                 let name = crate::util::nfc(&file_name.to_string_lossy());
                 let name = name.replace('\\', "/");
-                tracing::info!(ino = context.ino, name = %name, "winfsp::get_reparse_point: entered");
+                tracing::debug!(name = %name, "winfsp::get_reparse_point: entered");
                 // Resolve the WinFSP handle → ino, then ask the
                 // inner CoreFilesystem for the target bytes.
                 // inner.readlink is the trait method added in
@@ -1558,6 +1576,122 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                     total_size,
                     target_len = target_wide.len(),
                     "winfsp::get_reparse_point: returning REPARSE_DATA_BUFFER_SYMLINK"
+                );
+                Ok(total_size as u64)
+            }),
+        )
+    }
+
+    fn get_reparse_point_by_name(
+        &self,
+        file_name: &U16CStr,
+        _is_directory: bool,
+        buffer: &mut [u8],
+    ) -> Result<u64> {
+        // Issue #325: WinFSP calls this when resolving a path
+        // that traverses through a reparse point. The Rust
+        // wrapper's `get_security_by_name` resolver invokes the
+        // native WinFSP `FspFileSystemFindReparsePoint`, which
+        // walks the path components and calls this callback for
+        // each one. The `file_name` we receive is therefore a
+        // single path component (e.g. `_ci_symlink.txt`), NOT a
+        // full path with leading slash.
+        //
+        // Pre-fix this was the default no-op returning
+        // STATUS_INVALID_DEVICE_REQUEST, so the resolver path
+        // was broken: even though `get_security_by_name` could
+        // now return `reparse: true` via the resolver, WinFSP
+        // couldn't populate the REPARSE_DATA_BUFFER from a
+        // no-op `get_reparse_point_by_name`, and the kernel
+        // never saw STATUS_REPARSE — leading to
+        // ERROR_PATH_NOT_FOUND on `Get-Content V:\_ci_symlink.txt`.
+        //
+        // Implementation reuses the same encoding logic as
+        // `get_reparse_point` (component name → ino → readlink
+        // → REPARSE_DATA_BUFFER). The component-based lookup is
+        // the only difference vs the by-context variant.
+        catch_panic(
+            "get_reparse_point_by_name",
+            AssertUnwindSafe(|| {
+                let name = crate::util::nfc(&file_name.to_string_lossy());
+                // WinFSP normalizes backslashes to forward
+                // slashes before calling here, but be defensive
+                // in case a future caller sends `\`-separated
+                // components.
+                let component = name.replace('\\', "/");
+                tracing::debug!(
+                    component = %component,
+                    "winfsp::get_reparse_point_by_name: entered"
+                );
+                // Lookup under root (ino=1) — WinFSP sends
+                // single-component names for traversal of
+                // `<mountpoint>\<component>`, not full paths.
+                let attr = self.inner.lookup(1u64, &component).map_err(|e| {
+                    tracing::debug!(
+                        component = %component,
+                        error = %e,
+                        "winfsp::get_reparse_point_by_name: lookup failed"
+                    );
+                    io_err_to_status(e)
+                })?;
+                if attr.kind != CoreFileType::Symlink {
+                    // Not a reparse point — WinFSP shouldn't
+                    // call us for non-reparse components. Return
+                    // invalid-device so WinFSP treats the path
+                    // as a normal file rather than misinterpreting
+                    // it as a reparse hit.
+                    tracing::debug!(
+                        component = %component,
+                        kind = ?attr.kind,
+                        "winfsp::get_reparse_point_by_name: component is not a symlink, returning STATUS_INVALID_DEVICE_REQUEST"
+                    );
+                    return Err(FspError::from(STATUS_INVALID_DEVICE_REQUEST));
+                }
+                let ino = attr.ino;
+                let target_bytes = self
+                    .inner
+                    .readlink(ino)
+                    .map_err(|e| {
+                        tracing::debug!(ino, error = %e, "winfsp::get_reparse_point_by_name: readlink failed");
+                        e
+                    })
+                    .map_err(io_err_to_status)?;
+                // Encode target as UTF-16LE for SubstituteName
+                // and PrintName slots. See `get_reparse_point`
+                // for the full buffer layout comment.
+                let target_wide: Vec<u16> = target_bytes
+                    .iter()
+                    .map(|&b| b as u16) // ASCII fast path
+                    .collect();
+                let path_byte_len = (target_wide.len() * 2) as u16;
+                let total_data = 12u16 + path_byte_len * 2;
+                let total_size = 8u16 + total_data;
+                if buffer.len() < total_size as usize {
+                    return Err(FspError::from(STATUS_BUFFER_TOO_SMALL));
+                }
+                let buf = &mut buffer[..total_size as usize];
+                buf[0..4].copy_from_slice(&0xA000_000Cu32.to_le_bytes());
+                buf[4..6].copy_from_slice(&total_data.to_le_bytes());
+                buf[6..8].copy_from_slice(&0u16.to_le_bytes());
+                buf[8..10].copy_from_slice(&0u16.to_le_bytes());
+                buf[10..12].copy_from_slice(&path_byte_len.to_le_bytes());
+                buf[12..14].copy_from_slice(&path_byte_len.to_le_bytes());
+                buf[14..16].copy_from_slice(&path_byte_len.to_le_bytes());
+                buf[16..20].copy_from_slice(&0u32.to_le_bytes());
+                let path_start = 20;
+                for (i, ch) in target_wide.iter().enumerate() {
+                    let off = path_start + i * 2;
+                    buf[off..off + 2].copy_from_slice(&ch.to_le_bytes());
+                }
+                for (i, ch) in target_wide.iter().enumerate() {
+                    let off = path_start + target_wide.len() * 2 + i * 2;
+                    buf[off..off + 2].copy_from_slice(&ch.to_le_bytes());
+                }
+                tracing::debug!(
+                    component = %component,
+                    ino,
+                    total_size,
+                    "winfsp::get_reparse_point_by_name: returning REPARSE_DATA_BUFFER_SYMLINK"
                 );
                 Ok(total_size as u64)
             }),
