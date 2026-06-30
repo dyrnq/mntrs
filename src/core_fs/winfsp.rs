@@ -794,7 +794,14 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 })?;
                 let is_dir = attr.kind == CoreFileType::Directory;
                 let ino = attr.ino;
-                tracing::debug!(name = %name, ino, is_dir, "winfsp::open: lookup ok");
+                tracing::info!(
+                    name = %name,
+                    ino,
+                    is_dir,
+                    kind = ?attr.kind,
+                    file_attrs = core_kind_to_file_attributes(attr.kind, attr.perm),
+                    "winfsp::open: lookup ok"
+                );
                 // Bug 11: actually call CoreFilesystem::open so
                 // the per-handle FileHandleState (cache_fd for
                 // writes, prefetcher for reads) gets populated.
@@ -1472,7 +1479,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
             AssertUnwindSafe(|| {
                 let name = crate::util::nfc(&file_name.to_string_lossy());
                 let name = name.replace('\\', "/");
-                tracing::debug!(name = %name, "winfsp::get_reparse_point: entered");
+                tracing::info!(ino = context.ino, name = %name, "winfsp::get_reparse_point: entered");
                 // Resolve the WinFSP handle → ino, then ask the
                 // inner CoreFilesystem for the target bytes.
                 // inner.readlink is the trait method added in
