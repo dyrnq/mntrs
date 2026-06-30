@@ -729,11 +729,25 @@ function Mount-Test {
             -RedirectStandardError $secondMountErr `
             -PassThru -NoNewWindow
         # 10s budget. Pre-fix (or with a regression that
-        # restores the pre-#328 hang), this Wait-Process times
-        # out and we surface it as a HARD failure — silent
-        # hangs are the failure mode #328 was filed to catch.
-        $exited = $second | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
-        if ($null -eq $exited) {
+        # restores the pre-#328 hang), this poll loop reaches
+        # its deadline without $second.HasExited becoming true
+        # and we surface it as a HARD failure — silent hangs
+        # are the failure mode #328 was filed to catch.
+        #
+        # Implementation note: `Wait-Process -Timeout 10
+        # -ErrorAction SilentlyContinue` returns `$null` for
+        # BOTH "process exited cleanly" and "timed out"
+        # (PowerShell 7 — `-ErrorAction SilentlyContinue`
+        # suppresses the pipeline success output as well as the
+        # timeout error), so `$null -eq $exited` is always
+        # true and cannot distinguish the two cases. Poll
+        # `$second.HasExited` with a deadline instead — that
+        # property reflects the actual OS process state.
+        $deadline = (Get-Date).AddSeconds(10)
+        while ((Get-Date) -lt $deadline -and -not $second.HasExited) {
+            Start-Sleep -Milliseconds 50
+        }
+        if (-not $second.HasExited) {
             Stop-Process -Id $second.Id -Force -ErrorAction SilentlyContinue
             $errText = if (Test-Path -LiteralPath $secondMountErr) { Get-Content -LiteralPath $secondMountErr -Raw -ErrorAction SilentlyContinue } else { '' }
             $stdoutText = if (Test-Path -LiteralPath $secondMountLog) { Get-Content -LiteralPath $secondMountLog -Raw -ErrorAction SilentlyContinue } else { '' }
