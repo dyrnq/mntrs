@@ -29,13 +29,14 @@ use winfsp::FspError;
 
 use widestring::U16CStr;
 use windows::Win32::Foundation::{
-    STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_DEVICE_REQUEST, STATUS_UNSUCCESSFUL,
+    STATUS_BUFFER_TOO_SMALL, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST,
+    STATUS_UNSUCCESSFUL,
 };
 use winfsp::Result;
 use winfsp::constants::FspCleanupFlags;
 use winfsp::filesystem::{
     DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, ModificationDescriptor,
-    OpenFileInfo, VolumeInfo,
+    OpenFileInfo, StreamInfo, VolumeInfo, WideNameInfo,
 };
 use winfsp_sys::FILE_ACCESS_RIGHTS;
 
@@ -1763,6 +1764,59 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         )
     }
 
+    // Issue #309: `get_stream_info` returns the list
+    // of named streams (alternate data streams /
+    // ADS) for a file. The kernel calls this on
+    // every file open + every directory enumeration
+    // when `VolumeParams::named_streams` is enabled;
+    // returning the trait default
+    // (STATUS_INVALID_DEVICE_REQUEST) would break
+    // every file open.
+    //
+    // MntrsFs doesn't have ADS storage today, so
+    // every file has exactly one stream: the
+    // unnamed default stream. ADS writes
+    // (`Set-Content foo.exe:Zone.Identifier`)
+    // will fail with STATUS_NOT_IMPLEMENTED at
+    // some downstream path; ADS reads of existing
+    // streams (e.g. UAC zone markers written by
+    // browsers) will return zero entries, which
+    // the kernel maps to "no streams" — same as
+    // a freshly-created file with no ADS.
+    //
+    // The unnamed stream's `stream_name` is empty
+    // (the WinFSP `StreamInfo::set_name_raw` of an
+    // empty `[u16]`); the kernel interprets this
+    // as the default $DATA stream.
+    fn get_stream_info(&self, _context: &Self::FileContext, buffer: &mut [u8]) -> Result<u32> {
+        // Issue #314: panic safety wrapper.
+        catch_panic(
+            "get_stream_info",
+            AssertUnwindSafe(|| {
+                let mut stream = StreamInfo::<32>::new();
+                // Empty name → unnamed default
+                // stream. `set_name_raw(&[])` sets the
+                // entry's `size` to 0 (just the
+                // fixed-size header), which the
+                // kernel interprets as the default
+                // $DATA stream.
+                stream
+                    .set_name_raw(&[] as &[u16])
+                    .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+                let mut cursor: u32 = 0;
+                // append_to_buffer returns false when
+                // the buffer is too small. We treat
+                // that as a partial write — finalize
+                // the buffer so the kernel knows we
+                // ran out of space, and return the
+                // cursor so it can call us again.
+                stream.append_to_buffer(buffer, &mut cursor);
+                StreamInfo::<32>::finalize_buffer(buffer, &mut cursor);
+                Ok(cursor)
+            }),
+        )
+    }
+
     // Issue #249: implement read_directory. Pre-fix this was
     // the trait default `Err(STATUS_INVALID_DEVICE_REQUEST)`,
     // which made every `dir V:\` fail with "directory name
@@ -2237,5 +2291,61 @@ mod tests {
         };
         everyone(&sd, 48);
         everyone(&sd, 60);
+    }
+
+    // Issue #309: `get_stream_info` must always
+    // produce a non-empty buffer (the kernel
+    // requires at least the unnamed default
+    // stream). This test calls the WinFSP
+    // helper directly without a real WinFspHandle
+    // — the function only uses the buffer, not
+    // the context — and asserts the cursor moved
+    // forward (i.e. we wrote something) and the
+    // buffer no longer starts with a zero byte
+    // (i.e. the FSP_FSCTL_STREAM_INFO header was
+    // written).
+
+    #[test]
+    fn get_stream_info_returns_unnamed_stream() {
+        // Build a buffer large enough for at
+        // least one StreamInfo header + final
+        // terminator.
+        let mut buf = [0u8; 256];
+        // SAFETY: the function is safe to call
+        // without a real context because the
+        // implementation doesn't read the
+        // context argument. We pass a
+        // zeroed/empty context by way of the
+        // `()` type — but `get_stream_info`
+        // takes `&Self::FileContext`, which is
+        // `WinFspHandle`. We don't have a way
+        // to construct one without mounting.
+        //
+        // Instead, exercise the
+        // `StreamInfo::append_to_buffer` path
+        // directly via the same code path
+        // `get_stream_info` uses, so we can
+        // unit-test the format without a
+        // mount.
+        let mut stream = StreamInfo::<32>::new();
+        stream
+            .set_name_raw(&[] as &[u16])
+            .expect("empty name always fits in any buffer size");
+        let mut cursor: u32 = 0;
+        let appended = stream.append_to_buffer(&mut buf, &mut cursor);
+        assert!(appended, "empty stream entry should fit in 256 bytes");
+        let finalized = StreamInfo::<32>::finalize_buffer(&mut buf, &mut cursor);
+        assert!(finalized, "finalize terminator should fit after one entry");
+        assert!(
+            cursor > 0,
+            "cursor must advance past at least the terminator"
+        );
+        // The first StreamInfo header byte
+        // (size) is non-zero after the write.
+        let header_size = u16::from_le_bytes([buf[0], buf[1]]);
+        assert!(
+            header_size >= 8,
+            "StreamInfo header size must be at least 8 bytes (got {header_size})"
+        );
     }
 }

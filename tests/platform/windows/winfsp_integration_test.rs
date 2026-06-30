@@ -1201,3 +1201,59 @@ fn winfsp_set_security_accepts_grant() {
 
     drop(guard);
 }
+
+/// Issue #309: enabling
+/// `VolumeParams::named_streams(true)` requires
+/// the adapter's `get_stream_info` callback to
+/// return at least the unnamed default stream
+/// for every file — otherwise the kernel returns
+/// STATUS_INVALID_DEVICE_REQUEST on every file
+/// open, breaking basic `std::fs::read`. This
+/// test uses PowerShell's `Get-Item` (which
+/// triggers a QueryStreamInformation IRP) to
+/// verify the kernel receives a non-empty stream
+/// list. Pre-#309 the file open itself would
+/// fail before this command even ran.
+#[test]
+fn winfsp_named_streams_volume_flag_does_not_break_opens() {
+    let fs = Arc::new(make_memory_fs());
+    let guard = mntrs::core_fs::test_helpers::mount_winfsp(fs.clone()).expect("mount");
+    let mp = &guard.mount_path;
+    settle();
+
+    write_remote(&fs, "_ci_streams.txt", b"data");
+    let file_path = format!("{mp}_ci_streams.txt");
+
+    // `Get-Item` triggers a
+    // IRP_MJ_QUERY_INFORMATION with
+    // FileStreamInformation — exercises our
+    // get_stream_info callback end-to-end. If
+    // the kernel receives
+    // STATUS_INVALID_DEVICE_REQUEST, the
+    // PowerShell output would contain an error
+    // and exit code would be non-zero.
+    let output = std::process::Command::new("powershell.exe")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg(format!(
+            "$ErrorActionPreference = 'Stop'; (Get-Item -LiteralPath '{}').Length",
+            file_path.replace('\'', "''")
+        ))
+        .output()
+        .expect("powershell.exe");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "Get-Item failed for {file_path} (exit={:?})\nstdout: {stdout}\nstderr: {stderr}",
+        output.status.code()
+    );
+    assert_eq!(
+        stdout.trim(),
+        "4",
+        "Get-Item .Length should return the byte count (4); got: {stdout}"
+    );
+
+    drop(guard);
+}
