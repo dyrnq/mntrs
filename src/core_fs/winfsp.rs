@@ -1646,31 +1646,60 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                     Some((parent, name)) if !name.is_empty() => (parent, name),
                     _ => ("/", path.as_str()),
                 };
-                let parent_ino = if parent_path == "/" || parent_path.is_empty() {
-                    1u64
-                } else {
-                    let parent_basename = parent_path.trim_start_matches('/');
-                    self.inner
-                        .lookup(1u64, parent_basename)
-                        .map_err(|e| {
-                            tracing::debug!(
-                                parent = %parent_path,
-                                error = %e,
-                                "winfsp::get_reparse_point_by_name: parent lookup failed"
-                            );
-                            io_err_to_status(e)
-                        })?
-                        .ino
-                };
-                let attr = self.inner.lookup(parent_ino, basename).map_err(|e| {
+                // Issue #325: WinFSP passes the full path
+                // (including the leading `/`). The
+                // `CoreFilesystem::lookup(parent, name)` impl
+                // builds a fresh `full_path` from
+                // `resolve(parent).path` + `name`, which DROPS
+                // the leading slash for root-parented paths
+                // (`parent_path.is_empty()` branch) — and that
+                // built path doesn't match the symlinks map key
+                // (which has the leading slash, because
+                // `MntrsFs::create` preserves it). Pre-fix we
+                // got a `kind=RegularFile` from the backend
+                // `stat` (the 0-byte placeholder) instead of
+                // `Symlink`, and the resolver returned None.
+                //
+                // Use `find_ino_by_path` on the FULL path so
+                // we hit the `path_to_ino` reverse map entry
+                // populated by the original `alloc_ino`. This
+                // skips the `lookup` re-build path entirely
+                // and gives us the correct ino for both root
+                // (`/_ci_symlink.txt`) and nested
+                // (`/dir/link`) symlinks.
+                //
+                // Note: `find_ino_by_path` is `pub(crate)` on
+                // `MntrsFs` but we only have `&dyn
+                // CoreFilesystem` here. We can't downcast
+                // without a concrete type, so use `lookup`
+                // but supply the FULL path as `name` and
+                // `parent=1`. The MntrsFs impl builds
+                // `full_path = format!("{}/{}", "", "/foo") =
+                // "//foo"` which still mismatches. So instead
+                // call `lookup` with parent=1 and `name` =
+                // the full path WITH leading slash preserved
+                // — `MntrsFs::lookup` handles a leading slash
+                // in `name` correctly: it joins
+                // `parent_path = ""` and `name = "/foo"` via
+                // `format!("{}/{}", "", "/foo") = "//foo"`,
+                // which is the path from `get_reparse_point`
+                // (without going through `lookup`). Hmm.
+                // Actually let's trace: parent_path.is_empty()
+                // branch returns `name.to_string()` which IS
+                // the leading-slash path. So lookup(1,
+                // "/_ci_symlink.txt") returns full_path =
+                // "/_ci_symlink.txt" — correct. The previous
+                // code split and called lookup(1,
+                // "_ci_symlink.txt") which dropped the slash.
+                let attr = self.inner.lookup(1u64, &path).map_err(|e| {
                     tracing::info!(
-                        basename = %basename,
-                        parent_ino,
+                        path = %path,
                         error = %e,
                         "winfsp::get_reparse_point_by_name: lookup failed"
                     );
                     io_err_to_status(e)
                 })?;
+                let _ = (parent_path, basename); // kept for logging/debug only
                 if attr.kind != CoreFileType::Symlink {
                     // Not a reparse point — WinFSP shouldn't
                     // call us for non-reparse components. Return
