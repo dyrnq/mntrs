@@ -1464,9 +1464,10 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                     _ => ("/".to_string(), full_path.clone()),
                 };
                 let parent_ino = self.parent_ino_for(&parent_path).unwrap_or(1);
-                tracing::debug!(
+                tracing::info!(
                     ino = context.ino,
                     is_dir = context.is_dir,
+                    flags,
                     parent_ino,
                     basename = %basename,
                     "winfsp::cleanup: dispatching backend delete"
@@ -2016,7 +2017,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 } else {
                     0
                 };
-                tracing::debug!(
+                tracing::info!(
                     name = %name,
                     reparse_tag = format_args!("0x{reparse_tag:08X}"),
                     "winfsp::delete_reparse_point: entered"
