@@ -458,6 +458,90 @@ fn winfsp_nfc_delete() {
     drop(guard);
 }
 
+/// Issue #341: deleting a file that is still in the dirty
+/// write-back cache must not let the upload worker re-create
+/// it in the backend seconds later. Sequence:
+///
+/// 1. Mount-side `std::fs::write` → `WinFspAdapter::write`
+///    → dirty cache file + `writeback_pending` set entry
+///    with `per_task_delay = write_back_delay` (1 s in
+///    `new_test_fs`, 5 s in production — both defer the
+///    upload past the user's delete).
+/// 2. Mount-side `std::fs::remove_file` → Win32
+///    `IRP_MJ_SET_INFORMATION` + `IRP_MJ_CLEANUP` →
+///    `WinFspAdapter::cleanup` → `inner.unlink` →
+///    `op.delete` returns `NotFound` (file isn't in the
+///    backend yet). Pre-fix the cleanup callback logged
+///    this as "idempotent ok" and returned, BUT the
+///    `writeback_pending` entry was left intact; the
+///    worker later picked the task up and uploaded the
+///    cached bytes — the file reappeared seconds after
+///    the user thought they deleted it.
+/// 3. Post-fix: `MntrsFs::unlink` removes the
+///    `writeback_pending` entry + `.dirty` sidecar
+///    BEFORE `op.delete`. The worker (still in the
+///    delay queue, or already past it but not yet
+///    dequeued) sees no pending task and never
+///    schedules the upload.
+/// 4. Poll the backend for >`write_back_delay`
+///    (2.5 s in this test, well past the 1 s test
+///    delay). `op.exists(name)` MUST return false.
+///
+/// The "delete reappears" regression is data corruption
+/// from the user's POV — they believe V:\_ci_delete.txt
+/// is gone, then see it surface again. Pre-fix this test
+/// failed at the `!still_present` assertion at 2.5 s
+/// post-delete; post-fix it passes cleanly.
+#[test]
+fn winfsp_create_delete_dirty_cache() {
+    let fs = Arc::new(make_memory_fs());
+    let guard = mntrs::core_fs::test_helpers::mount_winfsp(fs.clone()).unwrap();
+    let mp = &guard.mount_path;
+    settle();
+
+    let name = "_ci_delete_dirty.txt";
+
+    // Step 1: write via the mount. This fires IRP_MJ_CREATE +
+    // IRP_MJ_WRITE. The adapter's write path enqueues the
+    // file in `writeback_pending` with the test fs's
+    // `write_back_delay` (1 s) and a `.dirty` sidecar.
+    std::fs::write(format!("{mp}{name}"), b"delete me").unwrap();
+    assert!(
+        std::path::Path::new(&format!("{mp}{name}")).exists(),
+        "mount-side write did not produce a visible file"
+    );
+
+    // Brief settle for the dirty cache entry to land in
+    // `writeback_pending` — well under the 1 s delay so
+    // the worker hasn't dequeued yet.
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Step 2: delete immediately. WinFSP will fire
+    // FspCleanupDelete; our cleanup callback dispatches
+    // `inner.unlink` which now drops the pending writeback
+    // before the backend delete (Issue #341 fix).
+    std::fs::remove_file(format!("{mp}{name}")).unwrap();
+
+    // Step 3: wait longer than `write_back_delay`. Pre-fix
+    // the worker's delay timer would fire here and upload
+    // the cached bytes, making `op.exists` flip back to
+    // `true`. Post-fix the upload is never scheduled.
+    std::thread::sleep(Duration::from_millis(2500));
+
+    // Step 4: verify the backend never re-uploaded the file.
+    let op = fs.op.clone();
+    let name_owned = name.to_string();
+    let still_present = rt_block_on(async move { op.exists(&name_owned).await.unwrap_or(true) });
+    assert!(
+        !still_present,
+        "{name} reappeared in the backend after delete \
+         (Issue #341: writeback worker re-uploaded a file \
+         whose delete raced the dirty-cache flush)"
+    );
+
+    drop(guard);
+}
+
 #[test]
 fn winfsp_write_large_file() {
     let fs = Arc::new(make_memory_fs());

@@ -4786,16 +4786,61 @@ impl CoreFilesystem for MntrsFs {
         );
         let op = self.op.clone();
         let p = full_path.clone();
-        // Bug D fix: preserve the opendal error kind so POSIX callers
-        // get the right errno (NotFound→ENOENT, IsADirectory→EISDIR,
-        // etc.) instead of a blanket EIO. The previous
-        // `map_err(|_| Error::other("unlink failed"))` swallowed the
-        // kind, which meant unlink on a non-existent file returned
-        // EIO — apps like rm would treat it as a generic I/O error
-        // and refuse to continue.
-        rt().block_on(async move { op.delete(&p).await })
-            .map_err(|e| opendal_to_io_error(&e, "unlink"))?;
         let cpath = crate::cache_path(&self.cache_dir, &full_path);
+
+        // Backend delete FIRST. For a file that IS in the
+        // backend (the common case via `write_remote` /
+        // FUSE-mount-then-unlink), the kernel's read IRP —
+        // which can race with the cleanup callback on the
+        // WinFSP dispatcher thread (issue #294) — must see
+        // the file gone from the backend before our local
+        // indices drop it. Doing op.delete first narrows
+        // the race window to whatever time elapses between
+        // backend.delete returning and our `let _ = cpath;
+        // let _ = indices;` chain below.
+        //
+        // Bug D fix: preserve the opendal error kind so
+        // POSIX callers get the right errno
+        // (NotFound→ENOENT, IsADirectory→EISDIR, etc.)
+        // instead of a blanket EIO.
+        let delete_result = rt()
+            .block_on(async move { op.delete(&p).await })
+            .map_err(|e| opendal_to_io_error(&e, "unlink"));
+
+        // Local cleanup runs UNCONDITIONALLY below — the
+        // `?` on `op.delete` that pre-fix hung the rest of
+        // the function behind a short-circuit short-circuit
+        // on NotFound, leaking the cache file, inodes
+        // entry, disk_cache_index entries, attr_cache,
+        // path_to_ino, dir_cache (the ino collision on
+        // recreate was the surface symptom — Bug E
+        // follow-up).
+        //
+        // Issue #341 specifics: a file still in the dirty
+        // write-back cache (path written via the mount but
+        // the upload hasn't fired yet) lands here with
+        // `op.delete` returning NotFound. Dropping the
+        // `writeback_pending` entry + `.dirty` sidecar
+        // below cancels the upload — without this, the
+        // worker would upload the cached bytes seconds
+        // later and the file reappears in the backend
+        // after the user already saw the delete complete.
+        //
+        // A worker that has already begun reading bytes
+        // from `cpath` will complete — the race window is
+        // bounded to bytes already buffered in the upload
+        // task at the moment unlink fires.
+        let was_dirty = self.writeback_pending.remove(full_path.as_str()).is_some();
+        if was_dirty {
+            // .dirty sidecar lives next to the cache file
+            // per writeback.rs:84.
+            let dirty_path = cpath.with_extension("dirty");
+            let _ = std::fs::remove_file(&dirty_path);
+            tracing::debug!(
+                path = %full_path,
+                "unlink: dropped pending writeback (dirty cache)"
+            );
+        }
         let _ = std::fs::remove_file(&cpath);
         // Clean block-level cache entries (disk + index).
         // O(1) via find_ino_by_path + inodes.get: replaces a
@@ -4840,7 +4885,14 @@ impl CoreFilesystem for MntrsFs {
         self.path_to_ino.remove(&full_path);
         self.attr_cache.remove(&full_path);
         self.cache_remove_entry(&parent_path, name);
-        Ok(())
+
+        // For the WinFSP cleanup callback at winfsp.rs:1032:
+        // a NotFound returned here is the "dirty-only"
+        // case — caught at the adapter layer as
+        // "backend already absent (idempotent success)".
+        // The local-state drop above is what keeps the
+        // worker from re-uploading the file.
+        delete_result
     }
 
     fn rmdir(&self, _parent: u64, name: &str) -> std::io::Result<()> {
