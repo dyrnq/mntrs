@@ -97,6 +97,28 @@ done
 ELAPSED=$(( $(date +%s) - START ))
 log "soak done: $ITER iterations in ${ELAPSED}s"
 
+# ── Drain daemon + kernel writeback queues before assertions ────────
+# The last several iterations' writebacks may not have settled yet (the
+# daemon delay queue holds them for --vfs-write-back seconds, and the
+# kernel page cache may still hold dirty pages awaiting setattr deliv-
+# ery). For 60s soak with 1s write-back this can take a few seconds.
+# Without this drain, the REMAINING_DIRTY assertion below races.
+# Note: under FUSE_WRITEBACK_CACHE (unconditional at fuser.rs:114), the
+# daemon's flush()/release() handlers are never called, so .dirty side-
+# cars are never created — REMAINING_DIRTY is reliably 0 in that case.
+# The poll loop still helps when WRITEBACK_CACHE is ever disabled.
+sync
+DRAIN_END=$(( $(date +%s) + 30 ))
+while (( $(date +%s) < DRAIN_END )); do
+    # `find` exits 0 with empty stdout when no match — avoids the `set
+    # -o pipefail` trap of `ls *.dirty` exiting 2 → silent script exit
+    # → confusing "soak done" with no further output.
+    N=$(find "$CACHE" -maxdepth 1 -name '*.dirty' -print 2>/dev/null | wc -l)
+    if (( N == 0 )); then break; fi
+    log "  draining: $N .dirty sidecars remaining ..."
+    sleep 1
+done
+
 # ── Final metrics ───────────────────────────────────────────────────
 stress_metric "$MNTRS_PID" "$METRICS" final
 FINAL_RSS=$(awk '/^VmRSS:/ {print $2}' "/proc/$MNTRS_PID/status")
@@ -124,7 +146,10 @@ log "thread_growth=$THREAD_GROWTH"
 assert_le "$THREAD_GROWTH" "20" "thread count growth"
 
 # 4. All writeback must have drained (no .dirty sidecars after soak).
-REMAINING_DIRTY=$(ls "$CACHE"/*.dirty 2>/dev/null | wc -l)
+# Use `find` (returns exit 0 with empty stdout on no match) — `ls *.dirty`
+# with no match exits 2 and trips `set -o pipefail` + `set -e`, silently
+# terminating the script before the assertion can print a meaningful msg.
+REMAINING_DIRTY=$(find "$CACHE" -maxdepth 1 -name '*.dirty' -print 2>/dev/null | wc -l)
 assert_eq "$REMAINING_DIRTY" "0" "no leftover .dirty sidecars"
 
 {
