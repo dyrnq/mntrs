@@ -14,15 +14,15 @@
 #   - State corruption in cache dir from abrupt exit
 #   - FUSE session leak when killed before cleanup
 #
-# Implementation note: under FUSE_WRITEBACK_CACHE (unconditional at
-# src/core_fs/fuser.rs:114), the kernel buffers writes in its own
-# page cache and only delivers a single setattr per file on close.
-# The daemon's flush()/release() handlers (which create .dirty
-# sidecars) are NEVER called. So this test verifies the cache file
-# directly instead of relying on .dirty sidecars as a recovery
-# marker. If WRITEBACK_CACHE is ever disabled, the .dirty path
-# becomes live and this test still passes (cache files are created
-# earlier in the write handler).
+# Implementation note: FUSE_WRITEBACK_CACHE is OFF by default in mntrs
+# (`FuserAdapter::write_back_cache`, opt-in via `--write-back-cache`).
+# The daemon's flush()/release() handlers create .dirty sidecars and
+# the daemon's write() handler creates cache files directly — both
+# observed synchronously per writeback segment. This test verifies
+# the cache file survives SIGKILL on the daemon. (If the future
+# test #07-writeback-cache-optin.sh opts back in to kernel writeback,
+# this test still passes — it asserts file integrity, not how the
+# file got there.)
 #
 # Runtime: ~20-40s.
 
@@ -53,14 +53,11 @@ log "writing 2 MiB to $MNT/recovered2.bin ..."
 dd if=/dev/urandom of="$MNT/recovered2.bin" bs=1M count=2 status=none
 
 # ── Build a fingerprint of the cache dir (sorted size:md5 per file) ──
-# We compare via direct disk md5 to side-step FUSE kernel page-cache
-# quirks (the kernel may serve userspace reads from its own cache
-# without consulting the daemon's write handler).
-# Use polling drain (cap 30s) because under FUSE_WRITEBACK_CACHE the
-# daemon sees setattr(set_size) on close, then the writeback worker
-# fires after --vfs-write-back (default 1s). The cache file lands on
-# disk only after the worker reads cache + upload. Total turnaround
-# can be 2-3s on slow CI runners.
+# Direct disk md5 (not FUSE) so the kernel page cache can't serve a
+# different bytes than what we wrote. Under the new default
+# (WRITEBACK_CACHE off), the daemon's write() handler creates the
+# cache file synchronously per segment — but we still drain briefly
+# to cover the --vfs-write-back upload worker (default 1s delay).
 DRAIN_END=$(( $(date +%s) + 30 ))
 while (( $(date +%s) < DRAIN_END )); do
     HAVE=$(find "$CACHE" -maxdepth 1 -type f \

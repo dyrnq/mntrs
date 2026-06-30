@@ -84,6 +84,13 @@ mntrs_setup() {
 #
 # Uses --daemon + --daemon-wait so the binary returns once the FUSE
 # mount is live (avoids racing with shell I/O through the mountpoint).
+#
+# NOTE: FUSE kernel writeback (`--write-back-cache`) is OFF by default
+# in mntrs (see `FuserAdapter::write_back_cache` + CLI flag's bool
+# default). Tests that want the old behavior (kernel buffering writes,
+# daemon's write() skipped for multi-page files) must opt in explicitly
+# via `"$@"`. Most stress tests rely on the default — daemon-side
+# write() is the contract they exercise.
 mntrs_mount() {
     local mnt="$1"
     local cache_dir="$2"
