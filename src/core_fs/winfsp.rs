@@ -1618,17 +1618,49 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 // slashes before calling here, but be defensive
                 // in case a future caller sends `\`-separated
                 // components.
-                let component = name.replace('\\', "/");
+                let path = name.replace('\\', "/");
                 tracing::info!(
-                    component = %component,
+                    path = %path,
                     "winfsp::get_reparse_point_by_name: entered"
                 );
-                // Lookup under root (ino=1) — WinFSP sends
-                // single-component names for traversal of
-                // `<mountpoint>\<component>`, not full paths.
-                let attr = self.inner.lookup(1u64, &component).map_err(|e| {
+                // Issue #325: WinFSP's
+                // `FspFileSystemFindReparsePoint` invokes this
+                // callback with the FULL path (including the
+                // leading `/`), not just the final component.
+                // Split it into (parent_path, basename) and
+                // walk the parent chain to find the right ino,
+                // then do a component-based lookup against that
+                // parent. For a root-level symlink like
+                // `/_ci_symlink.txt` the parent is ino=1; for
+                // nested paths like `/dir/link` we'd resolve
+                // `dir` first (out of scope for #325 — symlinks
+                // are created at the root only via the
+                // PowerShell `New-Item` we exercise in sub-test
+                // 10).
+                let (parent_path, basename) = match path.rsplit_once('/') {
+                    Some((parent, name)) if !name.is_empty() => (parent, name),
+                    _ => ("/", path.as_str()),
+                };
+                let parent_ino = if parent_path == "/" || parent_path.is_empty() {
+                    1u64
+                } else {
+                    let parent_basename = parent_path.trim_start_matches('/');
+                    self.inner
+                        .lookup(1u64, parent_basename)
+                        .map_err(|e| {
+                            tracing::debug!(
+                                parent = %parent_path,
+                                error = %e,
+                                "winfsp::get_reparse_point_by_name: parent lookup failed"
+                            );
+                            io_err_to_status(e)
+                        })?
+                        .ino
+                };
+                let attr = self.inner.lookup(parent_ino, basename).map_err(|e| {
                     tracing::debug!(
-                        component = %component,
+                        basename = %basename,
+                        parent_ino,
                         error = %e,
                         "winfsp::get_reparse_point_by_name: lookup failed"
                     );
@@ -1641,7 +1673,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                     // as a normal file rather than misinterpreting
                     // it as a reparse hit.
                     tracing::debug!(
-                        component = %component,
+                        basename = %basename,
                         kind = ?attr.kind,
                         "winfsp::get_reparse_point_by_name: component is not a symlink, returning STATUS_INVALID_DEVICE_REQUEST"
                     );
@@ -1688,7 +1720,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                     buf[off..off + 2].copy_from_slice(&ch.to_le_bytes());
                 }
                 tracing::debug!(
-                    component = %component,
+                    path = %path,
                     ino,
                     total_size,
                     "winfsp::get_reparse_point_by_name: returning REPARSE_DATA_BUFFER_SYMLINK"
