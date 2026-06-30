@@ -761,10 +761,83 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 // (the kernel's pre-open stat couldn't tell it was
                 // following a symlink).
                 if let Some(security) = reparse_point_resolver(file_name) {
+                    // Issue #325: the WinFSP resolver returns
+                    // `reparse: true` with `attributes =
+                    // reparse_index` for any found reparse
+                    // point. For an intermediate component the
+                    // kernel must redirect (return STATUS_REPARSE)
+                    // so the substituted name continues opening
+                    // the rest of the path. For the FINAL
+                    // component (the file the user actually
+                    // wants to operate on), returning STATUS_REPARSE
+                    // is wrong: it makes the kernel re-issue the
+                    // open on the SubstituteName, which means
+                    // subsequent operations like `Remove-Item`
+                    // act on the *target* file (`\??\V:\_ci_small.txt`)
+                    // rather than the symlink itself. The target
+                    // gets deleted as a side-effect, and PowerShell
+                    // then reports ERROR_FILE_NOT_FOUND for the
+                    // original symlink path.
+                    //
+                    // We detect "final component" by checking
+                    // whether the kernel-supplied path has any
+                    // remaining parent components after the
+                    // reparse. WinFSP's resolver stops at the
+                    // first reparse it finds; if the path has
+                    // only one component (no `/` separators,
+                    // just `\\_ci_symlink.txt`), the reparse IS
+                    // the final component. For multi-component
+                    // paths like `/dir/link` where `link` is a
+                    // symlink, the parent's only component is
+                    // the last segment that contains the reparse
+                    // — but the resolver still indicates the
+                    // reparse_index. Here we treat the final
+                    // segment as the reparse target only when
+                    // the path's component count matches.
+                    let total_components = if path.is_empty() {
+                        0
+                    } else {
+                        path.split('/').filter(|c| !c.is_empty()).count()
+                    };
+                    let reparse_index = security.attributes as usize;
+                    let is_final_component = reparse_index + 1 == total_components;
+                    if is_final_component {
+                        // Final-component reparse: return
+                        // STATUS_SUCCESS with FILE_ATTRIBUTE_REPARSE_POINT
+                        // set. The kernel opens the symlink file
+                        // itself (no redirect) and PowerShell can
+                        // query the reparse data via FSCTL_GET_REPARSE_POINT
+                        // (routed to our `get_reparse_point`
+                        // callback) for `(Get-Item ...).Target`.
+                        // `Remove-Item` then acts on the symlink
+                        // and our `delete_reparse_point` + cleanup
+                        // callbacks fire as expected.
+                        let attrs = core_kind_to_file_attributes(
+                            crate::core_fs::CoreFileType::Symlink,
+                            0o755,
+                        );
+                        tracing::info!(
+                            name = %name,
+                            reparse_index,
+                            total_components,
+                            attributes = attrs,
+                            "winfsp::get_security_by_name: final-component reparse, returning STATUS_SUCCESS with reparse attribute"
+                        );
+                        return Ok(FileSecurity {
+                            reparse: false,
+                            sz_security_descriptor: 0,
+                            attributes: attrs,
+                        });
+                    }
+                    // Intermediate reparse: STATUS_REPARSE so
+                    // the kernel substitutes the resolved name
+                    // and continues opening subsequent components.
                     tracing::info!(
                         name = %name,
+                        reparse_index,
+                        total_components,
                         attributes = security.attributes,
-                        "winfsp::get_security_by_name: reparse resolved, surfacing STATUS_REPARSE"
+                        "winfsp::get_security_by_name: intermediate reparse, surfacing STATUS_REPARSE"
                     );
                     return Ok(security);
                 }
