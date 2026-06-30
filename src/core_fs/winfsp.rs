@@ -865,11 +865,11 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 // attributes (mirroring what we do in open's FileInfo
                 // and in get_file_info).
                 let attr = self.inner.lookup(parent, &path).map_err(|e| {
-                tracing::debug!(name = %name, error = %e, "winfsp::get_security_by_name: lookup failed");
+                tracing::info!(name = %name, error = %e, "winfsp::get_security_by_name: lookup failed");
                 io_err_to_status(e)
             })?;
                 let attributes = core_kind_to_file_attributes(attr.kind, attr.perm);
-                tracing::debug!(name = %name, ?attr.kind, attributes, "winfsp::get_security_by_name: ok");
+                tracing::info!(name = %name, ?attr.kind, attributes, "winfsp::get_security_by_name: ok");
                 Ok(FileSecurity {
                     reparse: false,
                     sz_security_descriptor: 0,
@@ -893,15 +893,15 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 // Issue #307: NFC-normalize the kernel-supplied
                 // name (see get_security_by_name for rationale).
                 let name = crate::util::nfc(&file_name.to_string_lossy());
-                tracing::debug!(name = %name, "winfsp::open: entered");
+                tracing::info!(name = %name, "winfsp::open: entered");
                 let path = name.replace('\\', "/");
                 let attr = self.inner.lookup(1, &path).map_err(|e| {
-                    tracing::debug!(name = %name, error = %e, "winfsp::open: lookup failed");
+                    tracing::info!(name = %name, error = %e, "winfsp::open: lookup failed");
                     io_err_to_status(e)
                 })?;
                 let is_dir = attr.kind == CoreFileType::Directory;
                 let ino = attr.ino;
-                tracing::debug!(name = %name, ino, is_dir, "winfsp::open: lookup ok");
+                tracing::info!(name = %name, ino, is_dir, kind = ?attr.kind, "winfsp::open: lookup ok");
                 // Bug 11: actually call CoreFilesystem::open so
                 // the per-handle FileHandleState (cache_fd for
                 // writes, prefetcher for reads) gets populated.
@@ -992,7 +992,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 // Issue #307: NFC-normalize the kernel-supplied
                 // name (see get_security_by_name for rationale).
                 let name = crate::util::nfc(&file_name.to_string_lossy());
-                tracing::debug!(name = %name, ?create_options, file_attributes, "winfsp::create: entered");
+                tracing::info!(name = %name, ?create_options, file_attributes, "winfsp::create: entered");
                 // Win32 create_options bits (matches
                 // windows::Win32::Storage::FileSystem):
                 //   FILE_DIRECTORY_FILE   = 0x0000_0001
