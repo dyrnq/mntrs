@@ -2294,6 +2294,14 @@ impl CoreFilesystem for MntrsFs {
                 self.path_to_ino.insert(full_path.clone(), new_ino);
                 new_ino
             };
+            tracing::warn!(
+                path = %full_path,
+                ino,
+                had_existing = self.path_to_ino.get(&full_path).is_some(),
+                pti_size = self.path_to_ino.len(),
+                inodes_size = self.inodes.len(),
+                "Issue #325 debug: symlink lookup resolved"
+            );
             self.bump_lookup_count(ino);
             return Ok(self.core_attr_for_symlink(ino, &target));
         }
@@ -5542,6 +5550,13 @@ impl CoreFilesystem for MntrsFs {
             // `create` at the same path can take
             // the slot without colliding with the
             // stale reverse pointer.
+            tracing::warn!(
+                ino,
+                path = %path,
+                ?kind,
+                is_symlink = kind == FileType::Symlink,
+                "Issue #325 debug: forget dropping state"
+            );
             if kind != FileType::Symlink {
                 self.path_to_ino
                     .remove_if(&path, |_, current_ino| *current_ino == ino);
