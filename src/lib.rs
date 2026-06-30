@@ -5511,18 +5511,41 @@ impl CoreFilesystem for MntrsFs {
         if !drop_state {
             return;
         }
-        if let Some(InodeEntry { path, .. }) = self.resolve(ino) {
+        if let Some(InodeEntry { path, kind, .. }) = self.resolve(ino) {
             self.inodes.remove(&ino);
-            // Stat phase 2: drop the reverse map entry,
-            // but ONLY if it still points to the ino
-            // we're forgetting. A concurrent
-            // alloc_ino*(path) after a recreate at the
-            // same path may have already overwritten
-            // the entry with a fresh ino — in that
-            // case the entry is still live and we must
-            // not remove it.
-            self.path_to_ino
-                .remove_if(&path, |_, current_ino| *current_ino == ino);
+            // Issue #325: for symlinks, keep the
+            // `path_to_ino` entry. The symlink
+            // itself still exists in the
+            // filesystem — only the ino allocation
+            // was forgotten (the kernel released its
+            // last ref, e.g. after a handle close).
+            // Pre-fix the unconditional
+            // `path_to_ino.remove_if` below would
+            // drop the entry, then a subsequent
+            // `lookup` for the same path hit the
+            // symlinks short-circuit (still
+            // populated) and allocated a FRESH ino
+            // because `path_to_ino.get` returned
+            // None. The fresh ino carried no
+            // kernel-side state (no open handle,
+            // no delete-pending disposition), so
+            // `Remove-Item` issued a delete against
+            // the new ino, and our `cleanup`
+            // callback's `inner.unlink` looked up
+            // the wrong path_to_ino entry — the
+            // backend reported the file was already
+            // gone, and PowerShell bubbled
+            // ERROR_FILE_NOT_FOUND.
+            //
+            // For non-symlinks we still drop the
+            // reverse-map entry so a `mkdir` /
+            // `create` at the same path can take
+            // the slot without colliding with the
+            // stale reverse pointer.
+            if kind != FileType::Symlink {
+                self.path_to_ino
+                    .remove_if(&path, |_, current_ino| *current_ino == ino);
+            }
             self.attr_cache.remove(&path);
             // Clean up any open file handles for this inode
             // (actually handles key is fh, not ino; just filter by path)
