@@ -20,10 +20,11 @@
 
 #![cfg(windows)]
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use winfsp::FspError;
 
 use widestring::U16CStr;
@@ -38,9 +39,48 @@ use winfsp_sys::FILE_ACCESS_RIGHTS;
 
 // Win32 file attribute constants (same as win32 API)
 const FILE_ATTRIBUTE_READONLY: u32 = 0x00000001;
+const FILE_ATTRIBUTE_HIDDEN: u32 = 0x00000002;
+const FILE_ATTRIBUTE_SYSTEM: u32 = 0x00000004;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x00000020;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x00000080;
+const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x00000100;
+const FILE_ATTRIBUTE_OFFLINE: u32 = 0x00001000;
+const FILE_ATTRIBUTE_NOT_CONTENT_INDEXED: u32 = 0x00002000;
+
+// Issue #310: per-adapter TTL caches.
+//
+// `GETATTR_CACHE_TTL` is short (100 ms) because a single
+// Explorer Refresh fans out into many concurrent
+// `IRP_MJ_QUERY_INFORMATION` IRPs (one per file) — without a
+// cache, every IRP goes to the backend (S3 ≈ 200 ms per stat).
+// 100 ms is long enough to coalesce the burst, short enough
+// that a freshly-written file's new size is visible on the
+// next Explorer interaction.
+//
+// `VOLUME_INFO_CACHE_TTL` is longer (30 s) because
+// `get_volume_info` only depends on the disk's static
+// capacity — and Explorer calls it on every Refresh and every
+// Properties dialog. 30 s is the right balance between
+// "Explorer Refresh feels instant" and "operator can resize
+// the volume and see it within 30 s".
+const GETATTR_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(100);
+const VOLUME_INFO_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+// User-meaningful file-attribute bits that the kernel
+// hands us in `create`'s `file_attributes` and that we
+// want to OR into the returned `FileInfo.file_attributes`.
+// Bits like FILE_ATTRIBUTE_DIRECTORY / NORMAL / ARCHIVE are
+// set by `core_kind_to_file_attributes` based on the
+// backend's kind+perm and are not user-meaningful on
+// create (the kernel sets them based on the create-options
+// bits FILE_DIRECTORY_FILE / FILE_NON_DIRECTORY_FILE).
+const USER_FILE_ATTR_PASSTHROUGH: u32 = FILE_ATTRIBUTE_READONLY
+    | FILE_ATTRIBUTE_HIDDEN
+    | FILE_ATTRIBUTE_SYSTEM
+    | FILE_ATTRIBUTE_TEMPORARY
+    | FILE_ATTRIBUTE_OFFLINE
+    | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
 
 use super::{CoreFileAttr, CoreFileType, CoreFilesystem, CoreVolumeStat};
 
@@ -414,11 +454,48 @@ fn winfsp_access_to_open_flags(granted_access: winfsp_sys::FILE_ACCESS_RIGHTS) -
 /// WinFSP adapter that wraps a `CoreFilesystem`.
 pub struct WinFspAdapter<F: CoreFilesystem + 'static> {
     pub inner: Arc<F>,
+    /// Issue #310: per-adapter TTL cache for `get_file_info`.
+    /// Keyed by inode (`u64`) — the WinFSP callback only
+    /// hands us an inode via `WinFspHandle.ino`, not a path,
+    /// so we can't reuse `MntrsFs::attr_cache` (path-keyed)
+    /// directly. The cache saves one backend `stat_op`
+    /// round-trip per `IRP_MJ_QUERY_INFORMATION` IRP within
+    /// `GETATTR_CACHE_TTL` (100 ms). The inode→attr map is
+    /// bounded by the number of files the mount has touched
+    /// in the last 100 ms; for typical Explorer workloads
+    /// (a Refresh fans out to a few hundred files) the map
+    /// holds at most a few hundred entries and is naturally
+    /// trimmed by TTL expiry on the next miss.
+    getattr_cache: Mutex<HashMap<u64, (Instant, CoreFileAttr)>>,
+    /// Issue #310: per-adapter TTL cache for `get_volume_info`.
+    /// Holds the most recent `CoreVolumeStat` for
+    /// `VOLUME_INFO_CACHE_TTL` (30 s). `get_volume_info` is
+    /// the inner.statfs(1) call which is 200 ms+ on S3; the
+    /// cache keeps Explorer Refresh snappy.
+    volume_info_cache: Mutex<Option<(Instant, CoreVolumeStat)>>,
 }
 
 impl<F: CoreFilesystem + 'static> WinFspAdapter<F> {
     pub fn new(inner: Arc<F>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            getattr_cache: Mutex::new(HashMap::new()),
+            volume_info_cache: Mutex::new(None),
+        }
+    }
+
+    /// Issue #310: drop a single inode's cached `attr`
+    /// after a delete (and, in the future, rename).
+    /// Called from `cleanup` when the kernel passes
+    /// `FspCleanupDelete`. Without this an immediately-
+    /// following `IRP_MJ_QUERY_INFORMATION` for the same
+    /// ino would hit the 100 ms TTL entry and report the
+    /// file as still present, masking the delete.
+    fn invalidate_getattr_cache_ino(&self, ino: u64) {
+        let mut cache = self.getattr_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.remove(&ino).is_some() {
+            tracing::trace!(ino, "winfsp: invalidated getattr cache entry on delete");
+        }
     }
 
     /// Issue #56: resolve a full parent path (e.g.
@@ -664,6 +741,32 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 // Populate the OpenFileInfo so the kernel caches
                 // the freshly-created entry's attributes.
                 core_attr_to_file_info(&attr, file_info.as_mut());
+                // Issue #310: the kernel passes the
+                // user-requested file attributes (HIDDEN,
+                // SYSTEM, READONLY, etc.) in `file_attributes`.
+                // `core_attr_to_file_info` derives the bits
+                // from the backend's kind+perm (so it sets
+                // DIRECTORY / NORMAL / ARCHIVE / READONLY
+                // based on the attr). The user-meaningful
+                // bits are dropped — a `New-Item -Force` on a
+                // hidden file would still show up as a normal
+                // file in Explorer. OR in the meaningful bits
+                // (see USER_FILE_ATTR_PASSTHROUGH) so they
+                // round-trip into the kernel's cached
+                // FileInfo. The class bits (DIRECTORY /
+                // NORMAL / ARCHIVE) are NOT passed through;
+                // those are determined by the create-options
+                // bits and the backend's kind+perm.
+                let user_attrs = file_attributes & USER_FILE_ATTR_PASSTHROUGH;
+                if user_attrs != 0 {
+                    tracing::debug!(
+                        ino,
+                        file_attributes,
+                        user_attrs,
+                        "winfsp::create: passing through user-requested file attributes"
+                    );
+                    file_info.as_mut().file_attributes |= user_attrs;
+                }
                 let dir_fh = if is_dir {
                     self.inner.opendir(ino).map_err(io_err_to_status)?
                 } else {
@@ -716,12 +819,57 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         catch_panic(
             "get_file_info",
             AssertUnwindSafe(|| {
-                let attr = self.inner.getattr(context.ino).map_err(io_err_to_status)?;
-                tracing::trace!(
-                    ino = context.ino,
-                    size = attr.size,
-                    "winfsp::get_file_info: returning"
-                );
+                // Issue #310: per-adapter TTL cache. The
+                // WinFSP kernel issues many concurrent
+                // `IRP_MJ_QUERY_INFORMATION` IRPs for the
+                // same file during a single Explorer Refresh
+                // (size / mtime / attr lookups). Each one
+                // falling through to `inner.getattr(ino)`
+                // hits the backend. A 100 ms TTL coalesces
+                // the burst; the next miss after the burst
+                // returns a fresh value.
+                let ino = context.ino;
+                let now = Instant::now();
+                let cached: Option<CoreFileAttr> = {
+                    let cache = self.getattr_cache.lock().unwrap_or_else(|e| e.into_inner());
+                    cache.get(&ino).and_then(|(ts, attr)| {
+                        if now.duration_since(*ts) < GETATTR_CACHE_TTL {
+                            Some(*attr)
+                        } else {
+                            None
+                        }
+                    })
+                };
+                let attr = match cached {
+                    Some(attr) => {
+                        tracing::trace!(ino, "winfsp::get_file_info: cache hit");
+                        attr
+                    }
+                    None => {
+                        let attr = self.inner.getattr(ino).map_err(io_err_to_status)?;
+                        // Best-effort trim: if the map
+                        // grows past a few thousand entries
+                        // (very long-running mount with
+                        // constant inode churn), drop the
+                        // stale entries. The TTL above
+                        // would also clean entries on the
+                        // next miss, but a hard cap is
+                        // cheaper than unbounded memory.
+                        let mut cache =
+                            self.getattr_cache.lock().unwrap_or_else(|e| e.into_inner());
+                        if cache.len() > 4096 {
+                            let cutoff = now.checked_sub(GETATTR_CACHE_TTL).unwrap_or(now);
+                            cache.retain(|_, (ts, _)| *ts > cutoff);
+                        }
+                        cache.insert(ino, (now, attr));
+                        tracing::trace!(
+                            ino,
+                            size = attr.size,
+                            "winfsp::get_file_info: cache miss; populated"
+                        );
+                        attr
+                    }
+                };
                 core_attr_to_file_info(&attr, file_info);
                 Ok(())
             }),
@@ -969,6 +1117,19 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         swallow_panic(
             "cleanup",
             AssertUnwindSafe(|| {
+                // Issue #310: a delete-imminent cleanup
+                // must invalidate the per-adapter
+                // `get_file_info` cache. The kernel's
+                // next `get_file_info` for the same ino
+                // (e.g. an immediately-following
+                // `std::fs::read` to confirm the delete
+                // took effect) would otherwise hit the
+                // 100 ms TTL entry and report the file
+                // as still present, masking the delete
+                // for up to 100 ms.
+                if FspCleanupFlags::FspCleanupDelete.is_flagged(flags) {
+                    self.invalidate_getattr_cache_ino(context.ino);
+                }
                 // FspCleanupDelete = 0x01 — kernel asked
                 // us to actually remove the file. Without
                 // this flag, cleanup is just "last handle
@@ -1202,7 +1363,43 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         catch_panic(
             "get_volume_info",
             AssertUnwindSafe(|| {
-                let v = self.inner.statfs(1).map_err(io_err_to_status)?;
+                // Issue #310: per-adapter TTL cache. Explorer
+                // calls `get_volume_info` on every Refresh
+                // and on every Properties dialog — for S3
+                // backends that's 200 ms+ per call. 30 s TTL
+                // keeps the visible flow snappy while still
+                // letting an operator see a resize within
+                // 30 s. The cache holds a single entry (the
+                // most recent stat) — no growth concern.
+                let now = Instant::now();
+                let cached: Option<CoreVolumeStat> = {
+                    let cache = self
+                        .volume_info_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    cache.as_ref().and_then(|(ts, v)| {
+                        if now.duration_since(*ts) < VOLUME_INFO_CACHE_TTL {
+                            Some(v.clone())
+                        } else {
+                            None
+                        }
+                    })
+                };
+                let v = match cached {
+                    Some(v) => {
+                        tracing::trace!("winfsp::get_volume_info: cache hit");
+                        v
+                    }
+                    None => {
+                        let v = self.inner.statfs(1).map_err(io_err_to_status)?;
+                        *self
+                            .volume_info_cache
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = Some((now, v.clone()));
+                        tracing::trace!("winfsp::get_volume_info: cache miss; populated");
+                        v
+                    }
+                };
                 core_volume_to_volume_info(&v, out_volume_info);
                 tracing::debug!(
                     total_size = out_volume_info.total_size,
@@ -1265,9 +1462,30 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                     // where the fsync-on-cache-fd isn't enough
                     // (e.g. cloud storage where "durable" means
                     // uploaded, not just on local disk).
-                    self.inner
-                        .fsync(ctx.ino, ctx.fh, true)
-                        .map_err(io_err_to_status)?;
+                    //
+                    // Issue #310: a read-only handle has no
+                    // `cache_fd` in the trait, so `fsync`
+                    // returns `NotFound` to signal
+                    // "nothing to flush". That is a
+                    // semantic no-op for FlushFileBuffers
+                    // (the user didn't write anything
+                    // through this handle), not an error.
+                    // Surface it as a successful no-op
+                    // instead of STATUS_NOT_FOUND, which
+                    // would make Win32 FlushFileBuffers
+                    // fail for any file opened read-only.
+                    if let Err(e) = self.inner.fsync(ctx.ino, ctx.fh, true) {
+                        if e.kind() == std::io::ErrorKind::NotFound {
+                            tracing::trace!(
+                                ino = ctx.ino,
+                                fh = ctx.fh,
+                                "winfsp::flush: fsync returned NotFound (read-only \
+                                 handle, no cache fd); treating as no-op"
+                            );
+                        } else {
+                            return Err(io_err_to_status(e));
+                        }
+                    }
                     self.inner
                         .flush(ctx.ino, ctx.fh)
                         .map_err(io_err_to_status)?;

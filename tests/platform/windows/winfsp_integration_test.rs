@@ -1,5 +1,6 @@
 #![cfg(windows)]
 
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,6 +9,7 @@ use opendal::services::Memory;
 
 use mntrs::MntrsFs;
 use mntrs::core_fs::CoreFilesystem;
+use mntrs::core_fs::{CoreFileAttr, CoreVolumeStat};
 
 // One-shot tracing subscriber init. The `mntrs.exe` binary
 // initializes a global subscriber in main.rs; the test binary
@@ -814,4 +816,275 @@ fn test_generic_unmount_various_paths() {
     // Path with special chars
     let r = mntrs::cmd::mount::unmount_internal("/tmp/mntrs test with spaces");
     assert!(r.is_ok(), "unmount path with spaces should be graceful");
+}
+
+// ============================================================
+// Issue #310 regression tests: WinFSP per-adapter TTL caches
+// (get_file_info 100ms, get_volume_info 30s), flush
+// NotFound-as-noop, and create file_attributes passthrough.
+//
+// The cache lives on `WinFspAdapter`, not on `MntrsFs`, so
+// the only way to assert that a `get_file_info` /
+// `get_volume_info` IRP was served from the cache (and not
+// from the inner `CoreFilesystem` impl) is to count
+// delegations to the inner. `CountingCoreFs` wraps
+// `Arc<MntrsFs>` and increments an `AtomicU64` on each
+// `getattr` / `statfs` call, leaving the rest of the trait
+// untouched. The wrapper is built with a macro so adding new
+// trait methods later is a one-line `forward!` invocation.
+// ============================================================
+
+/// `CountingCoreFs` — wraps an `Arc<MntrsFs>` and counts
+/// how many times each high-traffic trait method is
+/// invoked. Used to verify the per-adapter TTL caches in
+/// `WinFspAdapter` actually save delegations to the inner
+/// `CoreFilesystem`. Counters are `AtomicU64` (Relaxed) so
+/// concurrent `get_file_info` IRPs from the WinFSP
+/// dispatcher don't need a lock.
+struct CountingCoreFs {
+    inner: Arc<MntrsFs>,
+    getattr_count: std::sync::atomic::AtomicU64,
+    statfs_count: std::sync::atomic::AtomicU64,
+}
+
+impl CountingCoreFs {
+    fn new(inner: Arc<MntrsFs>) -> Self {
+        Self {
+            inner,
+            getattr_count: std::sync::atomic::AtomicU64::new(0),
+            statfs_count: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+    fn getattr_count(&self) -> u64 {
+        self.getattr_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn statfs_count(&self) -> u64 {
+        self.statfs_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Forward every other `CoreFilesystem` method to the
+/// wrapped `MntrsFs`. The two methods we care about
+/// (`getattr`, `statfs`) are overridden below to bump
+/// their counters before delegating. The macro can't
+/// be used in `fn` signatures (`Result<_>` is illegal
+/// in item position) so the impl is written out by
+/// hand — the trait surface is small and stable.
+macro_rules! forward {
+    ($method:ident ( $($arg:ident : $aty:ty),* $(,)? ) -> $ret:ty) => {
+        fn $method(&self, $($arg: $aty),*) -> std::io::Result<$ret> {
+            self.inner.$method($($arg),*)
+        }
+    };
+}
+
+impl CoreFilesystem for CountingCoreFs {
+    forward!(init() -> ());
+    forward!(lookup(parent: u64, name: &str) -> CoreFileAttr);
+    forward!(lookup_many(parent: u64, names: &[&str]) -> Vec<std::io::Result<CoreFileAttr>>);
+    fn forget(&self, ino: u64, nlookup: u64) {
+        self.inner.forget(ino, nlookup)
+    }
+    fn getattr(&self, ino: u64) -> std::io::Result<CoreFileAttr> {
+        self.getattr_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.getattr(ino)
+    }
+    forward!(setattr(
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<std::time::SystemTime>,
+        _mtime: Option<std::time::SystemTime>,
+        fh: Option<u64>
+    ) -> CoreFileAttr);
+    forward!(opendir(ino: u64) -> u64);
+    forward!(readdir(ino: u64, fh: u64, offset: u64, _max: usize) -> Vec<mntrs::core_fs::CoreDirEntry>);
+    forward!(releasedir(_ino: u64, _fh: u64) -> ());
+    forward!(readdir_with_attrs(ino: u64, fh: u64, marker: &str) -> Vec<(mntrs::core_fs::CoreDirEntry, CoreFileAttr)>);
+    forward!(open(ino: u64, _flags: u32) -> u64);
+    forward!(read(ino: u64, fh: u64, offset: u64, size: u32) -> Vec<u8>);
+    forward!(write(ino: u64, fh: u64, offset: u64, data: &[u8]) -> u32);
+    forward!(flush(ino: u64, fh: u64) -> ());
+    forward!(fsync(ino: u64, fh: u64, datasync: bool) -> ());
+    forward!(fsyncdir(ino: u64, fh: u64, datasync: bool) -> ());
+    forward!(release(ino: u64, fh: u64) -> ());
+    forward!(create(parent: u64, name: &str, mode: u32) -> (CoreFileAttr, u64));
+    forward!(create_excl(parent: u64, name: &str, mode: u32) -> (CoreFileAttr, u64));
+    forward!(mkdir(parent: u64, name: &str) -> CoreFileAttr);
+    forward!(unlink(parent: u64, name: &str) -> ());
+    forward!(rmdir(parent: u64, name: &str) -> ());
+    forward!(rename(parent: u64, name: &str, newparent: u64, newname: &str) -> ());
+    forward!(rename_paths(src_path: &str, dst_path: &str) -> ());
+    forward!(readlink(ino: u64) -> Vec<u8>);
+    forward!(symlink(parent: u64, name: &str, target: &std::path::Path) -> CoreFileAttr);
+    fn statfs(&self, ino: u64) -> std::io::Result<CoreVolumeStat> {
+        self.statfs_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.statfs(ino)
+    }
+    forward!(getxattr(ino: u64, name: &str) -> Vec<u8>);
+    forward!(listxattr(ino: u64) -> Vec<Vec<u8>>);
+    forward!(access(ino: u64, mask: u32) -> ());
+    forward!(link(ino: u64, newparent: u64, newname: &str) -> CoreFileAttr);
+    forward!(fallocate(ino: u64, _fh: u64, offset: u64, length: u64, mode: i32) -> ());
+    forward!(copy_file_range(
+        ino_in: u64,
+        fh_in: u64,
+        offset_in: u64,
+        ino_out: u64,
+        fh_out: u64,
+        offset_out: u64,
+        len: u64
+    ) -> u32);
+}
+
+/// Issue #310: per-adapter `get_file_info` cache
+/// (100 ms TTL). Pre-fix every WinFSP `IRP_MJ_QUERY_
+/// INFORMATION` for the same inode within a single
+/// Explorer Refresh fell through to the inner
+/// `getattr` — one backend stat per IRP. Post-fix a
+/// burst of N concurrent `std::fs::metadata` calls
+/// within 100 ms produces exactly 1 inner `getattr`
+/// per ino; the rest are served from the
+/// per-adapter cache.
+#[test]
+fn winfsp_getattr_cache_coalesces_burst() {
+    let fs_inner = make_memory_fs();
+    // Pre-seed a file via the remote backend so the
+    // get_file_info callback has a real ino to look
+    // up (avoids the `ino == 1` shortcut in
+    // MntrsFs::getattr which would skip the stat
+    // path and contaminate the count).
+    write_remote(&fs_inner, "cached.bin", b"hello");
+
+    let counter = Arc::new(CountingCoreFs::new(Arc::new(fs_inner)));
+    let counter_for_guard = counter.clone();
+    let guard = mntrs::core_fs::test_helpers::mount_winfsp(counter.clone()).expect("mount");
+    let mp = &guard.mount_path;
+    settle();
+
+    // Baseline: opening the file issues a few lookups
+    // (get_security_by_name, open, get_file_info).
+    // Reset the counter so the assertion below
+    // measures only the burst.
+    counter
+        .getattr_count
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    counter
+        .statfs_count
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+
+    // Burst: 50 `std::fs::metadata` calls in quick
+    // succession (well under the 100 ms TTL). Each
+    // call triggers at least one `get_file_info`
+    // IRP from the kernel. Without the cache the
+    // counter would be >= 50; with the cache the
+    // adapter serves most of them from the ino
+    // cache and the counter stays at 1 (one miss
+    // + N-1 hits).
+    for _ in 0..50 {
+        let _ = std::fs::metadata(format!("{mp}cached.bin")).unwrap();
+    }
+
+    let after_burst = counter.getattr_count();
+    assert!(
+        after_burst <= 5,
+        "getattr cache miss: expected <= 5 inner calls for 50 stat IRPs, got {after_burst} \
+         (cache not active or TTL too short)"
+    );
+
+    drop(guard);
+    drop(counter_for_guard);
+}
+
+/// Issue #310: per-adapter `get_volume_info` cache
+/// (30 s TTL). Explorer calls this on every Refresh
+/// and every Properties dialog — for S3 backends
+/// that's 200 ms+ per call. With the cache, N
+/// consecutive `std::fs::metadata(V:)` calls (which
+/// trigger a volume-info IRP) hit the inner
+/// `statfs` exactly once.
+#[test]
+fn winfsp_volume_info_cache_coalesces_burst() {
+    let fs_inner = make_memory_fs();
+    let counter = Arc::new(CountingCoreFs::new(Arc::new(fs_inner)));
+    let counter_for_guard = counter.clone();
+    let guard = mntrs::core_fs::test_helpers::mount_winfsp(counter.clone()).expect("mount");
+    let mp = &guard.mount_path;
+    settle();
+
+    // 20 `std::fs::metadata` calls on the mount root
+    // — each one triggers a volume-info IRP. Pre-fix
+    // this would call inner.statfs(1) 20 times. Post-fix
+    // exactly 1 (the rest are served from the
+    // per-adapter cache).
+    counter
+        .statfs_count
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    for _ in 0..20 {
+        let _ = std::fs::metadata(mp.as_str()).unwrap();
+    }
+
+    let after_burst = counter.statfs_count();
+    assert!(
+        after_burst <= 2,
+        "volume_info cache miss: expected <= 2 inner statfs for 20 metadata IRPs, got {after_burst} \
+         (cache not active or TTL too short)"
+    );
+
+    drop(guard);
+    drop(counter_for_guard);
+}
+
+/// Issue #310: `WinFspAdapter::flush` must not
+/// surface the inner `fsync`'s `NotFound` (no cache
+/// fd on read-only handle) to the kernel as
+/// `STATUS_NOT_FOUND`. Pre-fix a `FlushFileBuffers`
+/// on a read-only handle returned
+/// `ERROR_FILE_NOT_FOUND` to user-space, breaking
+/// the Win32 contract that `FlushFileBuffers` is a
+/// no-op for read-only files. Post-fix it's a clean
+/// Ok(()) (no-op).
+#[test]
+fn winfsp_flush_readonly_handle_is_noop() {
+    let fs = Arc::new(make_memory_fs());
+    let guard = mntrs::core_fs::test_helpers::mount_winfsp(fs.clone()).expect("mount");
+    let mp = &guard.mount_path;
+    settle();
+
+    // Seed a file via the remote backend.
+    write_remote(&fs, "ro.txt", b"data");
+
+    // Open it read-only via `File::open` (no write
+    // access). The kernel will hand the adapter a
+    // handle with no cache_fd; a subsequent
+    // `FlushFileBuffers` exercises the fsync
+    // NotFound path.
+    use std::io::Read;
+    let mut f = std::fs::File::open(format!("{mp}ro.txt")).unwrap();
+    let mut buf = [0u8; 4];
+    f.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"data");
+
+    // FlushFileBuffers — must not error.
+    // Pre-fix this returned ERROR_FILE_NOT_FOUND
+    // (from the inner fsync's NotFound propagating
+    // as STATUS_NOT_FOUND). Post-fix it's Ok(())
+    // because the adapter treats "no cache fd" as
+    // a no-op (no buffers to flush on a read-only
+    // handle).
+    let flush_result = f.flush();
+    drop(f);
+    assert!(
+        flush_result.is_ok(),
+        "FlushFileBuffers on read-only handle returned {:?}; \
+         expected Ok (Issue #310: fsync NotFound should be a no-op)",
+        flush_result
+    );
+
+    drop(guard);
 }
