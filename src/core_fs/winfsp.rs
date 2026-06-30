@@ -1619,7 +1619,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 // in case a future caller sends `\`-separated
                 // components.
                 let component = name.replace('\\', "/");
-                tracing::debug!(
+                tracing::info!(
                     component = %component,
                     "winfsp::get_reparse_point_by_name: entered"
                 );
