@@ -1623,6 +1623,11 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                     path = %path,
                     "winfsp::get_reparse_point_by_name: entered"
                 );
+                tracing::info!(
+                    file_name_raw = ?file_name,
+                    path = %path,
+                    "winfsp::get_reparse_point_by_name: entered (raw)"
+                );
                 // Issue #325: WinFSP's
                 // `FspFileSystemFindReparsePoint` invokes this
                 // callback with the FULL path (including the
@@ -1658,7 +1663,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                         .ino
                 };
                 let attr = self.inner.lookup(parent_ino, basename).map_err(|e| {
-                    tracing::debug!(
+                    tracing::info!(
                         basename = %basename,
                         parent_ino,
                         error = %e,
@@ -1672,7 +1677,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                     // invalid-device so WinFSP treats the path
                     // as a normal file rather than misinterpreting
                     // it as a reparse hit.
-                    tracing::debug!(
+                    tracing::info!(
                         basename = %basename,
                         kind = ?attr.kind,
                         "winfsp::get_reparse_point_by_name: component is not a symlink, returning STATUS_INVALID_DEVICE_REQUEST"
@@ -1684,7 +1689,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                     .inner
                     .readlink(ino)
                     .map_err(|e| {
-                        tracing::debug!(ino, error = %e, "winfsp::get_reparse_point_by_name: readlink failed");
+                        tracing::info!(ino, error = %e, "winfsp::get_reparse_point_by_name: readlink failed");
                         e
                     })
                     .map_err(io_err_to_status)?;
@@ -1719,7 +1724,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                     let off = path_start + target_wide.len() * 2 + i * 2;
                     buf[off..off + 2].copy_from_slice(&ch.to_le_bytes());
                 }
-                tracing::debug!(
+                tracing::info!(
                     path = %path,
                     ino,
                     total_size,
