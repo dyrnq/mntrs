@@ -60,7 +60,44 @@ jobs:
         run: cargo build --release --package mntrs
 
       - name: Unit tests (lib only)
-        run: cargo test --lib --package mntrs
+        # Issue #309 / windows DLL flake: the lib's
+        # test binary transitively links
+        # `winfsp-x64.dll` (via the `winfsp` crate's
+        # FFI imports). On freshly-provisioned
+        # runner VMs the choco install (above)
+        # drops the DLL in a non-PATH location, and
+        # subsequent `run:` steps spawn fresh
+        # shells that don't inherit the install
+        # session's env. The binary then fails to
+        # start with STATUS_DLL_NOT_FOUND.
+        #
+        # Search common WinFSP install locations
+        # recursively for `winfsp-x64.dll` and add
+        # its directory to PATH. Logs the
+        # discovered path so future debug is easy.
+        shell: pwsh
+        run: |
+          $searchRoots = @(
+            'C:\Program Files\WinFSP',
+            'C:\Program Files (x86)\WinFSP',
+            'C:\Windows\System32',
+            'C:\ProgramData\chocolatey\lib\winfsp'
+          )
+          $dll = $null
+          foreach ($root in $searchRoots) {
+            if (Test-Path $root) {
+              $found = Get-ChildItem -Path $root -Recurse -Filter 'winfsp-x64.dll' -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($found) { $dll = $found; break }
+            }
+          }
+          if ($dll) {
+            $env:PATH = "$($dll.DirectoryName);$env:PATH"
+            Write-Host "Found winfsp-x64.dll at: $($dll.FullName)"
+          } else {
+            Write-Host "WARNING: winfsp-x64.dll not found in any known location"
+            Get-ChildItem -Path 'C:\' -Filter 'winfsp*' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 5 | ForEach-Object { Write-Host "  candidate: $($_.FullName)" }
+          }
+          cargo test --lib --package mntrs
 
       - name: Core FS unit tests
         run: cargo test --package mntrs --test core_fs_unit_test
