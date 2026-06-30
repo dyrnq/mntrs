@@ -254,8 +254,32 @@ fn core_attr_to_file_info(attr: &CoreFileAttr, file_info: &mut FileInfo) {
     tracing::trace!(
         ino = attr.ino,
         size = attr.size,
+        kind = ?attr.kind,
         "core_attr_to_file_info: setting file_size"
     );
+    // Issue #325: the kernel pairs `FILE_ATTRIBUTE_REPARSE_POINT`
+    // in `file_attributes` with a non-zero `reparse_tag` to know
+    // *which* reparse point a file is. WinFSP's FileInfo struct
+    // (winfsp::filesystem::FileInfo) carries both fields, and
+    // any file with the reparse-point attribute bit set MUST
+    // also report the matching tag — otherwise user-mode callers
+    // like PowerShell's `Remove-Item` (which uses DeleteFileW)
+    // see FILE_ATTRIBUTE_REPARSE_POINT but no valid reparse tag,
+    // and the kernel surfaces ERROR_FILE_NOT_FOUND before our
+    // `delete_reparse_point` / `cleanup` callbacks ever fire.
+    // Pre-fix we left `reparse_tag` at its `Default::default()`
+    // value of 0, so the kernel processed the symlink as a
+    // regular file with a broken reparse point and `Remove-Item`
+    // failed even though the file existed.
+    //
+    // Set the tag for symlinks (junctions and other reparse
+    // types are out of scope for #325). For non-symlinks the
+    // default 0 is the correct value — WinFSP ignores it when
+    // FILE_ATTRIBUTE_REPARSE_POINT is not set.
+    file_info.reparse_tag = match attr.kind {
+        CoreFileType::Symlink => 0xA000_000C, // IO_REPARSE_TAG_SYMLINK
+        _ => 0,
+    };
     file_info.file_size = attr.size;
     file_info.allocation_size = attr.size.next_power_of_two();
     file_info.creation_time = system_time_to_win32(attr.crtime);
@@ -882,8 +906,8 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
     fn open(
         &self,
         file_name: &U16CStr,
-        _create_options: u32,
-        _granted_access: FILE_ACCESS_RIGHTS,
+        create_options: u32,
+        granted_access: FILE_ACCESS_RIGHTS,
         _file_info: &mut OpenFileInfo,
     ) -> Result<Self::FileContext> {
         // Issue #314: panic safety wrapper — see catch_panic.
@@ -893,7 +917,12 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 // Issue #307: NFC-normalize the kernel-supplied
                 // name (see get_security_by_name for rationale).
                 let name = crate::util::nfc(&file_name.to_string_lossy());
-                tracing::info!(name = %name, "winfsp::open: entered");
+                tracing::info!(
+                    name = %name,
+                    create_options,
+                    granted_access = ?granted_access,
+                    "winfsp::open: entered"
+                );
                 let path = name.replace('\\', "/");
                 let attr = self.inner.lookup(1, &path).map_err(|e| {
                     tracing::info!(name = %name, error = %e, "winfsp::open: lookup failed");
@@ -916,7 +945,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 let fh = if is_dir {
                     ino
                 } else {
-                    let flags = winfsp_access_to_open_flags(_granted_access);
+                    let flags = winfsp_access_to_open_flags(granted_access);
                     self.inner.open(ino, flags).map_err(io_err_to_status)?
                 };
                 // WinFSP open() sets FileInfo via OpenFileInfo; kernel auto-fills from response
@@ -1452,7 +1481,22 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 };
                 // Issue #307: NFC-normalize the kernel-supplied
                 // name (see get_security_by_name for rationale).
-                let full_path = crate::util::nfc(&file_name.to_string_lossy()).replace('\\', "/");
+                // Issue #325 follow-up: also lowercase — Win32
+                // file names are case-insensitive at the OS layer
+                // and the kernel may pass the basename in any
+                // case form. `MntrsFs::create` stored the entry
+                // using whatever case the user supplied at
+                // `cmd mklink` time (typically lowercase), so
+                // unlink has to look up the same case to hit
+                // the in-memory symlinks / path_to_ino entries.
+                // Without this, `DeleteFileW` from PowerShell /
+                // cmd / .NET cleans up the placeholder but the
+                // symlink registration sticks around, and the
+                // next `Test-Path` reports the link as still
+                // present.
+                let full_path = crate::util::nfc(&file_name.to_string_lossy())
+                    .replace('\\', "/")
+                    .to_lowercase();
                 // Split into (parent_path, basename).
                 // WinFSP paths look like "/dir/file.txt"
                 // for non-root or "/file.txt" for root.
@@ -1521,10 +1565,22 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
     // FUSE/WinFSP adapters.
     fn set_delete(
         &self,
-        _context: &Self::FileContext,
-        _file_name: &U16CStr,
-        _delete_file: bool,
+        context: &Self::FileContext,
+        file_name: &U16CStr,
+        delete_file: bool,
     ) -> Result<()> {
+        // DEBUG-level: silent at default RUST_LOG=info to keep
+        // the high-frequency delete path quiet. Set
+        // RUST_LOG=trace when debugging whether the kernel
+        // routed a delete through `set_delete`, `cleanup`,
+        // both, or neither.
+        let name_dbg = file_name.to_string_lossy().replace('\\', "/");
+        tracing::debug!(
+            ino = context.ino,
+            name = %name_dbg,
+            delete_file,
+            "winfsp::set_delete: called"
+        );
         // No-op: see doc comment above. The decision is
         // made in `cleanup` via FspCleanupDelete.
         Ok(())

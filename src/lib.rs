@@ -2318,14 +2318,39 @@ impl CoreFilesystem for MntrsFs {
         // `MntrsFs::symlink`) and propagate ENOENT/NotFound
         // to user mode, breaking `Get-Item V:\link` and
         // `Test-Path V:\link` for freshly-created symlinks.
-        if let Some(target) = self.symlinks.get(&full_path) {
+        //
+        // Case-insensitive lookup: Win32 file names are
+        // case-insensitive at the OS layer. The WinFSP
+        // adapter may pass the basename in a different
+        // case form than what was stored at create time
+        // (e.g. `cmd mklink` lowercase + `DeleteFileW`
+        // uppercase). Direct `symlinks.get(&full_path)`
+        // misses; the case-insensitive scan finds the
+        // canonical stored key.
+        let symlink_entry = if let Some(t) = self.symlinks.get(&full_path) {
+            Some((full_path.clone(), t.value().clone()))
+        } else {
+            let target_lower = full_path.to_lowercase();
+            self.symlinks
+                .iter()
+                .find(|e| e.key().to_lowercase() == target_lower)
+                .map(|e| (e.key().clone(), e.value().clone()))
+        };
+        if let Some((stored_path, target)) = symlink_entry {
             // Resolve or allocate an ino for this symlink path
             // so subsequent ops (getattr / setattr / unlink)
             // can find it. alloc_ino* reuses an existing ino
             // for the same path (Issue #325) so a readdir →
             // re-lookup doesn't fragment the ino space.
+            //
+            // Use the canonical stored path (not `full_path`)
+            // for the alloc_ino key so the path_to_ino map
+            // entry matches what `attach_symlink_to_ino`
+            // stored at create time — a different-case
+            // `full_path` here would re-alloc a fresh ino
+            // and break the cleanup → ino lookup.
             let ino = self.alloc_ino(
-                &full_path,
+                &stored_path,
                 FileType::Symlink,
                 target.as_os_str().len() as u64,
             );
@@ -4924,13 +4949,63 @@ impl CoreFilesystem for MntrsFs {
         } else {
             format!("{}/{}", parent_path, name)
         };
+        // Issue #325 follow-up: the WinFSP adapter passes the
+        // basename in the form Win32 sent it (e.g. uppercase
+        // `_CI_SYMLINK.TXT` when `cmd mklink _ci_symlink.txt`
+        // was the original command), but `MntrsFs::create`
+        // stored the symlink in `symlinks` / `path_to_ino` /
+        // `inodes` with the lowercased form. A direct map
+        // lookup on `full_path` misses, so the unlink falls
+        // through to the backend (which has no file for a
+        // symlink) — leaving the in-memory entry in place and
+        // `Test-Path` continuing to return True after the
+        // `cleanup` callback. Walk the symlinks map once for a
+        // case-insensitive key match and remap everything off
+        // the canonical stored path.
+        let stored_symlink_path = if self.symlinks.contains_key(&full_path) {
+            Some(full_path.clone())
+        } else {
+            // Case-insensitive fallback: Win32 file names are
+            // case-insensitive at the OS layer, so the cleanup
+            // callback may receive the basename in any case
+            // form. `cmd mklink` lowercases the path on
+            // creation, then `DeleteFileW` re-supplies the
+            // kernel-side canonical (often uppercase) form.
+            let target_lower = full_path.to_lowercase();
+            let mut hit: Option<String> = None;
+            for entry in self.symlinks.iter() {
+                if entry.key().to_lowercase() == target_lower {
+                    hit = Some(entry.key().clone());
+                    break;
+                }
+            }
+            hit
+        };
         // Issue #325: if the entry is a symlink, drop it from
         // the in-memory table and bail without touching the
         // backend (there is no backend file for a symlink — see
         // `MntrsFs::symlink`). Also remove from path_to_ino /
         // inodes so subsequent lookup returns NotFound.
-        if self.symlinks.remove(&full_path).is_some() {
-            if let Some(ino) = self.path_to_ino.remove(&full_path).map(|(_, v)| v) {
+        if let Some(stored) = stored_symlink_path.as_ref() {
+            // Try the exact case first (fast path); fall back
+            // to the canonical case we found above so the
+            // lowercased-name / uppercased-kernel pair
+            // (the Win32 case-insensitive contract) still
+            // resolves the right entry.
+            if self.symlinks.remove(&full_path).is_none() {
+                self.symlinks.remove(stored);
+            }
+            // Use the canonical stored path for the
+            // path_to_ino / cache / attr_cache / writeback
+            // lookups so we drop the actual key the maps
+            // hold. `full_path` may differ in case from
+            // what `create` originally stored.
+            if let Some(ino) = self
+                .path_to_ino
+                .remove(stored.as_str())
+                .map(|(_, v)| v)
+                .or_else(|| self.path_to_ino.remove(&full_path).map(|(_, v)| v))
+            {
                 self.inodes.remove(&ino);
                 // Mirror the FUSE kernel's forget — drop our
                 // mirrored lookup_count so the inodes entry
@@ -4955,15 +5030,77 @@ impl CoreFilesystem for MntrsFs {
             // registered. Drop the placeholder and any pending
             // writeback sidecar so the next New-Item at the same
             // path sees NotFound and proceeds to create.
-            let cpath = crate::cache_path(&self.cache_dir, &full_path);
+            let cpath = crate::cache_path(&self.cache_dir, stored);
             let _ = std::fs::remove_file(&cpath);
             let dirty_path = cpath.with_extension("dirty");
             let _ = std::fs::remove_file(&dirty_path);
-            self.attr_cache.remove(&full_path);
+            self.attr_cache.remove(stored.as_str());
+            // `cache_remove_entry` indexes by (parent_path,
+            // basename) — those are the same regardless of
+            // the path case (we use parent_path, name here,
+            // matching the original `create` call's args).
             self.cache_remove_entry(&parent_path, name);
-            self.writeback_pending.remove(full_path.as_str());
+            // Issue #325: also drop the parent's entire
+            // dir_cache snapshot. The snapshot is keyed by
+            // canonicalized parent path and lists every
+            // child the last `list_op` saw — including
+            // symlinks. After unlink, a follow-up `Test-Path`
+            // / `Get-ChildItem` would otherwise re-read the
+            // snapshot and report the symlink as still
+            // present, masking the delete. Drop the whole
+            // parent entry; the next opendir refetches via
+            // list_op and re-materializes the listing
+            // without the just-removed symlink.
+            let parent_canon = canonicalize_list_path(&parent_path);
+            self.dir_cache.remove(parent_canon.as_str());
+            self.writeback_pending
+                .remove(stored.as_str())
+                .or_else(|| self.writeback_pending.remove(full_path.as_str()));
+            // Issue #325 follow-up: the `create` callback for
+            // a symlink NtCreateFile (New-Item -ItemType
+            // SymbolicLink / cmd mklink) writes a 0-byte
+            // placeholder into the backend via op.write,
+            // because the Win32 contract requires the file
+            // to exist as a reparse-point host. The
+            // `attach_symlink_to_ino` half of the create
+            // then promotes the in-memory entry to a
+            // symlink but does NOT remove the placeholder
+            // (the backend opendal `delete` would race with
+            // the just-completed write and surface
+            // NotFound). On unlink, the backend file IS
+            // still present — the next `opendir` /
+            // `list_op` re-reads the directory listing and
+            // returns the 0-byte placeholder as a regular
+            // file, masking the symlink delete.
+            //
+            // Issue the backend delete here, swallowing
+            // NotFound (idempotent: a second unlink sees the
+            // file already gone). Other errors get a warn
+            // but don't fail the unlink — the in-memory
+            // state is the source of truth for symlinks.
+            let op = self.op.clone();
+            let p = stored.clone();
+            let backend_del = rt().block_on(async move { op.delete(&p).await });
+            match backend_del {
+                Ok(()) => tracing::info!(
+                    path = %stored,
+                    "MntrsFs::unlink: dropped symlink backend placeholder"
+                ),
+                Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+                    tracing::debug!(
+                        path = %stored,
+                        "MntrsFs::unlink: backend placeholder already absent (idempotent)"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    path = %stored,
+                    error = %e,
+                    "MntrsFs::unlink: backend placeholder delete failed (may reappear in next readdir)"
+                ),
+            }
             tracing::info!(
-                path = %full_path,
+                path = %stored,
+                requested = %full_path,
                 "MntrsFs::unlink: dropped symlink entry (incl. cache file)"
             );
             return Ok(());
