@@ -60,7 +60,33 @@ jobs:
         run: cargo build --release --package mntrs
 
       - name: Unit tests (lib only)
-        run: cargo test --lib --package mntrs
+        # Issue #309 / windows DLL flake: the lib's
+        # test binary transitively links
+        # `winfsp-x64.dll` (via the `winfsp` crate's
+        # FFI imports). The DLL is installed by the
+        # choco step above at
+        # `C:\Program Files\WinFSP\bin\`, but the
+        # MSI installer's system-PATH update does
+        # NOT propagate to the current PowerShell
+        # session (or to subsequent `run:` steps,
+        # which spawn fresh shells). The binary
+        # then fails to start with
+        # STATUS_DLL_NOT_FOUND on freshly-provisioned
+        # runner VMs where the choco step is a real
+        # install (not a no-op cache hit).
+        #
+        # Force-add the winfsp bin directory to
+        # PATH for this step so the DLL search hits.
+        # Subsequent steps (Platform tests, e2e
+        # smoke) use the same shell / env so the
+        # fix carries forward.
+        shell: pwsh
+        run: |
+          $winfspBin = 'C:\Program Files\WinFSP\bin'
+          if (Test-Path $winfspBin) {
+            $env:PATH = "$winfspBin;$env:PATH"
+          }
+          cargo test --lib --package mntrs
 
       - name: Core FS unit tests
         run: cargo test --package mntrs --test core_fs_unit_test
