@@ -760,8 +760,17 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 // ERROR_PATH_NOT_FOUND for `V:\_ci_symlink.txt`
                 // (the kernel's pre-open stat couldn't tell it was
                 // following a symlink).
-                if let Some(security) = reparse_point_resolver(file_name) {
-                    // Issue #325: the WinFSP resolver returns
+                // Issue #325 debug: trace what the resolver returns so
+                // we can see why some paths don't get the reparse
+                // branch even when the underlying callback succeeded.
+                let resolver_outcome = reparse_point_resolver(file_name);
+                if let Some(security) = resolver_outcome {
+                    tracing::info!(
+                        name = %name,
+                        resolver_attributes = security.attributes,
+                        resolver_reparse = security.reparse,
+                        "winfsp::get_security_by_name: resolver returned Some(reparse)"
+                    );
                     // `reparse: true` with `attributes =
                     // reparse_index` for any found reparse
                     // point. For an intermediate component the
