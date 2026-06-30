@@ -1088,3 +1088,116 @@ fn winfsp_flush_readonly_handle_is_noop() {
 
     drop(guard);
 }
+
+/// Issue #308: the WinFSP kernel calls
+/// `get_security` on every Explorer Refresh, every
+/// Properties dialog, and every `Get-Acl` / `icacls`
+/// invocation. Pre-fix the adapter returned
+/// STATUS_INVALID_DEVICE_REQUEST, which made the
+/// Security tab in Properties empty, broke
+/// `icacls V:\file.txt`, and caused EDR / Defender
+/// ACL scans to misreport the mount. Post-fix the
+/// adapter synthesizes a 72-byte self-relative SD
+/// granting `Everyone` full access. This test
+/// shells out to `icacls.exe` (the simplest tool
+/// that prints the effective ACL on a file) to
+/// verify the kernel hands back a non-empty
+/// descriptor with the `Everyone` entry.
+#[test]
+fn winfsp_get_security_returns_synthetic_acl() {
+    let fs = Arc::new(make_memory_fs());
+    let guard = mntrs::core_fs::test_helpers::mount_winfsp(fs.clone()).expect("mount");
+    let mp = &guard.mount_path;
+    settle();
+
+    // Seed a file via the remote backend so the
+    // mount-side `get_security` callback has a
+    // real ino to look up.
+    write_remote(&fs, "_ci_acl.txt", b"data");
+    let file_path = format!("{mp}_ci_acl.txt");
+    // Touch the file via mount to force
+    // `get_security_by_name` to populate the ino
+    // cache; subsequent `get_security` calls go
+    // through the per-ino path that the SD fix
+    // targets.
+    let _ = std::fs::metadata(&file_path).unwrap();
+
+    // Run `icacls <file>` and capture stdout. The
+    // exit code is 0 on success, 1 on partial
+    // failures (e.g. "Some files could not be
+    // processed"). We only assert that the
+    // output contains the `Everyone` ACE marker
+    // — that's the proof the kernel received a
+    // real SD from our adapter.
+    let output = std::process::Command::new("icacls.exe")
+        .arg(&file_path)
+        .output()
+        .expect("icacls.exe not found (Windows-only test)");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        !stdout.is_empty() || !stderr.is_empty(),
+        "icacls produced no output for {file_path} (exit={:?})",
+        output.status.code()
+    );
+    assert!(
+        combined.contains("Everyone"),
+        "icacls output missing `Everyone` ACE for {file_path} -- \
+         kernel probably received an empty SD. Output:\n{combined}"
+    );
+    assert!(
+        combined.contains("_ci_acl.txt"),
+        "icacls output missing the target file name; \
+         got: {combined}"
+    );
+
+    drop(guard);
+}
+
+/// Issue #308: `set_security` must accept the
+/// change rather than return
+/// STATUS_INVALID_DEVICE_REQUEST. `icacls /grant`
+/// is the canonical user-mode tool that exercises
+/// this path (the `/grant` flag calls
+/// `SetSecurityInfo` with DACL-security-info on
+/// the file's SD). Pre-fix the adapter rejected
+/// every such call, breaking the common
+/// "permission fix" workflow.
+#[test]
+fn winfsp_set_security_accepts_grant() {
+    let fs = Arc::new(make_memory_fs());
+    let guard = mntrs::core_fs::test_helpers::mount_winfsp(fs.clone()).expect("mount");
+    let mp = &guard.mount_path;
+    settle();
+
+    write_remote(&fs, "_ci_set_acl.txt", b"data");
+    let file_path = format!("{mp}_ci_set_acl.txt");
+    let _ = std::fs::metadata(&file_path).unwrap();
+
+    // `icacls <file> /grant:r Everyone:(R)` is a
+    // roundtrip grant: revoke, then grant. The
+    // `/grant:r` flag requests a "generic read"
+    // DACL entry. Pre-#308 this returned
+    // `Access is denied` or `The requested
+    // operation requires an interactive window
+    // station` because the kernel couldn't apply
+    // the DACL. Post-#308 the kernel accepts the
+    // change (no-op at our end; we still return
+    // the synthesized SD on subsequent reads).
+    let output = std::process::Command::new("icacls.exe")
+        .arg(&file_path)
+        .arg("/grant:r")
+        .arg("Everyone:(R)")
+        .output()
+        .expect("icacls.exe");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "icacls /grant failed for {file_path} (exit={:?})\nstdout: {stdout}\nstderr: {stderr}",
+        output.status.code()
+    );
+
+    drop(guard);
+}
