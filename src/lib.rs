@@ -3091,29 +3091,53 @@ impl CoreFilesystem for MntrsFs {
             // insert) can't drift between the two paths.
             let first_blk = part.offset / CACHE_BLOCK_SIZE;
             let data = part.data.clone();
-            let n_blks = (data.len() as u64).div_ceil(CACHE_BLOCK_SIZE);
-            for i in 0..n_blks {
-                let s = (i * CACHE_BLOCK_SIZE) as usize;
-                let e = ((i + 1) * CACHE_BLOCK_SIZE) as usize;
-                // Issue #334 (sister to #331): skip the trailing
-                // partial block. `part.data` can be < CACHE_BLOCK_SIZE
-                // when BackpressureController shrinks the prefetcher
-                // window to the 128 KiB floor under `--mem-limit`
-                // pressure (prefetcher.rs:303). Without this guard,
-                // a 128 KiB slice would be `mem_cache.put`-ed under
-                // an 8 MiB block-aligned key, poisoning L1/L2 the
-                // same way #331's whole-file `put` did. The short
-                // tail falls through to the read handler's normal
-                // cache-miss path (multi_cache.read_block / remote
-                // fetch) on the next read, so the file is still
-                // correctly served — just without the prefetch
-                // warmup for the last partial block.
-                if e > data.len() {
-                    break;
+            // Issue #345: when `part.offset` is not block-aligned
+            // (e.g. 29.17 MiB), the original code wrote
+            // `data[i*8M..(i+1)*8M]` to block `first_blk + i` —
+            // but `data[0..8M]` starts at `part.offset` (29.17 MiB),
+            // not at the block boundary (24 MiB). Result: the
+            // .block file for block 3 contained f_02 source bytes
+            // from 29.17 MiB, not 24 MiB. Off-by-(part.offset %
+            // CACHE_BLOCK_SIZE) in every .block file. Fix: skip the
+            // leading partial block (data[0..8M - offset_in_blk]) and
+            // start writing from the next full block, with
+            // `first_full_blk = first_blk + 1`. Trailing partial
+            // block is still skipped (issue #334). Partial blocks
+            // fall through to the read handler's normal cache-miss
+            // path (file-level cache or remote fetch) on next read.
+            let offset_in_blk = (part.offset % CACHE_BLOCK_SIZE) as usize;
+            let (data_start, first_full_blk) = if offset_in_blk > 0 {
+                ((CACHE_BLOCK_SIZE as usize) - offset_in_blk, first_blk + 1)
+            } else {
+                (0, first_blk)
+            };
+            if data_start < data.len() {
+                let n_blks = ((data.len() - data_start) as u64).div_ceil(CACHE_BLOCK_SIZE);
+                for i in 0..n_blks {
+                    let s = data_start + (i * CACHE_BLOCK_SIZE) as usize;
+                    let e = data_start + ((i + 1) * CACHE_BLOCK_SIZE) as usize;
+                    // Issue #334 (sister to #331): skip the trailing
+                    // partial block. `part.data` can be <
+                    // CACHE_BLOCK_SIZE when BackpressureController
+                    // shrinks the prefetcher window to the 128 KiB
+                    // floor under `--mem-limit` pressure
+                    // (prefetcher.rs:303). Without this guard, a
+                    // 128 KiB slice would be `mem_cache.put`-ed
+                    // under an 8 MiB block-aligned key, poisoning
+                    // L1/L2 the same way #331's whole-file `put`
+                    // did. The short tail falls through to the read
+                    // handler's normal cache-miss path
+                    // (multi_cache.read_block / remote fetch) on
+                    // the next read, so the file is still correctly
+                    // served — just without the prefetch warmup
+                    // for the last partial block.
+                    if e > data.len() {
+                        break;
+                    }
+                    let slice = data.slice(s..e);
+                    self.mem_cache.put(ino, first_full_blk + i, slice.clone());
+                    self.write_block_cached(&path, first_full_blk + i, &slice);
                 }
-                let slice = data.slice(s..e);
-                self.mem_cache.put(ino, first_blk + i, slice.clone());
-                self.write_block_cached(&path, first_blk + i, &slice);
             }
             let start = (offset - part.offset) as usize;
             let end = (start + size as usize).min(data.len());
@@ -3456,8 +3480,25 @@ impl CoreFilesystem for MntrsFs {
         // (ino, block_idx) key, evicting anything else in cache
         // and forcing the next read on a neighbouring block to
         // re-fetch from remote. Bytes::slice is zero-copy.
-        let first_blk = offset / CACHE_BLOCK_SIZE;
-        let n_blks = (b.len() as u64).div_ceil(CACHE_BLOCK_SIZE);
+        // Issue #345: same off-by-offset guard as the prefetcher
+        // pop path. When `offset` is not block-aligned, the
+        // original code wrote `b[i*8M..(i+1)*8M]` to block
+        // `first_blk + i` — but `b[0..8M]` starts at `offset`,
+        // not at the block boundary. Skip the leading partial
+        // block (b[0..8M - offset_in_blk]) and start at
+        // `first_full_blk = first_blk + 1`. Trailing partial
+        // block guard (issue #337) is preserved.
+        let first_blk_raw = offset / CACHE_BLOCK_SIZE;
+        let offset_in_blk = (offset % CACHE_BLOCK_SIZE) as usize;
+        let (data_start, first_blk) = if offset_in_blk > 0 {
+            (
+                (CACHE_BLOCK_SIZE as usize) - offset_in_blk,
+                first_blk_raw + 1,
+            )
+        } else {
+            (0, first_blk_raw)
+        };
+        let n_blks = ((b.len().saturating_sub(data_start)) as u64).div_ceil(CACHE_BLOCK_SIZE);
         // Issue #337 (refined): only skip the trailing partial
         // block if there is MORE file content past this read —
         // i.e. the read ended mid-block and a future read of the
@@ -3473,8 +3514,8 @@ impl CoreFilesystem for MntrsFs {
         // reads L1-hit, no remote re-fetch).
         let read_reached_eof = offset + b.len() as u64 >= actual_size;
         for i in 0..n_blks {
-            let s = (i * CACHE_BLOCK_SIZE) as usize;
-            let e = ((i + 1) * CACHE_BLOCK_SIZE) as usize;
+            let s = data_start + (i * CACHE_BLOCK_SIZE) as usize;
+            let e = data_start + ((i + 1) * CACHE_BLOCK_SIZE) as usize;
             if e > b.len() && !read_reached_eof {
                 // Poison guard: tiny slice at non-block-aligned
                 // end, more file content past it. Skip and let
@@ -3539,8 +3580,8 @@ impl CoreFilesystem for MntrsFs {
         if !self.direct_io {
             let cache_dir = self.cache_dir.clone();
             for i in 0..n_blks {
-                let s = (i * CACHE_BLOCK_SIZE) as usize;
-                let e = ((i + 1) * CACHE_BLOCK_SIZE) as usize;
+                let s = data_start + (i * CACHE_BLOCK_SIZE) as usize;
+                let e = data_start + ((i + 1) * CACHE_BLOCK_SIZE) as usize;
                 // Issue #337 (L2 side — same refined guard
                 // as the L1 populate above). If we wrote a
                 // sub-8 MiB slice as a block cache file at
