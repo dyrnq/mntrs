@@ -1316,6 +1316,34 @@ impl MntrsFs {
     }
 
     fn alloc_ino(&self, path: &str, kind: FileType, size: u64) -> u64 {
+        // Issue #325: reuse an existing ino for this path
+        // when one is still registered. The pre-fix
+        // "last writer wins" comment was wrong — a second
+        // alloc_ino for the same path mints a fresh ino
+        // (NEXT_INO.fetch_add) and overwrites path_to_ino,
+        // even though the FUSE kernel still has the
+        // previous ino in its dentry cache. Symptom:
+        // sub-test 10 step 5 (Remove-Item) sees the
+        // placeholder's ino flip from 33 → 34 across
+        // readdir → re-lookup, and the second batch of
+        // get_security_by_name callbacks returns a
+        // different ino than the first batch did, so the
+        // symlink's `cleanup` callback's inner.unlink
+        // looks up the wrong path. Reuse the existing
+        // ino when the inodes entry is still live; if it
+        // was forgotten (inodes no longer has the entry),
+        // drop the stale path_to_ino slot and allocate
+        // fresh.
+        if let Some(existing) = self.path_to_ino.get(path).map(|r| *r.value()) {
+            if self.inodes.contains_key(&existing) {
+                return existing;
+            }
+            // Stale reverse-map entry — the ino was forgotten
+            // but path_to_ino wasn't cleared (can happen if
+            // forget was skipped for symlinks, #325). Clear
+            // it and fall through to allocate fresh.
+            self.path_to_ino.remove(path);
+        }
         let ino = NEXT_INO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inodes
             .entry(ino)
@@ -1328,13 +1356,9 @@ impl MntrsFs {
             });
         // Maintain the path→ino reverse map (stat phase 2
         // — `find_ino_by_path` is on the hot stat path).
-        // Last writer wins on collision: a second
-        // alloc_ino for the same path overwrites the
-        // older ino entry, matching the inodes map's
-        // and_modify behavior above. The leftover inodes
-        // entry for the older ino is eventually swept by
-        // FUSE `forget` or never read (the FUSE kernel
-        // uses our latest reply).
+        // The pre-fix collision policy (overwrite) is now
+        // short-circuited above; this insert is the
+        // first-time-only registration.
         self.path_to_ino.insert(path.to_string(), ino);
         ino
     }
@@ -1353,6 +1377,21 @@ impl MntrsFs {
         size: u64,
         mtime: SystemTime,
     ) -> u64 {
+        // Issue #325: same path-collision reuse policy as
+        // `alloc_ino` — see the long-form comment there for
+        // the ino-fragmentation rationale. Without this, a
+        // readdir → readdir_materialise → alloc_ino loop
+        // mints a fresh ino per readdir and the FUSE kernel
+        // sees a different ino than the dentry cache holds.
+        if let Some(existing) = self.path_to_ino.get(path).map(|r| *r.value()) {
+            if self.inodes.contains_key(&existing) {
+                return existing;
+            }
+            // Stale reverse-map entry — the ino was
+            // forgotten but path_to_ino wasn't cleared.
+            // Clear and fall through to allocate fresh.
+            self.path_to_ino.remove(path);
+        }
         let ino = NEXT_INO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inodes
             .entry(ino)
@@ -2282,28 +2321,13 @@ impl CoreFilesystem for MntrsFs {
         if let Some(target) = self.symlinks.get(&full_path) {
             // Resolve or allocate an ino for this symlink path
             // so subsequent ops (getattr / setattr / unlink)
-            // can find it.
-            let ino = if let Some(existing) = self.path_to_ino.get(&full_path) {
-                *existing
-            } else {
-                tracing::warn!(
-                    path = %full_path,
-                    "Issue #325 debug: symlink path_to_ino MISS, allocating fresh ino"
-                );
-                let new_ino = self.alloc_ino(
-                    &full_path,
-                    FileType::Symlink,
-                    target.as_os_str().len() as u64,
-                );
-                self.path_to_ino.insert(full_path.clone(), new_ino);
-                new_ino
-            };
-            tracing::warn!(
-                path = %full_path,
-                ino,
-                pti_size = self.path_to_ino.len(),
-                inodes_size = self.inodes.len(),
-                "Issue #325 debug: symlink lookup resolved"
+            // can find it. alloc_ino* reuses an existing ino
+            // for the same path (Issue #325) so a readdir →
+            // re-lookup doesn't fragment the ino space.
+            let ino = self.alloc_ino(
+                &full_path,
+                FileType::Symlink,
+                target.as_os_str().len() as u64,
             );
             self.bump_lookup_count(ino);
             return Ok(self.core_attr_for_symlink(ino, &target));
@@ -5553,13 +5577,6 @@ impl CoreFilesystem for MntrsFs {
             // `create` at the same path can take
             // the slot without colliding with the
             // stale reverse pointer.
-            tracing::warn!(
-                ino,
-                path = %path,
-                ?kind,
-                is_symlink = kind == FileType::Symlink,
-                "Issue #325 debug: forget dropping state"
-            );
             if kind != FileType::Symlink {
                 self.path_to_ino
                     .remove_if(&path, |_, current_ino| *current_ino == ino);
