@@ -447,6 +447,39 @@ pub trait CoreFilesystem: Send + Sync {
         Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     }
 
+    /// Issue #325: promote an EXISTING ino (already created by
+    /// the placeholder `create` callback) to a symlink with the
+    /// given target. Differs from `symlink` in that the ino was
+    /// allocated by the adapter's `create` — the kernel holds the
+    /// handle to this ino, so we must NOT allocate a new one.
+    ///
+    /// Win32 flow for `New-Item -ItemType SymbolicLink V:\link V:\target`:
+    ///   1. `CreateFileW(FILE_OPEN_REPARSE_POINT)` → adapter `create`
+    ///      allocates an ino for the placeholder and writes a 0-byte
+    ///      file to the backend so the ino has something to point at.
+    ///   2. `FSCTL_SET_REPARSE_POINT` → adapter `set_reparse_point`
+    ///      decodes the target bytes from the REPARSE_DATA_BUFFER
+    ///      and calls THIS method with the placeholder ino.
+    ///
+    /// Without this method the adapter's `set_reparse_point` would
+    /// have to call `symlink(parent, name, target)` — which
+    /// allocates a fresh ino — leaving the kernel's handle
+    /// pointing at the placeholder ino (kind=RegularFile) while the
+    /// `symlinks` map points at a different ino. Subsequent
+    /// `getattr`/`get_file_info` on the placeholder ino would then
+    /// return RegularFile (no reparse bit, `LinkType=""`, `Target=""`)
+    /// instead of the symlink we just registered.
+    ///
+    /// Default returns Unsupported; only MntrsFs overrides.
+    fn attach_symlink_to_ino(
+        &self,
+        ino: u64,
+        target: &std::path::Path,
+    ) -> std::io::Result<CoreFileAttr> {
+        let _ = (ino, target);
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+
     /// Get volume statistics.
     fn statfs(&self, ino: u64) -> std::io::Result<CoreVolumeStat>;
 

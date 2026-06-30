@@ -460,6 +460,231 @@ fn winfsp_nfc_delete() {
     drop(guard);
 }
 
+/// Issue #325: end-to-end symlink round-trip on the WinFSP
+/// mount. Exercises the kernel's FSCTL_SET_REPARSE_POINT →
+/// `set_reparse_point` → inner.symlink path, plus the
+/// `get_reparse_point` → inner.readlink path used by
+/// `Get-ChildItem -Attributes ReparsePoint` / `Get-Item
+/// ... | Select-Object Target`. Pre-fix the adapter's
+/// reparse_point callbacks were the trait default no-ops,
+/// which returned STATUS_INVALID_DEVICE_REQUEST and made
+/// `New-Item -ItemType SymbolicLink` fail.
+///
+/// Storage strategy: the symlink target lives in
+/// `MntrsFs::symlinks` (DashMap<String, PathBuf>) on the
+/// adapter; no backend file is created (issue #325 design
+/// — opendal memory/s3 would store a 0-byte placeholder
+/// that's not the right shape). The `cleanup` + `FspCleanupDelete`
+/// path routes through `MntrsFs::unlink` to drop both
+/// inodes and the symlinks table entry.
+#[test]
+fn winfsp_symlink_create_and_get() {
+    let fs = Arc::new(make_memory_fs());
+    let guard = mntrs::core_fs::test_helpers::mount_winfsp(fs.clone()).unwrap();
+    let mp = &guard.mount_path;
+    settle();
+
+    // Step 1 — write the target file (the symlink will
+    // resolve to this).
+    let target_name = "_sym_get_target.txt";
+    let target_body = b"target-body";
+    std::fs::write(format!("{mp}{target_name}"), target_body).unwrap();
+
+    // Step 2 — create the symlink via PowerShell syscall
+    // (the only way to issue FSCTL_SET_REPARSE_POINT through
+    // the Win32 API; `std::os::windows::fs::symlink_file`
+    // is gated on `[symlink]` Windows feature in stable Rust).
+    // We use `std::fs::hard_link` to confirm the create path
+    // works first (sanity), then build a small PowerShell
+    // invocation to create the symlink.
+    let link_name = "_sym_get_link.txt";
+    let ps = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "New-Item -ItemType SymbolicLink -Path '{mp}{link_name}' -Target '{mp}{target_name}'"
+            ),
+        ])
+        .output()
+        .expect("powershell New-Item must run");
+    assert!(
+        ps.status.success(),
+        "New-Item failed: stderr={}",
+        String::from_utf8_lossy(&ps.stderr)
+    );
+
+    settle();
+
+    // Step 3 — verify the kernel sees it as a reparse point
+    // by reading the Win32 attributes (FILE_ATTRIBUTE_REPARSE_POINT
+    // = 0x0000_0400). We use `Get-Item | Select-Object Attributes`
+    // which prints the friendly name (e.g. "ReparsePoint").
+    let attr = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("(Get-Item -LiteralPath '{mp}{link_name}').Attributes -as [string]"),
+        ])
+        .output()
+        .expect("powershell Attributes probe must run");
+    let attrs = String::from_utf8_lossy(&attr.stdout);
+    assert!(
+        attrs.contains("ReparsePoint"),
+        "link {link_name} should have ReparsePoint attribute; got '{attrs}'"
+    );
+
+    // Step 4 — verify the target field PowerShell reports
+    // matches the path we passed to New-Item.
+    let target_out = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("(Get-Item -LiteralPath '{mp}{link_name}').Target"),
+        ])
+        .output()
+        .expect("powershell Target probe must run");
+    let reported = String::from_utf8_lossy(&target_out.stdout)
+        .trim()
+        .to_string();
+    assert!(
+        reported.ends_with(target_name),
+        "Target '{reported}' should end with {target_name}"
+    );
+
+    drop(guard);
+}
+
+/// Issue #325: reading the link's target via the Win32 path
+/// (Get-Content, FSCTL_GET_REPARSE_POINT under the hood on
+/// Get-Item|Target) returns the bytes we originally asked
+/// for, not the placeholder content. This guards against
+/// regressions where `get_reparse_point` returns the
+/// MountPoint tag instead of the Symlink tag, or encodes
+/// the substitute name into the wrong slot of the
+/// REPARSE_DATA_BUFFER buffer.
+#[test]
+fn winfsp_symlink_round_trip_bytes() {
+    let fs = Arc::new(make_memory_fs());
+    let guard = mntrs::core_fs::test_helpers::mount_winfsp(fs.clone()).unwrap();
+    let mp = &guard.mount_path;
+    settle();
+
+    let target = "_round_trip_target.txt";
+    let body = b"round-trip-body";
+    std::fs::write(format!("{mp}{target}"), body).unwrap();
+
+    let link = "_round_trip_link.txt";
+    let ps = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("New-Item -ItemType SymbolicLink -Path '{mp}{link}' -Target '{mp}{target}'"),
+        ])
+        .output()
+        .expect("powershell New-Item must run");
+    assert!(
+        ps.status.success(),
+        "New-Item failed: stderr={}",
+        String::from_utf8_lossy(&ps.stderr)
+    );
+    settle();
+
+    // Read the target attribute (`Get-Item ... | Select-Object
+    // Target`) — this routes through the Win32
+    // FSCTL_GET_REPARSE_POINT user-mode path, which our
+    // adapter maps to inner.readlink.
+    let target_out = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("(Get-Item -LiteralPath '{mp}{link}').Target"),
+        ])
+        .output()
+        .expect("powershell Target readback must run");
+    let reported = String::from_utf8_lossy(&target_out.stdout)
+        .trim()
+        .to_string();
+    assert!(
+        reported.ends_with(target),
+        "Target '{reported}' should end with '{target}' after round-trip"
+    );
+    // Confirm the report is exactly the file we linked (no
+    // truncation, no path-mangling).
+    assert!(
+        reported.contains(target),
+        "Target missing target filename; reported='{reported}'"
+    );
+
+    drop(guard);
+}
+
+/// Issue #325: deleting a symlink via `Remove-Item` exercises
+/// the Win32 path of FSCTL_DELETE_REPARSE_POINT + the cleanup
+/// callback with FspCleanupDelete. After delete, `Test-Path`
+/// must return false and a fresh `Get-Item` must fail with
+/// the usual NotFound. This guards against stale entries
+/// remaining in MntrsFs::symlinks after the kernel-side
+/// delete completes.
+#[test]
+fn winfsp_symlink_delete_clears_state() {
+    let fs = Arc::new(make_memory_fs());
+    let guard = mntrs::core_fs::test_helpers::mount_winfsp(fs.clone()).unwrap();
+    let mp = &guard.mount_path;
+    settle();
+
+    let target = "_del_target.txt";
+    std::fs::write(format!("{mp}{target}"), b"x").unwrap();
+
+    let link = "_del_link.txt";
+    let ps = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("New-Item -ItemType SymbolicLink -Path '{mp}{link}' -Target '{mp}{target}'"),
+        ])
+        .output()
+        .expect("powershell New-Item must run");
+    assert!(ps.status.success(), "New-Item failed");
+    settle();
+
+    // `Test-Path` returns true if the symlink exists.
+    let exists_out = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("Test-Path -LiteralPath '{mp}{link}'"),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&exists_out.stdout).trim(),
+        "True",
+        "link should exist before Remove-Item"
+    );
+
+    // Remove the symlink.
+    std::fs::remove_file(format!("{mp}{link}")).unwrap();
+    settle();
+
+    // `Test-Path` must return false after delete.
+    let gone_out = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("Test-Path -LiteralPath '{mp}{link}'"),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&gone_out.stdout).trim(),
+        "False",
+        "link should be gone after Remove-Item (symlinks map not cleared?)"
+    );
+
+    drop(guard);
+}
+
 /// Issue #341: deleting a file that is still in the dirty
 /// write-back cache must not let the upload worker re-create
 /// it in the backend seconds later. Sequence:

@@ -616,6 +616,24 @@ pub struct MntrsFs {
     /// user's perspective).
     writeback_pending: std::sync::Arc<dashmap::DashSet<String>>,
 
+    /// Issue #325: in-memory symlink target table.
+    /// Maps the canonical `path → target` for every symlink
+    /// created through `CoreFilesystem::symlink`. opendal 0.57
+    /// has no create_symlink / read_symlink / xattr API in its
+    /// core, so we cannot delegate to the backend — the target
+    /// has to live somewhere mntrs owns. In-memory only is fine
+    /// for #325 scope (WinFSP creates a symlink and reads it back
+    /// within a single mount session); persistence across
+    /// remounts is a separate issue if a use-case appears.
+    ///
+    /// Keyed on the canonical POSIX-style path (`"sub/dir/link"`)
+    /// — same form `lookup` / `create` / `read` use to look the
+    /// file up in `path_to_ino` and the backend. The value is
+    /// the literal link target as supplied by the caller (may be
+    /// absolute, relative, or a UNC path; mntrs does NOT resolve
+    /// it — that's the kernel's job via `get_reparse_point`).
+    symlinks: dashmap::DashMap<String, std::path::PathBuf>,
+
     /// Issue #132: shared adaptive prefetch-window controller. One
     /// instance per `MntrsFs` so every prefetcher (and every FUSE
     /// reader feeding them) shares the same producer-vs-consumer
@@ -2234,6 +2252,32 @@ impl CoreFilesystem for MntrsFs {
         } else {
             format!("{}/{}", parent_path, name)
         };
+        // Issue #325: if the entry is a symlink, surface it
+        // as `FileType::Symlink` before consulting the backend.
+        // Without this short-circuit the kernel would see a
+        // backend NotFound for the symlink path (we never
+        // create a real backend file for symlinks — see
+        // `MntrsFs::symlink`) and propagate ENOENT/NotFound
+        // to user mode, breaking `Get-Item V:\link` and
+        // `Test-Path V:\link` for freshly-created symlinks.
+        if let Some(target) = self.symlinks.get(&full_path) {
+            // Resolve or allocate an ino for this symlink path
+            // so subsequent ops (getattr / setattr / unlink)
+            // can find it.
+            let ino = if let Some(existing) = self.path_to_ino.get(&full_path) {
+                *existing
+            } else {
+                let new_ino = self.alloc_ino(
+                    &full_path,
+                    FileType::Symlink,
+                    target.as_os_str().len() as u64,
+                );
+                self.path_to_ino.insert(full_path.clone(), new_ino);
+                new_ino
+            };
+            self.bump_lookup_count(ino);
+            return Ok(self.core_attr_for_symlink(ino, &target));
+        }
         // stat_op talks to the backend, but freshly-written data
         // is still in the local cache file (5s async writeback
         // delay). If the backend says "not found" but a cache
@@ -2417,6 +2461,23 @@ impl CoreFilesystem for MntrsFs {
                 FileType::Directory,
                 SystemTime::UNIX_EPOCH,
             )));
+        }
+        // Issue #325: symlink short-circuit. The inodes entry
+        // was registered with `kind = Symlink` by either
+        // `MntrsFs::symlink` (create-side) or `lookup`'s
+        // symlink branch (lookup-side). Don't try to
+        // stat_op the backend — there's no backend file for a
+        // symlink, and the target path bytes are the size.
+        if let Some(InodeEntry { path, kind, .. }) = self.resolve(ino)
+            && kind == FileType::Symlink
+        {
+            let target = self.symlinks.get(&path).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("getattr: ino {ino} has no symlink entry for {path}"),
+                )
+            })?;
+            return Ok(self.core_attr_for_symlink(ino, &target));
         }
         if let Some(InodeEntry {
             path,
@@ -4777,6 +4838,27 @@ impl CoreFilesystem for MntrsFs {
         } else {
             format!("{}/{}", parent_path, name)
         };
+        // Issue #325: if the entry is a symlink, drop it from
+        // the in-memory table and bail without touching the
+        // backend (there is no backend file for a symlink — see
+        // `MntrsFs::symlink`). Also remove from path_to_ino /
+        // inodes so subsequent lookup returns NotFound.
+        if self.symlinks.remove(&full_path).is_some() {
+            if let Some(ino) = self.path_to_ino.remove(&full_path).map(|(_, v)| v) {
+                self.inodes.remove(&ino);
+                // Mirror the FUSE kernel's forget — drop our
+                // mirrored lookup_count so the inodes entry
+                // can be GC'd later. The kernel's own forget
+                // will arrive separately and bump the count
+                // back to zero, but for cleanliness we just
+                // let the inodes removal stand.
+            }
+            tracing::info!(
+                path = %full_path,
+                "MntrsFs::unlink: dropped symlink entry"
+            );
+            return Ok(());
+        }
         // #89 debug: log unlink calls
         tracing::warn!(
             parent = %parent_path,
@@ -5095,6 +5177,200 @@ impl CoreFilesystem for MntrsFs {
         }
     }
 
+    // --- Issue #325: symlink / readlink overrides ---
+    //
+    // opendal 0.57 has no create_symlink / read_symlink API in
+    // its core, so we cannot delegate to the backend. Instead
+    // we keep a small in-memory table (see `symlinks` field)
+    // and surface the link through the trait as
+    // `FileType::Symlink` with the target bytes returned by
+    // `readlink`.
+    //
+    // Win32 flow that exercises this:
+    //   * `New-Item -ItemType SymbolicLink V:\link V:\target`
+    //     → Win32 CreateSymbolicLinkW → kernel FSCTL_SET_REPARSE_POINT
+    //     → WinFspAdapter::set_reparse_point → inner.symlink (here).
+    //   * `Get-Item V:\link` → Win32 GetFileAttributes →
+    //     WinFspAdapter::get_file_info → inner.getattr → lookup path
+    //     (which short-circuits to FileType::Symlink when the
+    //     entry is in the symlinks map).
+    //   * `Get-Content V:\link` → kernel STATUS_REPARSE →
+    //     WinFspAdapter::get_reparse_point → inner.readlink (here).
+    //
+    // Persistence across remounts is out of scope (see issue
+    // body); the map lives only for the duration of the
+    // mount. If a use-case appears for surviving remounts the
+    // natural follow-up is a `.mntrs/symlinks.json` sidecar
+    // file in the backend root.
+
+    fn symlink(
+        &self,
+        parent: u64,
+        name: &str,
+        target: &std::path::Path,
+    ) -> std::io::Result<CoreFileAttr> {
+        let parent_path = self.resolve(parent).map(|e| e.path).unwrap_or_default();
+        let full_path = if parent_path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{parent_path}/{name}")
+        };
+        // Block creating a symlink with the same name as a
+        // regular file / directory — the Win32 `create` callback
+        // already rejects duplicates via inner.create's normal
+        // path, but a reparse-point create can bypass that, so
+        // check the symlinks map and the inodes table here.
+        if self.symlinks.contains_key(&full_path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("symlink already exists: {full_path}"),
+            ));
+        }
+        self.symlinks
+            .insert(full_path.clone(), target.to_path_buf());
+        // Allocate an ino for the symlink entry. We do NOT
+        // create a real backend file (opendal memory/s3/hdfs
+        // would store a 0-byte placeholder that the kernel
+        // would then try to `read`, polluting the user-visible
+        // file list with the link's own contents). Instead we
+        // hand out an ino backed only by `path_to_ino` +
+        // `symlinks`; lookup's symlink short-circuit handles
+        // the rest.
+        let ino = self.alloc_ino(
+            &full_path,
+            FileType::Symlink,
+            target.as_os_str().len() as u64,
+        );
+        tracing::debug!(
+            path = %full_path,
+            target = %target.display(),
+            ino,
+            size = target.as_os_str().len() as u64,
+            "MntrsFs::symlink: alloc_ino returned"
+        );
+        // Register in path_to_ino / inodes so subsequent
+        // `lookup`/`getattr` hits resolve back to the symlink.
+        // alloc_ino already inserted into both maps; nothing
+        // else to do here.
+        // Bug 33: bump the kernel lookup count so the entry
+        // doesn't get reaped on the next forget.
+        self.bump_lookup_count(ino);
+        tracing::info!(
+            path = %full_path,
+            target = %target.display(),
+            ino,
+            "MntrsFs::symlink: registered symlink target"
+        );
+        Ok(self.core_attr_for_symlink(ino, target))
+    }
+
+    fn readlink(&self, ino: u64) -> std::io::Result<Vec<u8>> {
+        // Resolve ino → canonical path, then look the target up
+        // in the symlinks map. The WinFSP `get_reparse_point`
+        // callback encodes this as a REPARSE_DATA_BUFFER
+        // before returning to the kernel.
+        let entry = self.resolve(ino).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("readlink: ino {ino} not found"),
+            )
+        })?;
+        let target = self.symlinks.get(&entry.path).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("readlink: ino {ino} is not a symlink ({})", entry.path),
+            )
+        })?;
+        // Return target as the raw path bytes the kernel
+        // expects in the SubstituteName slot — UTF-16LE on
+        // Windows, UTF-8 on Unix. The WinFSP callback encodes
+        // to UTF-16LE before stuffing into REPARSE_DATA_BUFFER.
+        Ok(target.as_os_str().as_encoded_bytes().to_vec())
+    }
+
+    /// Issue #325: promote an existing ino (already created by
+    /// the placeholder `create` callback) into a symlink with
+    /// the given target. See `CoreFilesystem::attach_symlink_to_ino`
+    /// for the full design rationale.
+    ///
+    /// Validates that `ino` exists and is currently a regular
+    /// file (not a directory or already-symlink), populates the
+    /// `symlinks` map for the ino's path, mutates the inodes
+    /// entry's `kind` to Symlink, and returns a `CoreFileAttr`
+    /// with the symlink kind set so the kernel sees
+    /// `FILE_ATTRIBUTE_REPARSE_POINT` on subsequent
+    /// `GetFileAttributes` calls (which `Get-Item … .LinkType`
+    /// relies on).
+    fn attach_symlink_to_ino(
+        &self,
+        ino: u64,
+        target: &std::path::Path,
+    ) -> std::io::Result<CoreFileAttr> {
+        // Resolve path BEFORE mutating state — if the ino doesn't
+        // exist we'd write a dangling entry to the symlinks map.
+        let path = {
+            let entry = self.inodes.get(&ino).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("attach_symlink_to_ino: ino {ino} not registered"),
+                )
+            })?;
+            // Validate the ino is a regular file — a directory or
+            // symlink passing through here would mean a kernel-
+            // side bug (reparse points are files only per Win32).
+            let e = entry.value();
+            match e.kind {
+                FileType::RegularFile => {}
+                FileType::Symlink => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "attach_symlink_to_ino: ino {ino} ({}) is already a symlink",
+                            e.path
+                        ),
+                    ));
+                }
+                FileType::Directory => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "attach_symlink_to_ino: ino {ino} ({}) is a directory, not a file",
+                            e.path
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+            e.path.clone()
+        };
+        // Insert into symlinks map. Pre-fix this set_reparse_point
+        // also routed through `symlink`, which allocates a fresh
+        // ino — leaving the kernel holding the placeholder ino
+        // (kind=RegularFile, no reparse tag) which then failed
+        // Get-Item (.LinkType=""). Insert via the inodes' path
+        // so readlink resolves through the same lookup key.
+        self.symlinks.insert(path.clone(), target.to_path_buf());
+        // Mutate the inodes entry's kind in place so subsequent
+        // getattr / get_file_info / lookup return Symlink, which
+        // makes `core_kind_to_file_attributes` set
+        // FILE_ATTRIBUTE_REPARSE_POINT for this ino.
+        self.inodes.alter(&ino, |_, mut entry| {
+            entry.kind = FileType::Symlink;
+            entry.size = target.as_os_str().len() as u64;
+            entry
+        });
+        // Maintain the kernel lookup count so the entry isn't
+        // reaped on the next forget (matches the symlink path).
+        self.bump_lookup_count(ino);
+        tracing::info!(
+            ino,
+            path = %path,
+            target = %target.display(),
+            "MntrsFs::attach_symlink_to_ino: promoted existing ino to symlink"
+        );
+        Ok(self.core_attr_for_symlink(ino, target))
+    }
+
     fn forget(&self, _ino: u64, _nlookup: u64) {
         // FUSE forget: kernel says it had `nlookup`
         // references to this inode and is now releasing
@@ -5164,6 +5440,20 @@ impl CoreFilesystem for MntrsFs {
 // path — impractical for an isolated unit test of the
 // fallback branch).
 impl MntrsFs {
+    /// Issue #325: build a `CoreFileAttr` for a freshly-registered
+    /// symlink. `size` is set to the target path's byte length
+    /// (POSIX convention) so the kernel has a sane EOF if a
+    /// user accidentally reads the link instead of following
+    /// it. Inherent (not `CoreFilesystem`) because it's an
+    /// internal helper used by `symlink`, `getattr`, and
+    /// `lookup`'s symlink short-circuit — not a filesystem
+    /// callback the trait intends to expose.
+    fn core_attr_for_symlink(&self, ino: u64, target: &std::path::Path) -> CoreFileAttr {
+        let now = SystemTime::now();
+        let attr = self.make_attr(ino, target.as_os_str().len() as u64, FileType::Symlink, now);
+        to_core_attr(&attr)
+    }
+
     /// Issue #257: opt-in fallback for the read path. When
     /// `read_stale_on_backend_error` is `true` and the
     /// backend fetch fails, attempt to return bytes from
@@ -5742,6 +6032,10 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         #[cfg(not(windows))]
         fuse_notifier: std::sync::OnceLock::new(),
         writeback_pending: Arc::new(dashmap::DashSet::new()),
+        // Issue #325: in-memory symlink target table. Empty in
+        // tests; populated only by tests that exercise the
+        // symlink code paths.
+        symlinks: dashmap::DashMap::new(),
         // Issue #132: shared adaptive prefetch window controller.
         // Default min=128 KiB matches the read_chunk_size clamp
         // floor (lib.rs `self.read_chunk_size.clamp(131072, 16 MiB)`)

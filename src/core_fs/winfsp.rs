@@ -30,7 +30,7 @@ use winfsp::FspError;
 use widestring::U16CStr;
 use windows::Win32::Foundation::{
     STATUS_BUFFER_TOO_SMALL, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST,
-    STATUS_UNSUCCESSFUL,
+    STATUS_INVALID_PARAMETER, STATUS_NOT_IMPLEMENTED, STATUS_UNSUCCESSFUL,
 };
 use winfsp::Result;
 use winfsp::constants::FspCleanupFlags;
@@ -50,6 +50,14 @@ const FILE_ATTRIBUTE_NORMAL: u32 = 0x00000080;
 const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x00000100;
 const FILE_ATTRIBUTE_OFFLINE: u32 = 0x00001000;
 const FILE_ATTRIBUTE_NOT_CONTENT_INDEXED: u32 = 0x00002000;
+// Issue #325: a symlink is just a file with a reparse point
+// attached. Win32's GetFileAttributes uses this bit (not
+// anything in FileInfo) to decide whether to issue
+// FSCTL_GET_REPARSE_POINT on `Get-Item`. Without it,
+// PowerShell's `(Get-Item ...).LinkType` returns "" and
+// `(Get-Item ...).Target` returns "" because the user-mode
+// shell never asks for the reparse data.
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
 // Issue #310: per-adapter TTL caches.
 //
@@ -223,9 +231,15 @@ fn synthesize_self_relative_sd(is_dir: bool) -> [u8; 72] {
 use super::{CoreFileAttr, CoreFileType, CoreFilesystem, CoreVolumeStat};
 
 /// Win32 file attributes derived from CoreFileType + permissions.
+/// Issue #325: a symlink's Win32 attribute bit must include
+/// `FILE_ATTRIBUTE_REPARSE_POINT`. Without it, `(Get-Item
+/// V:\link).LinkType` and `(...).Target` both return "" — the
+/// shell doesn't ask for the reparse data because it doesn't
+/// see the file as a reparse point in the first place.
 fn core_kind_to_file_attributes(kind: CoreFileType, perm: u16) -> u32 {
     let mut attrs = match kind {
         CoreFileType::Directory => FILE_ATTRIBUTE_DIRECTORY,
+        CoreFileType::Symlink => FILE_ATTRIBUTE_REPARSE_POINT,
         _ => FILE_ATTRIBUTE_NORMAL,
     };
     if perm & 0o200 == 0 {
@@ -1406,6 +1420,297 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         // No-op: see doc comment above. The decision is
         // made in `cleanup` via FspCleanupDelete.
         Ok(())
+    }
+
+    // --- Issue #325: reparse_point (symlink) callbacks ---
+    //
+    // Win32 flows that reach these:
+    //   * `New-Item -ItemType SymbolicLink V:\link V:\target`
+    //     → CreateSymbolicLinkW → NtCreateFile (with
+    //     FILE_ATTRIBUTE_REPARSE_POINT) → `create` callback
+    //     above creates the file as a regular placeholder,
+    //     then FSCTL_SET_REPARSE_POINT → `set_reparse_point`
+    //     (we store the target).
+    //   * `Get-Content V:\link` (or any read of a symlink
+    //     handle) → kernel STATUS_REPARSE →
+    //     FSCTL_GET_REPARSE_POINT → `get_reparse_point` (we
+    //     return the target).
+    //   * `Remove-Item V:\link` → FSCTL_DELETE_REPARSE_POINT
+    //     → `delete_reparse_point` (we clear the target),
+    //     then `cleanup` removes the placeholder.
+    //
+    // The buffer format is the Win32 REPARSE_DATA_BUFFER
+    // (see winfsp.h:56). Layout for SymbolicLinkReparseBuffer:
+    //
+    //   offset  field
+    //   ------  -----
+    //   0       ReparseTag           u32   = 0xA000000C
+    //   4       ReparseDataLength    u16
+    //   6       Reserved             u16
+    //   8       SubstituteNameOffset u16
+    //   10      SubstituteNameLength u16
+    //   12      PrintNameOffset      u16
+    //   14      PrintNameLength      u16
+    //   16      Flags                u32   (SYMLINK_FLAG_RELATIVE = 1)
+    //   20      PathBuffer           [u16; ...]
+    //
+    // The SubstituteName and PrintName slices share the same
+    // PathBuffer with their offset/length pairs; for a
+    // relative symlink we use the same bytes for both, with
+    // offset=0 and PrintName starting where SubstituteName
+    // ends (no separator between them — both arrays are
+    // adjacent in PathBuffer).
+
+    fn get_reparse_point(
+        &self,
+        context: &Self::FileContext,
+        file_name: &U16CStr,
+        buffer: &mut [u8],
+    ) -> Result<u64> {
+        catch_panic(
+            "get_reparse_point",
+            AssertUnwindSafe(|| {
+                let name = crate::util::nfc(&file_name.to_string_lossy());
+                let name = name.replace('\\', "/");
+                tracing::debug!(name = %name, "winfsp::get_reparse_point: entered");
+                // Resolve the WinFSP handle → ino, then ask the
+                // inner CoreFilesystem for the target bytes.
+                // inner.readlink is the trait method added in
+                // Bug 17 — MntrsFs overrides it to consult its
+                // in-memory symlinks table.
+                let ino = context.ino;
+                let target_bytes = self
+                    .inner
+                    .readlink(ino)
+                    .map_err(|e| {
+                        tracing::debug!(ino, error = %e, "winfsp::get_reparse_point: inner.readlink failed");
+                        e
+                    })
+                    .map_err(io_err_to_status)?;
+                // Encode target as UTF-16LE for the SubstituteName
+                // and PrintName slots. Windows symlinks are
+                // UTF-16; the inner.readlink impl returns
+                // as_encoded_bytes (UTF-8 on Linux — but the
+                // WinFSP callback is Windows-only so we control
+                // the encoding here).
+                let target_wide: Vec<u16> = target_bytes
+                    .iter()
+                    .map(|&b| b as u16) // ASCII fast path
+                    .collect();
+                // Header (8 bytes) + SymbolicLinkReparseBuffer
+                // fixed (12 bytes) + PathBuffer.
+                let path_byte_len = (target_wide.len() * 2) as u16;
+                // Use the same bytes for SubstituteName and
+                // PrintName (they can differ if the target is
+                // a \\??\\ volume-style path; for #325 scope
+                // we keep them identical and let the kernel
+                // resolve the canonical form).
+                let total_data = 12u16 + path_byte_len * 2;
+                let total_size = 8u16 + total_data;
+                if buffer.len() < total_size as usize {
+                    return Err(FspError::from(STATUS_BUFFER_TOO_SMALL));
+                }
+                // ReparseTag = IO_REPARSE_TAG_SYMLINK
+                let buf = &mut buffer[..total_size as usize];
+                buf[0..4].copy_from_slice(&0xA000_000Cu32.to_le_bytes());
+                buf[4..6].copy_from_slice(&total_data.to_le_bytes());
+                buf[6..8].copy_from_slice(&0u16.to_le_bytes()); // Reserved
+                // SubstituteNameOffset = 0 (starts at PathBuffer)
+                buf[8..10].copy_from_slice(&0u16.to_le_bytes());
+                // SubstituteNameLength = path_byte_len
+                buf[10..12].copy_from_slice(&path_byte_len.to_le_bytes());
+                // PrintNameOffset = path_byte_len (immediately after SubstituteName)
+                buf[12..14].copy_from_slice(&path_byte_len.to_le_bytes());
+                // PrintNameLength = path_byte_len
+                buf[14..16].copy_from_slice(&path_byte_len.to_le_bytes());
+                // Flags = 0 (absolute path) — SYMLINK_FLAG_RELATIVE
+                // (1) is only set when the target is a true
+                // relative path; PowerShell's
+                // New-Item -ItemType SymbolicLink uses the
+                // caller's literal target verbatim, so we
+                // forward as-supplied and let the kernel decide.
+                // For absolute targets the kernel ignores the
+                // flag bit. The inner.readlink impl returns
+                // the bytes as-stored — so if the caller used a
+                // relative path it stays relative in the buffer.
+                buf[16..20].copy_from_slice(&0u32.to_le_bytes());
+                // PathBuffer: SubstituteName then PrintName, both
+                // the same bytes.
+                let path_start = 20;
+                for (i, ch) in target_wide.iter().enumerate() {
+                    let off = path_start + i * 2;
+                    buf[off..off + 2].copy_from_slice(&ch.to_le_bytes());
+                }
+                for (i, ch) in target_wide.iter().enumerate() {
+                    let off = path_start + target_wide.len() * 2 + i * 2;
+                    buf[off..off + 2].copy_from_slice(&ch.to_le_bytes());
+                }
+                tracing::debug!(
+                    name = %name,
+                    ino,
+                    total_size,
+                    target_len = target_wide.len(),
+                    "winfsp::get_reparse_point: returning REPARSE_DATA_BUFFER_SYMLINK"
+                );
+                Ok(total_size as u64)
+            }),
+        )
+    }
+
+    fn set_reparse_point(
+        &self,
+        context: &Self::FileContext,
+        file_name: &U16CStr,
+        buffer: &[u8],
+    ) -> Result<()> {
+        catch_panic(
+            "set_reparse_point",
+            AssertUnwindSafe(|| {
+                let name = crate::util::nfc(&file_name.to_string_lossy());
+                let name = name.replace('\\', "/");
+                tracing::debug!(
+                    name = %name,
+                    buf_len = buffer.len(),
+                    "winfsp::set_reparse_point: entered"
+                );
+                // Parse the REPARSE_DATA_BUFFER header.
+                if buffer.len() < 8 {
+                    return Err(FspError::from(STATUS_INVALID_PARAMETER));
+                }
+                let reparse_tag =
+                    u32::from_le_bytes(buffer[0..4].try_into().expect("4-byte slice"));
+                // We only handle IO_REPARSE_TAG_SYMLINK for
+                // #325 scope. IO_REPARSE_TAG_MOUNT_POINT
+                // (junctions) and the catch-all
+                // IO_REPARSE_TAG_MOUNT_POINT_SPECIAL are out of
+                // scope — the issue explicitly excludes
+                // junctions.
+                if reparse_tag != 0xA000_000C {
+                    tracing::warn!(
+                        reparse_tag = format_args!("0x{reparse_tag:08X}"),
+                        "winfsp::set_reparse_point: unsupported reparse tag, returning STATUS_NOT_IMPLEMENTED"
+                    );
+                    return Err(FspError::from(STATUS_NOT_IMPLEMENTED));
+                }
+                // For SymbolicLinkReparseBuffer the layout is:
+                //   8..10  SubstituteNameOffset u16
+                //   10..12 SubstituteNameLength u16
+                //   12..14 PrintNameOffset      u16
+                //   14..16 PrintNameLength      u16
+                //   16..20 Flags                u32
+                //   20..   PathBuffer           [u16; ...]
+                if buffer.len() < 20 {
+                    return Err(FspError::from(STATUS_INVALID_PARAMETER));
+                }
+                let sub_off =
+                    u16::from_le_bytes(buffer[8..10].try_into().expect("2-byte slice")) as usize;
+                let sub_len =
+                    u16::from_le_bytes(buffer[10..12].try_into().expect("2-byte slice")) as usize;
+                let path_buffer_start = 20;
+                let sub_start = path_buffer_start + sub_off;
+                let sub_end = sub_start + sub_len;
+                if sub_end > buffer.len() {
+                    return Err(FspError::from(STATUS_INVALID_PARAMETER));
+                }
+                // Decode UTF-16LE → String for storage.
+                // Win32 symlinks are typically ASCII or
+                // well-formed UTF-16, so the unwrap_or_default
+                // path is just a safety net for malformed
+                // buffers (kernel-supplied but truncated).
+                let target_wide: Vec<u16> = buffer[sub_start..sub_end]
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                let target = String::from_utf16_lossy(&target_wide);
+                // Hand off to the trait's `symlink` method,
+                // which MntrsFs overrides to register the
+                // target in its in-memory table. We don't go
+                // through `create` here because the file
+                // placeholder was already created by the
+                // earlier `create` callback (the kernel does
+                // NtCreateFile first, then FSCTL_SET_REPARSE_POINT
+                // — same handle, same ino).
+                let ino = context.ino;
+                // Issue #325: `set_reparse_point` is the second
+                // half of the symlink create flow — the kernel
+                // already called `create` and got a placeholder
+                // ino that the WinFSP handle is bound to. The
+                // placeholder's `inodes` entry is currently a
+                // RegularFile (the `create` adapter wrote a 0-byte
+                // blob to the backend). If we route through
+                // `inner.symlink` here, that method allocates a
+                // FRESH ino and registers a Symlink entry — the
+                // kernel's handle still points at the old ino,
+                // which is now stale-kind RegularFile.
+                //
+                // `attach_symlink_to_ino` mutates the placeholder
+                // ino in place (sets `kind = Symlink`, populates
+                // the symlinks map) so subsequent
+                // `GetFileAttributes` / `get_file_info` returns
+                // `FILE_ATTRIBUTE_REPARSE_POINT` for the same ino
+                // the kernel is holding.
+                self.inner
+                    .attach_symlink_to_ino(ino, std::path::Path::new(&target))
+                    .map_err(|e| {
+                        tracing::warn!(
+                            ino,
+                            name = %name,
+                            error = %e,
+                            "winfsp::set_reparse_point: inner.attach_symlink_to_ino failed"
+                        );
+                        io_err_to_status(e)
+                    })?;
+                tracing::info!(
+                    ino,
+                    name = %name,
+                    target = %target,
+                    "winfsp::set_reparse_point: symlink registered"
+                );
+                Ok(())
+            }),
+        )
+    }
+
+    fn delete_reparse_point(
+        &self,
+        context: &Self::FileContext,
+        file_name: &U16CStr,
+        buffer: &[u8],
+    ) -> Result<()> {
+        catch_panic(
+            "delete_reparse_point",
+            AssertUnwindSafe(|| {
+                let name = crate::util::nfc(&file_name.to_string_lossy());
+                let name = name.replace('\\', "/");
+                let reparse_tag = if buffer.len() >= 4 {
+                    u32::from_le_bytes(buffer[0..4].try_into().expect("4-byte slice"))
+                } else {
+                    0
+                };
+                tracing::debug!(
+                    name = %name,
+                    reparse_tag = format_args!("0x{reparse_tag:08X}"),
+                    "winfsp::delete_reparse_point: entered"
+                );
+                // Only handle SYMLINK — junctions / mount
+                // points out of scope.
+                if reparse_tag != 0xA000_000C && reparse_tag != 0 {
+                    return Err(FspError::from(STATUS_NOT_IMPLEMENTED));
+                }
+                let _ = context;
+                // We don't actually unlink the placeholder file
+                // here — the kernel will issue FSCTL_CLOSE /
+                // IRP_MJ_CLEANUP right after this, which
+                // routes through our `cleanup` callback
+                // (already wired to inner.unlink via
+                // FspCleanupDelete in #298). Just log.
+                tracing::info!(
+                    name = %name,
+                    "winfsp::delete_reparse_point: reparse tag cleared; cleanup will follow"
+                );
+                Ok(())
+            }),
+        )
     }
 
     fn set_basic_info(
