@@ -743,26 +743,34 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 let name = crate::util::nfc(&file_name.to_string_lossy());
                 tracing::info!(name = %name, "winfsp::get_security_by_name: entered");
                 let path = name.replace('\\', "/");
-                // Issue #325: if the kernel-supplied path IS a
-                // reparse point (a symlink), invoke the resolver.
-                // WinFSP will call `get_reparse_point_by_name`
-                // internally; if that returns a REPARSE_DATA_BUFFER
-                // we mirror its FileSecurity here. Returning
-                // `reparse: true` causes WinFSP to surface
-                // STATUS_REPARSE to the kernel, which then re-issues
-                // the open on the resolved SubstituteName
-                // (`\??\V:\_ci_small.txt`) — that's the path that
-                // `Get-Content V:\_ci_symlink.txt` actually needs to
-                // land on to read the file. Pre-fix we ignored the
-                // resolver and always returned `reparse: false`, so
-                // WinFSP opened our placeholder as if it were a
-                // regular 0-byte file and `Get-Content` got
+                // Issue #325: invoke the resolver to detect reparse
+                // points in the kernel-supplied path. WinFSP will
+                // call `get_reparse_point_by_name` internally; if
+                // that returns a REPARSE_DATA_BUFFER we mirror its
+                // FileSecurity here. Returning `reparse: true`
+                // causes WinFSP to surface STATUS_REPARSE to the
+                // kernel, which then re-issues the open on the
+                // resolved SubstituteName (`\??\V:\_ci_small.txt`)
+                // — that's the path that `Get-Content
+                // V:\_ci_symlink.txt` actually needs to land on to
+                // read the file. Pre-fix we ignored the resolver
+                // and always returned `reparse: false`, so WinFSP
+                // opened our placeholder as if it were a regular
+                // 0-byte file and `Get-Content` got
                 // ERROR_PATH_NOT_FOUND for `V:\_ci_symlink.txt`
                 // (the kernel's pre-open stat couldn't tell it was
                 // following a symlink).
-                // Issue #325 debug: trace what the resolver returns so
-                // we can see why some paths don't get the reparse
-                // branch even when the underlying callback succeeded.
+                //
+                // We invoke the resolver here, but note: WinFSP's
+                // `FspFileSystemFindReparsePoint` only invokes
+                // `get_reparse_point_by_name` for INTERMEDIATE
+                // path components — a single-component path like
+                // `\_ci_symlink.txt` makes the resolver return
+                // None. So we have to fall back to the lookup-ok
+                // branch for root-level symlinks and call the
+                // resolver from there (if the path has any
+                // intermediate components) or surface STATUS_REPARSE
+                // ourselves (if it's a single-component symlink).
                 let resolver_outcome = reparse_point_resolver(file_name);
                 if let Some(security) = resolver_outcome {
                     tracing::info!(
@@ -850,6 +858,11 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                     );
                     return Ok(security);
                 }
+                // Resolver returned None — fall through to the
+                // lookup-ok branch. If the lookup shows the file
+                // is a symlink, surface STATUS_REPARSE from there
+                // (the resolver can't find a reparse because
+                // there are no intermediate components).
                 let parent = 1u64; // root
                 // Issue #249 follow-up: WinFSP's pre-open stat uses
                 // the `attributes` field here to decide whether the
@@ -869,6 +882,70 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 io_err_to_status(e)
             })?;
                 let attributes = core_kind_to_file_attributes(attr.kind, attr.perm);
+                // Issue #325: WinFSP's `FspFileSystemFindReparsePoint`
+                // (see winfsp/src/dll/fsop.c:1537) only invokes
+                // `get_reparse_point_by_name` for INTERMEDIATE path
+                // components — for a single-component path like
+                // `\_ci_symlink.txt` the resolver's inner loop hits
+                // the trailing `\0` and returns FALSE without calling
+                // our callback. So the resolver path above is only
+                // hit for nested paths like `/dir/link` where `link`
+                // is a symlink. For root-level symlinks we have to
+                // surface the reparse ourselves from the lookup-ok
+                // branch, otherwise WinFSP returns STATUS_SUCCESS
+                // for what is actually a reparse point, the kernel
+                // stores a normal-file FCB, and `Remove-Item` fails
+                // with ERROR_FILE_NOT_FOUND (the kernel never issues
+                // `FSCTL_DELETE_REPARSE_POINT` because it doesn't
+                // know the file is a reparse point).
+                //
+                // Returning `reparse: true` here causes WinFSP to
+                // return STATUS_REPARSE to the kernel. The kernel
+                // then re-issues the create on the SubstituteName
+                // (the target) — *unless* the caller specified
+                // `FILE_OPEN_REPARSE_POINT` in CreateOptions (e.g.
+                // `Remove-Item`, which wants to act on the symlink
+                // itself). WinFSP passes that distinction through
+                // to `FspFileSystemResolveReparsePoints` as
+                // `ResolveLastPathComponent`: TRUE means "resolve
+                // the final component to its target" (read path),
+                // FALSE means "return the symlink as-is" (delete
+                // path). So the same `reparse: true` return value
+                // is correct for both read and delete operations;
+                // the kernel-side open flags decide which path
+                // gets taken.
+                //
+                // Surface STATUS_REPARSE for symlinks the
+                // resolver missed (single-component paths).
+                if attr.kind == CoreFileType::Symlink {
+                    // The resolver already returned None above
+                    // (its `FspFileSystemFindReparsePoint` only
+                    // walks intermediate components, so a
+                    // single-component path like
+                    // `\_ci_symlink.txt` makes it return FALSE
+                    // without invoking `get_reparse_point_by_name`).
+                    // We now know from our own `lookup` that the
+                    // path IS a symlink, so we have to surface
+                    // STATUS_REPARSE ourselves: `reparse: true`
+                    // makes WinFSP return STATUS_REPARSE to the
+                    // kernel, which then re-issues the create on
+                    // the resolved name (target) — *unless* the
+                    // caller specified `FILE_OPEN_REPARSE_POINT`
+                    // (e.g. `Remove-Item`), in which case the
+                    // kernel keeps the symlink open and issues
+                    // `FSCTL_DELETE_REPARSE_POINT` on close.
+                    tracing::info!(
+                        name = %name,
+                        ino = attr.ino,
+                        attributes,
+                        "winfsp::get_security_by_name: symlink fallback, surfacing STATUS_REPARSE"
+                    );
+                    return Ok(FileSecurity {
+                        reparse: true,
+                        sz_security_descriptor: 0,
+                        attributes: 0,
+                    });
+                }
                 tracing::info!(name = %name, ?attr.kind, attributes, "winfsp::get_security_by_name: ok");
                 Ok(FileSecurity {
                     reparse: false,
