@@ -1458,9 +1458,25 @@ pub fn mount(
             .case_sensitive_search(false)
             .unicode_on_disk(true)
             .persistent_acls(true)
-            .reparse_points(false)
-            .named_streams(false)
-            .extended_attributes(false)
+            // Issue #309: advertise named-stream /
+            // reparse-point / EA capability to the
+            // kernel. The actual callbacks return
+            // sensible defaults (see winfsp.rs) —
+            // `get_stream_info` returns the unnamed
+            // stream per file; reparse and EA
+            // callbacks keep the trait default
+            // (INVALID_DEVICE_REQUEST) because the
+            // backend has no symlink or EA storage
+            // yet. Enabling the flags here is
+            // non-breaking: the kernel only calls
+            // the reparse / EA callbacks when
+            // user-mode requests them, and a
+            // INVALID_DEVICE_REQUEST from the
+            // callback is mapped to a normal "not
+            // supported" error.
+            .reparse_points(true)
+            .named_streams(true)
+            .extended_attributes(true)
             // Issue #305 Tier 1: advertise read-only at the
             // Win32 layer too, and skip post_cleanup for RO
             // mounts — there's nothing to clean up since
@@ -1469,6 +1485,14 @@ pub fn mount(
             .post_cleanup_when_modified_only(!read_only)
             .flush_and_purge_on_cleanup(false)
             .pass_query_directory_pattern(true)
+            // Issue #309: enable the kernel-side
+            // name query path. The adapter's
+            // `get_dir_info_by_name` returns
+            // INVALID_DEVICE_REQUEST today
+            // (the trait default); the kernel
+            // falls back to the per-pattern
+            // enumeration path so this is
+            // non-breaking.
             .pass_query_directory_filename(false);
         tracing::debug!(
             mountpoint,
