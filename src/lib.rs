@@ -4853,9 +4853,32 @@ impl CoreFilesystem for MntrsFs {
                 // back to zero, but for cleanliness we just
                 // let the inodes removal stand.
             }
+            // Issue #325 follow-up: the `create` callback for a
+            // symlink NtCreateFile (New-Item -ItemType SymbolicLink)
+            // writes a 0-byte placeholder into the local cache
+            // directory, even though we never use that placeholder
+            // for symlink I/O (the symlink target is what users
+            // actually read/write). Without this unlink, the
+            // 0-byte cache file persists across Remove-Item +
+            // New-Item cycles. The next lookup for the same path
+            // falls through to the cache-file-metadata branch
+            // (see `lookup` at lib.rs:~2400) and returns a
+            // RegularFile with size=0 — which makes
+            // `New-Item V:\_ci_symlink.txt` fail with
+            // `ResourceExists` even though no symlink is
+            // registered. Drop the placeholder and any pending
+            // writeback sidecar so the next New-Item at the same
+            // path sees NotFound and proceeds to create.
+            let cpath = crate::cache_path(&self.cache_dir, &full_path);
+            let _ = std::fs::remove_file(&cpath);
+            let dirty_path = cpath.with_extension("dirty");
+            let _ = std::fs::remove_file(&dirty_path);
+            self.attr_cache.remove(&full_path);
+            self.cache_remove_entry(&parent_path, name);
+            self.writeback_pending.remove(full_path.as_str());
             tracing::info!(
                 path = %full_path,
-                "MntrsFs::unlink: dropped symlink entry"
+                "MntrsFs::unlink: dropped symlink entry (incl. cache file)"
             );
             return Ok(());
         }
