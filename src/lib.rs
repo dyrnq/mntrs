@@ -2247,6 +2247,25 @@ impl CoreFilesystem for MntrsFs {
             )));
         }
         let parent_path = self.resolve(parent).map(|e| e.path).unwrap_or_default();
+        // Issue #325: strip a single leading `/` from `name`
+        // when parent is the root. The WinFSP adapter's
+        // `create` / `get_security_by_name` callbacks pass
+        // `name.replace('\\', "/")` which preserves the
+        // leading backslash (kernel-supplied paths start
+        // with `\`), so the basename arrives here as
+        // `/_ci_symlink.txt` while the FUSE adapter passes
+        // `_ci_symlink.txt`. Without this trim, the two
+        // adapters disagree on the inodes / symlinks key for
+        // the same kernel path, and a `lookup` from one
+        // adapter misses what the other stored. Bare
+        // basename for root-parented is the canonical form
+        // (matches `cache_path`'s hash input and the existing
+        // unit tests).
+        let name = if parent_path.is_empty() && name.starts_with('/') {
+            &name[1..]
+        } else {
+            name
+        };
         let full_path = if parent_path.is_empty() {
             name.to_string()
         } else {
