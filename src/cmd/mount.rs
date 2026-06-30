@@ -409,19 +409,19 @@ pub fn mount_internal(
         false,                    // debug_fuse
         "mntrs-csi",              // volname
         None,                     // devname
-        false,                    // write_back_cache
-        &[],                      // fuse_options
-        &[],                      // fuse_flags
-        false,                    // daemon (no fork — std::thread::spawn holds session)
-        false,                    // daemon_wait
-        10,                       // daemon_timeout
-        false,                    // allow_root
-        false,                    // allow_idmap
-        0,                        // vfs_cache_max_size (off)
-        256,                      // mem_limit
-        "dashmap",                // mem_cache_impl (default)
-        0,                        // mem_cache_metrics_interval_secs (off)
-        5,                        // vfs_write_back
+        false, // write_back_cache (CSI: strict write-through; kernel writeback disabled by design — Pod multi-tenancy demands per-FS-message observability)
+        &[],   // fuse_options
+        &[],   // fuse_flags
+        false, // daemon (no fork — std::thread::spawn holds session)
+        false, // daemon_wait
+        10,    // daemon_timeout
+        false, // allow_root
+        false, // allow_idmap
+        0,     // vfs_cache_max_size (off)
+        256,   // mem_limit
+        "dashmap", // mem_cache_impl (default)
+        0,     // mem_cache_metrics_interval_secs (off)
+        5,     // vfs_write_back
         1024 * 1024, // writeback_immediate_threshold (1 MiB) — #202: small files skip the 5s delay queue
         "off",       // vfs_cache_mode
         0,           // vfs_read_ahead (off)
@@ -1343,6 +1343,7 @@ pub fn mount(
             std::time::Duration::from_secs(dir_cache_time),
             std::time::Duration::from_secs(attr_timeout),
             direct_io,
+            write_back_cache,
         );
         tracing::info!(
             elapsed_ms = _t_mount.elapsed().as_millis() as u64,
