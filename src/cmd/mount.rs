@@ -252,7 +252,8 @@ extern "C" fn cleanup() {
 
 /// Simplified mount entry point for CSI plugin.
 /// Uses defaults for all the FUSE tuning parameters.
-/// Check if a path is already a mount point by checking /proc/mounts.
+/// Check if a path is already a mount point by querying the Win32 DOS
+/// device manager.
 ///
 /// Issue #305 Tier 1: previous stub always returned `false`, so
 /// `mount_internal`'s idempotency check let a second `mntrs mount ... V:`
@@ -271,6 +272,16 @@ extern "C" fn cleanup() {
 /// `ERROR_INVALID_FUNCTION` for WinFSP volumes — they don't register
 /// a real NTFS-style volume GUID, so we can't distinguish "unmounted"
 /// from "WinFSP mount" via that API.
+///
+/// Issue #328 race hardening: the first process's `host.mount(V:)`
+/// returns `Ok` once WinFSP's user-mode `DefineDosDeviceW` call has
+/// completed, but there is a small window (observed pre-fix) where a
+/// second process's `QueryDosDeviceW("V:")` still returns 0 — the
+/// kernel-side mountpoint table is briefly invisible cross-process
+/// even though the user-mode call succeeded. We re-poll up to
+/// `IS_MOUNT_POINT_REPOLL_ATTEMPTS` times with `IS_MOUNT_POINT_REPOLL_DELAY_MS`
+/// between attempts so the second mount's idempotency check fires
+/// instead of racing past it into `host.mount()` collision.
 #[cfg(windows)]
 pub fn is_mount_point(path: &str) -> bool {
     use windows::Win32::Storage::FileSystem::QueryDosDeviceW;
@@ -285,31 +296,75 @@ pub fn is_mount_point(path: &str) -> bool {
     // mapped drives use "\Device\LanmanRedirector\..." — ~60 chars).
     let mut buf = [0u16; 1024];
     let wide: Vec<u16> = trimmed.encode_utf16().chain(std::iter::once(0)).collect();
-    let result = unsafe { QueryDosDeviceW(windows::core::PCWSTR(wide.as_ptr()), Some(&mut buf)) };
 
-    // QueryDosDeviceW returns 0 on failure, length (excluding the
-    // null terminator) on success. An empty result string ("")
-    // would be length 0 too but never happens for a real device.
-    if result > 0 {
-        true
-    } else {
-        // Failure: check GetLastError to distinguish unmapped
-        // drive letter (err=2 ERROR_FILE_NOT_FOUND) from
-        // malformed input. Be conservative on unexpected
-        // errors — assume mounted to avoid collisions.
+    for attempt in 0..IS_MOUNT_POINT_REPOLL_ATTEMPTS {
+        let result =
+            unsafe { QueryDosDeviceW(windows::core::PCWSTR(wide.as_ptr()), Some(&mut buf)) };
+
+        // QueryDosDeviceW returns 0 on failure, length (excluding the
+        // null terminator) on success. An empty result string ("")
+        // would be length 0 too but never happens for a real device.
+        if result > 0 {
+            return true;
+        }
+
         let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(2) {
-            false
-        } else {
+        // Distinguish "drive letter not assigned yet" (err=2
+        // ERROR_FILE_NOT_FOUND — the kernel-side table hasn't been
+        // updated cross-process yet) from "drive letter is permanently
+        // unmapped / malformed input" (some other error code).
+        // For err=2 we re-poll; for anything else we treat it as
+        // "mounted" to avoid collisions on weird input. The first
+        // mount's host.mount has either succeeded (in which case the
+        // kernel-side state is propagating) or it has not yet been
+        // attempted by anyone; both cases resolve to "wait and retry"
+        // on err=2 and "fail safe, treat as mounted" otherwise.
+        if err.raw_os_error() != Some(2) {
             tracing::debug!(
                 path,
+                attempt,
                 error = %err,
                 "is_mount_point(windows): QueryDosDeviceW returned unexpected error; treating as mount point"
             );
-            true
+            return true;
+        }
+
+        if attempt + 1 < IS_MOUNT_POINT_REPOLL_ATTEMPTS {
+            tracing::trace!(
+                path,
+                attempt,
+                max = IS_MOUNT_POINT_REPOLL_ATTEMPTS,
+                "is_mount_point(windows): QueryDosDeviceW returned ERROR_FILE_NOT_FOUND; re-polling"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(
+                IS_MOUNT_POINT_REPOLL_DELAY_MS,
+            ));
         }
     }
+
+    // Exhausted retries and still saw ERROR_FILE_NOT_FOUND — the
+    // drive letter is genuinely unmapped as far as the kernel-side
+    // table is concerned. Caller may proceed to host.mount().
+    tracing::trace!(
+        path,
+        attempts = IS_MOUNT_POINT_REPOLL_ATTEMPTS,
+        "is_mount_point(windows): drive letter unmapped after retries"
+    );
+    false
 }
+
+/// Issue #328 race hardening: number of re-poll attempts in
+/// `is_mount_point(windows)` before declaring the drive letter
+/// unmapped. The first mount's `host.mount()` returns Ok once
+/// WinFSP's user-mode `DefineDosDeviceW` has succeeded, but the
+/// kernel-side mountpoint table is briefly invisible to other
+/// processes (we measured ~50-200 ms on a quiet Win10 VM; the 5×
+/// 100 ms budget below = 500 ms ceiling is well under the 10 s
+/// budget imposed by mount-test.ps1 sub-test 13).
+#[cfg(windows)]
+const IS_MOUNT_POINT_REPOLL_ATTEMPTS: u32 = 5;
+#[cfg(windows)]
+const IS_MOUNT_POINT_REPOLL_DELAY_MS: u64 = 100;
 
 ///
 /// Check if a path is already a mount point on macOS.
@@ -758,17 +813,37 @@ pub fn mount(
     // own dispatcher pool — fuser backend).
     winfsp_dispatcher_threads: u32,
 ) -> Result<()> {
-    // Issue #305 Tier 1: idempotency check at the CLI entry
-    // point. Previously the public `mount` function skipped this
-    // check entirely, so a second `mntrs mount ... V:` proceeded
-    // all the way to `host.mount(mountpoint)` and collided with
-    // the live volume (Win32 STATUS_OBJECT_NAME_COLLISION 0xC0000035
-    // → "0xD0000035"). The CSI path used `mount_internal` which
-    // already had this check, but it was a no-op on Windows because
-    // `is_mount_point` returned false unconditionally.
+    // Issue #328: idempotency check at the CLI entry point.
+    // When V: is already mounted (by an earlier `mntrs mount`
+    // process, or by anything else — WinFSP / SMB / NTFS),
+    // reject this invocation with a clear, non-zero exit
+    // error instead of silently succeeding (which would mask
+    // user confusion) or racing into `host.mount()` and
+    // colliding with STATUS_OBJECT_NAME_COLLISION 0xC0000035
+    // (which used to slip past into the keep-alive loop and
+    // hang forever — see #328 history).
+    //
+    // The CSI path (`mount_internal` at line ~374) keeps the
+    // Ok(())-on-already-mounted behavior because CSI mounts
+    // can be retried idempotently by a sidecar; only the CLI
+    // path is required to fail loudly.
+    //
+    // `is_mount_point` itself re-polls (see IS_MOUNT_POINT_REPOLL_*
+    // constants below) to absorb the brief kernel-side race
+    // window between the first process's `host.mount` returning
+    // Ok and the drive letter becoming visible to a second
+    // process's `QueryDosDeviceW`. We add a final post-check
+    // after `host.mount` succeeds (line ~1583) for the
+    // reverse race — in case the first mount lands between
+    // this idempotency check and our `host.mount`.
     if is_mount_point(mountpoint) {
-        tracing::info!(mountpoint, "already mounted, skipping");
-        return Ok(());
+        tracing::info!(
+            mountpoint,
+            "already mounted, refusing to mount twice (issue #328)"
+        );
+        return Err(anyhow!(
+            "already mounted at {mountpoint}; run `mntrs unmount {mountpoint}` first"
+        ));
     }
 
     // Issue #209: --poll-interval is the legacy rclone alias
@@ -1510,12 +1585,41 @@ pub fn mount(
             mountpoint,
             "mount(windows): FileSystemHost::new returned; calling host.mount"
         );
-        host.mount(mountpoint)
-            .map_err(|e| anyhow::anyhow!("host.mount: {e}"))?;
+        host.mount(mountpoint).map_err(|e| {
+            // Issue #328: if the first `is_mount_point` poll raced
+            // past the live volume and we made it to host.mount,
+            // the Win32 kernel returns STATUS_OBJECT_NAME_COLLISION
+            // (0xC0000035). Surface a clear, actionable error
+            // naming the mountpoint instead of the raw NTSTATUS —
+            // mount-test.ps1 sub-test 13 greps stderr for the
+            // mountpoint path as part of its hard assertion.
+            anyhow::anyhow!(
+                "host.mount({mountpoint}) failed: {e}; \
+                 the drive letter is likely already mounted by another process. \
+                 Run `mntrs unmount {mountpoint}` first"
+            )
+        })?;
         tracing::debug!(
             mountpoint,
             "mount(windows): host.mount returned; calling host.start"
         );
+        // Issue #328 sanity check: `host.mount` returned Ok, so
+        // WinFSP thinks the drive letter is ours. Confirm that
+        // `QueryDosDeviceW` also sees the DOS device now — if it
+        // still reports ERROR_FILE_NOT_FOUND, something went wrong
+        // in the kernel-side mountpoint table update and the
+        // keep-alive loop below would hang without anyone able to
+        // talk to V:. Fail loudly so the operator sees a clean
+        // error instead of a silent hang.
+        #[cfg(windows)]
+        if !is_mount_point(mountpoint) {
+            return Err(anyhow!(
+                "host.mount({mountpoint}) returned Ok but the drive letter is \
+                 not visible to QueryDosDeviceW; the WinFSP kernel-side \
+                 mountpoint table may be in an inconsistent state. \
+                 Try `mntrs unmount {mountpoint}` and remount"
+            ));
+        }
         // Issue #249 follow-up: winfsp 0.13 split the old
         // `FspFileSystemStart` step into two — `host.mount` calls
         // `FspFileSystemSetMountPoint` (registers V: with the WinFSP
