@@ -4531,6 +4531,24 @@ impl CoreFilesystem for MntrsFs {
 
     fn create(&self, _parent: u64, name: &str, _mode: u32) -> std::io::Result<(CoreFileAttr, u64)> {
         let parent_path = self.resolve(_parent).map(|e| e.path).unwrap_or_default();
+        // Issue #325: strip a single leading `/` from `name`
+        // when parent is the root. The WinFSP adapter's
+        // `create` / `get_security_by_name` callbacks pass
+        // `name.replace('\\', "/")` which preserves the
+        // kernel-supplied leading backslash as a leading
+        // forward slash. The FUSE adapter passes the bare
+        // basename. Without this trim, the inodes /
+        // path_to_ino / symlinks map keys differ between
+        // adapters for the same logical path — and the
+        // symlink short-circuit in `lookup` (and the
+        // symlinks-map removal in `unlink` /
+        // `attach_symlink_to_ino`) miss the entry the other
+        // adapter stored.
+        let name = if parent_path.is_empty() && name.starts_with('/') {
+            &name[1..]
+        } else {
+            name
+        };
         let full_path = if parent_path.is_empty() {
             name.to_string()
         } else {
@@ -4682,6 +4700,13 @@ impl CoreFilesystem for MntrsFs {
         // and a helper would force a `&str` borrow past the
         // `block_on` boundary.
         let parent_path = self.resolve(_parent).map(|e| e.path).unwrap_or_default();
+        // Issue #325: strip leading `/` for root-parented (see
+        // create() for the cross-adapter rationale).
+        let name = if parent_path.is_empty() && name.starts_with('/') {
+            &name[1..]
+        } else {
+            name
+        };
         let full_path = if parent_path.is_empty() {
             name.to_string()
         } else {
@@ -4852,6 +4877,13 @@ impl CoreFilesystem for MntrsFs {
 
     fn unlink(&self, _parent: u64, name: &str) -> std::io::Result<()> {
         let parent_path = self.resolve(_parent).map(|e| e.path).unwrap_or_default();
+        // Issue #325: strip leading `/` for root-parented (see
+        // create() for the cross-adapter rationale).
+        let name = if parent_path.is_empty() && name.starts_with('/') {
+            &name[1..]
+        } else {
+            name
+        };
         let full_path = if parent_path.is_empty() {
             name.to_string()
         } else {
@@ -5021,6 +5053,13 @@ impl CoreFilesystem for MntrsFs {
 
     fn rmdir(&self, _parent: u64, name: &str) -> std::io::Result<()> {
         let parent_path = self.resolve(_parent).map(|e| e.path).unwrap_or_default();
+        // Issue #325: strip leading `/` for root-parented (see
+        // create() for the cross-adapter rationale).
+        let name = if parent_path.is_empty() && name.starts_with('/') {
+            &name[1..]
+        } else {
+            name
+        };
         let full_path = if parent_path.is_empty() {
             name.to_string()
         } else {
@@ -5066,6 +5105,18 @@ impl CoreFilesystem for MntrsFs {
     ) -> std::io::Result<()> {
         let parent_path = self.resolve(_parent).map(|e| e.path).unwrap_or_default();
         let newparent_path = self.resolve(_newparent).map(|e| e.path).unwrap_or_default();
+        // Issue #325: strip leading `/` for root-parented (see
+        // create() for the cross-adapter rationale).
+        let name = if parent_path.is_empty() && name.starts_with('/') {
+            &name[1..]
+        } else {
+            name
+        };
+        let newname = if newparent_path.is_empty() && newname.starts_with('/') {
+            &newname[1..]
+        } else {
+            newname
+        };
         let src = if parent_path.is_empty() {
             name.to_string()
         } else {
@@ -5252,6 +5303,13 @@ impl CoreFilesystem for MntrsFs {
         target: &std::path::Path,
     ) -> std::io::Result<CoreFileAttr> {
         let parent_path = self.resolve(parent).map(|e| e.path).unwrap_or_default();
+        // Issue #325: strip leading `/` for root-parented (see
+        // create() for the cross-adapter rationale).
+        let name = if parent_path.is_empty() && name.starts_with('/') {
+            &name[1..]
+        } else {
+            name
+        };
         let full_path = if parent_path.is_empty() {
             name.to_string()
         } else {
