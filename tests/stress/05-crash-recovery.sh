@@ -42,11 +42,17 @@ mkdir -p "$WORK"
 # delay queue firing because we verify the cache file, not the
 # .dirty sidecar.
 mntrs_mount "$MNT" "$CACHE"
-trap 'mntrs_unmount "$MNT" 2>/dev/null || true; pkill -9 -f "$(basename "$MNTRS_BIN") mount" 2>/dev/null || true' EXIT
+# Preserve cache dir on EXIT (failure path) so post-mortem is
+# possible — `mntrs_unmount` otherwise calls `remove_dir_all` which
+# wipes the only evidence of what the daemon did/didn't do.
+trap 'stress_preserve_cache "$CACHE" "fail"; mntrs_unmount "$MNT" 2>/dev/null || true; pkill -9 -f "$(basename "$MNTRS_BIN") mount" 2>/dev/null || true' EXIT
 
 # ── Write two files (creates cache files immediately) ────────────────
 FNAME="$MNT/recovered.bin"
 log "writing 4 MiB to $FNAME ..."
+# Plain dd (no oflag=direct) — once mntrs_mount's readiness check waits
+# for /proc/self/mounts registration (see common.sh), the kernel
+# correctly routes this write to the daemon's FUSE handler.
 dd if=/dev/urandom of="$FNAME" bs=1M count=4 status=none
 
 log "writing 2 MiB to $MNT/recovered2.bin ..."
@@ -58,12 +64,27 @@ dd if=/dev/urandom of="$MNT/recovered2.bin" bs=1M count=2 status=none
 # (WRITEBACK_CACHE off), the daemon's write() handler creates the
 # cache file synchronously per segment — but we still drain briefly
 # to cover the --vfs-write-back upload worker (default 1s delay).
-DRAIN_END=$(( $(date +%s) + 30 ))
+#
+# Drain budget raised to 60s (was 30s) for CI's higher-latency
+# ubuntu-24.04 kernel (~6.8.x) which can absorb multi-page writes
+# in page cache for several seconds before forwarding to FUSE.
+# Daemon-alive check in the loop catches Bug #286 P3 silent-death
+# scenarios: if the daemon dies mid-drain, no cache file will ever
+# materialize, and we want to fail fast with the daemon log in hand.
+DRAIN_END=$(( $(date +%s) + 60 ))
+DAEMON_BIN="$(basename "$MNTRS_BIN")"
 while (( $(date +%s) < DRAIN_END )); do
     HAVE=$(find "$CACHE" -maxdepth 1 -type f \
         ! -name '*.log' ! -name '*.dirty' ! -name '*.block' \
         -printf '.' 2>/dev/null | wc -c)
     if (( HAVE >= 2 )); then break; fi
+    # If the daemon died mid-drain, the cache file will never appear.
+    # Bail out early with the daemon log tail for diagnosis.
+    if ! pgrep -f "$DAEMON_BIN mount memory" >/dev/null 2>&1; then
+        log "daemon died during 60s drain — bail with last mount.log lines:"
+        tail -30 "$CACHE/mount.log" || true
+        break
+    fi
     sleep 1
 done
 
