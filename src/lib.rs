@@ -2114,12 +2114,88 @@ impl MntrsFs {
                 ))));
                 continue;
             }
+            // Build the full path once for the symlink override
+            // (below) and the alloc_ino key on the regular-file
+            // path. Single source of truth for path
+            // construction.
+            let full_path = format!("{}/{}", parent_path, name);
             // Try the snapshot first.
             let snapshot_hit = cached
                 .as_ref()
                 .and_then(|entries| entries.get(*name).map(|e| *e.value()));
             match snapshot_hit {
                 Some(DirEntryCacheValue { mode, size, mtime }) => {
+                    // Issue #325 follow-up (sub-test 10 step 5):
+                    // `dir_cache` snapshot entries for paths
+                    // that were later re-registered as symlinks
+                    // via `set_reparse_point` still carry the
+                    // placeholder `RegularFile` mode from the
+                    // original `create` backend write. Without
+                    // an override here, `read_directory` reports
+                    // `_ci_symlink.txt` as `RegularFile` (with a
+                    // fresh alloc_ino that doesn't match the
+                    // symlink's canonical ino). PowerShell's
+                    // FileSystemProvider then routes the
+                    // subsequent `Remove-Item` through a
+                    // non-reparse delete, which returns
+                    // STATUS_OBJECT_NAME_NOT_FOUND at the
+                    // kernel's pre-open stat check —
+                    // `set_delete` + `cleanup(FspCleanupDelete)`
+                    // never fire and the symlink sticks.
+                    //
+                    // Cross-check `self.symlinks` (in-memory
+                    // symlink registration populated by
+                    // `set_reparse_point`) and override the
+                    // kind + ino to match the canonical
+                    // registration. Uses the same
+                    // case-insensitive lookup shape as
+                    // `MntrsFs::lookup` / `unlink` so the
+                    // kernel's `case_insensitive` dispatch
+                    // (which canonicalizes basename to
+                    // uppercase before the IRP reaches us)
+                    // still hits.
+                    let canonical_symlink = if self.symlinks.contains_key(&full_path) {
+                        Some(full_path.clone())
+                    } else {
+                        let target_lower = full_path.to_lowercase();
+                        let mut hit: Option<String> = None;
+                        for entry in self.symlinks.iter() {
+                            if entry.key().to_lowercase() == target_lower {
+                                hit = Some(entry.key().clone());
+                                break;
+                            }
+                        }
+                        hit
+                    };
+                    if let Some(stored) = canonical_symlink {
+                        // `alloc_ino` reuses an existing ino for
+                        // the same path (see #325 — it always
+                        // returns the canonical ino for
+                        // symlinks). This is critical: the
+                        // kernel's `cleanup(FspCleanupDelete)`
+                        // dispatch in the WinFSP adapter binds
+                        // to a per-handle ino, and the
+                        // delete-time `set_delete`/`cleanup`
+                        // callbacks resolve the unlink by that
+                        // ino. A fresh alloc_ino here would give
+                        // a *new* ino, and the kernel's handle
+                        // (still pointing at the old one) would
+                        // dispatch the delete against the wrong
+                        // entry — no `set_delete` event, no
+                        // FspCleanupDelete cleanup.
+                        let target = self
+                            .symlinks
+                            .get(&stored)
+                            .map(|e| e.value().clone())
+                            .unwrap_or_default();
+                        let ino = self.alloc_ino(
+                            &stored,
+                            FileType::Symlink,
+                            target.as_os_str().len() as u64,
+                        );
+                        out.push(Ok(self.core_attr_for_symlink(ino, &target)));
+                        continue;
+                    }
                     let kind = match mode {
                         EntryMode::DIR => FileType::Directory,
                         _ => FileType::RegularFile,
@@ -2129,12 +2205,7 @@ impl MntrsFs {
                     // calls return the same
                     // data without a remote
                     // round-trip.
-                    let ino = self.alloc_ino_with_mtime(
-                        &format!("{}/{}", parent_path, name),
-                        kind,
-                        size,
-                        mtime,
-                    );
+                    let ino = self.alloc_ino_with_mtime(&full_path, kind, size, mtime);
                     out.push(Ok(to_core_attr(&self.make_attr(ino, size, kind, mtime))));
                 }
                 None => {
