@@ -152,20 +152,29 @@ function Mount-WinFsp {
         -ArgumentList @("mount", $BACKEND, $MNTRS_BNT) `
         -RedirectStandardOutput "mntrs-bench.stdout.log" `
         -RedirectStandardError  "mntrs-bench.stderr.log" `
-        -WindowStyle Hidden `
         -PassThru
     Write-Host "  started mntrs pid=$($script:MntrsProc.Id)"
-    # Wait for the drive letter to appear (max 30s).
+    # Wait for the drive letter to appear. Mirrors the proven
+    # readiness probe in tests/e2e/common/mount-test.ps1:325:
+    # 120 × 500ms = 60s budget, Test-Path with trailing backslash
+    # to force a kernel-mode drive query (bare "V:" can resolve
+    # via the cwd parser without verifying the drive exists).
     $ready = $false
-    for ($i = 1; $i -le 30; $i++) {
-        if (Test-Path -LiteralPath $MNTRS_BNT) {
+    for ($i = 1; $i -le 120; $i++) {
+        if (Test-Path "${MNTRS_BNT}\") {
             $ready = $true
             break
         }
-        Start-Sleep -Seconds 1
+        Start-Sleep -Milliseconds 500
     }
     if (-not $ready) {
-        throw "mntrs mount did not become ready in 30s. Check mntrs-bench.stderr.log."
+        Write-Host "--- mntrs-bench.stdout.log (last 40 lines) ---"
+        if (Test-Path "mntrs-bench.stdout.log") { Get-Content "mntrs-bench.stdout.log" -Tail 40 }
+        Write-Host "--- mntrs-bench.stderr.log (last 40 lines) ---"
+        if (Test-Path "mntrs-bench.stderr.log") { Get-Content "mntrs-bench.stderr.log" -Tail 40 }
+        Write-Host "--- mntrs processes ---"
+        Get-Process mntrs -ErrorAction SilentlyContinue | Select-Object Id, Name | Format-Table | Out-String | Write-Host
+        throw "mntrs mount did not become ready in 60s"
     }
     Write-Host "  $MNTRS_BNT ready"
 }
