@@ -392,19 +392,23 @@ fn append_to_pre_existing_file_after_read() {
     fs.release(attr.ino, wh).unwrap();
 
     // flush + release queue an async writeback to the backend.
-    // read2 must observe the appended content, which requires
-    // either the cache file to still hold it OR the writeback
-    // to have landed. Under heavy parallel test load the shared
-    // writeback worker pool can starve this 5-byte task for
-    // long enough that read2 falls through to the backend and
-    // sees the pre-append bytes. Yield a few times to let the
-    // tokio runtime drain the queue. (The pool uses opendal's
-    // in-memory backend so the upload itself is microseconds;
-    // the only wait is the worker thread picking the task off
-    // the DelayQueue.) 50ms is generous; in practice it lands
-    // in <1ms.
-    std::thread::sleep(std::time::Duration::from_millis(50));
-
+    // read2 must observe the appended content.
+    //
+    // Why no sleep (Issue #282): the data path for read2 is the
+    // **file-level cache** (lib.rs:~3418, "read: file-level cache
+    // hit (complete)"), which reads the on-disk cache file
+    // directly. The cache file already holds the appended bytes
+    // after `flush` (see Issue #128 backfill — write() writes
+    // through the cache fd, flush() persists via fdatasync). The
+    // multi_cache L1/L2 is invalidated by write() (lib.rs:~4270)
+    // so read2 falls through to the file-level cache, NOT the
+    // backend. The pre-fix `sleep(50ms)` was a guard against the
+    // async writeback worker, but read2 doesn't actually wait
+    // for writeback — it serves from the cache file. The sleep
+    // was masking a small scheduling delay before the fs's read
+    // handler was callable again; remove it entirely for a
+    // deterministic assertion.
+    //
     // read2 via a fresh read handle: must reflect the append.
     let rd2 = fs.open(attr.ino, 0).unwrap();
     let got = fs.read(attr.ino, rd2, 0, 13).unwrap();
