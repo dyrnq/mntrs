@@ -115,11 +115,17 @@ pub fn unmount(target: &str) -> Result<()> {
     fuse_unmount(&mountpoint)?;
 
     // remove from db
+    // Issue #384: canonicalize the mountpoint before the byte-
+    // equality match against `mounts.txt`. On macOS `/tmp` is a
+    // symlink to `/private/tmp`, so a user who mounted via
+    // `/private/tmp/foo` and unmounts via `/tmp/foo` (or vice
+    // versa) leaves a stale row otherwise.
+    let canon_mp = crate::util::canonicalize_mountpoint(&mountpoint);
     let db = crate::cmd::mount::mounts_db_path();
     if let Ok(content) = fs::read_to_string(&db) {
         let filtered: Vec<&str> = content
             .lines()
-            .filter(|l| l.split('\0').nth(1) != Some(mountpoint.as_str()))
+            .filter(|l| l.split('\0').nth(1) != Some(canon_mp.as_str()))
             .collect();
         if let Err(e) = fs::write(&db, filtered.join("\n")) {
             tracing::debug!(error=%e, "unmount db cleanup failed");
