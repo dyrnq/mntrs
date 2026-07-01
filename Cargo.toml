@@ -141,4 +141,5 @@ path = "tests/platform/windows/winfsp_integration_test.rs"
 [dev-dependencies]
 ctor = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"
 
