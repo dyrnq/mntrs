@@ -167,8 +167,14 @@ fn fuse_unmount(mountpoint: &str) -> Result<()> {
 /// just `cfg(unix)` so that the cfg predicate on its own is
 /// enough to prove the Linux path is unaffected by changes to
 /// `fuse_unmount_macos_with_umount`.
+///
+/// Visibility: `pub(crate)` so that `src/cmd/mount.rs` can reuse
+/// this helper at the cleanup / signal-watcher sites without
+/// duplicating the shell-out (Issue #374). The function's cfg
+/// predicate (not the visibility) is what matters for guaranteeing
+/// Linux behaviour is unaffected by changes to the macOS branch.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn fuse_unmount_via_fusermount(mountpoint: &str) -> Result<()> {
+pub(crate) fn fuse_unmount_via_fusermount(mountpoint: &str) -> Result<()> {
     let result = Command::new("fusermount3")
         .arg("-u")
         .arg(mountpoint)
@@ -213,8 +219,13 @@ fn fuse_unmount_via_fusermount(mountpoint: &str) -> Result<()> {
 /// Non-NotFound errors from `fusermount` (EACCES, ENOENT of the
 /// mountpoint path itself, etc.) are surfaced verbatim — the same
 /// as on Linux.
+///
+/// Visibility: `pub(crate)` so that `src/cmd/mount.rs` can reuse
+/// this helper at the cleanup / signal-watcher sites
+/// (Issue #374). On macOS they get the umount(8) fallback; on any
+/// other unix, this function's body is not even compiled.
 #[cfg(target_os = "macos")]
-fn fuse_unmount_macos_with_umount(mountpoint: &str) -> Result<()> {
+pub(crate) fn fuse_unmount_macos_with_umount(mountpoint: &str) -> Result<()> {
     let result = Command::new("fusermount3")
         .arg("-u")
         .arg(mountpoint)

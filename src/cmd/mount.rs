@@ -16,7 +16,6 @@ use std::io::{BufRead, BufReader};
 #[cfg(not(windows))]
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -240,11 +239,29 @@ extern "C" fn cleanup() {
         // in-process bookkeeping update, not an external
         // side effect.
         if !SHUTDOWN_BY_SIGNAL.load(std::sync::atomic::Ordering::Relaxed) {
-            let _ = Command::new("fusermount3")
-                .arg("-u")
-                .arg(mp)
-                .status()
-                .or_else(|_| Command::new("fusermount").arg("-u").arg(mp).status());
+            // Issue #374: reuse the cfg-gated helpers from
+            // `unmount`. Vanilla macOS has no `fusermount*`
+            // binary, so the in-line shell-out was previously
+            // silently failing and leaking the mount on
+            // atexit / SIGTERM paths. The macOS helper falls
+            // back to `umount(8)`; the non-macos unix helper
+            // is byte-identical to the pre-fix Linux chain.
+            //
+            // `cleanup()` is module-level (not under a
+            // `#[cfg(unix)]` block), so the helper references
+            // here use `cfg(all(unix, not(target_os = "macos")))`
+            // / `cfg(target_os = "macos")` to keep Windows
+            // builds untouched (the branches compile to dead
+            // code on Windows). See the same construction at
+            // `unmount.rs::fuse_unmount_via_fusermount`.
+            #[cfg(all(unix, not(target_os = "macos")))]
+            {
+                let _ = crate::cmd::unmount::fuse_unmount_via_fusermount(mp);
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let _ = crate::cmd::unmount::fuse_unmount_macos_with_umount(mp);
+            }
         }
         remove_mount(mp);
     }
@@ -1853,11 +1870,31 @@ pub fn mount(
                     return;
                 }
                 tracing::info!("signal received, unmounting...");
-                let _ = Command::new("fusermount3")
-                    .arg("-u")
-                    .arg(&mp)
-                    .status()
-                    .or_else(|_| Command::new("fusermount").arg("-u").arg(&mp).status());
+                // Issue #374: reuse the cfg-gated helpers from
+                // `unmount`. Vanilla macOS has no `fusermount*`
+                // binary, so the in-line shell-out was previously
+                // silently failing and leaking the mount on
+                // SIGINT/SIGTERM paths (the watcher thread is
+                // what runs in the Ctrl-C case). The macOS
+                // helper falls back to `umount(8)`; the
+                // non-macos unix helper is byte-identical to
+                // the pre-fix Linux chain.
+                //
+                // The signal-watcher `spawn()` block is inside
+                // `mount_internal`, which is module-level
+                // (compiles on Windows too) — same reason as
+                // `cleanup()` above. Use `cfg(all(unix,
+                // not(target_os = "macos")))` /
+                // `cfg(target_os = "macos")` to keep Windows
+                // untouched.
+                #[cfg(all(unix, not(target_os = "macos")))]
+                {
+                    let _ = crate::cmd::unmount::fuse_unmount_via_fusermount(&mp);
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = crate::cmd::unmount::fuse_unmount_macos_with_umount(&mp);
+                }
             })
             .ok();
 
