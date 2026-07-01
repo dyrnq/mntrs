@@ -73,20 +73,36 @@ pub(crate) fn io_err_to_fuse_errno(e: std::io::Error) -> Errno {
 }
 
 /// Adapter that wraps a `CoreFilesystem` and implements `fuser::Filesystem`.
+///
+/// `write_back_cache` gates `InitFlags::FUSE_WRITEBACK_CACHE` in `init()`. Off
+/// by default (matches the `--write-back-cache` CLI flag's `bool` default
+/// in `src/main.rs`). When off, the kernel does NOT buffer writes; the
+/// daemon's `write()` handler is called per writeback segment as before
+/// (#79/#80/#81). This restores daemon-side write observability and avoids
+/// 3 known cache-poisoning bugs (#331 read, #334 prefetch, #337 remote-fetch)
+/// plus the stress-suite failures under WRITEBACK_CACHE.
 pub struct FuserAdapter<F: CoreFilesystem + 'static> {
     pub inner: F,
     pub dir_cache_ttl: Duration,
     pub attr_ttl: Duration,
     pub direct_io: bool,
+    pub write_back_cache: bool,
 }
 
 impl<F: CoreFilesystem + 'static> FuserAdapter<F> {
-    pub fn new(inner: F, dir_cache_ttl: Duration, attr_ttl: Duration, direct_io: bool) -> Self {
+    pub fn new(
+        inner: F,
+        dir_cache_ttl: Duration,
+        attr_ttl: Duration,
+        direct_io: bool,
+        write_back_cache: bool,
+    ) -> Self {
         Self {
             inner,
             dir_cache_ttl,
             attr_ttl,
             direct_io,
+            write_back_cache,
         }
     }
 }
@@ -111,7 +127,21 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         // #81: WRITEBACK_CACHE — kernel buffers small writes and merges
         // them before sending to the filesystem. Cuts FUSE write requests
         // for small-write workloads (`dd bs=4k` etc).
-        let _ = config.add_capabilities(InitFlags::FUSE_WRITEBACK_CACHE);
+        //
+        // **Opt-in** since 2026-06-30: gated on `self.write_back_cache`
+        // (CLI: `--write-back-cache`). Default is OFF because under
+        // WRITEBACK_CACHE:
+        //   - daemon's `write()` is never called for multi-page files
+        //     (kernel page cache holds the data)
+        //   - 3 cache-poisoning bugs (#331/#334/#337) shipped post-merge
+        //   - stress 01/05 architecturally fail (no cache files for
+        //     multi-page bodies; daemon drain never settles)
+        // Users who want the small-write optimization can opt in with
+        // `--write-back-cache`. The kernel-side mount option
+        // `writeback_cache` at cmd/mount.rs is gated on the same flag.
+        if self.write_back_cache {
+            let _ = config.add_capabilities(InitFlags::FUSE_WRITEBACK_CACHE);
+        }
 
         // #optim: FUSE_HAS_EXPIRE_ONLY (protocol 7.38+, fuser 0.17
         // declares 7.40). Instead of invalidating a cached kernel entry

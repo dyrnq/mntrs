@@ -98,15 +98,12 @@ ELAPSED=$(( $(date +%s) - START ))
 log "soak done: $ITER iterations in ${ELAPSED}s"
 
 # ── Drain daemon + kernel writeback queues before assertions ────────
-# The last several iterations' writebacks may not have settled yet (the
-# daemon delay queue holds them for --vfs-write-back seconds, and the
-# kernel page cache may still hold dirty pages awaiting setattr deliv-
-# ery). For 60s soak with 1s write-back this can take a few seconds.
+# The last several iterations' writebacks may not have settled yet
+# (the daemon delay queue holds them for --vfs-write-back seconds).
 # Without this drain, the REMAINING_DIRTY assertion below races.
-# Note: under FUSE_WRITEBACK_CACHE (unconditional at fuser.rs:114), the
-# daemon's flush()/release() handlers are never called, so .dirty side-
-# cars are never created — REMAINING_DIRTY is reliably 0 in that case.
-# The poll loop still helps when WRITEBACK_CACHE is ever disabled.
+# Note: FUSE_WRITEBACK_CACHE is OFF by default in mntrs — the daemon
+# sees synchronous write() calls + creates .dirty sidecars from
+# flush()/release(). The poll loop checks .dirty count drains to 0.
 sync
 DRAIN_END=$(( $(date +%s) + 30 ))
 while (( $(date +%s) < DRAIN_END )); do

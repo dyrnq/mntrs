@@ -8,6 +8,36 @@
 > (see [Shadow fields](#shadow-fields-rclone-compat-not-implemented)
 > below).
 
+## Three writeback concepts (terminology)
+
+The word "writeback" appears in three independent places. Don't
+confuse them when debugging:
+
+| # | Name | Where | CLI flag | Default |
+|---|---|---|---|---|
+| 1 | FUSE kernel writeback | `libfuse InitFlags::FUSE_WRITEBACK_CACHE`, gated at `src/core_fs/fuser.rs:init()` on `FuserAdapter.write_back_cache` | `--write-back-cache` | **off** (since 2026-06-30; opt-in via the flag) |
+| 2 | mntrs VFS upload queue | `src/writeback.rs` subsystem, single path per [The single writeback path](#the-single-writeback-path) below | `--vfs-write-back` (delay), `--writeback-immediate` (threshold) | on (always; this is the durability path) |
+| 3 | OpenDAL backend cache | opendal internal; mntrs does not currently expose or tune it | (none — opendal internals) | opendal default |
+
+**Concept #1 (FUSE kernel writeback)** is the one this document
+refers to when discussing the `--write-back-cache` flag. It was
+unconditional at init (`src/core_fs/fuser.rs`) until 2026-06-30,
+which caused 3 cache-poisoning bugs (`#331`, `#334`, `#337`),
+bench regression in PR #339, and architectural failures in
+stress tests 01-large-dir and 05-crash-recovery (multi-page
+writes' `write()` handler not called). It is now **opt-in**: the
+default reverts to the on-write, off-kernel-buffering behavior
+that tests 01-06 assume. CSI drivers keep the default
+(disabled) because Pod multi-tenancy demands per-FS-message
+observability — they want every `write()` to land in the daemon.
+
+**Concept #2 (mntrs VFS upload queue)** is what almost everyone
+means by "the writeback". The rest of this document describes
+it.
+
+**Concept #3 (OpenDAL backend cache)** is opaque to mntrs and not
+relevant to most debugging.
+
 ## The single writeback path
 
 All writes — regardless of which rclone-compat flag you set —

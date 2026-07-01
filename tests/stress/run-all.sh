@@ -24,7 +24,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUITE_START=$(date +%s)
 
-ALL=(01-large-dir 02-large-file-io 03-cache-eviction 04-writeback-concurrent 05-crash-recovery 06-soak-mixed)
+ALL=(01-large-dir 02-large-file-io 03-cache-eviction 04-writeback-concurrent 05-crash-recovery 06-soak-mixed 07-writeback-cache-optin)
 
 if [[ $# -gt 0 ]]; then
     SELECTED=("$@")
