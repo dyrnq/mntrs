@@ -110,11 +110,18 @@ jobs:
       # Mount V: from memory://, run ~25 workloads, emit md table
       # + Result line. run_all.ps1 tears down V: on EXIT (success,
       # failure, or Ctrl+C) via its internal trap.
+      #
+      # IMPORTANT: `*>&1` (all-streams redirect), not `2>&1`. The
+      # bench script uses Write-Host for table rows, which writes
+      # to PowerShell's Information stream (6), not stdout. Tee-Object
+      # only captures the Success (stdout) stream by default, so
+      # without `*>&1` the entire table bypasses the file. This is
+      # the PS analog of bash `2>&1 | tee bench-result.txt`.
       - name: Run benchmark (WinFSP mount + PowerShell workload)
         shell: pwsh
         timeout-minutes: 10
         run: |
-          & ./bench/run_all.ps1 2>&1 | Tee-Object -FilePath bench-result.txt
+          & ./bench/run_all.ps1 *>&1 | Tee-Object -FilePath bench-result.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload bench artifact
