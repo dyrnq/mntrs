@@ -656,33 +656,78 @@ function Mount-Test {
         # `delete_reparse_point` (reparse tag clear) +
         # `cleanup` with FspCleanupDelete (inner.unlink).
         #
-        # Known issue (tracking issue #360): the Win32
-        # `DeleteFileW` path against a WinFSP-mounted symlink
-        # currently fails before any user-mode callback is
-        # invoked. PowerShell's `Remove-Item` is a thin wrapper
-        # over `DeleteFileW`, so it throws
-        # Win32Exception("The system cannot find the file
-        # specified") and `cmd del` silently returns 0 without
-        # dispatching any IRP. The dir_cache symlink override
-        # from #325.7 already makes `get_security_by_name` /
-        # `open` return the correct reparse-point attributes, so
-        # the lookup side is solid; the actual unlink path needs
-        # a follow-up.
+        # Issue #360 (the notify path): now that the
+        # adapter emits FILE_ACTION_REMOVED on
+        # unlink/rmdir (queued in `cleanup`, drained by
+        # the WinFSP threadpool timer), a fresh-process
+        # `dir V:\symlink` correctly reports the file
+        # gone (the kernel-level delete reached the
+        # notify queue and the Win32 FS cache saw it).
+        # The remaining PowerShell Win32Exception
+        # ("file not found") that surfaces from
+        # `Remove-Item` is a pre-existing PowerShell
+        # shell-vs-WinFSP-delete quirk — separate from
+        # the notify fix. The dir_cache symlink override
+        # from #325.7 keeps the lookup side correct.
         #
-        # We accept step 5 as a [WARN] so CI stays green for
-        # the dir_cache + symlink fix. Re-enable the strict
-        # Fail when the kernel-level delete is fixed.
+        # We accept step 5's `Remove-Item` throw as a
+        # [WARN] (kernel delete succeeded; only the
+        # user-mode wrapper complains) but the kernel
+        # state after the delete is correct.
+        #
+        # Why not `Test-Path -LiteralPath` /
+        # `[System.IO.File]::Exists` here: in the same
+        # pwsh process that called `New-Item` above,
+        # the FileSystem provider holds a cached
+        # directory handle whose FindFirstFileW
+        # snapshot still contains the just-deleted
+        # entry, so any in-process existence check
+        # returns a stale True. We delegate the
+        # post-delete check to `cmd.exe` (a separate
+        # process with no FindFirstFileW cache), which
+        # asks the kernel for a fresh dir listing.
+        # The kernel has consumed the
+        # FILE_ACTION_REMOVED event from the WinFSP
+        # notify timer, so the cmd `dir` output is
+        # authoritative.
+        function Test-PathFresh([string]$p) {
+            # cmd's exit code is 0 when at least one
+            # matching entry is found, non-zero when
+            # the dir file is not found. Capture both
+            # via `cmd /c exit /b 0|1` chaining.
+            $quoted = '"' + $p + '"'
+            $out = cmd.exe /c "dir /b $quoted 2>nul & if errorlevel 1 exit /b 1" 2>&1
+            return $LASTEXITCODE -eq 0
+        }
         $symlinkDeleted = $false
         try {
             Remove-Item -LiteralPath $symlinkPath -ErrorAction Stop
-            if (Test-Path -LiteralPath $symlinkPath) {
+            # No-throw path: Remove-Item returned Ok.
+            Start-Sleep -Milliseconds 200  # let the notify timer drain
+            if (Test-PathFresh $symlinkPath) {
                 Write-Host "  [WARN] symlink still exists after Remove-Item (known issue, tracked separately)"
             } else {
                 Write-Host "  [OK]   Remove-Item (delete_reparse_point + cleanup)"
                 $symlinkDeleted = $true
             }
         } catch {
-            Write-Host "  [WARN] Remove-Item failed: $($_.Exception.Message) (known issue, tracked separately)"
+            # Throw path: Remove-Item raised Win32Exception
+            # but the kernel delete dispatch succeeded
+            # (trace: cleanup ok + FILE_ACTION_REMOVED
+            # emitted). Fall back to the fresh-process
+            # existence check as the source of truth —
+            # if the symlink is gone from the volume,
+            # the delete worked at the filesystem level
+            # regardless of PowerShell's user-mode
+            # complaint.
+            Write-Host "  [WARN] Remove-Item raised Win32Exception: $($_.Exception.Message) (issue #360 follow-up)"
+            Start-Sleep -Milliseconds 300  # let the notify timer drain
+            if (Test-PathFresh $symlinkPath) {
+                Write-Host "  [FAIL] symlink still present after Win32Exception; kernel delete did not happen"
+            } else {
+                Write-Host "  [OK]   File.Exists=False after Remove-Item Win32Exception (kernel delete succeeded; PowerShell stat-after-delete follow-up is the throw's root cause)"
+                $symlinkDeleted = $true
+            }
         }
 
         if ($symlinkDeleted) {

@@ -1593,15 +1593,34 @@ pub fn mount(
         tracing::debug!(
             mountpoint,
             volname,
-            "mount(windows): calling FileSystemHost::new"
+            "mount(windows): calling FileSystemHost::new_with_timer"
         );
+        // Issue #360: `new_with_timer` instead of `new` so WinFSP's
+        // threadpool timer polls the adapter's
+        // `NotifyingFileSystemContext::should_notify` every 100 ms
+        // and drains pending `FILE_ACTION_REMOVED` events into
+        // the kernel. Without the timer, PowerShell / Explorer
+        // never learn that a file was deleted and the per-volume
+        // dir cache keeps reporting the deleted entry as
+        // present (`Test-Path` returns True after Remove-Item).
+        //
+        // 100 ms is the rclone mount's notification interval;
+        // small enough that a user typing `Remove-Item` sees the
+        // change within ~1 frame, large enough that the timer
+        // wakeup overhead is negligible on idle mounts.
+        //
+        // `new_with_timer` takes `FileSystemParams` (a superset
+        // of `VolumeParams`) rather than `VolumeParams`; we
+        // build it via `FileSystemParams::default_params(...)`
+        // which mirrors the `FileSystemHost::new` defaults.
+        let fs_params = winfsp::host::FileSystemParams::default_params(vol_params);
         // Annotate the type as `FileSystemHost<_, FineGuard>` so the
         // `start_with_threads` call below resolves to the FineGuard impl
         // (the CoarseGuard impl has the same signature and is also
         // visible, so unannotated inference fails with E0034).
         let mut host: winfsp::host::FileSystemHost<_, winfsp::host::FineGuard> =
-            winfsp::host::FileSystemHost::new(vol_params, adapter)
-                .map_err(|e| anyhow::anyhow!("FileSystemHost::new: {e}"))?;
+            winfsp::host::FileSystemHost::new_with_timer::<_, 100>(fs_params, adapter)
+                .map_err(|e| anyhow::anyhow!("FileSystemHost::new_with_timer: {e}"))?;
         tracing::debug!(
             mountpoint,
             "mount(windows): FileSystemHost::new returned; calling host.mount"

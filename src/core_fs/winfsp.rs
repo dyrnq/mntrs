@@ -20,7 +20,7 @@
 
 #![cfg(windows)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
@@ -38,6 +38,7 @@ use winfsp::filesystem::{
     DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, ModificationDescriptor,
     OpenFileInfo, StreamInfo, VolumeInfo, WideNameInfo,
 };
+use winfsp::notify::{Notifier, NotifyInfo, NotifyingFileSystemContext};
 use winfsp_sys::FILE_ACCESS_RIGHTS;
 
 // Win32 file attribute constants (same as win32 API)
@@ -58,6 +59,23 @@ const FILE_ATTRIBUTE_NOT_CONTENT_INDEXED: u32 = 0x00002000;
 // `(Get-Item ...).Target` returns "" because the user-mode
 // shell never asks for the reparse data.
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+// Issue #360: Win32 file-change-notification constants
+// used to push FILE_ACTION_REMOVED to the kernel via
+// FspFileSystemNotify. winfsp-sys does not re-export
+// these (they're declared in the Win32 SDK's
+// `<winbase.h>` / `<winnt.h>` via the `windows` crate's
+// `Win32_Storage_FileSystem` feature, but we want to
+// avoid pulling that into a hot path) — define them
+// locally. Values are stable since Windows 2000 /
+// NTFS 3.0 — see
+//   https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-file_notify_information
+// for FILE_ACTION_* and
+//   https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-readdirectorychangesw
+// for FILE_NOTIFY_CHANGE_*.
+const FILE_ACTION_REMOVED: u32 = 0x00000002;
+const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x00000001;
+const FILE_NOTIFY_CHANGE_DIR_NAME: u32 = 0x00000002;
 
 // Issue #310: per-adapter TTL caches.
 //
@@ -670,6 +688,23 @@ pub struct WinFspAdapter<F: CoreFilesystem + 'static> {
     /// read-only after construction.
     file_security_descriptor: [u8; 72],
     dir_security_descriptor: [u8; 72],
+    /// Issue #360: FIFO queue of pending `FILE_ACTION_REMOVED`
+    /// notifications that the adapter needs to push to the
+    /// kernel. WinFSP drives `NotifyingFileSystemContext` via
+    /// a periodic timer; `cleanup` pushes onto this queue
+    /// after every successful backend.unlink/rmdir, and
+    /// `should_notify()` / `notify()` drain it through
+    /// `FspFileSystemNotify`. Without this, PowerShell
+    /// `Test-Path` and `Remove-Item` keep showing the file as
+    /// present (Windows caches per-volume dir listings, and
+    /// we never told it they changed). Entries are `(basename,
+    /// filter, action)`; `basename` is the leaf name as the
+    /// kernel last saw it, so the filter picks FILE_NAME for
+    /// unlink and DIR_NAME for rmdir. The queue grows at the
+    /// rate of deletes (low — typical workloads are
+    /// ≪ 1000 ops/s) and drains within one timer tick
+    /// (100 ms), so an unbounded `VecDeque` is fine.
+    pending_notifications: Mutex<VecDeque<(String, u32, u32)>>,
 }
 
 impl<F: CoreFilesystem + 'static> WinFspAdapter<F> {
@@ -681,6 +716,7 @@ impl<F: CoreFilesystem + 'static> WinFspAdapter<F> {
             acl_enabled: true,
             file_security_descriptor: synthesize_self_relative_sd(false),
             dir_security_descriptor: synthesize_self_relative_sd(true),
+            pending_notifications: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -1527,11 +1563,42 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 // to the kernel because cleanup returns
                 // ().
                 match result {
-                    Ok(()) => tracing::debug!(
-                        ino = context.ino,
-                        basename = %basename,
-                        "winfsp::cleanup: backend delete ok"
-                    ),
+                    Ok(()) => {
+                        tracing::debug!(
+                            ino = context.ino,
+                            basename = %basename,
+                            "winfsp::cleanup: backend delete ok"
+                        );
+                        // Issue #360: push a kernel-visible
+                        // FILE_ACTION_REMOVED so PowerShell /
+                        // Explorer / cmd `dir` drop the
+                        // entry from their cached dir
+                        // listings. Without this the
+                        // per-volume dir cache keeps
+                        // reporting the file as present
+                        // and `Test-Path` after Remove-Item
+                        // returns True. Filter is
+                        // FILE_NAME for unlink and DIR_NAME
+                        // for rmdir (the kernel uses the
+                        // filter to decide which watched
+                        // handles get woken up; picking
+                        // both is safe but wasteful).
+                        let (filter, action) = if context.is_dir {
+                            (FILE_NOTIFY_CHANGE_DIR_NAME, FILE_ACTION_REMOVED)
+                        } else {
+                            (FILE_NOTIFY_CHANGE_FILE_NAME, FILE_ACTION_REMOVED)
+                        };
+                        let mut queue = self
+                            .pending_notifications
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        queue.push_back((basename.clone(), filter, action));
+                        tracing::trace!(
+                            basename = %basename,
+                            queue_len = queue.len(),
+                            "winfsp::cleanup: queued FILE_ACTION_REMOVED"
+                        );
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         tracing::debug!(
                             ino = context.ino,
@@ -2723,6 +2790,98 @@ impl<F: CoreFilesystem + 'static> winfsp::filesystem::AsyncFileSystemContext for
         // use). `spawn` is fire-and-forget; the future
         // runs on the shared worker pool.
         crate::rt().spawn(future);
+    }
+}
+
+// Issue #360: `NotifyingFileSystemContext` drains the
+// `pending_notifications` FIFO that `cleanup` pushes to
+// after every successful backend.unlink/rmdir, turning
+// them into kernel-visible `FILE_ACTION_REMOVED` events
+// via `FspFileSystemNotify`. Without this, PowerShell,
+// Explorer, and cmd `dir` keep showing the deleted file
+// in their cached per-volume directory listing — the
+// kernel's `FspFileSystemNotify` only fires when the
+// filesystem explicitly says something changed, and we
+// were staying silent on the delete path.
+//
+// The sentinel type is `()` because we use the WinFSP
+// threadpool timer (100 ms polling) rather than a manual
+// notifier thread; the sentinel only needs to distinguish
+// "queue empty" (`None`) from "queue has entries" (`Some(())`).
+//
+// `should_notify` is called from the WinFSP timer thread;
+// `notify` is also called from that same thread inside
+// `FspFileSystemNotifyBegin`/`End`. We must therefore
+// release the queue mutex before calling
+// `notifier.notify()` to avoid holding the lock across a
+// DeviceIoControl (which would block any concurrent
+// `cleanup` that pushes onto the queue and could
+// deadlock with the FUSE worker pool that `cleanup`
+// depends on).
+impl<F: CoreFilesystem + 'static> NotifyingFileSystemContext<()> for WinFspAdapter<F> {
+    fn should_notify(&self) -> Option<()> {
+        let queue = self
+            .pending_notifications
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if queue.is_empty() { None } else { Some(()) }
+    }
+
+    fn notify(&self, _ctx: (), notifier: &Notifier) {
+        // Drain the entire queue under the lock, then
+        // emit each entry outside the lock. If a new
+        // `cleanup` fires between the drain and the
+        // emit, its entry just waits for the next timer
+        // tick — the worst case is a ~100 ms delay, not
+        // loss of an event.
+        let drained: Vec<(String, u32, u32)> = {
+            let mut queue = self
+                .pending_notifications
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            queue.drain(..).collect()
+        };
+        let count = drained.len();
+        for (basename, filter, action) in drained {
+            // Per-entry error handling: `set_name` can
+            // fail with STATUS_INSUFFICIENT_RESOURCES
+            // if the leaf name is longer than the
+            // 255-char default buffer. We log and
+            // skip such entries; a 255-char filename
+            // is far beyond any realistic backend
+            // object key and the file IS gone from
+            // the backend, so the missed notification
+            // is at worst a stale-cache issue that
+            // self-heals on the next `dir` listing.
+            // `NotifyInfo` is generic over the
+            // BUFFER_SIZE const; we pin the default
+            // (255 chars, the Win32 max-name length)
+            // explicitly so the `notifier.notify`
+            // call below also resolves to the same
+            // const — the winfsp crate's
+            // `Notifier::notify<const BUFFER_SIZE>`
+            // signature otherwise leaves the const
+            // ambiguous.
+            let mut info: NotifyInfo = NotifyInfo::new();
+            if let Err(e) = info.set_name(&basename) {
+                tracing::warn!(
+                    basename = %basename,
+                    error = ?e,
+                    "winfsp::notify: NotifyInfo::set_name failed; \
+                     skipping this entry (filename may exceed 255 chars)"
+                );
+                continue;
+            }
+            info.filter = filter;
+            info.action = action;
+            notifier.notify(&info);
+        }
+        if count > 0 {
+            tracing::trace!(
+                count,
+                "winfsp::notify: drained pending_notifications and emitted FILE_ACTION_REMOVED events"
+            );
+        }
     }
 }
 
