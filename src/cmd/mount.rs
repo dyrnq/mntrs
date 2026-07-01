@@ -441,13 +441,14 @@ pub fn mount_internal(
     // stage FUSE mount path). Honor it here so cache files land
     // under the operator-chosen persistent path (K8s ReadOnlyRootFS
     // + tmpfs-safe). CLI `mntrs mount` doesn't pass the key, so
-    // we fall back to the original /tmp/mntrs-csi-cache/<slug> path
-    // — that path is NOT tmpfs-safe, but CLI users run locally and
-    // choose where to mount.
-    let cache_dir = opts.get("cache-dir").cloned().unwrap_or_else(|| {
-        let suffix = mountpoint.replace(['/', ':'], "_");
-        format!("/tmp/mntrs-csi-cache/{}", suffix)
-    });
+    // we fall back to `cache_dir_for_mount(mountpoint)`, which is
+    // cfg-isolated: per-user temp on macOS (Issue #382), the
+    // original /tmp path on Linux / other unix (CLI users run
+    // locally and choose where to mount).
+    let cache_dir = opts
+        .get("cache-dir")
+        .cloned()
+        .unwrap_or_else(|| cache_dir_for_mount(mountpoint));
     let _ = std::fs::create_dir_all(&cache_dir);
     // Register mountpoint→cache_dir so unmount_internal can find
     // the same path during cleanup (Bug 30 follow-up).
@@ -573,13 +574,32 @@ pub fn mount_internal(
     )
 }
 
-/// Simplified unmount entry point for CSI plugin.
-/// Unmount for CSI plugin.
-/// Waits for writeback queue to drain (up to 5 min), then unmounts.
-/// Falls back to lazy unmount if regular unmount fails.
+/// Compute the CLI-fallback cache directory for a mount, used by
+/// `mount_internal` (when `opts["cache-dir"]` is not set) and by
+/// `unmount_internal`'s cleanup. CSI operators that pass
+/// `cache-dir` explicitly in `opts` are unaffected.
+///
+/// Issue #382: macOS launchd always sets `$TMPDIR` to a per-user
+/// mode-0700 path under `/var/folders/.../T/`. The unconditional
+/// `/tmp/mntrs-csi-cache/<slug>` fallback landed on `/private/tmp`
+/// on macOS — world-readable and shared across all users on the
+/// host. Per-user temp avoids the cross-user cache leak on shared
+/// macOS hosts (CI runners, multi-user build servers). Linux and
+/// other unix keep the original `/tmp` path (byte-identical to
+/// pre-fix), so a change to the macOS branch cannot accidentally
+/// regress a Linux CI run.
 fn cache_dir_for_mount(mountpoint: &str) -> String {
     let suffix = mountpoint.replace(['/', ':'], "_");
-    format!("/tmp/mntrs-csi-cache/{}", suffix)
+    #[cfg(target_os = "macos")]
+    {
+        let base = std::env::var("TMPDIR")
+            .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string());
+        format!("{}/mntrs-csi-cache/{}", base.trim_end_matches('/'), suffix)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        format!("/tmp/mntrs-csi-cache/{}", suffix)
+    }
 }
 
 pub fn build_operator_sync(storage_url: &str, opts: &HashMap<String, String>) -> Result<Operator> {
@@ -2489,19 +2509,69 @@ mod tests_261_2 {
     use super::{MOUNT_CACHE_DIR, cache_dir_for_mount};
 
     /// Sanity: the legacy fallback path is unchanged from pre-#261.2.
-    /// CLI `mntrs mount /a/pvc` still gets `/tmp/mntrs-csi-cache/_a_pvc`.
+    /// CLI `mntrs mount /a/pvc` still gets the canonical cache
+    /// directory. Pre-Issue #382 the path was `/tmp/mntrs-csi-cache/...`
+    /// on every platform; post-#382 macOS uses the per-user `$TMPDIR`
+    /// base (cross-user temp-leak fix) while Linux / other unix keep
+    /// the original `/tmp` base.
     #[test]
     fn cache_dir_for_mount_cli_fallback_unchanged() {
         let path = cache_dir_for_mount("/a/pvc-1/globalmount");
-        assert_eq!(path, "/tmp/mntrs-csi-cache/_a_pvc-1_globalmount");
+        #[cfg(target_os = "macos")]
+        let expected = {
+            let base = std::env::var("TMPDIR")
+                .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string());
+            format!(
+                "{}/mntrs-csi-cache/_a_pvc-1_globalmount",
+                base.trim_end_matches('/')
+            )
+        };
+        #[cfg(not(target_os = "macos"))]
+        let expected = "/tmp/mntrs-csi-cache/_a_pvc-1_globalmount";
+        assert_eq!(path, expected);
     }
 
     /// Mountpoint with drive-letter colon (Windows-path-style mountpoint).
     /// Replacement turns `:` into `_` so the suffix is fs-safe.
+    /// (Issue #382 only changes the base directory; the suffix
+    /// derivation is the same on every platform.)
     #[test]
     fn cache_dir_for_mount_colon_replaced() {
         let path = cache_dir_for_mount("C:/mnt");
-        assert_eq!(path, "/tmp/mntrs-csi-cache/C__mnt");
+        #[cfg(target_os = "macos")]
+        let expected = {
+            let base = std::env::var("TMPDIR")
+                .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string());
+            format!("{}/mntrs-csi-cache/C__mnt", base.trim_end_matches('/'))
+        };
+        #[cfg(not(target_os = "macos"))]
+        let expected = "/tmp/mntrs-csi-cache/C__mnt";
+        assert_eq!(path, expected);
+    }
+
+    /// Issue #382: on macOS the cache-dir base is `$TMPDIR` (per-user,
+    /// mode 0700 under `/var/folders/.../T/`), not `/tmp` (which
+    /// resolves to `/private/tmp`, mode 1777, shared across users).
+    /// This test asserts the contract: the returned path's base is
+    /// NOT `/tmp` on macOS.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cache_dir_for_mount_macos_uses_per_user_temp() {
+        let path = cache_dir_for_mount("/some/mount");
+        // Sanity: must not leak into the shared /tmp tree.
+        assert!(
+            !path.starts_with("/tmp/"),
+            "macOS cache_dir_for_mount must not start with /tmp (got {path})"
+        );
+        // Sanity: must land under TMPDIR (or temp_dir fallback) and
+        // carry the canonical suffix.
+        let expected_base = std::env::var("TMPDIR")
+            .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string());
+        let expected_prefix = format!("{}/mntrs-csi-cache/", expected_base.trim_end_matches('/'));
+        assert!(
+            path.starts_with(&expected_prefix),
+            "macOS cache_dir_for_mount must start with {expected_prefix} (got {path})"
+        );
     }
 
     /// Issue #261.2 core: register mountpoint→cache_dir in the global
@@ -2551,10 +2621,18 @@ mod tests_261_2 {
         }
         .unwrap_or_else(|| cache_dir_for_mount(mp));
         assert_eq!(resolved, cache_dir_for_mount(mp));
-        assert_eq!(
-            resolved,
-            "/tmp/mntrs-csi-cache/_tmp_never-registered-mountpoint"
-        );
+        #[cfg(target_os = "macos")]
+        let expected_suffix = {
+            let base = std::env::var("TMPDIR")
+                .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string());
+            format!(
+                "{}/mntrs-csi-cache/_tmp_never-registered-mountpoint",
+                base.trim_end_matches('/')
+            )
+        };
+        #[cfg(not(target_os = "macos"))]
+        let expected_suffix = "/tmp/mntrs-csi-cache/_tmp_never-registered-mountpoint";
+        assert_eq!(resolved, expected_suffix);
     }
 
     /// Map entry wins even if helper would compute a different value.
@@ -2563,9 +2641,25 @@ mod tests_261_2 {
     #[test]
     fn mount_cache_dir_entry_wins_over_helper() {
         let mp = "/mnt/csi/pvc-abc";
-        // Helper would compute: /tmp/mntrs-csi-cache/_mnt_csi_pvc-abc
+        // Helper would compute: the suffix is `_mnt_csi_pvc-abc` on
+        // every platform; the base directory differs on macOS
+        // (Issue #382) so we accept either `/tmp/mntrs-csi-cache/` or
+        // `<TMPDIR>/mntrs-csi-cache/` as the helper output.
         let helper_path = cache_dir_for_mount(mp);
-        assert!(helper_path.starts_with("/tmp/mntrs-csi-cache/"));
+        assert!(
+            helper_path.ends_with("/mntrs-csi-cache/_mnt_csi_pvc-abc"),
+            "helper path should carry canonical suffix (got {helper_path})"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            !helper_path.starts_with("/tmp/"),
+            "macOS helper must not land in shared /tmp (got {helper_path})"
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert!(
+            helper_path.starts_with("/tmp/mntrs-csi-cache/"),
+            "non-macOS helper should land in /tmp/mntrs-csi-cache (got {helper_path})"
+        );
         // CSI registers: /var/lib/mntrs/cache/<encoded_volume_id>
         let csi_path = "/var/lib/mntrs/cache/_s3_bucket_prefix";
         if let Ok(mut map) = MOUNT_CACHE_DIR.lock() {
