@@ -128,30 +128,89 @@ pub fn unmount(target: &str) -> Result<()> {
     Ok(())
 }
 
-/// POSIX: shell out to `fusermount3` (fallback `fusermount`).
+/// POSIX: shell out to `fusermount3` (fallback `fusermount`,
+/// then `umount(8)` on macOS/BSD/Solaris — issue #371).
+///
+/// On macOS neither `fusermount3` nor `fusermount` exists, so
+/// without the third fallback `Command::new("fusermount*")` returns
+/// `ErrorKind::NotFound` and unmount fails outright even when the
+/// FUSE mount is live (verified on macOS 15.7.7 + macFUSE 5.2.0).
+/// `umount(8)` is the BSD/macOS unmount entry point that delivers
+/// the unmount signal to macFUSE's `mount_macfuse` helper.
+///
+/// Linux behavior is unchanged: `fusermount3` / `fusermount` are
+/// always present on a libfuse install, so the `umount` branch is
+/// unreachable there. If a Linux host has a broken libfuse install
+/// (both fusermount binaries absent), the fallback surfaces
+/// `umount`'s error verbatim — silently calling `umount` on Linux
+/// would risk unmounting a non-FUSE mountpoint.
 #[cfg(unix)]
 fn fuse_unmount(mountpoint: &str) -> Result<()> {
-    let result = Command::new("fusermount3")
+    // Try fusermount3 first, then fusermount. Collect distinct
+    // NotFound vs non-NotFound failures so we can decide whether
+    // to fall through to umount (only when BOTH fusermount
+    // binaries are absent — i.e. not a libfuse host).
+    let f3 = Command::new("fusermount3")
         .arg("-u")
         .arg(mountpoint)
-        .status()
-        .or_else(|_| {
-            Command::new("fusermount")
-                .arg("-u")
-                .arg(mountpoint)
-                .status()
-        });
+        .status();
+    let result = match f3 {
+        // fusermount3 absent: try fusermount (Linux libfuse1 fallback)
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Command::new("fusermount")
+            .arg("-u")
+            .arg(mountpoint)
+            .status(),
+        // Either succeeded or failed with a real error (permission,
+        // mountpoint busy, etc.) — propagate, do NOT fall through
+        // to umount. A Linux host with fusermount3 installed but
+        // failing for a non-NotFound reason should not silently
+        // succeed via umount (would unmount the wrong thing).
+        other => other,
+    };
 
     match result {
         Ok(status) if status.success() => {
             eprintln!("unmounted {mountpoint}");
-            Ok(())
+            return Ok(());
         }
-        Ok(status) => Err(anyhow!(
-            "fusermount failed with exit code {}",
-            status.code().unwrap_or(-1)
-        )),
-        Err(e) => Err(anyhow!("failed to run fusermount: {e}")),
+        Ok(status) => {
+            return Err(anyhow!(
+                "fusermount failed with exit code {}",
+                status.code().unwrap_or(-1)
+            ));
+        }
+        Err(e) => {
+            // Both fusermount3 and fusermount absent — this is
+            // the macOS/BSD/Solaris case (issue #371). Fall through
+            // to umount(8), which is the platform-native unmount
+            // entry point and delivers the unmount signal to
+            // macFUSE's mount_macfuse helper.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                // fusermount exists but failed to spawn for a
+                // non-NotFound reason (rare; e.g. EACCES on a
+                // weirdly-permed binary). Surface the real error
+                // rather than trying umount.
+                return Err(anyhow!("failed to run fusermount: {e}"));
+            }
+            tracing::debug!(
+                mountpoint,
+                "fuse_unmount: neither fusermount3 nor fusermount present; falling back to umount(8)"
+            );
+            let umount_status = Command::new("umount").arg(mountpoint).status();
+            match umount_status {
+                Ok(s) if s.success() => {
+                    eprintln!("unmounted {mountpoint}");
+                    Ok(())
+                }
+                Ok(s) => Err(anyhow!(
+                    "umount failed with exit code {} (neither fusermount3 nor fusermount present on this host)",
+                    s.code().unwrap_or(-1)
+                )),
+                Err(e2) => Err(anyhow!(
+                    "no unmount tool available: fusermount3 / fusermount / umount all missing or non-executable ({e2})"
+                )),
+            }
+        }
     }
 }
 
