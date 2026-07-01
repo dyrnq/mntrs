@@ -148,11 +148,47 @@ $script:MntrsProc = $null
 
 function Mount-WinFsp {
     Write-Host "--- Mounting $BACKEND at $MNTRS_BNT ---"
+
+    # Pre-flight: WinFsp.Launcher service must be running for the
+    # mount to attach. The choco install in the workflow usually
+    # starts it, but on some runner images it stays stopped. Mirror
+    # the proven pattern in tests/e2e/common/mount-test.ps1:248-255:
+    # detect + start if needed. If still not running after Start-
+    # Service, the kernel driver is genuinely missing and the mount
+    # can't succeed.
+    $svc = Get-Service WinFsp.Launcher -ErrorAction SilentlyContinue
+    if ($null -eq $svc) {
+        throw "WinFsp.Launcher service not registered — choco install of WinFSP did not complete"
+    }
+    if ($svc.Status -ne 'Running') {
+        Write-Host "  WinFsp.Launcher status=$($svc.Status), starting..."
+        try { Start-Service WinFsp.Launcher -ErrorAction Stop }
+        catch { throw "failed to start WinFsp.Launcher: $_" }
+        Start-Sleep -Seconds 2
+    }
+    Write-Host "  WinFsp.Launcher running"
+
+    # Pre-flight: PATH += WinFsp\bin so winfsp-x64.dll resolves at
+    # mntrs.exe process start. The bench-windows.yml workflow's
+    # 'Search winfsp-x64.dll + PATH' step runs in a DIFFERENT GHA
+    # step, and GHA steps don't share env vars. So we have to
+    # re-do the PATH augmentation here. Mirrors mount-test.ps1:235.
+    $winFspBin = 'C:\Program Files\WinFsp\bin'
+    if (-not (Test-Path $winFspBin)) {
+        # x86 choco SxS layout — alternate install location.
+        $winFspBin = 'C:\Program Files (x86)\WinFsp\bin'
+    }
+    if (Test-Path $winFspBin) {
+        if ($env:PATH -notlike "*$winFspBin*") {
+            $env:PATH = "$winFspBin;$env:PATH"
+            Write-Host "  PATH += $winFspBin"
+        }
+    } else {
+        Write-Host "  ::warning::WinFsp runtime dir not found at standard choco paths"
+    }
+
     # Mirrors tests/e2e/common/mount-test.ps1:308-313 invocation
     # exactly: -RedirectStandardOutput/Error + -PassThru + -NoNewWindow.
-    # Without -NoNewWindow, on windows-latest runners the spawned
-    # mntrs exits silently within ~60s (no stdout/stderr, just gone)
-    # before the WinFSP kernel-mode attach completes.
     $script:MntrsProc = Start-Process -FilePath $MNTRS_BIN `
         -ArgumentList @("mount", $BACKEND, $MNTRS_BNT) `
         -RedirectStandardOutput "mntrs-bench.stdout.log" `
