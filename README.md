@@ -184,7 +184,7 @@ Three-tier cache: **memory → disk → remote**. Block-level (8 MB) indexing. D
 | `--vfs-cache-max-size` | `0` (off) | none (post-#243) | `0` = no LRU | Disk cache upper limit (LRU) |
 | `--vfs-cache-min-free-space` | `0` (off) | none (post-#243) | `0` = no floor check | Min free space before eviction |
 | `--vfs-cache-max-age` | 3600s | — | 3600s | Max cache file age (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
-| `--vfs-cache-mode` | `writes` | — | `writes` | `off` / `minimal` / `writes` / `full` (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
+| `--vfs-cache-mode` | `off` | — | `off` | `off` / `minimal` / `writes` / `full` (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
 | `--vfs-cache-poll-interval` | 60s | — | 60s | Stale-object poll interval (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
 | `--mem-limit` | 256 MB | — | 256 MB | Memory cache upper limit |
 | `--dir-cache-time` | 10s | — | 10s | Directory listing TTL |
@@ -215,7 +215,7 @@ Three-tier cache: **memory → disk → remote**. Block-level (8 MB) indexing. D
 | `--vfs-read-ahead` | 131072 | 131072 | Bytes prefetched past EOF |
 | `--async-read` | false | false | Async reads (FUSE kernel) |
 | `--vfs-fast-fingerprint` | false | false | Fast change detection (size+mtime) |
-| `--vfs-read-wait` | 20ms | 20ms | Sequential read wait threshold |
+| `--vfs-read-wait` | 1s | 1s | Sequential read wait threshold |
 | `--vfs-write-wait` | 1s | 1s | Sequential write wait threshold |
 
 **Adaptive chunk reader**: chunk size doubles on sequential reads, resets to 128 KB on seek. Up to 8 MB cap.
