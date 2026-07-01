@@ -438,9 +438,16 @@ try {
     Invoke-Safely -Name "Run-Delete"    -Block { Run-Delete }
 
     $lines = Render-Result
-    $lines | Tee-Object -FilePath $RESULT_FILE
+    # Emit to stdout only. The workflow step's outer pipeline
+    # already does `2>&1 | Tee-Object -FilePath bench-result.txt`,
+    # so a second Tee-Object here would race the outer one for the
+    # same file handle and fail with "process cannot access the file
+    # because it is being used by another process". Local direct
+    # invocation can pipe into a Tee-Object explicitly:
+    #     pwsh bench/run_all.ps1 2>&1 | Tee-Object bench-result.txt
+    foreach ($l in $lines) { Write-Host $l }
     Write-Host ""
-    Write-Host "Result written to $RESULT_FILE"
+    Write-Host "Result emitted to stdout (workflow step tees to $RESULT_FILE)"
     exit 0
 } catch {
     Write-Error "::error::run_all: $_"
