@@ -71,12 +71,17 @@ function Add-Row {
 # Mirrors bash's `time` output shape so the regression script's
 # Parse-Time regex (parse_time() in check-regression.sh, Parse-Time
 # in check-regression.ps1) can handle both pipelines uniformly.
+#
+# Format spec is "<int-minutes>m<seconds.N3>s" — same as bash
+# printf "%dm%.3fs". Split total seconds into whole minutes +
+# remaining seconds (not whole-seconds + fractional-seconds, which
+# produced "60m0.310s" for a 60.31s test). For sub-second tests
+# (most small reads), $m=0 and $s is the raw <1s value.
 function Format-Time {
     param([TimeSpan] $ts)
-    $total = [int]$ts.TotalSeconds
-    $frac = $ts.TotalSeconds - $total
-    # bash printf "%dm%.3fs" — 3-decimal fractional part
-    return ("{0}m{1:N3}s" -f $total, $frac)
+    $m = [int]($ts.TotalSeconds / 60)
+    $s = $ts.TotalSeconds - ($m * 60)
+    return ("{0}m{1:N3}s" -f $m, $s)
 }
 
 # Bench: run a scriptblock, time it, record a row.
