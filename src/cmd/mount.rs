@@ -1299,10 +1299,24 @@ pub fn mount(
             MountOption::Exec,
             MountOption::FSName(devname.unwrap_or(volname).to_string()),
         ];
-        if write_back_cache {
-            cfg.mount_options
-                .push(MountOption::CUSTOM("writeback_cache".to_string()));
-        }
+        // #361: the kernel-side mount option `writeback_cache` is the
+        // legacy libfuse 2 syntax. Modern libfuse 3.7+ (incl. 3.17 on
+        // ubuntu-24.04) honors `InitFlags::FUSE_WRITEBACK_CACHE`
+        // declared in `FuserAdapter::init()` (src/core_fs/fuser.rs:142).
+        // Passing the option name here makes `fusermount3` exit with
+        // "unknown option 'writeback_cache'" before INIT happens, so
+        // the kernel never gets a chance to enable per-inode writeback.
+        //
+        // We rely solely on the INIT capability flag now. The kernel
+        // still controls per-inode writeback opt-in via the inode flag
+        // returned in the lookup/create reply (kernel >= 4.18 honors
+        // this; older kernels silently ignore it and fall back to
+        // synchronous writes).
+        //
+        // The CLI `--write-back-cache` still exists for users who want
+        // the small-write optimization; the `write_back_cache` field
+        // on `FuserAdapter` is what gates the capability declaration.
+        let _ = write_back_cache; // see FuserAdapter::init()
         if allow_root {
             cfg.mount_options
                 .push(MountOption::CUSTOM("allow_root".to_string()));
