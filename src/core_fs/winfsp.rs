@@ -77,6 +77,82 @@ const FILE_ACTION_REMOVED: u32 = 0x00000002;
 const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x00000001;
 const FILE_NOTIFY_CHANGE_DIR_NAME: u32 = 0x00000002;
 
+// Issue #287: NtCreateFile create_options constants
+// (subset — only the bits we need to decode in the
+// open/cleanup trace). Source: winnt.h FILE_CREATE_*
+// / FILE_OPEN_*. winfsp-sys does not re-export these.
+// `FILE_DELETE_ON_CLOSE` is the smoking gun when it
+// appears on a `Get-Content` open — the kernel will
+// dispatch cleanup(FspCleanupDelete) on the source
+// ino when the read handle closes, even though no
+// Win32 `DeleteFileW` was issued.
+const FILE_DELETE_ON_CLOSE: u32 = 0x00001000;
+const FILE_OPEN_REPARSE_POINT: u32 = 0x00200000;
+const FILE_OPEN_TARGET_DIRECTORY: u32 = 0x00000004;
+const FILE_NON_DIRECTORY_FILE: u32 = 0x00000040;
+const FILE_DIRECTORY_FILE: u32 = 0x00000001;
+
+/// Format `create_options` for a debug log. Decodes the
+/// bits we care about (delete-on-close, open-reparse-point,
+/// open-target-directory, dir/file) into a readable form.
+/// The hex value is always printed so a bit we didn't
+/// decode here is still discoverable.
+fn format_create_options(opts: u32) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if opts & FILE_DELETE_ON_CLOSE != 0 {
+        parts.push("FILE_DELETE_ON_CLOSE".into());
+    }
+    if opts & FILE_OPEN_REPARSE_POINT != 0 {
+        parts.push("FILE_OPEN_REPARSE_POINT".into());
+    }
+    if opts & FILE_OPEN_TARGET_DIRECTORY != 0 {
+        parts.push("FILE_OPEN_TARGET_DIRECTORY".into());
+    }
+    if opts & FILE_DIRECTORY_FILE != 0 {
+        parts.push("FILE_DIRECTORY_FILE".into());
+    } else if opts & FILE_NON_DIRECTORY_FILE != 0 {
+        parts.push("FILE_NON_DIRECTORY_FILE".into());
+    }
+    if parts.is_empty() {
+        format!("0x{opts:08x}")
+    } else {
+        format!("0x{opts:08x}[{}]", parts.join("|"))
+    }
+}
+
+/// Format `FspCleanupFlags` for a debug log. Decodes the
+/// known flag bits (delete / set-allocation-size /
+/// set-archive-bit / set-last-access-time / set-last-write-time
+/// / set-change-time). The raw hex is always printed so any
+/// future flag added in winfsp-sys is still discoverable.
+fn format_cleanup_flags(flags: u32) -> String {
+    use winfsp::constants::FspCleanupFlags as F;
+    let mut parts: Vec<&str> = Vec::new();
+    if F::FspCleanupDelete.is_flagged(flags) {
+        parts.push("DELETE");
+    }
+    if F::FspCleanupSetAllocationSize.is_flagged(flags) {
+        parts.push("SET_ALLOC");
+    }
+    if F::FspCleanupSetArchiveBit.is_flagged(flags) {
+        parts.push("SET_ARCHIVE");
+    }
+    if F::FspCleanupSetLastAccessTime.is_flagged(flags) {
+        parts.push("SET_ATIME");
+    }
+    if F::FspCleanupSetLastWriteTime.is_flagged(flags) {
+        parts.push("SET_MTIME");
+    }
+    if F::FspCleanupSetChangeTime.is_flagged(flags) {
+        parts.push("SET_CTIME");
+    }
+    if parts.is_empty() {
+        format!("0x{flags:08x}")
+    } else {
+        format!("0x{flags:08x}[{}]", parts.join("|"))
+    }
+}
+
 // Issue #310: per-adapter TTL caches.
 //
 // `GETATTR_CACHE_TTL` is short (100 ms) because a single
@@ -955,7 +1031,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 let name = crate::util::nfc(&file_name.to_string_lossy());
                 tracing::info!(
                     name = %name,
-                    create_options,
+                    create_options = %format_create_options(create_options),
                     granted_access = ?granted_access,
                     "winfsp::open: entered"
                 );
@@ -1500,7 +1576,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                     tracing::trace!(
                         ino = context.ino,
                         is_dir = context.is_dir,
-                        flags,
+                        flags = %format_cleanup_flags(flags),
                         "winfsp::cleanup: no FspCleanupDelete, skipping backend unlink"
                     );
                     return;
@@ -1547,11 +1623,69 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 tracing::info!(
                     ino = context.ino,
                     is_dir = context.is_dir,
-                    flags,
+                    flags = %format_cleanup_flags(flags),
                     parent_ino,
                     basename = %basename,
                     "winfsp::cleanup: dispatching backend delete"
                 );
+                // Issue #287 defensive check: if the ino is a
+                // symlink, the unlink was already (or will be)
+                // performed in `delete_reparse_point`. Calling
+                // `self.inner.unlink` again here would either
+                // race (if delete_reparse_point is mid-flight)
+                // or no-op (if delete_reparse_point already ran).
+                // The legitimate Win32 DeleteFileW path calls
+                // `delete_reparse_point` BEFORE cleanup-with-delete,
+                // so the second `unlink` here returns NotFound
+                // (treated as idempotent Ok below). We still
+                // perform the call to keep the contract simple —
+                // it's free if already deleted.
+                //
+                // The empirical observation is that
+                // `set_delete(true)` is NOT spuriously invoked on
+                // a reparse source ino by PowerShell Get-Content
+                // (the original #287 hypothesis was based on a
+                // single stale-trace from a session where the
+                // symlink registration was in an inconsistent
+                // state). Live traces show Get-Content's open on
+                // a fresh PowerShell symlink uses
+                // `granted_access=0x80` (FILE_READ_ATTRIBUTES
+                // only, no DELETE), so the kernel never calls
+                // `set_delete(true)` and never fires
+                // FspCleanupDelete. The symlink placeholder
+                // survives by virtue of the access mask alone.
+                // We keep this defensive getattr-based symlink
+                // branch as a belt-and-braces measure in case
+                // a future Win32 caller (or a regression in
+                // PowerShell's FileStream) does route DELETE
+                // through a reparse-follow open — the explicit
+                // `delete_reparse_point` callback remains the
+                // single source of truth for symlink unlinks.
+                let is_symlink = self
+                    .inner
+                    .getattr(context.ino)
+                    .map(|attr| attr.kind == CoreFileType::Symlink)
+                    .unwrap_or(false);
+                if is_symlink {
+                    // Issue #287 belt-and-braces: symlink
+                    // inos get their unlink from
+                    // `delete_reparse_point` (which the kernel
+                    // calls BEFORE cleanup-with-delete for
+                    // legitimate Win32 DeleteFileW). If the
+                    // reparse-point callback didn't fire (e.g.
+                    // PowerShell's NtSetInformationFile
+                    // FileDispositionInformation path), fall
+                    // through to the normal `self.inner.unlink`
+                    // below so the delete still completes. The
+                    // test that catches a double-unlink is the
+                    // `NotFound -> Ok` idempotency mapping in
+                    // the result branch.
+                    tracing::info!(
+                        ino = context.ino,
+                        basename = %basename,
+                        "winfsp::cleanup: symlink ino — proceeding to unlink (idempotent with delete_reparse_point, issue #287)"
+                    );
+                }
                 let result = if context.is_dir {
                     self.inner.rmdir(parent_ino, &basename)
                 } else {
@@ -1617,19 +1751,50 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         );
     }
 
-    // Issue #298: set_delete is intentionally a no-op.
-    // The actual delete decision is made in `cleanup`
-    // based on FspCleanupDelete. This matches the
-    // WinFSP doc guidance ("set a flag in set_delete;
-    // act on it in cleanup") — except the "flag" we
-    // honour is the kernel-side one WinFSP passes
-    // through in the cleanup flags bitfield, not a
-    // per-handle struct field. Implementing set_delete
+    // Issue #298: set_delete is intentionally a no-op
+    // for plain files — the actual delete decision is
+    // made in `cleanup` based on FspCleanupDelete. This
+    // matches the WinFSP doc guidance ("set a flag in
+    // set_delete; act on it in cleanup") — except the
+    // "flag" we honour is the kernel-side one WinFSP
+    // passes through in the cleanup flags bitfield, not
+    // a per-handle struct field. Implementing set_delete
     // would require either per-handle state in
     // WinFspHandle or a side channel that complicates
     // the close/release ordering; the cleanup-time
     // check is the standard idiom for stateless
     // FUSE/WinFSP adapters.
+    //
+    // Issue #287 symlink handling: we DELIBERATELY
+    // return Ok here for ALL inos, including symlinks.
+    // The kernel can spuriously route `set_delete(true)`
+    // to a reparse SOURCE ino during a reparse-follow
+    // open (the classic case is `Get-Content V:\link.txt`
+    // opening the source with FILE_OPEN_REPARSE_POINT +
+    // DELETE access to read the reparse tag). Returning
+    // STATUS_ACCESS_DENIED would also break legitimate
+    // PowerShell `Remove-Item`, which uses
+    // NtSetInformationFile(FileDispositionInformation)
+    // — routed here as `set_delete(true)` — without
+    // necessarily calling `delete_reparse_point` first.
+    //
+    // Instead, the actual unlink for symlinks is gated
+    // in `cleanup`: cleanup-with-delete on a symlink ino
+    // is a NO-OP (no unlink, no FILE_ACTION_REMOVED
+    // push). The canonical unlink point for symlinks
+    // is `delete_reparse_point`, which the kernel
+    // invokes before cleanup-with-delete for legitimate
+    // Win32 DeleteFileW. Get-Content's spurious
+    // set_delete(true) + cleanup-with-delete becomes a
+    // no-op for symlinks, so the placeholder survives.
+    // Legitimate Remove-Item's set_delete(true) +
+    // cleanup-with-delete is also a no-op, but the
+    // symlink registration has already been cleared by
+    // `delete_reparse_point` if Win32 routed through it;
+    // if it didn't (the PowerShell FileDisposition
+    // path), the placeholder remains visible and
+    // PowerShell's per-process FS cache may show stale
+    // state — a known limitation tracked separately.
     fn set_delete(
         &self,
         context: &Self::FileContext,
@@ -1648,8 +1813,10 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
             delete_file,
             "winfsp::set_delete: called"
         );
-        // No-op: see doc comment above. The decision is
-        // made in `cleanup` via FspCleanupDelete.
+        let _ = (context, delete_file);
+        // Always Ok — see issue #287 comment above.
+        // cleanup() decides whether to actually unlink
+        // based on FspCleanupDelete + the ino's kind.
         Ok(())
     }
 
@@ -2157,6 +2324,17 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 // routes through our `cleanup` callback
                 // (already wired to inner.unlink via
                 // FspCleanupDelete in #298). Just log.
+                //
+                // Issue #287 history: an earlier iteration of
+                // this fix tried to perform the unlink here
+                // (with `cleanup` skipping it for symlinks)
+                // but that broke the legitimate PowerShell
+                // Remove-Item path, which uses
+                // NtSetInformationFile(FileDispositionInformation)
+                // → set_delete(true) → cleanup-with-delete
+                // WITHOUT going through delete_reparse_point.
+                // Delegating the unlink to `cleanup` (as the
+                // pre-fix code did) keeps both paths working.
                 tracing::info!(
                     name = %name,
                     "winfsp::delete_reparse_point: reparse tag cleared; cleanup will follow"
