@@ -43,8 +43,13 @@ if (-not $BACKEND) { $BACKEND = "memory://" }
 $RESULT_FILE = $env:RESULT_FILE
 if (-not $RESULT_FILE) { $RESULT_FILE = "bench-result.txt" }
 
-$DATA_DIR    = Join-Path $MNTRS_BNT "data"
-$MANY_DIR    = Join-Path $DATA_DIR "many"
+# String concat (not Join-Path) on purpose: Join-Path validates that
+# the root drive exists. At script-top-level the mount hasn't happened
+# yet, so Join-Path "V:" "data" throws "Cannot find drive V" and
+# triggers the trap before the function table is fully populated.
+# Workload functions below use Join-Path freely — by then V: exists.
+$DATA_DIR    = "${MNTRS_BNT}\data"
+$MANY_DIR    = "${DATA_DIR}\many"
 
 # Trims trailing colon for the case where MNTRS_MNT is "V:"
 $MNTRS_MNT_NO_COLON = $MNTRS_BNT.TrimEnd(':')
@@ -180,13 +185,15 @@ function Unmount-WinFsp {
 }
 
 # Register cleanup on EXIT (success, failure, Ctrl+C).
+# Only the script-level trap is needed — the try/finally below also
+# covers normal cleanup. (Module.OnRemove was tried as a third
+# belt-and-suspenders hook but SessionState.Module is $null for .ps1
+# files invoked via `&`, so that line throws and the trap fires
+# before Unmount-WinFsp is defined.)
 trap {
     Unmount-WinFsp
     break
 }
-$ExecutionContext.SessionState.Module.OnRemove = {
-    Unmount-WinFsp
-}.GetNewClosure()
 
 # ── Workload definitions ─────────────────────────────────────────────
 
