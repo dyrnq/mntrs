@@ -385,19 +385,32 @@ const IS_MOUNT_POINT_REPOLL_DELAY_MS: u64 = 100;
 
 ///
 /// Check if a path is already a mount point on macOS.
+///
+/// Issue #376: previously this used `split_whitespace()` and
+/// matched `fields[2]` against the canonical mount path. That
+/// silently broke when the mount point contained whitespace
+/// (e.g. `/Volumes/My Drive/test`), where the path itself got
+/// split across fields and `fields[2]` became `/Volumes/My` — a
+/// false negative on the idempotency check at `mount.rs:856` and
+/// the wait-loops at lines 614, 691, 1918.
+///
+/// macOS `mount(8)` output format is
+/// `<special> on <mount_point> (<opts>)`. We anchor on the literal
+/// substring `on <canonical> (` so whitespace inside the path is
+/// matched verbatim. The trailing ` (` anchor prevents false
+/// matches like `/Volumes/foo` against a line ending in
+/// `/Volumes/foo-bar (...)`.
 #[cfg(target_os = "macos")]
 pub fn is_mount_point(path: &str) -> bool {
     use std::process::Command;
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
+    let needle = format!("on {} (", canonical.to_string_lossy());
     let output = Command::new("mount")
         .output()
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default();
-    output.lines().any(|line| {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        fields.len() >= 3 && fields[2] == canonical.to_string_lossy().as_ref()
-    })
+    output.lines().any(|line| line.contains(&needle))
 }
 
 #[cfg(target_os = "linux")]
