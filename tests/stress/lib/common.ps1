@@ -81,6 +81,15 @@ function Write-Fail {
     Write-Host "  FAIL $msg" -ForegroundColor Red
     throw "stress: $msg"
 }
+function Write-Skip {
+    # Exit code 77 is the autotools "skip" convention; run-all.ps1
+    # classifies it as SKIP rather than FAIL. Mirrors bash common.sh's
+    # `exit 77` pattern in scenarios like 03-cache-eviction.sh when
+    # the mem-limit backend isn't available.
+    param([string] $msg)
+    Write-Host "  SKIP $msg" -ForegroundColor Yellow
+    exit 77
+}
 function Write-Section {
     param([string] $msg)
     Write-Host ""

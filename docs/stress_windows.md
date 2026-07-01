@@ -62,11 +62,13 @@ pwsh tests/stress/ci-smoke.ps1 02-large-file-io 06-soak-mixed
 ## SKIP semantics
 
 If a scenario cannot run on the current host (e.g. WinFSP feature not
-wired, memory backend rejected, environment limitation), it should
-emit a line starting with `  SKIP:` and exit 0. `run-all.ps1` reads
-the log after each scenario and classifies SKIP as a non-fail. The
-suite passes if 0 FAILs, regardless of SKIP count. The final summary
-line lists skipped scenarios explicitly:
+wired, memory backend rejected, environment limitation), call
+`Write-Skip "<reason>"` from `lib/common.ps1`. It emits a
+`  SKIP <reason>` line and exits with code **77** (autotools
+convention, mirrors bash `common.sh`'s `exit 77` pattern).
+`run-all.ps1` classifies exit code 77 as SKIP (not FAIL). The suite
+passes if 0 FAILs, regardless of SKIP count. The final summary line
+lists skipped scenarios explicitly:
 
 ```
 stress suite: 5 passed, 0 failed, 1 skipped
@@ -76,6 +78,11 @@ skipped: 03-cache-eviction
 Use SKIP sparingly — only for scenarios that genuinely cannot run on
 the host. A scenario that runs to completion but reports a degraded
 result should FAIL, not SKIP.
+
+Exit-code classification (not log-grep) is used so Write-Host output
+(to the Information stream) doesn't need to round-trip through a file
+just to be parsed. Only stdout is redirected to the per-scenario log
+file; classification reads `$proc.ExitCode` directly.
 
 ## Platform differences vs Linux
 

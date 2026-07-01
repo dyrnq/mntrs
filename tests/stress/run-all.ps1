@@ -63,14 +63,20 @@ foreach ($s in $selected) {
     }
 
     # Run scenario in a child pwsh so a scenario's terminating error
-    # doesn't poison the suite. Capture all streams (Write-Host is
-    # Information stream #6; defaults to stdout-only on PS5). Read
-    # exit code + log for SKIP/FAIL/PASS classification.
+    # doesn't poison the suite. Classify by exit code (autotools
+    # convention, mirrors bash common.sh):
+    #   0   = PASS
+    #   77  = SKIP (Write-Skip helper exits 77 in common.ps1)
+    #   *   = FAIL
+    # Only redirect stdout (NOT stderr) — Start-Process rejects two
+    # redirects pointing at the same file. Scenario stderr inherits
+    # the parent's stderr handle, so it still flows into the
+    # workflow's `*>&1 | Tee-Object` capture upstream. The log file
+    # is for postmortem only; classification reads $proc.ExitCode.
     $outFile = Join-Path $env:TEMP "stress-$s-$PID.log"
     $proc = Start-Process -FilePath "pwsh" `
         -ArgumentList @("-NoProfile", "-File", $scriptPath) `
         -RedirectStandardOutput $outFile `
-        -RedirectStandardError  $outFile `
         -PassThru -NoNewWindow -Wait
 
     if (Test-Path -LiteralPath $outFile) {
@@ -78,16 +84,13 @@ foreach ($s in $selected) {
     }
 
     $exitCode = $proc.ExitCode
-    # Read full log for SKIP classification (lines like "  SKIP: ...").
-    $logText = if (Test-Path -LiteralPath $outFile) { Get-Content -LiteralPath $outFile -Raw } else { "" }
-
-    if ($exitCode -eq 0 -and $logText -match "(?im)^\s*SKIP\b") {
+    if ($exitCode -eq 0) {
+        Write-Host "  → PASS ($s)"
+        $pass++
+    } elseif ($exitCode -eq 77) {
         Write-Host "  → SKIP ($s)"
         $skipped++
         $skippedScenarios += $s
-    } elseif ($exitCode -eq 0) {
-        Write-Host "  → PASS ($s)"
-        $pass++
     } else {
         Write-Host "  → FAIL ($s, exit=$exitCode)"
         $fail++
