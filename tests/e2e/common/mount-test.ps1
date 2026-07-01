@@ -596,8 +596,22 @@ function Mount-Test {
         # `New-Item ... -ErrorAction Stop` would fail with
         # "path already exists". Memory backend is fresh each run,
         # so this is a no-op there.
+        #
+        # Known issue (tracking issue #360): when the leftover is
+        # a symlink, the kernel rejects the DeleteFileW pre-IRP, so
+        # `Remove-Item -ErrorAction SilentlyContinue` still raises
+        # a Win32Exception that gets caught by the outer `try/catch`
+        # below and would surface as a spurious "symlink unexpected
+        # error" Fail. Route through the BCL with an explicit
+        # try/catch so the error is fully swallowed; if the cleanup
+        # actually fails, step 1 will throw a more informative error
+        # (and that path is captured by #360 as a follow-up).
         if (Test-Path -LiteralPath $symlinkPath) {
-            Remove-Item -LiteralPath $symlinkPath -Force -ErrorAction SilentlyContinue
+            try {
+                [System.IO.File]::Delete($symlinkPath)
+            } catch {
+                # Swallow — issue #360 will surface in step 1 if it matters.
+            }
         }
         # Step 1 — create the link.
         New-Item -ItemType SymbolicLink -Path $symlinkPath -Target $symlinkTarget -ErrorAction Stop | Out-Null
@@ -681,8 +695,23 @@ function Mount-Test {
     } catch {
         Fail "symlink unexpected error: $($_.Exception.GetType().Name) - $($_.Exception.Message)"
     } finally {
+        # Known issue (#360): when step 5's Remove-Item fails, the
+        # kernel rejects the unlink pre-IRP and the symlink is left
+        # in place. The `finally` cleanup is best-effort: any
+        # Win32Exception or non-terminating error here would emit
+        # an `::error::` GitHub Actions annotation (even with
+        # `-ErrorAction SilentlyContinue`, the underlying Write-Error
+        # stream still produces the annotation in some PowerShell
+        # hosts), so we route through the BCL directly to fully
+        # suppress the error output. Step 5's [WARN] is the
+        # authoritative signal that the cleanup will likely fail;
+        # we don't double-report here.
         if (Test-Path -LiteralPath $symlinkPath) {
-            Remove-Item -LiteralPath $symlinkPath -Force -ErrorAction SilentlyContinue
+            try {
+                [System.IO.File]::Delete($symlinkPath)
+            } catch {
+                # Swallow — issue #360 will surface elsewhere.
+            }
         }
     } }
 
