@@ -148,11 +148,16 @@ $script:MntrsProc = $null
 
 function Mount-WinFsp {
     Write-Host "--- Mounting $BACKEND at $MNTRS_BNT ---"
+    # Mirrors tests/e2e/common/mount-test.ps1:308-313 invocation
+    # exactly: -RedirectStandardOutput/Error + -PassThru + -NoNewWindow.
+    # Without -NoNewWindow, on windows-latest runners the spawned
+    # mntrs exits silently within ~60s (no stdout/stderr, just gone)
+    # before the WinFSP kernel-mode attach completes.
     $script:MntrsProc = Start-Process -FilePath $MNTRS_BIN `
         -ArgumentList @("mount", $BACKEND, $MNTRS_BNT) `
         -RedirectStandardOutput "mntrs-bench.stdout.log" `
         -RedirectStandardError  "mntrs-bench.stderr.log" `
-        -PassThru
+        -PassThru -NoNewWindow
     Write-Host "  started mntrs pid=$($script:MntrsProc.Id)"
     # Wait for the drive letter to appear. Mirrors the proven
     # readiness probe in tests/e2e/common/mount-test.ps1:325:
