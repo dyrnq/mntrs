@@ -2057,8 +2057,22 @@ impl MntrsFs {
 
     /// Remove a single entry from directory cache (like rclone delObject).
     /// Called after unlink/rmdir to avoid full directory re-read.
+    ///
+    /// Issue #360: this used to do a raw `dir_cache.get(parent_path)`,
+    /// which missed when the caller passed the non-canonical form
+    /// (e.g. `"foo"` instead of `"foo/"`) — `cache_add_entry` and
+    /// `list_op` both canonicalize the key, so the snapshot lives
+    /// under the trailing-slash form. Unlink/rmdir receive the
+    /// raw inode path from `self.resolve(_parent)`, which is the
+    /// non-canonical form. Without canonicalizing here, the
+    /// surgical single-entry removal silently misses for any
+    /// non-root parent, and the next readdir on the parent
+    /// reports the just-unlinked entry as still present (stale
+    /// snapshot). Canonicalize before lookup so the key matches
+    /// what `cache_add_entry` / `list_op` stored.
     fn cache_remove_entry(&self, parent_path: &str, name: &str) {
-        if let Some(entry) = self.dir_cache.get(parent_path) {
+        let parent_path = canonicalize_list_path(parent_path);
+        if let Some(entry) = self.dir_cache.get(&parent_path) {
             let (_, entries) = entry.value();
             entries.remove(name);
         }
@@ -5284,6 +5298,22 @@ impl CoreFilesystem for MntrsFs {
         self.path_to_ino.remove(&full_path);
         self.attr_cache.remove(&full_path);
         self.cache_remove_entry(&parent_path, name);
+        // Issue #360: invalidate the parent's dir_cache
+        // snapshot as a belt-and-braces complement to the
+        // surgical `cache_remove_entry` above. The snapshot is
+        // keyed by canonicalized parent path (list_op /
+        // cache_add_entry canonicalize; cache_remove_entry now
+        // canonicalizes too) and lists every child the last
+        // `list_op` saw — including the file we just unlinked.
+        // A follow-up readdir that hits the snapshot would
+        // otherwise still surface the entry, masking the
+        // delete. Drop the whole parent entry; the next
+        // opendir refetches via list_op and re-materializes
+        // the listing without the just-removed file. Matches
+        // the symlink branch's `parent_canon.remove` and the
+        // rmdir branch's `invalidate_dir_cache` pattern.
+        let parent_canon = canonicalize_list_path(&parent_path);
+        self.dir_cache.remove(parent_canon.as_str());
 
         // For the WinFSP cleanup callback at winfsp.rs:1032:
         // a NotFound returned here is the "dirty-only"
@@ -7184,6 +7214,87 @@ mod tests {
             attr.mtime, mtime,
             "mtime is the dir_cache's server-side modtime (not the cache file's mtime)"
         );
+    }
+
+    // ── issue #360: cache_remove_entry key canonicalization ───
+
+    /// Issue #360: `cache_remove_entry` must canonicalize its
+    /// parent_path key to match what `cache_add_entry` /
+    /// `list_op` stored under. Pre-fix this used a raw
+    /// `dir_cache.get(parent_path)` lookup, which missed for
+    /// any non-root parent when the caller passed the
+    /// non-canonical form (`"foo"` instead of `"foo/"`) —
+    /// which is exactly what `MntrsFs::unlink` /
+    /// `MntrsFs::rmdir` receive from `self.resolve(_parent)`,
+    /// because the inodes entry's path is the raw (no
+    /// trailing-slash) form. The silent miss meant a follow-up
+    /// readdir on the parent would still surface the just-
+    /// unlinked entry from the stale snapshot, masking the
+    /// delete. Pin the fix: add an entry with `cache_add_entry`
+    /// (which canonicalizes), then remove with the raw
+    /// non-canonical parent_path; the entry must be gone.
+    #[test]
+    fn cache_remove_entry_canonicalizes_parent_key() {
+        use crate::util::canonicalize_list_path;
+        let dir = scratch_dir("360-remove-canonical");
+        let fs = new_test_fs_evict(dir, 1024 * 1024);
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        // Seed a nested-dir snapshot entry under the canonical
+        // key — what list_op would store after a real listing.
+        // cache_add_entry canonicalizes "foo" → "foo/" before
+        // the dir_cache insert.
+        fs.cache_add_entry("foo", "bar.txt", EntryMode::FILE, 1024, mtime);
+        let parent_key = canonicalize_list_path("foo");
+        assert!(
+            fs.dir_cache.get(&parent_key).is_some(),
+            "precondition: seeded entry must be reachable under the canonical key"
+        );
+        assert!(
+            fs.dir_cache
+                .get(&parent_key)
+                .unwrap()
+                .value()
+                .1
+                .contains_key("bar.txt"),
+            "precondition: snapshot must list 'bar.txt' under the canonical key"
+        );
+        // Now unlink — MntrsFs::unlink passes the raw parent
+        // path (from `self.resolve(_parent)`), not the
+        // canonical form. Pre-fix this `dir_cache.get("foo")`
+        // missed because the snapshot lives under "foo/".
+        fs.cache_remove_entry("foo", "bar.txt");
+        // Pin: the entry must be gone from the canonical-key
+        // snapshot. Pre-fix it would still be there because
+        // the raw-key lookup silently missed the whole map
+        // entry.
+        let snapshot_after = fs
+            .dir_cache
+            .get(&parent_key)
+            .map(|e| e.value().1.contains_key("bar.txt"))
+            .unwrap_or(false);
+        assert!(
+            !snapshot_after,
+            "post-unlink snapshot must NOT list 'bar.txt' under the canonical key \
+             (issue #360: cache_remove_entry must canonicalize parent_path to match \
+             the canonical key cache_add_entry / list_op stored under)"
+        );
+    }
+
+    /// Issue #360: `cache_remove_entry` is idempotent on a
+    /// parent that has no snapshot yet (the surgical removal
+    /// silently no-ops). Pre-fix this was already correct
+    /// for the missing-snapshot case — pin it so a future
+    /// refactor that adds error propagation (or panics) for
+    /// the missing-snapshot case trips CI.
+    #[test]
+    fn cache_remove_entry_missing_snapshot_is_noop() {
+        let dir = scratch_dir("360-remove-missing-snapshot");
+        let fs = new_test_fs_evict(dir, 1024 * 1024);
+        // No entries seeded. cache_remove_entry must not
+        // panic / error.
+        fs.cache_remove_entry("never/listed", "phantom.txt");
+        // Post-condition: dir_cache is still empty.
+        assert_eq!(fs.dir_cache.len(), 0, "no snapshot was ever seeded");
     }
 
     // ── issue #258: stat_op error-kind distinction ────────────
