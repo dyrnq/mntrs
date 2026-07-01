@@ -1010,6 +1010,12 @@ pub fn mount(
         // Issue #38: empty pending set; populated on
         // first flush/release.
         writeback_pending: std::sync::Arc::new(dashmap::DashSet::new()),
+        // Issue #325: in-memory symlink target table. Empty at
+        // mount start; populated by `MntrsFs::symlink` when
+        // user-mode code creates a symbolic link (Win32
+        // `New-Item -ItemType SymbolicLink` → WinFSP
+        // `set_reparse_point` → inner.symlink).
+        symlinks: dashmap::DashMap::new(),
         // Issue #132: shared adaptive prefetch window controller.
         backpressure: std::sync::Arc::new(crate::backpressure::BackpressureController::new()),
         // Issue #201: per-mount prefetch budget. Same cap as
