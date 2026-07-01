@@ -25,5 +25,13 @@ $env:STRESS_SOAK_SECS = "60"
 $env:STRESS_INTERVAL = "1"
 
 # Forward any positional args (subset of scenarios) through to run-all.
-& (Join-Path $PSScriptRoot "run-all.ps1") @args
+# Use @() instead of @args so an empty arg list doesn't splat $null
+# (which PowerShell rejects with "A positional parameter cannot be
+# found that accepts argument '$null'"). If $args has items, splat
+# them; otherwise call without args (= all scenarios).
+if ($args.Count -gt 0) {
+    & (Join-Path $PSScriptRoot "run-all.ps1") @args
+} else {
+    & (Join-Path $PSScriptRoot "run-all.ps1")
+}
 exit $LASTEXITCODE
