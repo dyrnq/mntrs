@@ -126,12 +126,19 @@ fn record_mount(storage: &str, mountpoint: &str, read_only: bool) {
         .parent()
         .expect("BUG: mounts_db() path must have a parent directory");
     let _ = std::fs::create_dir_all(dir);
+    // Issue #384: canonicalize the mountpoint so the row written
+    // here and the row filtered by `remove_mount` / `unmount`'s
+    // db cleanup agree byte-for-byte. On macOS `/tmp` is a
+    // symlink to `/private/tmp` — without canonicalization a
+    // user-supplied `/tmp/foo` here and `/private/tmp/foo` in
+    // the unmount path produce a stale entry.
+    let canon_mp = crate::util::canonicalize_mountpoint(mountpoint);
     // Atomically rewrite: tmp + rename (POSIX atomic)
     let tmp = format!("{}.tmp.{}", path, std::process::id());
     let mut lines = Vec::new();
     if let Ok(existing) = std::fs::read_to_string(&path) {
         for l in existing.lines() {
-            if l.split('\0').nth(1) != Some(mountpoint) {
+            if l.split('\0').nth(1) != Some(canon_mp.as_str()) {
                 lines.push(l.to_string());
             }
         }
@@ -144,7 +151,7 @@ fn record_mount(storage: &str, mountpoint: &str, read_only: bool) {
         0,
         format!(
             "{}\0{}\0{}\0{}\0{}\0{}",
-            storage, mountpoint, pid, user, ro, backend
+            storage, canon_mp, pid, user, ro, backend
         ),
     );
     let content = lines.join("\n") + "\n";
@@ -171,13 +178,18 @@ fn remove_mount(mountpoint: &str) {
     // parallel) where one finishes + unmounts while
     // another is starting can hit it. Atomic rename
     // closes the window for free.
+    // Issue #384: canonicalize the mountpoint before
+    // filtering so the byte-equality match against the row
+    // `record_mount` wrote (also canonicalized) succeeds on
+    // macOS where `/tmp` is a symlink to `/private/tmp`.
+    let canon_mp = crate::util::canonicalize_mountpoint(mountpoint);
     let content = match fs::read_to_string(&path) {
         Ok(c) => c,
         Err(_) => return,
     };
     let filtered: Vec<&str> = content
         .lines()
-        .filter(|l| l.split('\0').nth(1) != Some(mountpoint))
+        .filter(|l| l.split('\0').nth(1) != Some(canon_mp.as_str()))
         .collect();
     let new_body = filtered.join("\n");
     let tmp = format!("{}.tmp.{}", path, std::process::id());
@@ -2677,5 +2689,141 @@ mod tests_261_2 {
         if let Ok(mut map) = MOUNT_CACHE_DIR.lock() {
             map.remove(mp);
         }
+    }
+
+    // ── Issue #384: record_mount / remove_mount agree on canonical form ──
+    //
+    // Pre-#384: `record_mount` wrote the raw user-supplied mountpoint to
+    // `mounts.txt`, and `remove_mount` filtered on byte-equality against
+    // the raw user-supplied mountpoint. On macOS `/tmp/foo` and
+    // `/private/tmp/foo` are byte-different, so a mount-via-one-form /
+    // unmount-via-the-other-form round trip left a stale entry.
+    //
+    // These tests build a symlink under a tempdir, register the mount
+    // through one of the two forms, then ask `remove_mount` to clean it
+    // up via the *other* form. Post-#384 both callsites canonicalize, so
+    // the row matches and the file ends up empty (or at least stripped
+    // of the registered row).
+    //
+    // We redirect `HOME` to the tempdir so the `mounts_db()` path lands
+    // inside it — `mounts_db()` consults `HOME` / `XDG_DATA_HOME` and we
+    // don't want to pollute the developer's real `~/.local/share/mntrs/`.
+
+    use super::{record_mount, remove_mount};
+    // `std::os::unix::fs::symlink` is only available on unix. The
+    // two tests that use it are already `#[cfg(unix)]`-gated, but
+    // the `use` itself needs its own gate so a Windows build
+    // doesn't choke on the unresolved import (CI run 28526350657).
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    /// Mount via the canonical form, remove via the symlinked form.
+    /// Post-fix this must succeed (the recorded row is in canonical
+    /// form; the filter canonicalizes the request too — they match).
+    #[cfg(unix)]
+    #[test]
+    fn record_remove_symlink_agreement_canonical_then_symlinked() {
+        let _env_lock = crate::util::tests_env_mutex();
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: set_var/remove_var are unsafe in recent rustc. The
+        // mutex above serializes against any other test touching HOME.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+        // Two real dirs joined by a symlink, mimicking /tmp → /private/tmp.
+        let real = home.path().join("real");
+        let link_dir = home.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(&link_dir).unwrap();
+        let target = real.join("mnt");
+        let alias = link_dir.join("mnt");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &alias).unwrap();
+
+        // Canonicalize the target up-front. On macOS `tempdir()` lives
+        // under `/var/folders/...` which is itself a symlink to
+        // `/private/var/folders/...` — `record_mount` runs
+        // `fs::canonicalize` on the input, so the recorded row will
+        // be the canonical form, not the raw `target` string. Assert
+        // against the canonical form so the test reflects what the
+        // implementation actually writes.
+        let canon = std::fs::canonicalize(&target)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        // Record using the canonical form (real path).
+        record_mount("memory:///", target.to_str().unwrap(), false);
+        let db = crate::cmd::mount::mounts_db_path();
+        let contents = std::fs::read_to_string(&db).unwrap();
+        assert!(
+            contents
+                .lines()
+                .any(|l| l.split('\0').nth(1) == Some(canon.as_str())),
+            "recorded row should carry canonical mountpoint {canon:?} (got {contents:?})"
+        );
+        // Remove using the symlinked form (alias). Pre-#384 this would
+        // miss because the recorded row is canonical but the filter
+        // looks for the raw symlinked form.
+        remove_mount(alias.to_str().unwrap());
+        let after = std::fs::read_to_string(&db).unwrap_or_default();
+        assert!(
+            !after
+                .lines()
+                .any(|l| l.split('\0').nth(1) == Some(canon.as_str())),
+            "remove_mount must strip the canonical row even when called with the symlinked form (after: {after:?})"
+        );
+    }
+
+    /// Mount via the symlinked form, remove via the canonical form.
+    /// Same shape as the previous test, exercising the opposite
+    /// direction. After #384 both ends canonicalize, so the row
+    /// matches in either order.
+    #[cfg(unix)]
+    #[test]
+    fn record_remove_symlink_agreement_symlinked_then_canonical() {
+        let _env_lock = crate::util::tests_env_mutex();
+        let home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+        let real = home.path().join("real");
+        let link_dir = home.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(&link_dir).unwrap();
+        let target = real.join("mnt");
+        let alias = link_dir.join("mnt");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &alias).unwrap();
+
+        // Record using the symlinked form (alias). `record_mount`
+        // canonicalizes internally, so the row stored is the
+        // canonical form.
+        record_mount("memory:///", alias.to_str().unwrap(), false);
+        let db = crate::cmd::mount::mounts_db_path();
+        let contents = std::fs::read_to_string(&db).unwrap();
+        // `record_mount` canonicalizes; both the symlinked and the
+        // canonical inputs collapse to the same stored form.
+        let canon = std::fs::canonicalize(&target)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            contents
+                .lines()
+                .any(|l| l.split('\0').nth(1) == Some(canon.as_str())),
+            "recorded row should carry canonical mountpoint {canon:?} (got {contents:?})"
+        );
+        // Remove using the canonical form directly. Should match.
+        remove_mount(&canon);
+        let after = std::fs::read_to_string(&db).unwrap_or_default();
+        assert!(
+            !after
+                .lines()
+                .any(|l| l.split('\0').nth(1) == Some(canon.as_str())),
+            "remove_mount(canonical) must strip the row (after: {after:?})"
+        );
     }
 }

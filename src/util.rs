@@ -217,6 +217,71 @@ pub(crate) fn canonicalize_list_path(raw: &str) -> String {
     }
 }
 
+/// Resolve a mountpoint to its canonical form so that
+/// `record_mount` / `remove_mount` / `unmount`'s `mounts.txt`
+/// cleanup all see the same string regardless of how the user
+/// typed the symlinked prefix. Issue #384.
+///
+/// On macOS `/tmp` is a symlink to `/private/tmp`, so `/tmp/foo`
+/// and `/private/tmp/foo` are byte-different but refer to the same
+/// directory. Without canonicalization, `mounts.txt` can accumulate
+/// stale entries after a normal mount/unmount round-trip where the
+/// user passes the canonical form on mount and the symlinked form
+/// on unmount (or vice versa): the recorded row is filtered out
+/// by string-equality against the *other* form, the line survives,
+/// and `mntrs list` shows a ghost mount that's already gone.
+///
+/// On Linux this is effectively a no-op for the common case — the
+/// `/tmp` directory is a real directory, and `fs::canonicalize`
+/// returns the input unchanged. macOS is where the symlink
+/// resolution actually matters.
+///
+/// This helper does NOT lowercase. Linux filesystems are case-
+/// sensitive (ext4/xfs/btrfs) and lowercasing would silently merge
+/// genuinely-different files into the same canonical key. macOS
+/// APFS case-insensitivity is a separate, larger concern; see the
+/// open issue thread for that direction. This fix only resolves
+/// symlinks.
+///
+/// Fallback: if `fs::canonicalize` fails (e.g. the mountpoint
+/// directory was already deleted between mount and unmount), the
+/// raw string is returned. `umount(8)` and the `mounts.txt` filter
+/// will surface their own ENOENT-style diagnostic in that case.
+pub(crate) fn canonicalize_mountpoint(mp: &str) -> String {
+    std::fs::canonicalize(mp)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| mp.to_string())
+}
+
+// ── test-only env-mutex ─────────────────────────────────────────
+//
+// Tests in `util::tests` and `cmd::mount::tests_261_2` both mutate
+// process-wide env vars (`HOME`, `XDG_DATA_HOME`, ...) via
+// `std::env::set_var` / `remove_var`. Cargo runs tests in parallel,
+// so two env-mutating tests can race on the same var. We serialize
+// them through a single shared mutex so the env state one test sees
+// is the env state the next test observes.
+//
+// Issue #289 closed the in-`util` race; Issue #384 extended the
+// requirement to the record/remove roundtrip tests in `mount.rs`
+// which also touch `HOME`. The same mutex is shared.
+//
+// The `cfg(test)` gate keeps this out of release builds.
+#[cfg(test)]
+pub(crate) static TESTS_ENV_MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+/// Acquire the shared test env-mutex. Callers MUST drop the guard
+/// before returning from the test body — holding it across an
+/// assertion will deadlock the rest of the suite.
+#[cfg(test)]
+pub(crate) fn tests_env_mutex() -> std::sync::MutexGuard<'static, ()> {
+    TESTS_ENV_MUTEX
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 // ── Unicode NFC normalization (Issue #307) ─────────────────────────
 
 /// Canonicalize a file-name to NFC (Unicode precomposed form).
@@ -461,7 +526,6 @@ pub fn detect_cgroup_memory_limit() -> Option<u64> {
 mod tests {
     use super::*;
     use std::path::Path;
-    use std::sync::Mutex;
 
     // ── env-mutation serialization (Issue #289) ─────────────────────
     //
@@ -479,12 +543,14 @@ mod tests {
     // serialize the env-mutating tests via a single shared
     // `OnceLock<Mutex>` that's locked at the top of every
     // test body that calls `set_var` / `remove_var`.
-    static ENV_MUTEX: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    // Issue #384: this same mutex is now `pub(crate)` (see
+    // `TESTS_ENV_MUTEX` above) so tests in other modules can
+    // serialize against the env mutations this module's tests
+    // perform. Alias here for the in-module callers — locking the
+    // shared static is cheaper than re-declaring a second
+    // `OnceLock`.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_MUTEX
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        super::tests_env_mutex()
     }
 
     // ── fnmatch ────────────────────────────────────────────────────
@@ -604,6 +670,86 @@ mod tests {
         let a = canonicalize_list_path("foo/bar");
         let b = canonicalize_list_path(&a);
         assert_eq!(a, b);
+    }
+
+    // ── canonicalize_mountpoint (Issue #384) ────────────────────────
+    //
+    // On macOS `/tmp` is a symlink to `/private/tmp` — the helper
+    // must collapse those forms so `record_mount` and `remove_mount`
+    // agree byte-for-byte. On Linux the input is typically a real
+    // directory and the helper returns the input unchanged.
+    //
+    // We don't test `/tmp` ↔ `/private/tmp` directly because that
+    // pair is macOS-specific; instead we construct a symlink under
+    // a `tempfile::tempdir()` and assert the helper resolves it.
+    // That way the test passes on every unix platform and still
+    // exercises the symlink-resolution branch.
+
+    // `std::os::unix::fs::symlink` only resolves on unix. Gate the
+    // whole test — the same behavior is implicitly verified by the
+    // live macOS smoke test in `PR mount/umount roundtrip` (the
+    // helper is exercised through `record_mount` / `remove_mount`
+    // on Linux + macOS; the unit test only adds the synthetic
+    // symlink case).
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_mountpoint_resolves_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        symlink(&real, &link).unwrap();
+
+        let resolved = canonicalize_mountpoint(link.to_str().unwrap());
+        // Both forms must point to the same canonical directory.
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&real)
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn canonicalize_mountpoint_no_symlink_is_identity() {
+        // A real directory with no symlinks in the path is
+        // returned in canonical form (which on Linux is the
+        // input; on macOS may differ if the path sits under a
+        // symlinked prefix — we only assert the round-trip
+        // agrees).
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let a = canonicalize_mountpoint(real.to_str().unwrap());
+        let b = canonicalize_mountpoint(&a);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn canonicalize_mountpoint_missing_path_returns_raw() {
+        // fs::canonicalize on a non-existent path returns an
+        // Err. The helper must fall back to the raw string so
+        // record/remove callers don't see a surprising empty
+        // string or panic. The mountpoint in the issue
+        // reproduction could have been deleted between mount
+        // and unmount — that path must still behave
+        // sensibly.
+        let missing = "/this/path/definitely/does/not/exist/mntrs-test";
+        let got = canonicalize_mountpoint(missing);
+        assert_eq!(got, missing);
+    }
+
+    #[test]
+    fn canonicalize_mountpoint_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let first = canonicalize_mountpoint(real.to_str().unwrap());
+        let second = canonicalize_mountpoint(&first);
+        // canonicalize(canonicalize(x)) == canonicalize(x)
+        assert_eq!(first, second);
     }
 
     // ── opendal_to_io_error ─────────────────────────────────────────
