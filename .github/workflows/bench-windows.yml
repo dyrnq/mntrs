@@ -1,0 +1,167 @@
+name: Benchmark (Windows)
+
+# Issue #378: Windows bench pipeline — mirrors bench.yml (the Linux
+# bench) for the WinFSP adapter. Runs on windows-latest weekly +
+# on PR + on main push + on manual dispatch. Memory backend only
+# in this PR (no MinIO setup); S3 backend is a follow-up.
+#
+# Output: bench-result.txt (md table from bench/run_all.ps1) and
+# microbench-result.txt (cargo test --test microbench --release
+# output). Both uploaded as artifacts for inspection. The
+# "Check regressions" step gates on bench/baseline-windows.txt
+# with a 20% threshold; missing baseline emits a warning and
+# exits 0 (matches the bash baseline pattern).
+#
+# Reusing the ci-windows.yml WinFSP install + DLL PATH search
+# patterns verbatim (per memory mntrs-winfsp-ci-dll-path).
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Weekly Mon 02:00 UTC. Off-the-hour to spread CI load; matches
+    # the bash bench.yml cadence.
+    - cron: '0 2 * * 1'
+
+jobs:
+
+  bench-windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # WinFSP install — same pin as ci-windows.yml (2.1.25156,
+      # LongPathSupport=true). Without --version the choco default
+      # may drift between runs and silently change behavior.
+      - name: Install WinFSP + protoc
+        shell: pwsh
+        run: |
+          choco install -y winfsp --version=2.1.25156 --params='LongPathSupport=true'
+          choco install -y protoc
+
+      # winfsp-x64.dll PATH workaround — same recursive search as
+      # ci-windows.yml. On freshly-provisioned runner VMs the choco
+      # install drops the DLL in a non-PATH location; subsequent
+      # `run:` steps spawn fresh shells that don't inherit the
+      # install session's env. Without this, cargo test fails with
+      # STATUS_DLL_NOT_FOUND.
+      - name: Search winfsp-x64.dll + PATH
+        shell: pwsh
+        run: |
+          $searchRoots = @(
+            'C:\Program Files\WinFSP',
+            'C:\Program Files (x86)\WinFSP',
+            'C:\Windows\System32',
+            'C:\ProgramData\chocolatey\lib\winfsp'
+          )
+          $dll = $null
+          foreach ($root in $searchRoots) {
+            if (Test-Path $root) {
+              $found = Get-ChildItem -Path $root -Recurse -Filter 'winfsp-x64.dll' -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($found) { $dll = $found; break }
+            }
+          }
+          if ($dll) {
+            $env:PATH = "$($dll.DirectoryName);$env:PATH"
+            Write-Host "Found winfsp-x64.dll at: $($dll.FullName)"
+          } else {
+            Write-Host "WARNING: winfsp-x64.dll not found in any known location"
+          }
+
+      - name: Build mntrs (release)
+        run: cargo build --release --package mntrs
+
+      # Microbench tests are platform-agnostic (pure data-structure
+      # timing). Run with --release and --nocapture so the per-test
+      # println! lines land in the artifact. Internal asserts
+      # (`speedup >= 5x` / `>= 1.05x`) act as a sanity gate; if
+      # they trip the whole cargo test step fails.
+      - name: Run microbench (sanity)
+        run: |
+          cargo test --test microbench --release -- --nocapture 2>&1 | Tee-Object -FilePath microbench-result.txt
+
+      - name: Upload microbench artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: microbench-result-windows
+          path: microbench-result.txt
+          if-no-files-found: warn
+
+      # Mount V: from memory://, run ~25 workloads, emit md table
+      # + Result line. run_all.ps1 tears down V: on EXIT (success,
+      # failure, or Ctrl+C) via its internal trap.
+      - name: Run benchmark (WinFSP mount + PowerShell workload)
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          & ./bench/run_all.ps1 2>&1 | Tee-Object -FilePath bench-result.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload bench artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-result-windows
+          path: bench-result.txt
+          if-no-files-found: warn
+
+      # Regression check. With no baseline, emits ::warning:: and
+      # exits 0 (matches bash behavior). After the first main-push
+      # run produces a bench-result.txt artifact, that file is
+      # committed as bench/baseline-windows.txt and subsequent
+      # runs gate on it.
+      - name: Check regressions
+        shell: pwsh
+        run: |
+          & ./bench/check-regression.ps1 `
+              -Current bench-result.txt `
+              -Baseline bench/baseline-windows.txt `
+              -Threshold 0.20
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Cleanup: kill any mntrs.exe that escaped the trap (e.g.
+      # cargo test panic). Mirrors ci-windows.yml's belt-and-
+      # suspenders cleanup pattern.
+      - name: Cleanup mount (always)
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process mntrs -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
+          $mntrs = Join-Path ${{ github.workspace }} 'target\release\mntrs.exe'
+          if (Test-Path $mntrs) {
+            try { & $mntrs unmount V: 2>&1 | Out-Null } catch { }
+          }
+          $mountsDb = Join-Path $env:USERPROFILE '.local\share\mntrs\mounts.txt'
+          if (Test-Path $mountsDb) {
+            try {
+              $lines = Get-Content -LiteralPath $mountsDb -ErrorAction Stop
+              $kept = foreach ($l in $lines) {
+                $parts = $l -split "`0"
+                if ($parts.Count -ge 2 -and $parts[1] -ne 'V:') { $l }
+              }
+              if ($null -eq $kept -or $kept.Count -eq 0) {
+                Remove-Item -LiteralPath $mountsDb -Force -ErrorAction Stop
+              } else {
+                Set-Content -LiteralPath $mountsDb -Value ($kept -join "`n") -NoNewline -ErrorAction Stop
+              }
+            } catch {
+              Write-Host "::warning::mounts.txt cleanup failed: $($_.Exception.Message)"
+            }
+          }
+          exit 0
