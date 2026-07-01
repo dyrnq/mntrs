@@ -641,9 +641,19 @@ pub mod test_helpers {
         // also visible, so unannotated inference fails with E0034).
         // Production mount at src/cmd/mount.rs:1370 makes the same
         // annotation.
+        //
+        // Issue #360: use `new_with_timer` so the adapter's
+        // `NotifyingFileSystemContext::should_notify` is polled and
+        // FILE_ACTION_REMOVED events reach the kernel — the test
+        // helper must mirror production semantics or the tests would
+        // miss bugs that only show up when the user-mode mount
+        // actually pushes change notifications.
+        let fs_params =
+            winfsp::host::FileSystemParams::default_params(winfsp::host::VolumeParams::default());
         let mut host: winfsp::host::FileSystemHost<_, winfsp::host::FineGuard> =
-            FileSystemHost::new(winfsp::host::VolumeParams::default(), adapter)
-                .map_err(|e| std::io::Error::other(format!("FileSystemHost::new: {e}")))?;
+            FileSystemHost::new_with_timer::<_, 100>(fs_params, adapter).map_err(|e| {
+                std::io::Error::other(format!("FileSystemHost::new_with_timer: {e}"))
+            })?;
         // `host.mount` accepts anything `&M: Into<MountPoint>` — the
         // &str conversion is provided by the winfsp crate's blanket
         // `impl<S: AsRef<OsStr>> From<&S> for MountPoint`. Production
