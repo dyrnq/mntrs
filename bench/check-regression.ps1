@@ -159,6 +159,16 @@ function Check-Regression {
             continue
         }
 
+        # FAIL rows (broken tests) have the literal string "FAIL" as
+        # the time column. Parse-Time can't handle that and would
+        # crash with 'method on null' on TrimEnd('s'). Skip with a
+        # warning instead — broken tests aren't perf regressions.
+        if ($cur_time -notmatch '^\d+m[\d.]+s$' -or $base_time -notmatch '^\d+m[\d.]+s$') {
+            Write-Warning "  ::warning:::: '$test' not a time string in both files (cur='$cur_time' base='$base_time'), skipping"
+            $warns++
+            continue
+        }
+
         $cur_sec = Parse-Time -t $cur_time
         $base_sec = Parse-Time -t $base_time
         if ($base_sec -eq 0) { continue }  # divide-by-zero guard
