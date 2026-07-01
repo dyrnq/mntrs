@@ -14,15 +14,15 @@
 #   - State corruption in cache dir from abrupt exit
 #   - FUSE session leak when killed before cleanup
 #
-# Implementation note: under FUSE_WRITEBACK_CACHE (unconditional at
-# src/core_fs/fuser.rs:114), the kernel buffers writes in its own
-# page cache and only delivers a single setattr per file on close.
-# The daemon's flush()/release() handlers (which create .dirty
-# sidecars) are NEVER called. So this test verifies the cache file
-# directly instead of relying on .dirty sidecars as a recovery
-# marker. If WRITEBACK_CACHE is ever disabled, the .dirty path
-# becomes live and this test still passes (cache files are created
-# earlier in the write handler).
+# Implementation note: FUSE_WRITEBACK_CACHE is OFF by default in mntrs
+# (`FuserAdapter::write_back_cache`, opt-in via `--write-back-cache`).
+# The daemon's flush()/release() handlers create .dirty sidecars and
+# the daemon's write() handler creates cache files directly — both
+# observed synchronously per writeback segment. This test verifies
+# the cache file survives SIGKILL on the daemon. (If the future
+# test #07-writeback-cache-optin.sh opts back in to kernel writeback,
+# this test still passes — it asserts file integrity, not how the
+# file got there.)
 #
 # Runtime: ~20-40s.
 
@@ -42,31 +42,49 @@ mkdir -p "$WORK"
 # delay queue firing because we verify the cache file, not the
 # .dirty sidecar.
 mntrs_mount "$MNT" "$CACHE"
-trap 'mntrs_unmount "$MNT" 2>/dev/null || true; pkill -9 -f "$(basename "$MNTRS_BIN") mount" 2>/dev/null || true' EXIT
+# Preserve cache dir on EXIT (failure path) so post-mortem is
+# possible — `mntrs_unmount` otherwise calls `remove_dir_all` which
+# wipes the only evidence of what the daemon did/didn't do.
+trap 'stress_preserve_cache "$CACHE" "fail"; mntrs_unmount "$MNT" 2>/dev/null || true; pkill -9 -f "$(basename "$MNTRS_BIN") mount" 2>/dev/null || true' EXIT
 
 # ── Write two files (creates cache files immediately) ────────────────
 FNAME="$MNT/recovered.bin"
 log "writing 4 MiB to $FNAME ..."
+# Plain dd (no oflag=direct) — once mntrs_mount's readiness check waits
+# for /proc/self/mounts registration (see common.sh), the kernel
+# correctly routes this write to the daemon's FUSE handler.
 dd if=/dev/urandom of="$FNAME" bs=1M count=4 status=none
 
 log "writing 2 MiB to $MNT/recovered2.bin ..."
 dd if=/dev/urandom of="$MNT/recovered2.bin" bs=1M count=2 status=none
 
 # ── Build a fingerprint of the cache dir (sorted size:md5 per file) ──
-# We compare via direct disk md5 to side-step FUSE kernel page-cache
-# quirks (the kernel may serve userspace reads from its own cache
-# without consulting the daemon's write handler).
-# Use polling drain (cap 30s) because under FUSE_WRITEBACK_CACHE the
-# daemon sees setattr(set_size) on close, then the writeback worker
-# fires after --vfs-write-back (default 1s). The cache file lands on
-# disk only after the worker reads cache + upload. Total turnaround
-# can be 2-3s on slow CI runners.
-DRAIN_END=$(( $(date +%s) + 30 ))
+# Direct disk md5 (not FUSE) so the kernel page cache can't serve a
+# different bytes than what we wrote. Under the new default
+# (WRITEBACK_CACHE off), the daemon's write() handler creates the
+# cache file synchronously per segment — but we still drain briefly
+# to cover the --vfs-write-back upload worker (default 1s delay).
+#
+# Drain budget raised to 60s (was 30s) for CI's higher-latency
+# ubuntu-24.04 kernel (~6.8.x) which can absorb multi-page writes
+# in page cache for several seconds before forwarding to FUSE.
+# Daemon-alive check in the loop catches Bug #286 P3 silent-death
+# scenarios: if the daemon dies mid-drain, no cache file will ever
+# materialize, and we want to fail fast with the daemon log in hand.
+DRAIN_END=$(( $(date +%s) + 60 ))
+DAEMON_BIN="$(basename "$MNTRS_BIN")"
 while (( $(date +%s) < DRAIN_END )); do
     HAVE=$(find "$CACHE" -maxdepth 1 -type f \
         ! -name '*.log' ! -name '*.dirty' ! -name '*.block' \
         -printf '.' 2>/dev/null | wc -c)
     if (( HAVE >= 2 )); then break; fi
+    # If the daemon died mid-drain, the cache file will never appear.
+    # Bail out early with the daemon log tail for diagnosis.
+    if ! pgrep -f "$DAEMON_BIN mount memory" >/dev/null 2>&1; then
+        log "daemon died during 60s drain — bail with last mount.log lines:"
+        tail -30 "$CACHE/mount.log" || true
+        break
+    fi
     sleep 1
 done
 

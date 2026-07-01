@@ -249,3 +249,83 @@ the field breaks the CLI surface (unknown flag).
 - [#142](../../issues/142) — parent shadow-field gap (merged)
 - [`durability.md`](durability.md) — actual writeback/durability model
 - [[`feedback-rclone-params-keep-and-document`](../) — keep-and-document rule
+
+## `--write-back-cache` (opt-in FUSE kernel writeback)
+
+`--write-back-cache` is **NOT** one of the 9 rclone-compat shadow
+fields above — it is a real, wired flag (`src/main.rs:57-59`,
+`src/cmd/mount.rs:660`, `src/core_fs/fuser.rs:init()`). Its
+default is **`false`** (opt-in) since 2026-06-30.
+
+When `false`: the daemon's `write()` handler runs per writeback
+segment, the kernel doesn't buffer, the `.dirty` sidecar shows
+up on close, and tests 01-06 (which assume this mode) pass
+cleanly.
+
+When `true`: the kernel buffers multi-page writes in its page
+cache and only delivers setattr(size) on close. The daemon's
+`write()` is never called for the body. This restores rclone's
+default rcd's small-write optimization but interferes with
+mntrs's per-message observability — hence the opt-in.
+
+### Why the default is off
+
+The flag was added (PR #79/80/81, commit `a53571c`, 2026-06-18)
+and **unconditional** in init. Over the following 12 days the
+trade proved net-negative for mntrs:
+
+- **3 cache-poisoning bugs** — `#331` (mem_cache read at
+  lib.rs:3050), `#334` (prefetch path at lib.rs:2966-2975),
+  `#337` (remote-fetch L1 populate at lib.rs:3333). All three
+  were races where the kernel cache hid real write timing and
+  the daemon's `write()` (which guarded the cache write) was
+  never called. Fixed in PRs #333 and #339.
+- **Bench regression** — PR #339 noted 26/69 vs 43/69 wins;
+  some workloads became slower.
+- **stress 01 + 05 architecturally fail** under WRITEBACK_CACHE:
+  - `01-large-dir` — daemon sees 80-90% of file creates
+    because the kernel buffers create/setattr pairs
+  - `05-crash-recovery` — 0 cache files for 4 MiB / 2 MiB
+    multi-page bodies because daemon's `write()` never fires
+
+The PR gates `InitFlags::FUSE_WRITEBACK_CACHE` behind the flag.
+CSI drivers (Pod multi-tenancy) keep the default `false` —
+they want per-FS-message observability.
+
+### Lock-in test
+
+`tests/stress/07-writeback-cache-optin.sh` mounts with
+`--write-back-cache` and verifies the contract:
+
+1. Multi-page writes do NOT call daemon's write() until close.
+2. After close + daemon SIGKILL, the data is still served
+   correctly.
+3. A new daemon mounts over the same cache dir and sees the
+   cache file with non-empty content.
+
+This locks in the opt-in behavior so a future regression that
+flips the default back to `true` will fail CI loudly.
+
+### Re-enabling the flag
+
+If you want rclone-style small-write behavior:
+
+```bash
+mntrs mount s3://bucket /mnt --write-back-cache
+```
+
+The kernel-side mount option `writeback_cache` at `mount.rs:1227`
+is gated on the same flag, so the FUSE INIT and libfuse mount
+option stay in sync.
+
+### Related
+
+- #81 — original PR for unconditional WRITEBACK_CACHE
+- #331, #334, #337 — three cache-poisoning bugs
+- #339 — fix PR for #337 (also covers #334)
+- #354 — obsolete (closed in the fix PR); the "04 missing
+  files" report was a misframing under WRITEBACK_CACHE.
+- [`fuse-writeback-opt-out.md`](../) — memory file documenting
+  the rationale.
+- [`durability.md`](durability.md) — see "Three writeback
+  concepts" above for the other two writeback concepts.
