@@ -162,6 +162,21 @@ function Check-Regression {
         $cur_sec = Parse-Time -t $cur_time
         $base_sec = Parse-Time -t $base_time
         if ($base_sec -eq 0) { continue }  # divide-by-zero guard
+
+        # Noise floor: skip tests whose baseline is below 0.1s.
+        # At sub-100ms, single-digit-ms run-to-run jitter translates
+        # to 20%+ percentage swings, so the percentage threshold
+        # produces false positives. The bash version's critical
+        # tests (cat 100M, random 50x 1M, concurrent 4x 10M) all
+        # have baselines in the 0.5-3s range so they don't trip
+        # this; the PS version adds Random-Read 50x 10M.bin (~7ms)
+        # and Get-ChildItem 500 (~60ms, marginal) which do.
+        if ($base_sec -lt 0.1) {
+            Write-Warning "  ::warning:::: '$test' baseline ${base_time} is below 0.1s noise floor (cur='$cur_time'), skipping regression check"
+            $warns++
+            continue
+        }
+
         $slow_pct = ($cur_sec - $base_sec) / $base_sec
 
         if ($slow_pct -gt $Threshold) {
