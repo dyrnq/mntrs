@@ -297,7 +297,7 @@ mntrs mount s3://bucket *
 mntrs mount s3://bucket C:\mnt\s3
 ```
 
-CI tested on Windows with 11 WinFSP mount integration tests (covering mount/unmount, write/read, list, rename, setattr, statfs, unicode, and multi-MB roundtrips).
+CI tested on Windows with 31 WinFSP integration tests (covering mount/unmount lifecycle, write/read roundtrip, list/create/delete/rename, setattr/truncate, statfs, nested directories, large-file reads, unicode + NFC normalization, symlink create/get/rename/delete, dirty-cache lifecycle, readdir paging, getattr/statfs cache coalescing, volume flush, and mount-internal scheme variants).
 
 ### Kubernetes (CSI)
 
@@ -425,7 +425,7 @@ cargo bench                         # micro-benchmarks
 | Workflow | Environment | Scope |
 |----------|-------------|-------|
 | `CI` | Linux | Build + test + clippy + fmt |
-| `CI - Windows` | Windows | WinFSP + release build + 11 mount integration tests |
+| `CI - Windows` | Windows | WinFSP + release build + 31 mount integration tests |
 | `CI - macOS` | macOS | macFUSE + build + test |
 | `Integration Tests` | Linux | S3 / HDFS / memory mount tests + HDFS Kerberos auth |
 | `CSI Integration Test` | Linux (k3s) | CSI driver e2e with HDFS backend |
