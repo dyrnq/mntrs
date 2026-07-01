@@ -461,6 +461,31 @@ pub fn detect_cgroup_memory_limit() -> Option<u64> {
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::sync::Mutex;
+
+    // ── env-mutation serialization (Issue #289) ─────────────────────
+    //
+    // The XDG-helper tests below mutate process-wide env vars
+    // (`XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR`,
+    // `HOME`). Cargo runs tests in parallel by default, so two
+    // tests touching the same var can race — e.g. `data_dir_xdg_data_home_wins`
+    // setting `XDG_DATA_HOME=/custom/data` and `data_dir_no_env_errors`
+    // removing it concurrently. CI hit the race in run 28496095276
+    // (Ok('/custom/data') leaked across the boundary). The local
+    // pre-commit run usually misses the race because the parallel
+    // scheduler happens not to overlap them.
+    //
+    // We don't want to force `--test-threads=1` (slow), so we
+    // serialize the env-mutating tests via a single shared
+    // `OnceLock<Mutex>` that's locked at the top of every
+    // test body that calls `set_var` / `remove_var`.
+    static ENV_MUTEX: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     // ── fnmatch ────────────────────────────────────────────────────
 
@@ -766,8 +791,9 @@ mod tests {
     /// is also set (env precedence).
     #[test]
     fn data_dir_xdg_data_home_wins() {
-        // SAFETY: tests run serially in cargo; setting a unique value
-        // here doesn't collide with other tests.
+        let _g = env_lock();
+        // SAFETY: serialized via `env_lock` against other
+        // env-mutating tests in this module (Issue #289).
         unsafe {
             std::env::set_var("XDG_DATA_HOME", "/custom/data");
             std::env::set_var("HOME", "/home/test");
@@ -783,6 +809,7 @@ mod tests {
     /// `$XDG_DATA_HOME` is unset.
     #[test]
     fn data_dir_home_fallback() {
+        let _g = env_lock();
         unsafe {
             std::env::remove_var("XDG_DATA_HOME");
             std::env::set_var("HOME", "/home/test");
@@ -795,6 +822,7 @@ mod tests {
     /// unset — the bug fix: was silently falling back to /tmp.
     #[test]
     fn data_dir_no_env_errors() {
+        let _g = env_lock();
         unsafe {
             std::env::remove_var("XDG_DATA_HOME");
             std::env::remove_var("HOME");
@@ -810,6 +838,7 @@ mod tests {
     /// Empty XDG_DATA_HOME is treated as unset (XDG spec edge case).
     #[test]
     fn data_dir_empty_xdg_falls_back() {
+        let _g = env_lock();
         unsafe {
             std::env::set_var("XDG_DATA_HOME", "");
             std::env::set_var("HOME", "/home/test");
@@ -824,6 +853,7 @@ mod tests {
     /// `config_dir()` mirrors data_dir but for XDG_CONFIG_HOME.
     #[test]
     fn config_dir_xdg_config_home_wins() {
+        let _g = env_lock();
         unsafe {
             std::env::set_var("XDG_CONFIG_HOME", "/custom/config");
             std::env::set_var("HOME", "/home/test");
@@ -837,6 +867,7 @@ mod tests {
 
     #[test]
     fn config_dir_home_fallback() {
+        let _g = env_lock();
         unsafe {
             std::env::remove_var("XDG_CONFIG_HOME");
             std::env::set_var("HOME", "/home/test");
@@ -849,6 +880,7 @@ mod tests {
     /// Errors if unset — the fix.
     #[test]
     fn runtime_dir_errors_without_xdg() {
+        let _g = env_lock();
         unsafe {
             std::env::remove_var("XDG_RUNTIME_DIR");
             std::env::set_var("HOME", "/home/test");
@@ -863,6 +895,7 @@ mod tests {
 
     #[test]
     fn runtime_dir_xdg_set() {
+        let _g = env_lock();
         unsafe {
             std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
         }
@@ -872,6 +905,7 @@ mod tests {
 
     #[test]
     fn runtime_dir_empty_errors() {
+        let _g = env_lock();
         unsafe {
             std::env::set_var("XDG_RUNTIME_DIR", "");
         }
