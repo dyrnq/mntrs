@@ -404,6 +404,19 @@ function Render-Result {
 
 # ── Main ─────────────────────────────────────────────────────────────
 
+# Each Run-* category is wrapped in its own try/catch so a single
+# failing workload doesn't abort the rest of the bench. Individual
+# test failures are already captured as FAIL rows inside Bench's
+# own try/catch — the per-category wrap is a defense-in-depth so a
+# fault in Run-* itself (not just inside Bench) can't kill the
+# script before Render-Result runs and the artifact is written.
+
+function Invoke-Safely {
+    param([string] $Name, [scriptblock] $Block)
+    try { & $Block }
+    catch { Write-Warning "::warning::$Name threw: $_" }
+}
+
 try {
     Write-Host "============================================"
     Write-Host " mntrs Windows bench (Issue #378)"
@@ -419,13 +432,13 @@ try {
     Mount-WinFsp
     Pre-Stage-Data
 
-    Run-SeqRead
-    Run-RandRead
-    Run-Concurrent
-    Run-Write
-    Run-CopyMove
-    Run-ReadDir
-    Run-Delete
+    Invoke-Safely -Name "Run-SeqRead"   -Block { Run-SeqRead }
+    Invoke-Safely -Name "Run-RandRead"  -Block { Run-RandRead }
+    Invoke-Safely -Name "Run-Concurrent" -Block { Run-Concurrent }
+    Invoke-Safely -Name "Run-Write"     -Block { Run-Write }
+    Invoke-Safely -Name "Run-CopyMove"  -Block { Run-CopyMove }
+    Invoke-Safely -Name "Run-ReadDir"   -Block { Run-ReadDir }
+    Invoke-Safely -Name "Run-Delete"    -Block { Run-Delete }
 
     $lines = Render-Result
     $lines | Tee-Object -FilePath $RESULT_FILE
