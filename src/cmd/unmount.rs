@@ -254,7 +254,18 @@ pub(crate) fn fuse_unmount_macos_with_umount(mountpoint: &str) -> Result<()> {
                 mountpoint,
                 "fuse_unmount(macos): fusermount(-3) not on PATH; falling back to umount(8) (Issue #371)"
             );
-            let umount_status = Command::new("umount").arg(mountpoint).status();
+            // Issue #379: macOS `umount(8)` (BSD-derived) does not
+            // canonicalize before matching the mount table — pass
+            // the canonical path so a user-supplied `/tmp/foo`
+            // (which symlinks to `/private/tmp/foo` on macOS) matches
+            // the entry listed by `mount(8)`. On canonicalize
+            // failure (e.g. the mountpoint dir was deleted between
+            // mount and unmount), fall back to the raw string;
+            // `umount(8)` will return its own "not currently
+            // mounted" / ENOENT-style diagnostic.
+            let canonical = std::fs::canonicalize(mountpoint)
+                .unwrap_or_else(|_| std::path::PathBuf::from(mountpoint));
+            let umount_status = Command::new("umount").arg(&canonical).status();
             match umount_status {
                 Ok(s) if s.success() => {
                     eprintln!("unmounted {mountpoint}");
