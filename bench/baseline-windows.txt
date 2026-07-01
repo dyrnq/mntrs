@@ -1,0 +1,21 @@
+# Windows bench baseline (initial placeholder — Issue #378)
+#
+# This file is intentionally empty. The first successful workflow_dispatch
+# run on main (post-merge of the Windows bench pipeline) will produce a
+# `bench-result.txt` artifact; download it and commit it here as the
+# initial baseline. Subsequent PR + weekly cron runs will then gate on
+# it (20% regression threshold, matching the bash baseline pattern).
+#
+# Format (mirror of bench/baseline.txt, rclone column dropped since this
+# PR is mntrs-only on Windows):
+#
+#   ==========================================================
+#     BENCHMARK SUMMARY: mntrs (Windows WinFSP / memory://)
+#   ==========================================================
+#     Category         | Test                      |   mntrs
+#     -----------------+---------------------------+---------
+#     SeqRead          | Get-Content 1K.bin        |  0m0.005s
+#     ...
+#     -----------------+---------------------------+---------
+#     Result: mntrs=25  tests=25  (25 total)
+#   ==========================================================
