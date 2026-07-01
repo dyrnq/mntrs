@@ -234,16 +234,13 @@ function Unmount-WinFsp {
     } catch { }
 }
 
-# Register cleanup on EXIT (success, failure, Ctrl+C).
-# Only the script-level trap is needed — the try/finally below also
-# covers normal cleanup. (Module.OnRemove was tried as a third
-# belt-and-suspenders hook but SessionState.Module is $null for .ps1
-# files invoked via `&`, so that line throws and the trap fires
-# before Unmount-WinFsp is defined.)
-trap {
-    Unmount-WinFsp
-    break
-}
+# Cleanup on EXIT (success, failure, Ctrl+C) is handled by the
+# try/finally in the main block. No script-level trap: a trap
+# fires on any terminating error and re-throws via `break`, which
+# then trips the main try/catch into exiting 1 even though
+# individual test failures are already recorded as FAIL rows
+# inside Bench's try/catch. That breaks the "table always
+# emitted" contract.
 
 # ── Workload definitions ─────────────────────────────────────────────
 
