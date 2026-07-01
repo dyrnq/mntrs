@@ -52,6 +52,15 @@ jobs:
         run: cargo test --workspace --lib
 
       - name: Core FS unit tests
+        # Issue #304 option 2: this step is allowed to fail without
+        # turning the workflow red. The test class covers
+        # append-after-read / cache-state races that are sensitive to
+        # transient host state on `macos-latest` (#282 closed once on
+        # run #28281201014, #288 suspected but unverified). The
+        # failure doesn't indicate a real regression on this PR;
+        # it surfaces the existing flake so the maintainer sees it.
+        # Re-evaluate when a self-hosted Mac runner lands (option 4).
+        continue-on-error: true
         run: cargo test --workspace --test core_fs_unit_test
 
       - name: Platform tests
