@@ -160,24 +160,7 @@ impl CacheLayer for DiskBlockCache {
             None => return false,
         };
         let written_size = buf.len() as u64;
-        let wrote = if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&blk_path)
-        {
-            use std::io::Write;
-            let ok = f.write_all(&buf).is_ok();
-            if ok {
-                let _ = f.set_len(written_size);
-            }
-            if !ok {
-                tracing::debug!(?blk_path, "L2 block cache write failed");
-            }
-            ok
-        } else {
-            false
-        };
+        let wrote = write_block(&blk_path, &buf, written_size);
         if wrote {
             self.disk_cache_index.insert(
                 (path.to_string(), Some(block_idx)),
@@ -216,6 +199,57 @@ impl CacheLayer for DiskBlockCache {
         // (and still queued) self-skips instead of re-creating a stale
         // `.block` file the loop above just removed.
         crate::disk_write_pool::bump_path_cache_gen(path);
+    }
+}
+
+/// Write a serialized block to disk at mode 0o600 (unix) or
+/// default perms elsewhere. Returns true on success. Centralized
+/// so the rest of the file has one place to audit the perm.
+fn write_block(blk_path: &std::path::Path, buf: &[u8], written_size: u64) -> bool {
+    use std::io::Write;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(blk_path)
+        {
+            Ok(mut f) => {
+                let ok = f.write_all(buf).is_ok();
+                if ok {
+                    let _ = f.set_len(written_size);
+                }
+                if !ok {
+                    tracing::debug!(?blk_path, "L2 block cache write failed");
+                }
+                ok
+            }
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(blk_path)
+        {
+            Ok(mut f) => {
+                let ok = f.write_all(buf).is_ok();
+                if ok {
+                    let _ = f.set_len(written_size);
+                }
+                if !ok {
+                    tracing::debug!(?blk_path, "L2 block cache write failed");
+                }
+                ok
+            }
+            Err(_) => false,
+        }
     }
 }
 

@@ -3159,8 +3159,35 @@ impl CoreFilesystem for MntrsFs {
             self.populate_cache_from_backend(&path);
             let cpath = crate::cache_path(&self.cache_dir, &path);
             if let Some(parent) = cpath.parent() {
+                // Force 0o700 on the cache sub-dir (best-effort).
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    let _ = std::fs::DirBuilder::new()
+                        .mode(0o700)
+                        .recursive(true)
+                        .create(parent);
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ =
+                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+                }
+                #[cfg(not(unix))]
                 let _ = std::fs::create_dir_all(parent);
             }
+            // Force 0o600 on the cache file (plaintext object bodies).
+            #[cfg(unix)]
+            let cache_fd = {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .read(true)
+                    .mode(0o600)
+                    .open(&cpath)
+                    .ok()
+            };
+            #[cfg(not(unix))]
             let cache_fd = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
