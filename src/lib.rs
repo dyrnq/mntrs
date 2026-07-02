@@ -1275,7 +1275,9 @@ impl MntrsFs {
         // Issue #268.4 O25: mount-time recovery summary.
         // Single info line gives operators the headline counts;
         // per-sidecar detail is at debug level above.
-        if recovered_count + orphan_count + send_err_count + read_err_count + no_sender_count > 0 {
+        let total =
+            recovered_count + orphan_count + send_err_count + read_err_count + no_sender_count;
+        if total > 0 {
             tracing::info!(
                 recovered = recovered_count,
                 orphan_sidecars_removed = orphan_count,
@@ -1285,6 +1287,25 @@ impl MntrsFs {
                 cache_dir = %self.cache_dir.display(),
                 "writeback: recovery scan complete"
             );
+            // Issue #395 fix #2: when recovery hit a *stuck* state —
+            // the sidecar exists but we can't enqueue / read it —
+            // surface a warn-level line telling the operator
+            // they have pending writes that will not auto-retry.
+            // Without this, the operator's only signal is per-sidecar
+            // warnings above (debug-by-default in production). The
+            // fix here + the `mntrs list-dirty` subcommand together
+            // close the silent-failure loop end-to-end.
+            let stuck = send_err_count + no_sender_count + read_err_count;
+            if stuck > 0 {
+                tracing::warn!(
+                    stuck_sidecars = stuck,
+                    cache_dir = %self.cache_dir.display(),
+                    "{} pending .dirty sidecar(s) require manual intervention — \
+                     run `mntrs list-dirty {}` to inspect",
+                    stuck,
+                    self.cache_dir.display()
+                );
+            }
         } else {
             tracing::debug!(
                 cache_dir = %self.cache_dir.display(),
