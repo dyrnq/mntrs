@@ -966,11 +966,24 @@ pub fn mount(
         elapsed_ms = _t_mount.elapsed().as_millis() as u64,
         "mount: after init calls (opendal_sync_op + disk_write_pool)"
     );
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    // Issue #382 fix: on macOS, route the default cache directory
+    // through `cache_dir_for_mount` so we land in `$TMPDIR` (per-user)
+    // instead of `$HOME/.cache/mntrs`. This matches the CSI path and
+    // avoids cross-user reads on shared macOS hosts where home dirs
+    // can be world-traversable. Linux keeps the legacy `~/.cache/mntrs`
+    // path to avoid an unrelated behavior change in CI.
     let cache_dir_path = if let Some(cd) = cache_dir {
         std::path::PathBuf::from(cd)
     } else {
-        std::path::PathBuf::from(format!("{}/.cache/mntrs", home))
+        #[cfg(target_os = "macos")]
+        {
+            std::path::PathBuf::from(cache_dir_for_mount(mountpoint))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            std::path::PathBuf::from(format!("{}/.cache/mntrs", home))
+        }
     };
     // mem_limit is interpreted as MiB by the CLI; 0 means
     // "unbounded" (still tracked, but no eviction triggered).
@@ -1259,16 +1272,30 @@ pub fn mount(
                     revents: 0,
                 };
                 // 250 ms tick — short enough to react near the deadline
-                // and long enough not to busy-loop.
+                // and long enough not to busy-loop. Retry on EINTR so
+                // that SIGINT/SIGTERM during `--daemon --daemon-wait`
+                // does not block the parent until the full timeout
+                // expires (the signal handler sets SHUTDOWN_REQUESTED
+                // and the loop checks it below).
                 let n = unsafe { libc::poll(&mut pfd, 1, 250) };
+                if n < 0 {
+                    let errno = std::io::Error::last_os_error().raw_os_error();
+                    if errno == Some(libc::EINTR) {
+                        continue;
+                    }
+                    break;
+                }
                 if n > 0 && (pfd.revents & libc::POLLHUP) != 0 {
                     signaled = true;
                     break;
                 }
+                if SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
             }
             if !signaled {
-                eprintln!(
-                    "mntrs: daemon did not signal mount readiness within {}s; \
+                tracing::warn!(
+                    "daemon did not signal mount readiness within {}s; \
                      child may have crashed. Check MNTRS_DAEMON_LOG if set.",
                     _daemon_timeout
                 );
@@ -1300,15 +1327,25 @@ pub fn mount(
     if std::env::var_os("MNTRS_INTERNAL_DAEMON").is_some() && daemon {
         unsafe {
             let target: i32 = match std::env::var_os("MNTRS_DAEMON_LOG") {
-                Some(p) => std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(p.to_string_lossy().as_ref())
-                    .map(|f| {
-                        use std::os::unix::io::IntoRawFd;
-                        f.into_raw_fd()
-                    })
-                    .unwrap_or(-1),
+                Some(p) => {
+                    // MNTRS_DAEMON_LOG captures the daemon's stdout/
+                    // stderr; tracing output can include storage URLs
+                    // and error context, so create the file with
+                    // 0600 to prevent cross-user reads on a shared
+                    // macOS host (issue #audit: previously inherited
+                    // the process umask, typically 0644).
+                    use std::os::unix::fs::OpenOptionsExt;
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .mode(0o600)
+                        .open(p.to_string_lossy().as_ref())
+                        .map(|f| {
+                            use std::os::unix::io::IntoRawFd;
+                            f.into_raw_fd()
+                        })
+                        .unwrap_or(-1)
+                }
                 None => libc::open(c"/dev/null".as_ptr(), libc::O_RDWR),
             };
             if target >= 0 {
