@@ -28,6 +28,10 @@ $CACHE = Join-Path $WORK "cache"
 
 Write-Section "02-large-file-io: ${STRESS_FILE_MB} MiB sequential write+read+md5"
 Initialize-Stress
+trap {
+    Invoke-StressCleanup
+    continue
+}
 if (-not (Test-Path -LiteralPath $WORK)) {
     New-Item -ItemType Directory -Force -Path $WORK | Out-Null
 }

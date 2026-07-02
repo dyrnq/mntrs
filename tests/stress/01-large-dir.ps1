@@ -36,6 +36,15 @@ $LOG = Join-Path $WORK "run.log"
 
 Write-Section "01-large-dir: $STRESS_FILES files x $STRESS_BYTES bytes"
 Initialize-Stress
+# Trap any terminating error from here on and clean up the mount
+# before re-throwing. Mirrors bash's `trap '...' ERR + EXIT` for
+# scenarios that need postmortem. The previous engine-event
+# pattern kept the pwsh process alive for 20 min after a throw
+# (see common.ps1 Invoke-StressCleanup docstring).
+trap {
+    Invoke-StressCleanup
+    continue
+}
 if (-not (Test-Path -LiteralPath $WORK)) {
     New-Item -ItemType Directory -Force -Path $WORK | Out-Null
 }

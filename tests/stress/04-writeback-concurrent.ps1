@@ -36,6 +36,10 @@ $TOTAL_FILES = $STRESS_PARALLEL * $STRESS_FILES_PP
 
 Write-Section "04-writeback-concurrent: ${STRESS_PARALLEL} writers x ${STRESS_FILES_PP} files x ${STRESS_FILE_KB} KiB"
 Initialize-Stress
+trap {
+    Invoke-StressCleanup
+    continue
+}
 if (-not (Test-Path -LiteralPath $WORK)) {
     New-Item -ItemType Directory -Force -Path $WORK | Out-Null
 }

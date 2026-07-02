@@ -35,6 +35,10 @@ $CACHE = Join-Path $WORK "cache"
 
 Write-Section "03-cache-eviction: $N_FILES x ${FILE_MB}MiB = ${TOTAL_MB}MiB with mem-limit=${STRESS_MEM_MB}MiB"
 Initialize-Stress
+trap {
+    Invoke-StressCleanup
+    continue
+}
 if (-not (Test-Path -LiteralPath $WORK)) {
     New-Item -ItemType Directory -Force -Path $WORK | Out-Null
 }

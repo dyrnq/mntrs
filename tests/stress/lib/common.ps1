@@ -429,6 +429,22 @@ function Get-StressMetrics {
 # preservation is conditional on the script-level $script:PreserveOnExit
 # flag, which scenarios that want post-mortem can set to $true before
 # any failure).
+#
+# IMPORTANT: the previous implementation used
+# `Register-EngineEvent PowerShell.Exiting -SupportEvent -Action {...}`
+# to install a global EXIT trap (like bash's `trap '...' EXIT`). That
+# approach has a serious bug: the action's `$script:` and function
+# references pin common.ps1's script scope alive, which keeps the
+# pwsh process from exiting for the full 20-min step timeout even
+# after the scenario script throws. CI run 28556905743 hung for
+# ~19 minutes after the first scenario failed.
+#
+# Fix: drop the engine-event-based trap. Scenarios that need cleanup
+# on exit must call `Invoke-StressCleanup` themselves in a `finally`
+# block (or rely on the workflow's `Cleanup mount (always)` step,
+# which is a belt-and-suspenders fallback). `Register-StressCleanup`
+# keeps its API for compat — it just no longer installs a global
+# engine trap.
 $script:PreserveOnExit = $false
 $script:CleanupMountpoint = $null
 $script:CleanupCacheDir = $null
@@ -444,19 +460,16 @@ function Register-StressCleanup {
     $script:PreserveOnExit = $PreserveOnExit
 }
 
-# Wire up the cleanup trap exactly once. PowerShell's Register-EngineEvent
-# PowerShell.Exiting fires on script exit (success, exception, Ctrl+C)
-# — matches bash's `trap '...' EXIT`.
-if (-not $global:__STRESS_CLEANUP_REGISTERED) {
-    $global:__STRESS_CLEANUP_REGISTERED = $true
-    Register-EngineEvent -SourceIdentifier PowerShell.Exiting -SupportEvent -Action {
-        if ($script:CleanupMountpoint) {
-            try {
-                if ($script:PreserveOnExit) {
-                    Preserve-StressCache -CacheDir $script:CleanupCacheDir -Label "fail"
-                }
-                Dismount-StressDrive -Mountpoint $script:CleanupMountpoint
-            } catch { }
-        }
-    } | Out-Null
+# Run the cleanup registered via Register-StressCleanup. Call from a
+# `finally` block so it fires on both success and exception paths.
+# Idempotent: no-op if Register-StressCleanup was never called.
+function Invoke-StressCleanup {
+    if ($script:CleanupMountpoint) {
+        try {
+            if ($script:PreserveOnExit) {
+                Preserve-StressCache -CacheDir $script:CleanupCacheDir -Label "fail"
+            }
+            Dismount-StressDrive -Mountpoint $script:CleanupMountpoint
+        } catch { }
+    }
 }
