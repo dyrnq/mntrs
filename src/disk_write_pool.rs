@@ -341,8 +341,41 @@ impl DiskWriteJob {
                     None => return,
                 };
                 if let Some(parent) = cpath.parent() {
+                    // Force 0o700 on cache sub-dirs (plaintext
+                    // object bodies live in the per-write files).
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::DirBuilderExt;
+                        let _ = std::fs::DirBuilder::new()
+                            .mode(0o700)
+                            .recursive(true)
+                            .create(parent);
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            parent,
+                            std::fs::Permissions::from_mode(0o700),
+                        );
+                    }
+                    #[cfg(not(unix))]
                     let _ = std::fs::create_dir_all(parent);
                 }
+                // Force 0o600 on the cache file itself.
+                #[cfg(unix)]
+                let mut f = {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    match std::fs::OpenOptions::new()
+                        .create(true)
+                        .truncate(false)
+                        .write(true)
+                        .read(true)
+                        .mode(0o600)
+                        .open(cpath)
+                    {
+                        Ok(f) => f,
+                        Err(_) => return,
+                    }
+                };
+                #[cfg(not(unix))]
                 let mut f = match std::fs::OpenOptions::new()
                     .create(true)
                     .truncate(false)
@@ -435,6 +468,23 @@ impl DiskWriteJob {
             Some(b) => b,
             None => return,
         };
+        // Block-cache write site — same perms treatment as the
+        // cpath open above.
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .mode(0o600)
+                .open(blk_path)
+            {
+                Ok(f) => f,
+                Err(_) => return,
+            }
+        };
+        #[cfg(not(unix))]
         let mut f = match std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
