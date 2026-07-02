@@ -860,7 +860,7 @@ pub fn mount(
     no_apple_double: bool,
     no_apple_xattr: bool,
     hash_filter: Option<String>,
-    _mount_case_insensitive: bool,
+    mount_case_insensitive: bool,
     _max_read_ahead: u64,
     vfs_read_chunk_size_limit: u64,
     vfs_read_chunk_streams: u32,
@@ -1442,9 +1442,9 @@ pub fn mount(
                 cfg.mount_options
                     .push(MountOption::CUSTOM("noapplexattr".to_string()));
             }
-            if _mount_case_insensitive {
+            if mount_case_insensitive {
                 cfg.mount_options
-                    .push(MountOption::CUSTOM("mount_case_insensitive".to_string()));
+                    .push(MountOption::CUSTOM("case_insensitive".to_string()));
             }
         }
         if default_permissions {
