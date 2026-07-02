@@ -313,6 +313,17 @@ enum Commands {
     Unmount { target: String },
     /// List active mounts
     List,
+    /// List pending `.dirty` sidecars in a cache dir (issue #395 fix #1).
+    ///
+    /// After an upload failure the daemon leaves a `.dirty` sidecar
+    /// next to the cache file. There's no other CLI surface for these —
+    /// without this command the user has no way to discover that a
+    /// write silently failed to upload. Always returns exit 0 even if
+    /// the dir is empty (a clean cache is the healthy state).
+    Dirty {
+        /// Path to the cache dir to scan (e.g. /var/cache/mntrs)
+        cache_dir: std::path::PathBuf,
+    },
     /// Install systemd service
     Install {
         #[command(subcommand)]
@@ -558,6 +569,9 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::List => {
             mntrs::cmd::list::list()?;
+        }
+        Commands::Dirty { cache_dir } => {
+            mntrs::cmd::dirty::list_dirty(&cache_dir)?;
         }
         Commands::Install { action } => match action {
             Some(InstallAction::Systemd) | None => {
