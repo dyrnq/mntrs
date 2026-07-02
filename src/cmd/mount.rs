@@ -1324,15 +1324,34 @@ pub fn mount(
     if std::env::var_os("MNTRS_INTERNAL_DAEMON").is_some() && daemon {
         unsafe {
             let target: i32 = match std::env::var_os("MNTRS_DAEMON_LOG") {
-                Some(p) => std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(p.to_string_lossy().as_ref())
-                    .map(|f| {
+                Some(p) => {
+                    // Issue #391 follow-up: the daemon log carries
+                    // tracing output (file paths, error context,
+                    // even a redacted storage_url still reveals
+                    // bucket + host). Force mode 0o600 on unix so
+                    // a peer user on a shared box can't `tail -f`
+                    // the log. On non-unix we fall back to the
+                    // original default-perms open.
+                    #[cfg(unix)]
+                    let open = {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .mode(0o600)
+                            .open(p.to_string_lossy().as_ref())
+                    };
+                    #[cfg(not(unix))]
+                    let open = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(p.to_string_lossy().as_ref());
+                    open.map(|f| {
                         use std::os::unix::io::IntoRawFd;
                         f.into_raw_fd()
                     })
-                    .unwrap_or(-1),
+                    .unwrap_or(-1)
+                }
                 None => libc::open(c"/dev/null".as_ptr(), libc::O_RDWR),
             };
             if target >= 0 {
