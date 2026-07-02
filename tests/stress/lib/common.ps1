@@ -246,13 +246,30 @@ function Mount-StressDrive {
     # Build argument list (mirrors common.sh:119-130, minus --daemon /
     # --allow-other which are cfg-gated out on Windows). Mount on the
     # drive letter only — WinFSP rejects subpath mountpoints.
-    $vfsWriteBack = if ($env:STRESS_VFS_WRITE_BACK) { $env:STRESS_VFS_WRITE_BACK } else { "1" }
+    #
+    # --vfs-write-back: OFF by default (matches bench/run_all.ps1's
+    # working config). Under --vfs-write-back 1, writes go through a
+    # 1s delayed-upload queue; the FUSE readdir snapshot at opendir
+    # time only sees the backend, not the local cache, so
+    # `Get-ChildItem` after a fresh write burst returns 0 entries
+    # (sandbox repro: scenario 01 with 1000 files at 64B each). The
+    # bench doesn't hit this because it omits --vfs-write-back, so
+    # writes go directly into the in-memory backend and readdir
+    # sees them immediately. Scenarios that need to exercise the
+    # writeback path (04-writeback-concurrent, 05-crash-recovery)
+    # pass `--vfs-write-back 1` via $ExtraArgs.
+    #
+    # --vfs-cache-mode: kept as "full" for rclone-compat (the
+    # runtime ignores it — see docs/vfs-cache-flags.md — but
+    # rclone users expect the flag round-trip).
     $argList = @(
         "mount", "memory:///", $driveLetter,
         "--cache-dir", $CacheDir,
-        "--vfs-cache-mode", "full",
-        "--vfs-write-back", $vfsWriteBack
+        "--vfs-cache-mode", "full"
     )
+    if ($env:STRESS_VFS_WRITE_BACK) {
+        $argList += @("--vfs-write-back", $env:STRESS_VFS_WRITE_BACK)
+    }
     if ($ExtraArgs.Count -gt 0) {
         $argList += $ExtraArgs
     }
@@ -307,9 +324,20 @@ function Mount-StressDrive {
 # Usage: Dismount-StressDrive <mountpoint>
 # Mirrors common.sh:mntrs_unmount. Strips any subdir component to
 # extract the drive letter for mntrs.exe unmount (which only accepts
-# drive letters, not paths). Tries mntrs.exe unmount first (clean
-# path: drains writeback + releases session), falls back to
-# Stop-Process -Force if the daemon is unresponsive.
+# drive letters, not paths). Order matters:
+#   1. Stop-Process -Force FIRST — the only reliable way to unblock
+#      the script if mntrs is stuck draining a large writeback queue
+#      (e.g. 1000 pending files in 01-large-dir). `mntrs.exe unmount`
+#      waits synchronously for the writeback drain to complete, which
+#      can take minutes; the parent script hangs the whole step
+#      until the 20-min CI timeout fires.
+#   2. `mntrs.exe unmount` after — best-effort clean release. By
+#      this point the process is already gone so the WinFSP
+#      session is already torn down; this is a no-op for the
+#      happy-path Stop-Process -Force exit code 0.
+#   3. DefineDosDeviceW-style clear via `mntrs.exe unmount` is also
+#      no longer needed since the killed process releases the
+#      device mapping.
 function Dismount-StressDrive {
     param([Parameter(Mandatory = $true)] [string] $Mountpoint)
 
@@ -319,17 +347,31 @@ function Dismount-StressDrive {
     }
     $driveLetter = $Matches[1].ToUpper() + ":"
 
-    # Clean unmount first (mirrors common.sh:174-177: prefer native
-    # unmount, fall back to fusermount).
-    try {
-        & $script:MntrsBin unmount $driveLetter 2>&1 | Out-Null
-    } catch { }
-
-    # Belt-and-suspenders: if mntrs is still running (clean unmount
-    # raced), force-stop it.
+    # Force-stop the daemon first (don't wait for writeback drain —
+    # under --vfs-write-back 1 + 1000 pending files the unmount
+    # blocks the parent script for minutes, hanging the CI step
+    # until the 20-min timeout fires).
     if ($script:MntrsProc -and -not $script:MntrsProc.HasExited) {
         try { Stop-Process -Id $script:MntrsProc.Id -Force -ErrorAction Stop }
         catch { Write-Warn "  unmount: Stop-Process failed: $_" }
+    }
+    $script:MntrsProc = $null
+
+    # Best-effort clean unmount. With the daemon already gone, this
+    # is a no-op on the happy path; on the race where Stop-Process
+    # failed, this provides a fallback drain. Wrapped in a tight
+    # timeout so a stuck unmount can't hang the parent either.
+    try {
+        $job = Start-ThreadJob -ScriptBlock { & $using:script:MntrsBin unmount $using:driveLetter 2>&1 | Out-Null } -ErrorAction Stop
+        if (Wait-Job $job -Timeout 5) {
+            Receive-Job $job -ErrorAction SilentlyContinue | Out-Null
+        } else {
+            Stop-Job $job -ErrorAction SilentlyContinue
+            Write-Warn "  unmount: mntrs.exe unmount timed out after 5s (daemon already stopped, ignoring)"
+        }
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
+    } catch {
+        # mntrs.exe not on PATH, or already gone — both fine.
     }
 
     # Final wait so the drive letter clears before the next scenario.

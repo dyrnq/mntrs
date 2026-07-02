@@ -40,7 +40,11 @@ if (-not (Test-Path -LiteralPath $WORK)) {
     New-Item -ItemType Directory -Force -Path $WORK | Out-Null
 }
 
-Mount-StressDrive -Mountpoint $MNT -CacheDir $CACHE
+# This scenario specifically exercises the writeback upload path.
+# Enable --vfs-write-back 1 so writes go through the local cache
+# first, get uploaded async (matching the Linux stress test).
+Mount-StressDrive -Mountpoint $MNT -CacheDir $CACHE `
+    "--vfs-write-back", "1"
 # Preserve cache dir on EXIT (failure path) so post-mortem is
 # possible — `mntrs.exe unmount` calls `remove_dir_all` which wipes
 # the only evidence of what the daemon did/didn't do.

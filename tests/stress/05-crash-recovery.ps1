@@ -35,10 +35,12 @@ if (-not (Test-Path -LiteralPath $WORK)) {
     New-Item -ItemType Directory -Force -Path $WORK | Out-Null
 }
 
-# Default write-back delay 1s is fine: we don't depend on the
-# delay queue firing because we verify the cache file, not the
-# .dirty sidecar. Mirrors common.sh:43-44.
-Mount-StressDrive -Mountpoint $MNT -CacheDir $CACHE
+# This scenario exercises the writeback cache (cache file
+# verification after a hard kill). Enable --vfs-write-back 1
+# so writes go through the local cache first; the post-crash
+# test verifies the cache file (not the .dirty sidecar).
+Mount-StressDrive -Mountpoint $MNT -CacheDir $CACHE `
+    "--vfs-write-back", "1"
 # Preserve cache dir on EXIT (failure path) so post-mortem is
 # possible — `mntrs.exe unmount` calls `remove_dir_all` which wipes
 # the only evidence of what the daemon did/didn't do.
@@ -137,7 +139,8 @@ Assert-Eq ($POST_FP -join "`n") ($PRE_FP -join "`n") "cache file sizes+md5s unch
 Write-Log "remounting to verify recovery doesn't damage cache files ..."
 # Re-source helpers in case env was clobbered.
 . (Join-Path $PSScriptRoot "lib\common.ps1")
-Mount-StressDrive -Mountpoint $MNT -CacheDir $CACHE
+Mount-StressDrive -Mountpoint $MNT -CacheDir $CACHE `
+    "--vfs-write-back", "1"
 Start-Sleep -Seconds 1  # let recovery startup scan the cache dir
 
 $POST_RECOVERY_FP = @(Get-CacheFingerprint -Dir $CACHE)
