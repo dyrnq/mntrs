@@ -228,6 +228,11 @@ Three-tier cache: **memory → disk → remote**. Block-level (8 MB) indexing. D
 
 4/6 leading, 1/6 tie, 1/6 behind (recoverable by matching `--stat-cache-ttl=300`).
 
+The macOS variant lives at `bench/run_all_mac.sh`. See
+`docs/benchmark_macos.md` for methodology and the rclone
+auto-detect path. No CI workflow runs it — see issue #304
+for the GH runner macFUSE kext limitation.
+
 ---
 
 ## Write
@@ -417,7 +422,8 @@ cargo build --package mntrs-csi --release
 
 # Benchmarks
 cargo bench                         # micro-benchmarks
-./bench/run_all.sh                  # vs rclone (MinIO)
+./bench/run_all.sh                  # vs rclone (MinIO, Linux)
+./bench/run_all_mac.sh              # macOS variant (manual, see docs/benchmark_macos.md)
 ```
 
 ### CI Matrix (GitHub Actions)
@@ -431,6 +437,7 @@ cargo bench                         # micro-benchmarks
 | `CSI Integration Test` | Linux (k3s) | CSI driver e2e with HDFS backend |
 | `CSI e2e` | Linux (k3s) | CSI driver e2e with S3 (MinIO) backend |
 | `Benchmark` | Linux | vs rclone performance (MinIO) |
+| macOS bench (manual) | macOS developer | `bench/run_all_mac.sh` (issue #304 — no GH runner support) |
 
 ---
 
