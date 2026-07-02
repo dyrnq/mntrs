@@ -253,6 +253,31 @@ pub(crate) fn canonicalize_mountpoint(mp: &str) -> String {
         .unwrap_or_else(|_| mp.to_string())
 }
 
+/// Return `s` with any `userinfo` (the `KEY:SECRET@host` form per
+/// RFC 1738) replaced by `***`. The userinfo form
+/// `s3://AKIA...:wJal...@s3.amazonaws.com/bucket` is accepted by
+/// `url::Url::parse` and used to leak the secret through
+/// `tracing::info!(storage_url = ...)` and through opendal error
+/// `Display` chains. Stripping it before any log line keeps the
+/// secret out of MNTRS_DAEMON_LOG (mode 0600 — good), stderr
+/// (mode 0644 — bad — captured by macOS unified log via launchd),
+/// shell history, and Sentry-style log aggregators.
+pub(crate) fn redact_storage_url(s: &str) -> String {
+    match url::Url::parse(s) {
+        Ok(u) if !u.username().is_empty() || u.password().is_some() => {
+            let mut sanitized = url::Url::parse("s3://x@x/").unwrap_or_else(|_| u.clone());
+            if let Some(host) = u.host_str() {
+                let _ = sanitized.set_host(Some(host));
+            }
+            sanitized.set_path(u.path());
+            sanitized.set_username("***").ok();
+            sanitized.set_password(None).ok();
+            sanitized.to_string()
+        }
+        _ => s.to_string(),
+    }
+}
+
 // ── test-only env-mutex ─────────────────────────────────────────
 //
 // Tests in `util::tests` and `cmd::mount::tests_261_2` both mutate
@@ -520,6 +545,35 @@ pub fn detect_cgroup_memory_limit() -> Option<u64> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::*;
+    #[test]
+    fn plain_url_unchanged() {
+        assert_eq!(redact_storage_url("s3://bucket/path"), "s3://bucket/path");
+    }
+    #[test]
+    fn userinfo_replaced() {
+        let r = redact_storage_url("s3://AKIA:secret@s3.amazonaws.com/bucket");
+        assert!(!r.contains("AKIA"));
+        assert!(!r.contains("secret"));
+        assert!(r.contains("***"));
+        assert!(r.contains("s3.amazonaws.com"));
+        assert!(r.contains("bucket"));
+    }
+    #[test]
+    fn password_only_replaced() {
+        let r = redact_storage_url("s3://bucket:mysecret@host.example/path/key");
+        assert!(!r.contains("mysecret"));
+        assert!(r.contains("***"));
+        assert!(r.contains("host.example"));
+    }
+    #[test]
+    fn garbage_input_passes_through() {
+        assert_eq!(redact_storage_url("not a url"), "not a url");
+    }
 }
 
 #[cfg(test)]
