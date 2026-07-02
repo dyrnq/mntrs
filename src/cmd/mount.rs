@@ -568,6 +568,7 @@ pub fn mount_internal(
         false,       // links
         false,       // noapple_double
         false,       // noapple_xattr,
+        false,       // no_macos_metadata (CSI runs on Linux; macOS metadata filter is a no-op)
         None,        // hash_filter
         false,       // mount_case_insensitive
         131072,      // max_read_ahead
@@ -859,6 +860,7 @@ pub fn mount(
     _links: bool,
     no_apple_double: bool,
     no_apple_xattr: bool,
+    no_macos_metadata: bool,
     hash_filter: Option<String>,
     mount_case_insensitive: bool,
     _max_read_ahead: u64,
@@ -1161,6 +1163,7 @@ pub fn mount(
         use_server_modtime,
         no_apple_double,
         no_apple_xattr,
+        no_macos_metadata,
         hash_filter: hash_filter.as_ref().and_then(|hf| {
             let mut parts = hf.splitn(2, '/');
             let k: usize = parts.next()?.parse().ok()?;
@@ -1428,6 +1431,24 @@ pub fn mount(
         // the small-write optimization; the `write_back_cache` field
         // on `FuserAdapter` is what gates the capability declaration.
         let _ = write_back_cache; // see FuserAdapter::init()
+        // Issue #408 (macos audit, Fix 2): the FUSE writeback
+        // capability is declared in `FuserAdapter::init()`, which is
+        // the Linux/Windows code path. macFUSE has its own kernel-
+        // managed write buffering that the FUSE writeback capability
+        // doesn't gate — on macOS the value is silently ignored.
+        // Surface that as a warn so users copying `--write-back-cache`
+        // invocations from a Linux guide onto a macOS host see
+        // something other than silence. The flag itself stays
+        // visible (not hidden) so a script that runs on a mixed
+        // fleet doesn't fail at the clap layer on macOS hosts.
+        #[cfg(target_os = "macos")]
+        if write_back_cache {
+            tracing::warn!(
+                "--write-back-cache is ignored on macOS: macFUSE manages its own \
+                 write buffering; the FUSE writeback capability is not exposed \
+                 through macFUSE. Drop the flag on macOS hosts."
+            );
+        }
         if allow_root {
             cfg.mount_options
                 .push(MountOption::CUSTOM("allow_root".to_string()));

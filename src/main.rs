@@ -54,7 +54,11 @@ enum Commands {
         /// Device name shown in mount table
         #[arg(long)]
         devname: Option<String>,
-        /// Enable write-back caching (kernel buffers writes before sending to mntrs)
+        /// Enable write-back caching (kernel buffers writes before sending to mntrs).
+        /// **Linux / Windows only** — silently ignored on macOS; macFUSE manages
+        /// its own write buffering outside the FUSE writeback capability. The
+        /// flag stays accepted on macOS so mixed-fleet scripts don't fail at
+        /// the CLI layer; a warning is logged at mount time when it is set.
         #[arg(long)]
         write_back_cache: bool,
         /// Raw FUSE option (repeatable), e.g. -o allow_other
@@ -210,6 +214,16 @@ enum Commands {
         /// macOS: ignore Apple extended attributes (rclone defaults to true)
         #[arg(long, default_value_t = true)]
         noapple_xattr: bool,
+        /// macOS: skip Finder / Spotlight / FSEvents metadata entries
+        /// (.DS_Store per-directory, .Trashes / .fseventsd /
+        /// .Spotlight-V100 / .TemporaryItems / .DocumentRevisions-V100
+        /// at volume root). Default true so a normal Finder browsing
+        /// session doesn't write a `.DS_Store` per directory into the
+        /// backend. Matches the precedent set by `--noapple-double` /
+        /// `--noapple-xattr` (rclone parity). Library users without the
+        /// CLI default get `false` (no filtering) for least-surprise.
+        #[arg(long, default_value_t = true)]
+        no_macos_metadata: bool,
         /// Consistent hash-based sharding: k of n (e.g. --hash-filter 1/4)
         #[arg(long, value_name = "K/N")]
         hash_filter: Option<String>,
@@ -405,6 +419,7 @@ fn main() -> anyhow::Result<()> {
             links,
             noapple_double,
             noapple_xattr,
+            no_macos_metadata,
             hash_filter,
             mount_case_insensitive,
             max_read_ahead,
@@ -538,6 +553,7 @@ fn main() -> anyhow::Result<()> {
                 links,
                 noapple_double,
                 noapple_xattr,
+                no_macos_metadata,
                 hash_filter,
                 mount_case_insensitive,
                 max_read_ahead,
