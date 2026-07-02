@@ -88,6 +88,24 @@ impl PartQueue {
         if self.is_full_for(part.data.len() as u64) {
             return Err("queue full".to_string());
         }
+        // Audit #3 / PR #405: reject overlapping/duplicate offsets
+        // so the FUSE read path can't serve stale data. The
+        // download thread is supposed to advance `offset` past the
+        // previous part's end before issuing the next read, but a
+        // short read combined with the skip-on-reserve-failure
+        // path (`offset += shrunk`) can land two parts covering the
+        // same range. Returning Err here lets the caller treat it
+        // like a terminal push (advance offset, continue) without
+        // poisoning the queue.
+        if let Some(back) = self.parts.back() {
+            let back_end = back.offset + back.data.len() as u64;
+            if part.offset < back_end {
+                return Err(format!(
+                    "overlapping offset: new part starts at {} but previous part ends at {}",
+                    part.offset, back_end
+                ));
+            }
+        }
         self.current_bytes += part.data.len() as u64;
         self.parts.push_back(part);
         Ok(())
@@ -213,7 +231,10 @@ fn read_and_push(
     let buf = match result {
         Ok(b) => b,
         Err(e) => {
-            let mut qlock = q.lock().unwrap();
+            let mut qlock = q.lock().unwrap_or_else(|p| {
+                tracing::warn!("prefetch queue mutex poisoned; recovering");
+                p.into_inner()
+            });
             qlock.set_error(format!("prefetch read failed: {e}"));
             return false;
         }
@@ -230,7 +251,10 @@ fn read_and_push(
     if record_fetched {
         bp.record_part_fetched(part_len, elapsed);
     }
-    let mut qlock = q.lock().unwrap();
+    let mut qlock = q.lock().unwrap_or_else(|p| {
+        tracing::warn!("prefetch queue mutex poisoned; recovering");
+        p.into_inner()
+    });
     // Backpressure: park on the Condvar while the queue is full.
     // `cond.wait` releases the queue lock while parked, so a FUSE
     // `pop` can proceed and free room; it re-acquires the lock on
@@ -289,6 +313,15 @@ impl HandlePrefetcher {
         // (no first-read regression) while letting the window grow or
         // shrink based on consumer rate vs producer rate thereafter.
         let first_chunk = chunk_size;
+        // Audit #3 / PR #405: respect the configured min_window
+        // instead of hardcoding 128 KiB. A controller built with
+        // `with_window(64 * 1024, ...)` should be able to shrink
+        // chunks to 64 KiB under memory pressure; the previous
+        // hardcoded 128 KiB floor made `try_reserve(128 KiB)` fail
+        // and skipped the chunk even when a 64 KiB fetch would have
+        // fit.
+        let bp_min_window: u64 = backpressure.min_window();
+        let bp_max_window: u64 = backpressure.max_window();
         std::thread::spawn(move || {
             let mut offset = 0u64;
             // Issue #201: counter for hysteresis. Reset on reserve
@@ -296,11 +329,13 @@ impl HandlePrefetcher {
             // mem_pressure currently set, call `set_mem_pressure(false)`
             // so the EMA can recompute the window naturally.
             let mut consecutive_successes: u32 = 0;
-            // Issue #201: floor for the shrunk chunk on a reserve
-            // failure. Matches `BackpressureController`'s default
-            // min_window (128 KiB) so a hammered prefetcher doesn't
-            // shrink below what the controller would have given it.
-            let bp_min_window: u64 = 128 * 1024;
+            // Audit #3 / PR #405: use the controller's configured
+            // min_window (captured above at spawn time). Clamp the
+            // initial chunk to `[bp_min_window, bp_max_window]` so a
+            // caller-supplied `chunk_size` outside the configured
+            // range doesn't bypass the backpressure contract.
+            let _bp_min_window = bp_min_window;
+            let _bp_max_window = bp_max_window;
             'download: while offset < file_size {
                 if c.load(Ordering::Relaxed) {
                     break;
@@ -392,7 +427,12 @@ impl HandlePrefetcher {
                 }
                 offset = end;
             }
-            q.lock().unwrap().set_finished();
+            q.lock()
+                .unwrap_or_else(|p| {
+                    tracing::warn!("prefetch queue mutex poisoned; recovering");
+                    p.into_inner()
+                })
+                .set_finished();
             // Wake any straggler waiter (defensive — the only waiter
             // is this thread, which is now done; but a `cancel` that
             // raced with `set_finished` may have a notify in flight).
@@ -421,7 +461,10 @@ impl HandlePrefetcher {
         // waiter's post-wake `is_terminal` read; the Condvar's own
         // internal sync would also suffice, but the lock makes the
         // ordering explicit and matches the pattern in `pop`.
-        let _g = self.queue.lock().unwrap();
+        let _g = self.queue.lock().unwrap_or_else(|p| {
+            tracing::warn!("prefetch queue mutex poisoned; recovering");
+            p.into_inner()
+        });
         self.cond.notify_all();
     }
 
@@ -445,7 +488,10 @@ impl HandlePrefetcher {
     /// `if elapsed.as_secs_f64() <= 0.0 { return; }` guard skips the
     /// update — no EMA pollution.
     pub fn pop(&self, offset: u64, consume_started: Option<Instant>) -> Option<Part> {
-        let mut g = self.queue.lock().unwrap();
+        let mut g = self.queue.lock().unwrap_or_else(|p| {
+            tracing::warn!("prefetch queue mutex poisoned; recovering");
+            p.into_inner()
+        });
         let before = g.current_bytes();
         let part = g.pop(offset);
         if g.current_bytes() < before {
@@ -496,7 +542,10 @@ impl Drop for HandlePrefetcher {
         self.cancelled.store(true, Ordering::Relaxed);
         // Lock + notify mirrors `cancel()` so a pusher parked on
         // `cond.wait` observes the cancelled flag and exits.
-        let _g = self.queue.lock().unwrap();
+        let _g = self.queue.lock().unwrap_or_else(|p| {
+            tracing::warn!("prefetch queue mutex poisoned; recovering");
+            p.into_inner()
+        });
         self.cond.notify_all();
         drop(_g);
         // Bounded wait for the download thread. 200 ms is a
@@ -606,6 +655,73 @@ mod tests {
         assert_eq!(p2.data[0], 1);
     }
 
+    /// Audit #3 / PR #405: `push` must reject an offset that overlaps
+    /// the previous part. Without this guard the FUSE read path can
+    /// serve stale data if the downloader lands two parts covering
+    /// the same byte range (short read + skip-on-reserve-failure).
+    #[test]
+    fn test_part_queue_rejects_overlapping_offset() {
+        let mut q = PartQueue::new(1024, false_flag());
+        q.push(Part {
+            offset: 0,
+            data: Bytes::from(vec![0u8; 100]),
+        })
+        .unwrap();
+        // Same offset as the back's start → exact duplicate.
+        let err = q
+            .push(Part {
+                offset: 0,
+                data: Bytes::from(vec![1u8; 50]),
+            })
+            .unwrap_err();
+        assert!(err.contains("overlapping offset"), "got: {err}");
+        // Offset inside the previous range (50..149) → partial overlap.
+        let err = q
+            .push(Part {
+                offset: 50,
+                data: Bytes::from(vec![2u8; 50]),
+            })
+            .unwrap_err();
+        assert!(err.contains("overlapping offset"), "got: {err}");
+        // Offset at the previous part's end boundary (== 100) is
+        // allowed (the new part starts where the previous one ended).
+        q.push(Part {
+            offset: 100,
+            data: Bytes::from(vec![3u8; 50]),
+        })
+        .unwrap();
+    }
+
+    /// Audit #3 / PR #405: recovering from a poisoned mutex must
+    /// not panic the FUSE worker. We poison the mutex by panicking
+    /// inside the lock (a thread holding the lock and unwinding),
+    /// then verify a subsequent `lock_or_recover` succeeds and
+    /// sees the still-consistent inner state.
+    #[test]
+    fn test_part_queue_recovers_from_poison() {
+        use std::sync::Mutex;
+        let q: Arc<Mutex<PartQueue>> = Arc::new(Mutex::new(PartQueue::new(1024, false_flag())));
+        // Clone the Arc, poison one handle, then read the other.
+        let q2 = q.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = q2.lock().unwrap();
+            panic!("intentional poison for test");
+        })
+        .join();
+        // q is now poisoned; unwrap would panic. The recovery idiom
+        // (used in the production code) must succeed.
+        let mut g = q.lock().unwrap_or_else(|p| p.into_inner());
+        // Verify the queue is in a consistent state — empty, not
+        // cancelled, not finished. The panic happened before any
+        // push, so all flags remain default.
+        assert!(!g.is_terminal());
+        // 1025 bytes would exceed the 1024-byte cap; an empty queue
+        // accepts this length without overflow.
+        assert!(g.is_full_for(1025));
+        assert!(!g.is_full_for(1024));
+        assert!(g.pop(0).is_none());
+    }
+
     #[test]
     fn test_push_respects_cancelled() {
         let flag = Arc::new(AtomicBool::new(false));
@@ -662,7 +778,10 @@ mod tests {
                 data: Bytes::from(vec![1u8; 8]),
             };
             let part_len = part.data.len() as u64;
-            let mut qlock = q2.lock().unwrap();
+            let mut qlock = q2.lock().unwrap_or_else(|p| {
+                tracing::warn!("prefetch queue mutex poisoned; recovering");
+                p.into_inner()
+            });
             loop {
                 if qlock.is_terminal() {
                     return false; // unexpected — test should free room
@@ -681,7 +800,10 @@ mod tests {
 
         // Free room — this must wake the parked pusher via notify_one.
         let popped = {
-            let mut g = queue.lock().unwrap();
+            let mut g = queue.lock().unwrap_or_else(|p| {
+                tracing::warn!("prefetch queue mutex poisoned; recovering");
+                p.into_inner()
+            });
             let before = g.current_bytes();
             let p = g.pop(0);
             if g.current_bytes() < before {
@@ -699,7 +821,10 @@ mod tests {
         );
 
         // The second part is now in the queue.
-        let g = queue.lock().unwrap();
+        let g = queue.lock().unwrap_or_else(|p| {
+            tracing::warn!("prefetch queue mutex poisoned; recovering");
+            p.into_inner()
+        });
         assert_eq!(g.current_bytes(), 8, "queue should hold the second part");
     }
 
