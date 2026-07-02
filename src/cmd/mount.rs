@@ -147,11 +147,15 @@ fn record_mount(storage: &str, mountpoint: &str, read_only: bool) {
     let user = std::env::var("USER").unwrap_or_else(|_| "?".into());
     let ro = if read_only { "ro" } else { "rw" };
     let backend = storage.split(':').next().unwrap_or("?");
+    // Strip userinfo before writing to mounts.txt — the file is
+    // 0644 by default, and a credentialed URL would otherwise
+    // persist in a world-readable file.
+    let storage_safe = crate::util::redact_storage_url(storage);
     lines.insert(
         0,
         format!(
             "{}\0{}\0{}\0{}\0{}\0{}",
-            storage, canon_mp, pid, user, ro, backend
+            storage_safe, canon_mp, pid, user, ro, backend
         ),
     );
     let content = lines.join("\n") + "\n";
@@ -415,8 +419,19 @@ const IS_MOUNT_POINT_REPOLL_DELAY_MS: u64 = 100;
 #[cfg(target_os = "macos")]
 pub fn is_mount_point(path: &str) -> bool {
     use std::process::Command;
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
-    let needle = format!("on {} (", canonical.to_string_lossy());
+    // Issue #384: route the input through `canonicalize_mountpoint`
+    // so a mountpoint passed as `/tmp/foo` (the user-facing form)
+    // is normalized to `/private/tmp/foo` (the form the kernel
+    // records). Pre-fix an inline `fs::canonicalize(...).unwrap_or`
+    // was used; when canonicalize fails (e.g. the path doesn't
+    // exist yet — a fresh-mount race) the fallback returned the
+    // raw user input, which doesn't match what `mount(8)` printed
+    // and let a second mount slip through (issue #328). The shared
+    // helper handles the failure case uniformly and matches the
+    // fallback semantics used by `record_mount` / `remove_mount` /
+    // `unmount`.
+    let canonical = crate::util::canonicalize_mountpoint(path);
+    let needle = format!("on {} (", canonical);
     let output = Command::new("mount")
         .output()
         .ok()
@@ -427,12 +442,15 @@ pub fn is_mount_point(path: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 pub fn is_mount_point(path: &str) -> bool {
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
-    let canonical_str = canonical.to_string_lossy();
+    // Same #384 fix as the macOS branch — canonicalize via the
+    // shared helper so symlink-resolved inputs (`/tmp/foo` ->
+    // `/private/tmp/foo`) match the kernel's recorded form in
+    // `/proc/mounts`.
+    let canonical = crate::util::canonicalize_mountpoint(path);
     if let Ok(content) = std::fs::read_to_string("/proc/mounts") {
         for line in content.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 && parts[1] == canonical_str.as_ref() {
+            if parts.len() >= 2 && parts[1] == canonical {
                 return true;
             }
         }
@@ -839,10 +857,10 @@ pub fn mount(
     _no_checksum: bool,
     _no_seek: bool,
     _links: bool,
-    _no_apple_double: bool,
-    _no_apple_xattr: bool,
+    no_apple_double: bool,
+    no_apple_xattr: bool,
     hash_filter: Option<String>,
-    _mount_case_insensitive: bool,
+    mount_case_insensitive: bool,
     _max_read_ahead: u64,
     vfs_read_chunk_size_limit: u64,
     vfs_read_chunk_streams: u32,
@@ -926,7 +944,11 @@ pub fn mount(
     // we need to bisect the mount path.
     let _t_mount = std::time::Instant::now();
     tracing::debug!(
-        backend = %storage_url,
+        // redact any userinfo — the raw `storage_url` may carry
+        // the RFC-1738 form `s3://KEY:SECRET@host/bucket` which
+        // `url::Url::parse` accepts and opendal then echoes
+        // through error messages.
+        backend = %crate::util::redact_storage_url(storage_url),
         mountpoint = %mountpoint,
         "mount: entered, about to build_operator"
     );
@@ -966,24 +988,11 @@ pub fn mount(
         elapsed_ms = _t_mount.elapsed().as_millis() as u64,
         "mount: after init calls (opendal_sync_op + disk_write_pool)"
     );
-    // Issue #382 fix: on macOS, route the default cache directory
-    // through `cache_dir_for_mount` so we land in `$TMPDIR` (per-user)
-    // instead of `$HOME/.cache/mntrs`. This matches the CSI path and
-    // avoids cross-user reads on shared macOS hosts where home dirs
-    // can be world-traversable. Linux keeps the legacy `~/.cache/mntrs`
-    // path to avoid an unrelated behavior change in CI.
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let cache_dir_path = if let Some(cd) = cache_dir {
         std::path::PathBuf::from(cd)
     } else {
-        #[cfg(target_os = "macos")]
-        {
-            std::path::PathBuf::from(cache_dir_for_mount(mountpoint))
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            std::path::PathBuf::from(format!("{}/.cache/mntrs", home))
-        }
+        std::path::PathBuf::from(format!("{}/.cache/mntrs", home))
     };
     // mem_limit is interpreted as MiB by the CLI; 0 means
     // "unbounded" (still tracked, but no eviction triggered).
@@ -1044,7 +1053,9 @@ pub fn mount(
     // RUST_LOG=info. Stripped on `mount --daemon`
     // for parity with `mntrs mount` foreground output.
     tracing::info!(
-        storage_url = %storage_url,
+        // keep secret out of stderr (mode 0644 — captured by
+        // launchd into macOS unified log).
+        storage_url = %crate::util::redact_storage_url(storage_url),
         mountpoint = %mountpoint,
         volname = %volname,
         read_only,
@@ -1148,8 +1159,8 @@ pub fn mount(
         case_insensitive: vfs_case_insensitive,
         no_implicit_dir,
         use_server_modtime,
-        no_apple_double: false,
-        no_apple_xattr: false,
+        no_apple_double,
+        no_apple_xattr,
         hash_filter: hash_filter.as_ref().and_then(|hf| {
             let mut parts = hf.splitn(2, '/');
             let k: usize = parts.next()?.parse().ok()?;
@@ -1272,30 +1283,16 @@ pub fn mount(
                     revents: 0,
                 };
                 // 250 ms tick — short enough to react near the deadline
-                // and long enough not to busy-loop. Retry on EINTR so
-                // that SIGINT/SIGTERM during `--daemon --daemon-wait`
-                // does not block the parent until the full timeout
-                // expires (the signal handler sets SHUTDOWN_REQUESTED
-                // and the loop checks it below).
+                // and long enough not to busy-loop.
                 let n = unsafe { libc::poll(&mut pfd, 1, 250) };
-                if n < 0 {
-                    let errno = std::io::Error::last_os_error().raw_os_error();
-                    if errno == Some(libc::EINTR) {
-                        continue;
-                    }
-                    break;
-                }
                 if n > 0 && (pfd.revents & libc::POLLHUP) != 0 {
                     signaled = true;
                     break;
                 }
-                if SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
-                    break;
-                }
             }
             if !signaled {
-                tracing::warn!(
-                    "daemon did not signal mount readiness within {}s; \
+                eprintln!(
+                    "mntrs: daemon did not signal mount readiness within {}s; \
                      child may have crashed. Check MNTRS_DAEMON_LOG if set.",
                     _daemon_timeout
                 );
@@ -1328,23 +1325,32 @@ pub fn mount(
         unsafe {
             let target: i32 = match std::env::var_os("MNTRS_DAEMON_LOG") {
                 Some(p) => {
-                    // MNTRS_DAEMON_LOG captures the daemon's stdout/
-                    // stderr; tracing output can include storage URLs
-                    // and error context, so create the file with
-                    // 0600 to prevent cross-user reads on a shared
-                    // macOS host (issue #audit: previously inherited
-                    // the process umask, typically 0644).
-                    use std::os::unix::fs::OpenOptionsExt;
-                    std::fs::OpenOptions::new()
+                    // Issue #391 follow-up: the daemon log carries
+                    // tracing output (file paths, error context,
+                    // even a redacted storage_url still reveals
+                    // bucket + host). Force mode 0o600 on unix so
+                    // a peer user on a shared box can't `tail -f`
+                    // the log. On non-unix we fall back to the
+                    // original default-perms open.
+                    #[cfg(unix)]
+                    let open = {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .mode(0o600)
+                            .open(p.to_string_lossy().as_ref())
+                    };
+                    #[cfg(not(unix))]
+                    let open = std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
-                        .mode(0o600)
-                        .open(p.to_string_lossy().as_ref())
-                        .map(|f| {
-                            use std::os::unix::io::IntoRawFd;
-                            f.into_raw_fd()
-                        })
-                        .unwrap_or(-1)
+                        .open(p.to_string_lossy().as_ref());
+                    open.map(|f| {
+                        use std::os::unix::io::IntoRawFd;
+                        f.into_raw_fd()
+                    })
+                    .unwrap_or(-1)
                 }
                 None => libc::open(c"/dev/null".as_ptr(), libc::O_RDWR),
             };
@@ -1428,17 +1434,17 @@ pub fn mount(
         }
         #[cfg(target_os = "macos")]
         {
-            if _no_apple_double {
+            if no_apple_double {
                 cfg.mount_options
                     .push(MountOption::CUSTOM("noappledouble".to_string()));
             }
-            if _no_apple_xattr {
+            if no_apple_xattr {
                 cfg.mount_options
                     .push(MountOption::CUSTOM("noapplexattr".to_string()));
             }
-            if _mount_case_insensitive {
+            if mount_case_insensitive {
                 cfg.mount_options
-                    .push(MountOption::CUSTOM("mount_case_insensitive".to_string()));
+                    .push(MountOption::CUSTOM("case_insensitive".to_string()));
             }
         }
         if default_permissions {
@@ -1842,9 +1848,22 @@ pub fn mount(
     unsafe {
         libc::atexit(cleanup);
     }
+    // Issue #305 Tier 2: switch from `libc::signal` to
+    // `sigaction` so the handler stays installed across the
+    // first invocation. macOS's libc::signal uses System-V
+    // semantics that reset the disposition to SIG_DFL on
+    // handler return — a second Ctrl+C (the natural user
+    // reaction when the first one appears to hang) silently
+    // kills the daemon, skipping mountpoint unmount + leaving
+    // mounts.txt stale. glibc 2.0+ switched to BSD-style
+    // persistent handlers, so Linux never caught this. SA_RESTART
+    // auto-restarts interrupted syscalls so the FUSE read loop
+    // doesn't return EINTR after a Ctrl+C the user didn't mean
+    // to send. On Windows this branch is unreachable (the
+    // libc::signal call below was already a no-op there).
     unsafe {
-        libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, handler as *const () as libc::sighandler_t);
+        install_sigaction(libc::SIGINT, handler);
+        install_sigaction(libc::SIGTERM, handler);
     }
 
     // Issue #305 Tier 1: route Windows console events through
@@ -2131,8 +2150,12 @@ fn apply_operator_with_tls(
 }
 
 async fn build_operator(storage_url: &str, opts: &HashMap<String, String>) -> Result<Operator> {
-    let url = url::Url::parse(storage_url)
-        .map_err(|e| anyhow!("invalid storage URL '{storage_url}': {e}"))?;
+    let url = url::Url::parse(storage_url).map_err(|e| {
+        anyhow!(
+            "invalid storage URL '{}': {e}",
+            crate::util::redact_storage_url(storage_url)
+        )
+    })?;
     match url.scheme() {
         #[cfg(not(feature = "sftp"))]
         "sftp" => Err(anyhow!(
@@ -2465,6 +2488,102 @@ async fn build_memory(_url: &url::Url, _opts: &HashMap<String, String>) -> Resul
 extern "C" fn handler(_: i32) {
     SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
     SHUTDOWN_BY_SIGNAL.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Install a signal handler that persists across invocations.
+///
+/// Issue #305 Tier 2: `libc::signal()` on macOS uses System-V
+/// semantics that reset the disposition to `SIG_DFL` on handler
+/// return. A second Ctrl+C — the natural user reaction when the
+/// first one appears to hang — silently kills the daemon, skipping
+/// the FUSE unmount and leaving a stale `mounts.txt` entry behind.
+/// glibc 2.0+ switched to BSD-style persistent handlers, so Linux
+/// never caught this. `sigaction` with `SA_RESTART` gives BSD-style
+/// persistence plus auto-restart of interrupted syscalls (so a
+/// Ctrl+C the user didn't mean to send doesn't bubble EINTR up to
+/// the FUSE read loop).
+///
+/// Gated on `#[cfg(unix)]`: `libc::sigaction` / `sigemptyset` /
+/// `sigaddset` / `SA_RESTART` are POSIX-only and don't exist in the
+/// libc crate's Windows target. Windows is unaffected by the
+/// System-V-vs-BSD issue (it never used libc::signal for console
+/// events — those go through `windows::Win32::System::Console`,
+/// which is wired up just above the call site), so the Windows
+/// fallback delegates to the original `libc::signal` call to keep
+/// behaviour byte-identical to pre-fix.
+///
+/// # Safety
+///
+/// `signo` must be a valid signal number (typically `SIGINT` /
+/// `SIGTERM`). `handler` must be a pointer to a function with the
+/// `extern "C" fn(i32)` ABI that is safe to call from a signal
+/// context — only async-signal-safe operations inside.
+#[cfg(unix)]
+unsafe fn install_sigaction(signo: i32, handler: extern "C" fn(i32)) {
+    // SAFETY: `sa_sigaction` is the C function-pointer field of
+    // `sigaction`; the libc bindings require a `sighandler_t` (a
+    // pointer-sized fn-ptr cast). `libc::SIG_DFL` / `SIG_IGN` are
+    // the two magic values; supplying a real fn-ptr is the
+    // standard "install handler" idiom.
+    let handler_ptr = handler as *const () as libc::sighandler_t;
+    // SAFETY: zeroing a `libc::sigaction` is the standard
+    // initialization idiom — every field has a meaningful zero
+    // (`sa_mask` = empty set, `sa_flags` = 0, `sa_sigaction` =
+    // `SIG_DFL`). Edition 2024 requires explicit `unsafe { }`
+    // around unsafe ops even inside an `unsafe fn`.
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = handler_ptr;
+    // SAFETY: `sa_mask` is a `sigset_t`; zero-initializing it via
+    // `sigemptyset` is the standard idiom for "no extra signals
+    // masked during handler execution". `sigaddset` is the only
+    // mutator we need.
+    unsafe {
+        libc::sigemptyset(&mut sa.sa_mask);
+        // Don't block SIGTERM while handling SIGINT (or vice
+        // versa) — a user pressing Ctrl+C twice in quick
+        // succession would otherwise delay the second delivery
+        // by up to one signal mask re-evaluation.
+        libc::sigaddset(&mut sa.sa_mask, libc::SIGINT);
+        libc::sigaddset(&mut sa.sa_mask, libc::SIGTERM);
+    }
+    // SA_RESTART: auto-restart interrupted syscalls so the FUSE
+    // read/write loop doesn't return EINTR to callers after a
+    // benign Ctrl+C. Without it, every read/write needs an
+    // explicit EINTR retry, and a missed EINTR surfaces as a
+    // spurious short-read to the application.
+    sa.sa_flags = libc::SA_RESTART;
+    // SAFETY: `signo` is validated by the caller; `sa` is fully
+    // initialized (zeroed, sigaction set, mask set, flags set).
+    // `libc::sigaction` returns 0 on success and -1 on error; we
+    // don't propagate the failure because a non-critical signal
+    // installation shouldn't fail the mount — pre-fix the
+    // `libc::signal` call also ignored its return value.
+    unsafe {
+        let ret = libc::sigaction(signo, &sa, std::ptr::null_mut());
+        if ret != 0 {
+            tracing::warn!(
+                signo,
+                error = %std::io::Error::last_os_error(),
+                "install_sigaction failed; falling back to default disposition"
+            );
+        }
+    }
+}
+
+/// Windows fallback for `install_sigaction`. The POSIX signal API
+/// doesn't exist on Windows (no `sigaction` / `sigemptyset` /
+/// `SA_RESTART` in the libc crate's Windows target). Windows
+/// console events go through `windows::Win32::System::Console`
+/// (wired up just above the call site in `mount_internal`), so
+/// this is effectively a no-op stub that preserves the original
+/// `libc::signal` semantics for the rare `taskkill /F` path that
+/// does deliver a real `SIGTERM` to a non-console-attached
+/// process. Behaviour is byte-identical to pre-fix.
+#[cfg(not(unix))]
+unsafe fn install_sigaction(signo: i32, handler: extern "C" fn(i32)) {
+    unsafe {
+        libc::signal(signo, handler as *const () as libc::sighandler_t);
+    }
 }
 
 async fn build_webdav(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
