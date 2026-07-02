@@ -147,11 +147,15 @@ fn record_mount(storage: &str, mountpoint: &str, read_only: bool) {
     let user = std::env::var("USER").unwrap_or_else(|_| "?".into());
     let ro = if read_only { "ro" } else { "rw" };
     let backend = storage.split(':').next().unwrap_or("?");
+    // Strip userinfo before writing to mounts.txt — the file is
+    // 0644 by default, and a credentialed URL would otherwise
+    // persist in a world-readable file.
+    let storage_safe = crate::util::redact_storage_url(storage);
     lines.insert(
         0,
         format!(
             "{}\0{}\0{}\0{}\0{}\0{}",
-            storage, canon_mp, pid, user, ro, backend
+            storage_safe, canon_mp, pid, user, ro, backend
         ),
     );
     let content = lines.join("\n") + "\n";
@@ -926,7 +930,11 @@ pub fn mount(
     // we need to bisect the mount path.
     let _t_mount = std::time::Instant::now();
     tracing::debug!(
-        backend = %storage_url,
+        // redact any userinfo — the raw `storage_url` may carry
+        // the RFC-1738 form `s3://KEY:SECRET@host/bucket` which
+        // `url::Url::parse` accepts and opendal then echoes
+        // through error messages.
+        backend = %crate::util::redact_storage_url(storage_url),
         mountpoint = %mountpoint,
         "mount: entered, about to build_operator"
     );
@@ -1031,7 +1039,9 @@ pub fn mount(
     // RUST_LOG=info. Stripped on `mount --daemon`
     // for parity with `mntrs mount` foreground output.
     tracing::info!(
-        storage_url = %storage_url,
+        // keep secret out of stderr (mode 0644 — captured by
+        // launchd into macOS unified log).
+        storage_url = %crate::util::redact_storage_url(storage_url),
         mountpoint = %mountpoint,
         volname = %volname,
         read_only,
@@ -2094,8 +2104,12 @@ fn apply_operator_with_tls(
 }
 
 async fn build_operator(storage_url: &str, opts: &HashMap<String, String>) -> Result<Operator> {
-    let url = url::Url::parse(storage_url)
-        .map_err(|e| anyhow!("invalid storage URL '{storage_url}': {e}"))?;
+    let url = url::Url::parse(storage_url).map_err(|e| {
+        anyhow!(
+            "invalid storage URL '{}': {e}",
+            crate::util::redact_storage_url(storage_url)
+        )
+    })?;
     match url.scheme() {
         #[cfg(not(feature = "sftp"))]
         "sftp" => Err(anyhow!(
