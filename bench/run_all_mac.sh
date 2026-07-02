@@ -99,13 +99,26 @@ case "${MAC_BENCH_INCLUDE_RCLONE:-auto}" in
             # to reach MinIO through a corporate egress. We pass the
             # env through unchanged rather than baking in a default —
             # operators set the proxy in their shell rc when needed.
-            HTTP_PROXY="$HTTP_PROXY" \
-            HTTPS_PROXY="$HTTPS_PROXY" \
+            # `${HTTP_PROXY:-}` returns "" when unset, satisfying `set -u`.
+            HTTP_PROXY="${HTTP_PROXY:-}" \
+            HTTPS_PROXY="${HTTPS_PROXY:-}" \
                 "$RC_BIN" mount bench:bench-bucket "$PROBE_DIR" \
                     --daemon --allow-non-empty --vfs-cache-mode=writes \
                     --log-file "$PROBE_DIR.log" --log-level ERROR 2>/dev/null
-            sleep 3
-            if mount | grep -q " on $(canonicalize_mnt "$PROBE_DIR") ("; then
+            # macFUSE kext handshake can take 15-20s on busy hosts.
+            # Mirror the main-mount polling loop (see "Mount rclone"
+            # below) instead of a fixed 3s sleep, otherwise we
+            # mis-classify a working rclone binary as "brew-installed"
+            # and silently fall back to mntrs-only.
+            RC_PROBE_OK=0
+            for _ in $(seq 1 30); do
+                sleep 1
+                if mount | grep -qF " on $(canonicalize_mnt "$PROBE_DIR") ("; then
+                    RC_PROBE_OK=1
+                    break
+                fi
+            done
+            if [[ "$RC_PROBE_OK" == "1" ]]; then
                 RCLONE_OPT_IN=1
                 echo "[mac-bench] rclone auto-detected at $RC_BIN (mount test OK)"
             else
@@ -213,8 +226,9 @@ if [[ "$RCLONE_OPT_IN" == "1" ]]; then
     # Proxy: pass through the operator's env (rclone respects
     # HTTP_PROXY/HTTPS_PROXY for the S3 backend). Don't bake in
     # defaults — operators set this in their shell rc when needed.
-    HTTP_PROXY="$HTTP_PROXY" \
-    HTTPS_PROXY="$HTTPS_PROXY" \
+    # `${HTTP_PROXY:-}` returns "" when unset, satisfying `set -u`.
+    HTTP_PROXY="${HTTP_PROXY:-}" \
+    HTTPS_PROXY="${HTTPS_PROXY:-}" \
         "$RC_BIN" mount "bench:$BUCKET" "$RCLONE_MNT" \
             --daemon --allow-non-empty \
             --vfs-cache-mode=writes --vfs-write-back=5s \
@@ -261,7 +275,23 @@ echo ""
 # ── Upload test data via S3 (skip when MAC_BENCH_SKIP_S3=1) ──────────
 if [[ "${MAC_BENCH_SKIP_S3:-0}" != "1" ]]; then
     echo "--- Uploading test data ---"
-    uv tool install awscli 2>/dev/null || pip3 install awscli 2>/dev/null || true
+    # Try to install awscli if missing. Without this precondition, the
+    # subsequent `aws s3 mb/sync` calls fail silently and the bench
+    # runs against an empty bucket — producing 0-IO "PASS" results
+    # that look valid but don't exercise anything.
+    if ! command -v aws >/dev/null 2>&1; then
+        if command -v uv >/dev/null 2>&1; then
+            uv tool install awscli 2>&1 | tail -5 || true
+        elif command -v pip3 >/dev/null 2>&1; then
+            pip3 install --user awscli 2>&1 | tail -5 || true
+        fi
+    fi
+    if ! command -v aws >/dev/null 2>&1; then
+        echo "ERROR: awscli not found and could not be installed." >&2
+        echo "       Install via 'brew install awscli' or 'uv tool install awscli'," >&2
+        echo "       or set MAC_BENCH_SKIP_S3=1 to skip the S3 backend." >&2
+        exit 1
+    fi
     AWS_ACCESS_KEY_ID="$ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$SECRET_KEY" \
         aws --endpoint-url "$ENDPOINT" --no-verify-ssl s3 mb "s3://$BUCKET" 2>/dev/null || true
     rm -rf /tmp/bench-upload; mkdir -p /tmp/bench-upload
@@ -429,8 +459,8 @@ bench_mr "touch exist" touch "$MNTRS_MNT/1K.bin"          || touch "$RCLONE_MNT/
 
 # ── 15. Chmod ────────────────────────────────────────────────────────
 echo ""; echo "=== 15. Chmod ==="; CATEGORY="Chmod"
-bench_mr "chmod" chmod 0644 "$MNTRS_MNT/1K.bin" 2>/dev/null || true \
-    | chmod 0644 "$RCLONE_MNT/1K.bin" 2>/dev/null || true
+bench_mr "chmod" chmod 0644 "$MNTRS_MNT/1K.bin" 2>/dev/null || \
+    chmod 0644 "$RCLONE_MNT/1K.bin" 2>/dev/null || true
 
 # ── 16. Symlink ──────────────────────────────────────────────────────
 echo ""; echo "=== 16. Symlink ==="; CATEGORY="Symlink"
@@ -438,8 +468,8 @@ ln -sf "$MNTRS_MNT/1K.bin" "$MNTRS_MNT/bench-link" 2>/dev/null || true
 if [[ "$RCLONE_OPT_IN" == "1" ]]; then
     ln -sf "$RCLONE_MNT/1K.bin" "$RCLONE_MNT/bench-link" 2>/dev/null || true
 fi
-bench_mr "readlink" readlink "$MNTRS_MNT/bench-link" 2>/dev/null || true \
-    | readlink "$RCLONE_MNT/bench-link" 2>/dev/null || true
+bench_mr "readlink" readlink "$MNTRS_MNT/bench-link" 2>/dev/null || \
+    readlink "$RCLONE_MNT/bench-link" 2>/dev/null || true
 
 # ── 17. Large dir ops ────────────────────────────────────────────────
 echo ""; echo "=== 17. Large dir ops ==="; CATEGORY="LargeDir"
@@ -558,7 +588,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 echo ""
 echo "=== FINAL TABLE ==="
-python3 "$REPO_ROOT/bench/render_table.py" "$RESULT_TMP" 2>&1 | tee -a "$RESULT_MD"
+# python3 is required for the markdown table renderer. On macOS 12.3+
+# it's not preinstalled; this gate prevents silent result corruption
+# (a missing python3 leaves the .md file empty and the user sees a
+# "PASS=96" line with no per-test breakdown).
+if command -v python3 >/dev/null 2>&1; then
+    python3 "$REPO_ROOT/bench/render_table.py" "$RESULT_TMP" 2>&1 | tee -a "$RESULT_MD"
+else
+    echo "WARN: python3 not found; the rendered markdown table is unavailable." >&2
+    echo "      Install via 'brew install python@3.12' or set PATH to include it." >&2
+    echo "      Raw per-test data is preserved at: $RESULT_COPY" >&2
+fi
 
 # ── Final summary ────────────────────────────────────────────────────
 ELAPSED=$(( $(date +%s) - START_TIME ))
