@@ -419,8 +419,19 @@ const IS_MOUNT_POINT_REPOLL_DELAY_MS: u64 = 100;
 #[cfg(target_os = "macos")]
 pub fn is_mount_point(path: &str) -> bool {
     use std::process::Command;
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
-    let needle = format!("on {} (", canonical.to_string_lossy());
+    // Issue #384: route the input through `canonicalize_mountpoint`
+    // so a mountpoint passed as `/tmp/foo` (the user-facing form)
+    // is normalized to `/private/tmp/foo` (the form the kernel
+    // records). Pre-fix an inline `fs::canonicalize(...).unwrap_or`
+    // was used; when canonicalize fails (e.g. the path doesn't
+    // exist yet — a fresh-mount race) the fallback returned the
+    // raw user input, which doesn't match what `mount(8)` printed
+    // and let a second mount slip through (issue #328). The shared
+    // helper handles the failure case uniformly and matches the
+    // fallback semantics used by `record_mount` / `remove_mount` /
+    // `unmount`.
+    let canonical = crate::util::canonicalize_mountpoint(path);
+    let needle = format!("on {} (", canonical);
     let output = Command::new("mount")
         .output()
         .ok()
@@ -431,12 +442,15 @@ pub fn is_mount_point(path: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 pub fn is_mount_point(path: &str) -> bool {
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
-    let canonical_str = canonical.to_string_lossy();
+    // Same #384 fix as the macOS branch — canonicalize via the
+    // shared helper so symlink-resolved inputs (`/tmp/foo` ->
+    // `/private/tmp/foo`) match the kernel's recorded form in
+    // `/proc/mounts`.
+    let canonical = crate::util::canonicalize_mountpoint(path);
     if let Ok(content) = std::fs::read_to_string("/proc/mounts") {
         for line in content.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 && parts[1] == canonical_str.as_ref() {
+            if parts.len() >= 2 && parts[1] == canonical {
                 return true;
             }
         }
@@ -843,8 +857,8 @@ pub fn mount(
     _no_checksum: bool,
     _no_seek: bool,
     _links: bool,
-    _no_apple_double: bool,
-    _no_apple_xattr: bool,
+    no_apple_double: bool,
+    no_apple_xattr: bool,
     hash_filter: Option<String>,
     _mount_case_insensitive: bool,
     _max_read_ahead: u64,
@@ -1145,8 +1159,8 @@ pub fn mount(
         case_insensitive: vfs_case_insensitive,
         no_implicit_dir,
         use_server_modtime,
-        no_apple_double: false,
-        no_apple_xattr: false,
+        no_apple_double,
+        no_apple_xattr,
         hash_filter: hash_filter.as_ref().and_then(|hf| {
             let mut parts = hf.splitn(2, '/');
             let k: usize = parts.next()?.parse().ok()?;
@@ -1401,11 +1415,11 @@ pub fn mount(
         }
         #[cfg(target_os = "macos")]
         {
-            if _no_apple_double {
+            if no_apple_double {
                 cfg.mount_options
                     .push(MountOption::CUSTOM("noappledouble".to_string()));
             }
-            if _no_apple_xattr {
+            if no_apple_xattr {
                 cfg.mount_options
                     .push(MountOption::CUSTOM("noapplexattr".to_string()));
             }
@@ -1815,9 +1829,22 @@ pub fn mount(
     unsafe {
         libc::atexit(cleanup);
     }
+    // Issue #305 Tier 2: switch from `libc::signal` to
+    // `sigaction` so the handler stays installed across the
+    // first invocation. macOS's libc::signal uses System-V
+    // semantics that reset the disposition to SIG_DFL on
+    // handler return — a second Ctrl+C (the natural user
+    // reaction when the first one appears to hang) silently
+    // kills the daemon, skipping mountpoint unmount + leaving
+    // mounts.txt stale. glibc 2.0+ switched to BSD-style
+    // persistent handlers, so Linux never caught this. SA_RESTART
+    // auto-restarts interrupted syscalls so the FUSE read loop
+    // doesn't return EINTR after a Ctrl+C the user didn't mean
+    // to send. On Windows this branch is unreachable (the
+    // libc::signal call below was already a no-op there).
     unsafe {
-        libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, handler as *const () as libc::sighandler_t);
+        install_sigaction(libc::SIGINT, handler);
+        install_sigaction(libc::SIGTERM, handler);
     }
 
     // Issue #305 Tier 1: route Windows console events through
@@ -2442,6 +2469,102 @@ async fn build_memory(_url: &url::Url, _opts: &HashMap<String, String>) -> Resul
 extern "C" fn handler(_: i32) {
     SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
     SHUTDOWN_BY_SIGNAL.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Install a signal handler that persists across invocations.
+///
+/// Issue #305 Tier 2: `libc::signal()` on macOS uses System-V
+/// semantics that reset the disposition to `SIG_DFL` on handler
+/// return. A second Ctrl+C — the natural user reaction when the
+/// first one appears to hang — silently kills the daemon, skipping
+/// the FUSE unmount and leaving a stale `mounts.txt` entry behind.
+/// glibc 2.0+ switched to BSD-style persistent handlers, so Linux
+/// never caught this. `sigaction` with `SA_RESTART` gives BSD-style
+/// persistence plus auto-restart of interrupted syscalls (so a
+/// Ctrl+C the user didn't mean to send doesn't bubble EINTR up to
+/// the FUSE read loop).
+///
+/// Gated on `#[cfg(unix)]`: `libc::sigaction` / `sigemptyset` /
+/// `sigaddset` / `SA_RESTART` are POSIX-only and don't exist in the
+/// libc crate's Windows target. Windows is unaffected by the
+/// System-V-vs-BSD issue (it never used libc::signal for console
+/// events — those go through `windows::Win32::System::Console`,
+/// which is wired up just above the call site), so the Windows
+/// fallback delegates to the original `libc::signal` call to keep
+/// behaviour byte-identical to pre-fix.
+///
+/// # Safety
+///
+/// `signo` must be a valid signal number (typically `SIGINT` /
+/// `SIGTERM`). `handler` must be a pointer to a function with the
+/// `extern "C" fn(i32)` ABI that is safe to call from a signal
+/// context — only async-signal-safe operations inside.
+#[cfg(unix)]
+unsafe fn install_sigaction(signo: i32, handler: extern "C" fn(i32)) {
+    // SAFETY: `sa_sigaction` is the C function-pointer field of
+    // `sigaction`; the libc bindings require a `sighandler_t` (a
+    // pointer-sized fn-ptr cast). `libc::SIG_DFL` / `SIG_IGN` are
+    // the two magic values; supplying a real fn-ptr is the
+    // standard "install handler" idiom.
+    let handler_ptr = handler as *const () as libc::sighandler_t;
+    // SAFETY: zeroing a `libc::sigaction` is the standard
+    // initialization idiom — every field has a meaningful zero
+    // (`sa_mask` = empty set, `sa_flags` = 0, `sa_sigaction` =
+    // `SIG_DFL`). Edition 2024 requires explicit `unsafe { }`
+    // around unsafe ops even inside an `unsafe fn`.
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = handler_ptr;
+    // SAFETY: `sa_mask` is a `sigset_t`; zero-initializing it via
+    // `sigemptyset` is the standard idiom for "no extra signals
+    // masked during handler execution". `sigaddset` is the only
+    // mutator we need.
+    unsafe {
+        libc::sigemptyset(&mut sa.sa_mask);
+        // Don't block SIGTERM while handling SIGINT (or vice
+        // versa) — a user pressing Ctrl+C twice in quick
+        // succession would otherwise delay the second delivery
+        // by up to one signal mask re-evaluation.
+        libc::sigaddset(&mut sa.sa_mask, libc::SIGINT);
+        libc::sigaddset(&mut sa.sa_mask, libc::SIGTERM);
+    }
+    // SA_RESTART: auto-restart interrupted syscalls so the FUSE
+    // read/write loop doesn't return EINTR to callers after a
+    // benign Ctrl+C. Without it, every read/write needs an
+    // explicit EINTR retry, and a missed EINTR surfaces as a
+    // spurious short-read to the application.
+    sa.sa_flags = libc::SA_RESTART;
+    // SAFETY: `signo` is validated by the caller; `sa` is fully
+    // initialized (zeroed, sigaction set, mask set, flags set).
+    // `libc::sigaction` returns 0 on success and -1 on error; we
+    // don't propagate the failure because a non-critical signal
+    // installation shouldn't fail the mount — pre-fix the
+    // `libc::signal` call also ignored its return value.
+    unsafe {
+        let ret = libc::sigaction(signo, &sa, std::ptr::null_mut());
+        if ret != 0 {
+            tracing::warn!(
+                signo,
+                error = %std::io::Error::last_os_error(),
+                "install_sigaction failed; falling back to default disposition"
+            );
+        }
+    }
+}
+
+/// Windows fallback for `install_sigaction`. The POSIX signal API
+/// doesn't exist on Windows (no `sigaction` / `sigemptyset` /
+/// `SA_RESTART` in the libc crate's Windows target). Windows
+/// console events go through `windows::Win32::System::Console`
+/// (wired up just above the call site in `mount_internal`), so
+/// this is effectively a no-op stub that preserves the original
+/// `libc::signal` semantics for the rare `taskkill /F` path that
+/// does deliver a real `SIGTERM` to a non-console-attached
+/// process. Behaviour is byte-identical to pre-fix.
+#[cfg(not(unix))]
+unsafe fn install_sigaction(signo: i32, handler: extern "C" fn(i32)) {
+    unsafe {
+        libc::signal(signo, handler as *const () as libc::sighandler_t);
+    }
 }
 
 async fn build_webdav(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
