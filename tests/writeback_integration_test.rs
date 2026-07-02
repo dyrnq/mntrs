@@ -26,7 +26,7 @@ use std::time::Duration;
 use mntrs::writeback::WritebackTask;
 use mntrs::{FileType, InodeEntry, Inodes, writeback};
 use opendal::Operator;
-use opendal::services::Memory;
+use opendal::services::{Memory, S3};
 
 /// Unique tempdir per test process; avoids cross-test contamination.
 fn scratch_dir(label: &str) -> PathBuf {
@@ -397,4 +397,152 @@ fn large_file_with_default_delay_uses_5s() {
         !h.wait_drain(&dirty, 1_000),
         "5s-delay upload still pending at 1s (issue #202 non-immediate path)"
     );
+}
+
+/// Issue #TBD: when a writeback upload fails, the `.dirty` sidecar
+/// stays on disk indefinitely. The retry loop will retry for up to
+/// ~75 seconds (5 attempts × 1+2+4+8 s backoff = 15 s + 60 s
+/// cooldown) per cycle, and after `MAX_REENQUEUE_CYCLES = 10`
+/// cycles (≈ 15 min total) a single `error!` log line fires — but
+/// the `.dirty` sidecar still stays for "operator inspection" with
+/// no CLI (`mntrs list .dirty`), no metric, and no mount-time
+/// surface. The user has no way to know their write is silently
+/// failing from the application layer.
+///
+/// Repro: build an S3 Operator pointed at port 1 (no listener) so
+/// every `op.write()` returns connection-refused. Stage a file +
+/// `.dirty` sidecar. Enqueue with `per_task_delay: ZERO` so the
+/// worker processes it on the next tick. After the 5-attempt
+/// in-process loop exhausts and the task is re-enqueued at
+/// `cycle = 1` (60 s cooldown), the bug surface is observable:
+/// `.dirty` still on disk, no surface to find it.
+///
+/// The user-perceived bug is identical at cycle 0 vs cycle 9 vs
+/// cycle 10 — silent failure starts on the FIRST attempt. The
+/// 15-minute wait for STUCK just means the user has even less
+/// signal of a real problem. This test exercises the
+/// first-cycle-failure surface, which is the actionable one.
+#[test]
+fn dirty_sidecar_lingers_with_no_surface_on_upload_failure() {
+    use opendal::ErrorKind;
+
+    // Port 1 = guaranteed not listening. Connection refused
+    // returns in <100ms per attempt.
+    let failing_op = Arc::new(
+        Operator::new(
+            S3::default()
+                .endpoint("http://127.0.0.1:1")
+                .region("us-east-1")
+                .bucket("nobody")
+                .access_key_id("AKIAFAKE")
+                .secret_access_key("fake"),
+        )
+        .unwrap()
+        .finish(),
+    );
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let inodes: Inodes = Arc::new(dashmap::DashMap::new());
+    let disk_cache_index: Arc<dashmap::DashMap<_, _>> = Arc::new(dashmap::DashMap::new());
+    let writeback_pending: Arc<dashmap::DashSet<_>> = Arc::new(dashmap::DashSet::new());
+    let cache_dir = scratch_dir("dirty-no-surface");
+
+    let (tx, handle) = rt.block_on(async {
+        writeback::spawn(
+            failing_op.clone(),
+            inodes.clone(),
+            disk_cache_index.clone(),
+            cache_dir.clone(),
+            writeback_pending.clone(),
+            Duration::from_millis(100),
+        )
+    });
+
+    // Stage cache file + .dirty sidecar (mimics flush/release).
+    let cache_path = cache_dir.join("stuck.bin");
+    std::fs::write(&cache_path, b"data destined to be stuck").unwrap();
+    let dirty = cache_path.with_extension("dirty");
+    std::fs::write(&dirty, "stuck.bin").unwrap();
+    assert!(dirty.exists(), "precondition: .dirty sidecar present");
+    assert!(cache_path.exists(), "precondition: cache file present");
+
+    // Mimic flush/release inserting into writeback_pending first
+    // (so the worker's eventual failure path actually clears it).
+    writeback_pending.insert("/remote/stuck.bin".to_string());
+
+    // Fresh task: cycle=0, immediate delay. Worker will run
+    // 5 attempts (15s of backoff) then re-enqueue at cycle=1.
+    tx.send(WritebackTask {
+        ino: 1,
+        remote_path: "/remote/stuck.bin".to_string(),
+        cache_path: cache_path.clone(),
+        retry_cycle: 0,
+        per_task_delay: Duration::ZERO,
+    })
+    .unwrap();
+
+    // Wait for first 5-attempt loop to complete. Each attempt
+    // fails on connection-refused in <100ms; backoff sleeps are
+    // 1+2+4+8 = 15s. Plus a small fudge for runtime wakeup.
+    std::thread::sleep(Duration::from_millis(20_000));
+
+    // CORE BUG ASSERTION (1): after the 5-attempt loop exhausts,
+    // .dirty sidecar is still on disk. The user has no way to
+    // know the upload is failing — no CLI, no metric, no
+    // mount-time surface. The .dirty just sits there until the
+    // 60s cooldown elapses and the task is tried again.
+    assert!(
+        dirty.exists(),
+        "BUG: after 5 failed upload attempts, .dirty sidecar is \
+         still on disk with NO operator-visible surface (no \
+         `mntrs list .dirty`, no metric, no mount-time warning). \
+         The user's write is silently lost from the application layer."
+    );
+    assert!(
+        cache_path.exists(),
+        "cache file should also persist (writeback leaves the file \
+         for next-mount recovery — see lib.rs:1239)"
+    );
+
+    // CORE BUG ASSERTION (2): the task is re-enqueued at cycle=1
+    // (60s cooldown), still in retry. writeback_pending has been
+    // removed by the worker's re-enqueue path, but a fresh write
+    // to the same path would re-insert and bounce. The
+    // application-level user has no way to know any of this.
+    //
+    // We don't assert on writeback_pending here because the
+    // worker removed it before re-enqueuing (issue #38). What we
+    // do assert is that the file is STILL pending from a
+    // user-visible standpoint: the .dirty is on disk, and
+    // there's no surface to enumerate it.
+
+    // Sanity: confirm the failing backend is actually rejecting
+    // writes with a non-NotFound error kind, so the test is
+    // really hitting the connection-refused path (not e.g. an
+    // auth issue that would mask the bug).
+    let kind_check = rt.block_on(async {
+        failing_op
+            .write("/remote/probe", b"x".as_slice())
+            .await
+            .map(|_| ())
+    });
+    let kind_summary = match &kind_check {
+        Ok(()) => Ok(()),
+        Err(e) => Err(e.kind()),
+    };
+    assert!(
+        matches!(kind_summary, Err(k) if k != ErrorKind::NotFound),
+        "failing op should reject with a connection error, not NotFound: got {:?}",
+        kind_summary
+    );
+
+    // Cleanup
+    drop(tx);
+    handle.abort();
+    rt.shutdown_timeout(Duration::from_millis(100));
 }
