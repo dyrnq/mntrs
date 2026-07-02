@@ -575,7 +575,18 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::Install { action } => match action {
             Some(InstallAction::Systemd) | None => {
-                mntrs::cmd::install::systemd()?;
+                #[cfg(target_os = "linux")]
+                {
+                    mntrs::cmd::install::systemd()?;
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = action;
+                    anyhow::bail!(
+                        "`mntrs install` is only supported on Linux; \
+                         this build targets a non-Linux OS"
+                    );
+                }
             }
         },
     }
