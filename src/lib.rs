@@ -578,6 +578,7 @@ pub struct MntrsFs {
     pub(crate) use_server_modtime: bool,
     pub(crate) no_apple_double: bool,
     pub(crate) no_apple_xattr: bool,
+    pub(crate) no_macos_metadata: bool,
     pub(crate) hash_filter: Option<(usize, usize)>,
     pub(crate) block_norm_dupes: bool,
     pub(crate) write_wait: Duration,
@@ -992,6 +993,49 @@ static FUSE_NOTIFIER: once_cell::sync::OnceCell<fuser::Notifier> = once_cell::sy
 /// even a 1M-entry readdir would page-fault the user-
 /// space `ls` long before the cap.
 const MAX_LIST_ENTRIES: usize = 1_000_000;
+
+/// Names of macOS system metadata files / directories that the
+/// Finder / Spotlight / FSEvents subsystems create on every volume
+/// they touch (issue #408):
+///
+/// - `.DS_Store` — Finder per-directory state. Created every time
+///   the user browses a directory in Finder, even on a remote mount.
+/// - `.Trashes` — Trash database at the volume root.
+/// - `.fseventsd` — File System Events daemon state at the volume
+///   root.
+/// - `.Spotlight-V100` — Spotlight index at the volume root.
+/// - `.TemporaryItems` — Finder temp scratch at the volume root.
+/// - `.DocumentRevisions-V100` — document revisions at the volume
+///   root.
+///
+/// Filtered at the readdir level when the
+/// `no_macos_metadata` flag is on (CLI default: true). The list
+/// is a const slice (not a HashSet) because:
+///   * 6 entries — linear scan is faster than hashing for this size.
+///   * The slice is `const`, so the data lives in `.rodata` and is
+///     cache-line hot on every readdir call.
+const MACOS_METADATA_NAMES: &[&str] = &[
+    ".DS_Store",
+    ".Trashes",
+    ".fseventsd",
+    ".Spotlight-V100",
+    ".TemporaryItems",
+    ".DocumentRevisions-V100",
+];
+
+/// True iff `name` matches a well-known macOS metadata entry. The
+/// match is exact (no prefix / suffix) — `name` here is the
+/// basename from the readdir loop, so a prefix-anchored match
+/// against the const list is sufficient and avoids false positives
+/// like `myfile.DS_Store.bak`.
+///
+/// Platform-neutral Rust code; the function returns false for any
+/// name not in the list. The CLI flag is documented as macOS-
+/// specific, so a Linux mount that happens to have a `.DS_Store`
+/// file (e.g. synced from a macOS host) would still be filtered.
+fn is_macos_metadata(name: &str) -> bool {
+    MACOS_METADATA_NAMES.contains(&name)
+}
 
 impl MntrsFs {
     fn resolve(&self, ino: u64) -> Option<InodeEntry> {
@@ -1901,6 +1945,18 @@ impl MntrsFs {
                 }
                 // Skip Apple Double files on macOS
                 if self.no_apple_double && name.starts_with("._") {
+                    continue;
+                }
+                // Skip Finder / Spotlight / FSEvents metadata on macOS.
+                // These are created by macOS when the user browses the
+                // mount (per-directory `.DS_Store`) or by the kernel /
+                // Spotlight indexer at the volume root. Without this
+                // filter, every default mntrs mount on macOS gains a
+                // growing list of `.*` metadata files in the backend
+                // (issue #408). The flag defaults to true at the CLI
+                // level; library users get `false` (no filtering) for
+                // least-surprise behaviour.
+                if self.no_macos_metadata && is_macos_metadata(&name) {
                     continue;
                 }
                 if !self.include_patterns.is_empty() {
@@ -6465,6 +6521,7 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         use_server_modtime: false,
         no_apple_double: false,
         no_apple_xattr: false,
+        no_macos_metadata: false,
         hash_filter: None,
         block_norm_dupes: false,
         write_wait: std::time::Duration::from_secs(0),
@@ -7571,5 +7628,48 @@ mod tests {
             .expect_err("partial cache must not be served");
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
         assert!(err.to_string().contains("synthetic backend failure"));
+    }
+
+    // ── is_macos_metadata (issue #408) ────────────────────────────
+
+    /// Every name in the const list must match. Pin the list so a
+    /// future change (renaming, removing) requires an explicit
+    /// test update and a fresh audit pass.
+    #[test]
+    fn is_macos_metadata_matches_all_known_entries() {
+        for n in MACOS_METADATA_NAMES {
+            assert!(
+                is_macos_metadata(n),
+                "known macOS metadata name should match: {n:?}"
+            );
+        }
+    }
+
+    /// Names that LOOK like macOS metadata but aren't must not
+    /// match. Pins the exact-match (not prefix) semantics so
+    /// user-created files like `my.DS_Store` or `notes.txt` are
+    /// not silently hidden.
+    #[test]
+    fn is_macos_metadata_rejects_lookalikes_and_regular_files() {
+        for n in [
+            "notes.txt",
+            "readme.md",
+            "my.DS_Store",
+            "DS_Store",  // missing leading dot
+            ".ds_store", // wrong case (case-sensitive)
+            ".DS_Store.bak",
+            "._DS_Store", // AppleDouble form, not the metadata itself
+            ".Trash",     // close but not the canonical .Trashes
+            "spotlight",  // missing dot prefix
+            "",
+            ".",
+            "..",
+            "file.DS_Store.tar.gz",
+        ] {
+            assert!(
+                !is_macos_metadata(n),
+                "non-metadata name should not match: {n:?}"
+            );
+        }
     }
 }
