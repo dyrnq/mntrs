@@ -207,8 +207,8 @@ enum Commands {
         /// macOS: ignore Apple Double files (._ prefix, rclone defaults to true)
         #[arg(long, default_value_t = true)]
         noapple_double: bool,
-        /// macOS: ignore Apple extended attributes
-        #[arg(long)]
+        /// macOS: ignore Apple extended attributes (rclone defaults to true)
+        #[arg(long, default_value_t = true)]
         noapple_xattr: bool,
         /// Consistent hash-based sharding: k of n (e.g. --hash-filter 1/4)
         #[arg(long, value_name = "K/N")]
