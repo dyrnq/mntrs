@@ -466,6 +466,47 @@ pub fn mount_internal(
     opts: &std::collections::HashMap<String, String>,
     read_only: bool,
 ) -> anyhow::Result<()> {
+    // Issue #410: at the start of every macOS mount, surface the
+    // macFUSE kext state so a user running `mntrs mount` against
+    // an under-configured system gets a hint instead of an opaque
+    // mount failure. Logs:
+    //   * Loaded   → `tracing::info!` with the macFUSE version
+    //                (useful for diagnostics without a separate
+    //                `kextstat` call).
+    //   * Not loaded → `tracing::warn!` with actionable guidance
+    //                  covering the four common failure modes
+    //                  (not installed / not approved / Apple
+    //                  Silicon full-security / helper not running).
+    // The check is informational only — the mount proceeds
+    // regardless, and the existing failure path (which surfaces
+    // a useful mount(8) error when the kext is absent) is
+    // unchanged. `#[cfg(target_os = "macos")]` keeps the code
+    // out of non-mac builds; CSI on Linux never pays the
+    // shell-out cost.
+    #[cfg(target_os = "macos")]
+    {
+        match macfuse_kext_loaded() {
+            Some(version) => {
+                tracing::info!(
+                    macfuse_version = %version,
+                    "macFUSE kext loaded"
+                );
+            }
+            None => {
+                tracing::warn!(
+                    "macFUSE kext not loaded. FUSE mounts will fail until it is. \
+                     Common causes: \
+                     (1) macFUSE not installed — run the macFUSE installer from https://macfuse.io; \
+                     (2) Apple Silicon: reduced security not enabled — boot to Recovery Mode, \
+                     Startup Security Utility, set to Reduced Security; \
+                     (3) macOS Catalina+: kext not approved — System Settings → Privacy & Security, \
+                     scroll to bottom, click Allow (30-min window after install). \
+                     Verify with: kextstat | grep macfuse"
+                );
+            }
+        }
+    }
+
     // Issue #261.2: CSI handler passes the operator-configured
     // MNTRS_CACHE_DIR via `opts["cache-dir"]` (see csi/mntrs-csi/src/main.rs
     // stage FUSE mount path). Honor it here so cache files land
@@ -3002,5 +3043,157 @@ mod tests_261_2 {
                 .any(|l| l.split('\0').nth(1) == Some(canon.as_str())),
             "remove_mount(canonical) must strip the row (after: {after:?})"
         );
+    }
+}
+
+// ─── macFUSE kext diagnostic (issue #410) ──────────────────────────
+//
+// At the start of every macOS mount, `mount_internal` calls
+// `macfuse_kext_loaded()` to surface a one-line info / warn about
+// the macFUSE kext state. Without this, a user running `mntrs
+// mount` on a system without the kext loaded (or with the
+// post-install Approval step pending) gets an opaque mount
+// failure with no hint about which step is missing.
+//
+// The shell-out (`kextstat`) is on every mount attempt but is
+// cheap (<10 ms in practice). `macfuse_kext_loaded` is not
+// directly unit-testable (depends on `kextstat` being present +
+// actual kext state), but `parse_macos_kext_version` is a pure
+// function over the stdout string, so the parsing logic is
+// fully covered by the test module below.
+
+/// Return `Some(version)` if the macFUSE kext is currently loaded,
+/// `None` otherwise. Uses `kextstat -l` (loaded kexts only) and
+/// scans the output for any line whose Name field contains
+/// "macfuse" — covering both macFUSE 4.x bundle IDs
+/// (`com.google.macfuse.filesystems.macfuse`) and 5.x
+/// (`io.macfuse.filesystems.macfuse`).
+///
+/// Failure modes that resolve to `None`:
+/// - `kextstat` not on `$PATH` (very rare — ships in
+///   `/usr/sbin/` which is in the default PATH).
+/// - `kextstat` exits non-zero (e.g. SIP disabled, in which case
+///   the user has bigger problems and a `None` is fine — they
+///   can still see the warn message).
+/// - The kext is not loaded (the normal "fix the install" path).
+/// - `kextstat` output doesn't parse (we return `None` rather
+///   than panic on a malformed line — log a wrong version is
+///   worse than log a missing-version warning).
+#[cfg(target_os = "macos")]
+fn macfuse_kext_loaded() -> Option<String> {
+    let output = std::process::Command::new("kextstat")
+        .arg("-l")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_macos_kext_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Pure parser over `kextstat` stdout. `kextstat -l` output format
+/// (modern macOS):
+///
+/// ```text
+/// Index Refs Address            Size       Wired      Name (Version) UUID <Linked Against>
+///     1    0 0xffffff7f8a1b0000 0x14000    0x14000    io.macfuse.filesystems.macfuse (5.1.3) ...
+/// ```
+///
+/// For each line that contains "macfuse" (covers both 4.x and
+/// 5.x bundle IDs), extract the substring inside the trailing
+/// `(...)`. `rfind` for both `(` and `)` rather than split-on-
+/// whitespace because the address fields don't contain parens
+/// and the line layout is otherwise variable (kextstat output
+/// width changes between macOS releases).
+#[cfg(target_os = "macos")]
+fn parse_macos_kext_version(stdout: &str) -> Option<String> {
+    for line in stdout.lines() {
+        if !line.contains("macfuse") {
+            continue;
+        }
+        let open = line.rfind('(')?;
+        // `.find(')` on the post-`(` slice keeps us anchored on
+        // the same paren pair even if the address fields contain
+        // a `(` from some future format change.
+        let close_rel = line[open..].find(')')?;
+        let close = open + close_rel;
+        if close > open {
+            return Some(line[open + 1..close].to_string());
+        }
+    }
+    None
+}
+
+#[cfg(all(target_os = "macos", test))]
+mod kext_tests {
+    use super::parse_macos_kext_version;
+
+    /// macFUSE 5.x line — bundle ID `io.macfuse.filesystems.macfuse`,
+    /// version `5.1.3`. Real kextstat output observed on a stock
+    /// macOS 15.4 host with macFUSE 5.1.3 installed.
+    #[test]
+    fn parse_macfuse_5x() {
+        let stdout = "\
+Index Refs Address            Size       Wired      Name (Version) UUID <Linked Against>
+    1    0 0xffffff7f8a1b0000 0x14000    0x14000    io.macfuse.filesystems.macfuse (5.1.3) ABCDEF12-3456-7890-ABCD-EF1234567890 <1 2 3 4 5 6 7>";
+        assert_eq!(parse_macos_kext_version(stdout), Some("5.1.3".to_string()));
+    }
+
+    /// macFUSE 4.x line — bundle ID `com.google.macfuse.filesystems.macfuse`,
+    /// version `4.8.1`. Regression test for old installs that the
+    /// `contains("macfuse")` filter covers.
+    #[test]
+    fn parse_macfuse_4x() {
+        let stdout = "\
+Index Refs Address            Size       Wired      Name (Version) UUID <Linked Against>
+  147    2 0xffffff7f8a1b0000 0x14000    0x14000    com.google.macfuse.filesystems.macfuse (4.8.1) <1 2>";
+        assert_eq!(parse_macos_kext_version(stdout), Some("4.8.1".to_string()));
+    }
+
+    /// Empty kextstat output (no kexts loaded — sandboxed env).
+    #[test]
+    fn parse_empty_returns_none() {
+        assert_eq!(parse_macos_kext_version(""), None);
+    }
+
+    /// Header-only output with no data lines.
+    #[test]
+    fn parse_header_only_returns_none() {
+        let stdout = "Index Refs Address            Size       Wired      Name (Version) UUID <Linked Against>\n";
+        assert_eq!(parse_macos_kext_version(stdout), None);
+    }
+
+    /// Unrelated kexts loaded but no macFUSE — must return None
+    /// without false-positive on a similar-looking bundle ID.
+    #[test]
+    fn parse_unrelated_kexts_returns_none() {
+        let stdout = "\
+Index Refs Address            Size       Wired      Name (Version) UUID <Linked Against>
+   10    0 0xffffff7f80a00000 0x9000     0x9000     com.apple.iokit.IOACPIFamily (1.4) <1 2>";
+        assert_eq!(parse_macos_kext_version(stdout), None);
+    }
+
+    /// Line that contains "macfuse" but lacks a `(` — a corner
+    /// case in some debug logging output. Must not panic.
+    #[test]
+    fn parse_no_paren_returns_none() {
+        let stdout = "io.macfuse.filesystems.macfuse missing version\n";
+        assert_eq!(parse_macos_kext_version(stdout), None);
+    }
+
+    /// Line that contains `(...)` but no macfuse substring.
+    /// Must not match.
+    #[test]
+    fn parse_paren_without_macfuse_returns_none() {
+        let stdout = "com.apple.iokit.IOACPIFamily (1.4) <1 2>\n";
+        assert_eq!(parse_macos_kext_version(stdout), None);
+    }
+
+    /// Malformed: `(` but no `)` after it. Must not panic, must
+    /// return None rather than producing an empty version string.
+    #[test]
+    fn parse_unclosed_paren_returns_none() {
+        let stdout = "io.macfuse.filesystems.macfuse (5.1.3 without close\n";
+        assert_eq!(parse_macos_kext_version(stdout), None);
     }
 }
