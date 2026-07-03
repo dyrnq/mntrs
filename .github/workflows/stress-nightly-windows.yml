@@ -1,0 +1,186 @@
+name: stress-nightly-windows
+
+# Issue #388: Windows stress pipeline — mirrors stress-nightly.yml
+# (the Linux stress workflow) for the WinFSP adapter. Runs on
+# windows-latest nightly + on manual dispatch. Memory backend only
+# in this PR (no MinIO setup); S3 backend is a follow-up.
+#
+# Output: per-scenario stdout via Tee-Object (success scenario's
+# log lines + PASS markers land in stress-result.txt). On failure
+# the scratch dir ($env:RUNNER_TEMP/mntrs-stress/**) is uploaded as
+# an artifact for postmortem, mirroring stress-nightly.yml's
+# `/tmp/mntrs-stress/**` upload pattern.
+#
+# Scenario skip semantics: each per-scenario PS1 script that
+# cannot run (e.g. memory:// backend rejected, WinFSP feature not
+# wired, environment limitation) emits a `  SKIP: <reason>` line
+# and exits 0. The run-all wrapper classifies SKIP as a non-fail
+# (the suite passes if 0 failures, regardless of skip count).
+#
+# Reusing the ci-windows.yml WinFSP install + DLL PATH search
+# patterns verbatim (per memory mntrs-winfsp-ci-dll-path).
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    # 04:00 UTC daily. Off-the-hour to spread CI load; matches the
+    # Linux stress-nightly.yml cadence.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: "Space-separated scenarios (default: all)"
+        required: false
+        type: string
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  stress-windows:
+    runs-on: windows-latest
+    # 30min budget: cold-cache debug build (~8min) + 6 scenarios
+    # (~5min with ci-smoke sizes). 30min leaves ~17min headroom
+    # for cache restores that land mid-run.
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # WinFSP install — same pin as ci-windows.yml (2.1.25156,
+      # LongPathSupport=true). Without --version the choco default
+      # may drift between runs and silently change behavior.
+      - name: Install WinFSP + protoc
+        shell: pwsh
+        run: |
+          choco install -y winfsp --version=2.1.25156 --params='LongPathSupport=true'
+          choco install -y protoc
+
+      # winfsp-x64.dll PATH workaround — same recursive search as
+      # ci-windows.yml. On freshly-provisioned runner VMs the choco
+      # install drops the DLL in a non-PATH location; subsequent
+      # `run:` steps spawn fresh shells that don't inherit the
+      # install session's env. Without this, mntrs.exe fails with
+      # STATUS_DLL_NOT_FOUND.
+      - name: Search winfsp-x64.dll + PATH
+        shell: pwsh
+        run: |
+          $searchRoots = @(
+            'C:\Program Files\WinFSP',
+            'C:\Program Files (x86)\WinFSP',
+            'C:\Windows\System32',
+            'C:\ProgramData\chocolatey\lib\winfsp'
+          )
+          $dll = $null
+          foreach ($root in $searchRoots) {
+            if (Test-Path $root) {
+              $found = Get-ChildItem -Path $root -Recurse -Filter 'winfsp-x64.dll' -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($found) { $dll = $found; break }
+            }
+          }
+          if ($dll) {
+            $env:PATH = "$($dll.DirectoryName);$env:PATH"
+            Write-Host "Found winfsp-x64.dll at: $($dll.FullName)"
+          } else {
+            Write-Host "WARNING: winfsp-x64.dll not found in any known location"
+          }
+
+      # Stress uses debug builds (line numbers in stack traces on
+      # failure). Matches tests/stress/lib/common.sh's mntrs_setup.
+      - name: Build mntrs (debug)
+        run: cargo build --bin mntrs
+
+      # Run the stress suite. ci-smoke.ps1 picks conservative sizes
+      # (1k files / 256 MiB / 60s soak) so total runtime is ~5 min
+      # instead of the default ~30 min operator soak sizes.
+      #
+      # IMPORTANT: `*>&1` (all-streams redirect), not `2>&1`. The
+      # scripts use Write-Host for status lines, which writes to
+      # PowerShell's Information stream (6), not stdout. Tee-Object
+      # only captures the Success (stdout) stream by default, so
+      # without `*>&1` the status output bypasses the file.
+      #
+      # Each per-scenario PS1 script registers an EXIT trap that
+      # dismounts V:\stress-NN before the next scenario runs, so
+      # mntrs.exe processes don't accumulate across scenarios.
+      # The Cleanup mount (always) step is a belt-and-suspenders
+      # fallback for cases where the trap didn't fire.
+      - name: Run stress suite
+        shell: pwsh
+        timeout-minutes: 20
+        env:
+          # Forward workflow_dispatch input as a space-separated
+          # arg list. Default to empty (= all scenarios).
+          STRESS_SCENARIOS: ${{ inputs.scenarios }}
+        run: |
+          $scenarios = "${{ inputs.scenarios }}"
+          if ([string]::IsNullOrWhiteSpace($scenarios)) { $scenarios = "" }
+          & pwsh -NoProfile -File ./tests/stress/ci-smoke.ps1 @scenarios `
+              *>&1 | Tee-Object -FilePath stress-result.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload stress result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-result-windows-${{ github.run_id }}
+          path: stress-result.txt
+          if-no-files-found: warn
+
+      # On failure, upload the scratch dir so postmortem is
+      # possible. Mirrors stress-nightly.yml's
+      # /tmp/mntrs-stress/** upload pattern (default stress
+      # scratch on windows-latest is $env:RUNNER_TEMP).
+      - name: Upload scratch logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-scratch-windows-${{ github.run_id }}
+          path: ${{ runner.temp }}/mntrs-stress/**
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # Cleanup: kill any mntrs.exe that escaped a scenario's
+      # trap (e.g. cargo test panic mid-scenario, or scenario
+      # crashed before trap registration). Without this, the
+      # next job in the runner pool would see V: still mounted.
+      - name: Cleanup mount (always)
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process mntrs -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
+          $mntrs = Join-Path ${{ github.workspace }} 'target\debug\mntrs.exe'
+          if (Test-Path $mntrs) {
+            # Clean up all V:\stress-* subdirs the suite created.
+            foreach ($sub in @('stress-01', 'stress-02', 'stress-03', 'stress-04', 'stress-05', 'stress-06')) {
+              try { & $mntrs unmount "V:\$sub" 2>&1 | Out-Null } catch { }
+            }
+            try { & $mntrs unmount V: 2>&1 | Out-Null } catch { }
+          }
+          $mountsDb = Join-Path $env:USERPROFILE '.local\share\mntrs\mounts.txt'
+          if (Test-Path $mountsDb) {
+            try {
+              $lines = Get-Content -LiteralPath $mountsDb -ErrorAction Stop
+              $kept = foreach ($l in $lines) {
+                $parts = $l -split "`0"
+                if ($parts.Count -ge 2 -and $parts[1] -ne 'V:') { $l }
+              }
+              if ($null -eq $kept -or $kept.Count -eq 0) {
+                Remove-Item -LiteralPath $mountsDb -Force -ErrorAction Stop
+              } else {
+                Set-Content -LiteralPath $mountsDb -Value ($kept -join "`n") -NoNewline -ErrorAction Stop
+              }
+            } catch {
+              Write-Host "::warning::mounts.txt cleanup failed: $($_.Exception.Message)"
+            }
+          }
+          exit 0

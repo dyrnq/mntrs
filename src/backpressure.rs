@@ -139,6 +139,22 @@ impl BackpressureController {
         self.inner.lock().unwrap().window
     }
 
+    /// Audit #3 / PR #405: expose the configured `min_window` so
+    /// callers (e.g. the prefetcher download thread) can use the
+    /// configured floor when shrinking chunks on memory pressure,
+    /// instead of hardcoding a value that may not match the
+    /// controller's configured floor.
+    pub fn min_window(&self) -> u64 {
+        self.inner.lock().unwrap().min_window
+    }
+
+    /// Audit #3 / PR #405: expose the configured `max_window` for
+    /// symmetry with `min_window`. Useful for callers that need to
+    /// size their initial fetch.
+    pub fn max_window(&self) -> u64 {
+        self.inner.lock().unwrap().max_window
+    }
+
     /// Compute the next window from the current
     /// rates. Halve the window if the producer
     /// is faster than the consumer (queue is

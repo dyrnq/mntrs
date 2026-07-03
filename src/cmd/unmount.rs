@@ -115,11 +115,17 @@ pub fn unmount(target: &str) -> Result<()> {
     fuse_unmount(&mountpoint)?;
 
     // remove from db
+    // Issue #384: canonicalize the mountpoint before the byte-
+    // equality match against `mounts.txt`. On macOS `/tmp` is a
+    // symlink to `/private/tmp`, so a user who mounted via
+    // `/private/tmp/foo` and unmounts via `/tmp/foo` (or vice
+    // versa) leaves a stale row otherwise.
+    let canon_mp = crate::util::canonicalize_mountpoint(&mountpoint);
     let db = crate::cmd::mount::mounts_db_path();
     if let Ok(content) = fs::read_to_string(&db) {
         let filtered: Vec<&str> = content
             .lines()
-            .filter(|l| l.split('\0').nth(1) != Some(mountpoint.as_str()))
+            .filter(|l| l.split('\0').nth(1) != Some(canon_mp.as_str()))
             .collect();
         if let Err(e) = fs::write(&db, filtered.join("\n")) {
             tracing::debug!(error=%e, "unmount db cleanup failed");
@@ -129,8 +135,52 @@ pub fn unmount(target: &str) -> Result<()> {
 }
 
 /// POSIX: shell out to `fusermount3` (fallback `fusermount`).
+///
+/// Issue #371: macOS has no `fusermount(-3)` binary; vanilla
+/// installs return `Err(NotFound)` for both names and the
+/// previous single-path implementation always failed there. The
+/// macOS branch (see `fuse_unmount_macos_with_umount`) additionally
+/// falls through to the platform `umount(8)` so the unmount signal
+/// reaches macFUSE's `mount_macfuse` helper.
+///
+/// Platform split (matches the `#[cfg(unix)]` outer guard that
+/// keeps the Windows branch in a sibling `fuse_unmount`):
+/// - macOS-only path:  `cfg(target_os = "macos")` → umount fallback.
+/// - Linux / *BSD / Solaris: `cfg(all(unix, not(target_os = "macos")))`
+///   → original fusermount-only chain, **byte-identical** to the
+///   pre-fix implementation, so a change to the macOS branch
+///   cannot accidentally regress a Linux CI run.
 #[cfg(unix)]
 fn fuse_unmount(mountpoint: &str) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        fuse_unmount_via_fusermount(mountpoint)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        fuse_unmount_macos_with_umount(mountpoint)
+    }
+}
+
+/// Linux + non-macOS unix: the original `fusermount3` →
+/// `fusermount` chain, preserved verbatim from the pre-fix
+/// implementation. macOS is dispatched to
+/// `fuse_unmount_macos_with_umount` instead so this function
+/// compiles only when `target_os` is anything **except** macOS.
+///
+/// Gated by `cfg(all(unix, not(target_os = "macos")))` rather than
+/// just `cfg(unix)` so that the cfg predicate on its own is
+/// enough to prove the Linux path is unaffected by changes to
+/// `fuse_unmount_macos_with_umount`.
+///
+/// Visibility: `pub(crate)` so that `src/cmd/mount.rs` can reuse
+/// this helper at the cleanup / signal-watcher sites without
+/// duplicating the shell-out (Issue #374). The function's cfg
+/// predicate (not the visibility) is what matters for guaranteeing
+/// Linux behaviour is unaffected by changes to the macOS branch.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn fuse_unmount_via_fusermount(mountpoint: &str) -> Result<()> {
     let result = Command::new("fusermount3")
         .arg("-u")
         .arg(mountpoint)
@@ -151,6 +201,91 @@ fn fuse_unmount(mountpoint: &str) -> Result<()> {
             "fusermount failed with exit code {}",
             status.code().unwrap_or(-1)
         )),
+        Err(e) => Err(anyhow!("failed to run fusermount: {e}")),
+    }
+}
+
+/// macOS-only unmount path (Issue #371).
+///
+/// Tries the same `fusermount3` → `fusermount` chain as the Linux
+/// path first — a user who installs libfuse via Homebrew gets the
+/// same primary code path — then, when both names return
+/// `Err(NotFound)` (the macOS-vanilla case), defers to `umount(8)`.
+///
+/// Why umount(8) works on macOS: macFUSE's `mount_macfuse` helper
+/// (installed at
+/// `/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse`
+/// and registered with the kernel via the FSKit extension
+/// `io.macfuse.app.fsmodule`) implements the unmount protocol
+/// for `macfuse` filesystem entries listed by `mount(8)`. A plain
+/// `umount <mountpoint>` against one of those entries routes
+/// through that helper, so we don't need a macOS-specific
+/// unmount binary.
+///
+/// Non-NotFound errors from `fusermount` (EACCES, ENOENT of the
+/// mountpoint path itself, etc.) are surfaced verbatim — the same
+/// as on Linux.
+///
+/// Visibility: `pub(crate)` so that `src/cmd/mount.rs` can reuse
+/// this helper at the cleanup / signal-watcher sites
+/// (Issue #374). On macOS they get the umount(8) fallback; on any
+/// other unix, this function's body is not even compiled.
+#[cfg(target_os = "macos")]
+pub(crate) fn fuse_unmount_macos_with_umount(mountpoint: &str) -> Result<()> {
+    let result = Command::new("fusermount3")
+        .arg("-u")
+        .arg(mountpoint)
+        .status()
+        .or_else(|_| {
+            Command::new("fusermount")
+                .arg("-u")
+                .arg(mountpoint)
+                .status()
+        });
+
+    match result {
+        Ok(status) if status.success() => {
+            eprintln!("unmounted {mountpoint}");
+            Ok(())
+        }
+        Ok(status) => Err(anyhow!(
+            "fusermount failed with exit code {}",
+            status.code().unwrap_or(-1)
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Vanilla macOS install: no fusermount(-3) binary on
+            // PATH. Defer to umount(8) so the unmount signal
+            // reaches macFUSE's mount_macfuse helper. (Issue #371.)
+            tracing::debug!(
+                mountpoint,
+                "fuse_unmount(macos): fusermount(-3) not on PATH; falling back to umount(8) (Issue #371)"
+            );
+            // Issue #379: macOS `umount(8)` (BSD-derived) does not
+            // canonicalize before matching the mount table — pass
+            // the canonical path so a user-supplied `/tmp/foo`
+            // (which symlinks to `/private/tmp/foo` on macOS) matches
+            // the entry listed by `mount(8)`. On canonicalize
+            // failure (e.g. the mountpoint dir was deleted between
+            // mount and unmount), fall back to the raw string;
+            // `umount(8)` will return its own "not currently
+            // mounted" / ENOENT-style diagnostic.
+            let canonical = std::fs::canonicalize(mountpoint)
+                .unwrap_or_else(|_| std::path::PathBuf::from(mountpoint));
+            let umount_status = Command::new("umount").arg(&canonical).status();
+            match umount_status {
+                Ok(s) if s.success() => {
+                    eprintln!("unmounted {mountpoint}");
+                    Ok(())
+                }
+                Ok(s) => Err(anyhow!(
+                    "umount failed with exit code {}",
+                    s.code().unwrap_or(-1)
+                )),
+                Err(e2) => Err(anyhow!(
+                    "failed to run umount (fusermount also missing): {e2}"
+                )),
+            }
+        }
         Err(e) => Err(anyhow!("failed to run fusermount: {e}")),
     }
 }

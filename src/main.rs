@@ -54,7 +54,11 @@ enum Commands {
         /// Device name shown in mount table
         #[arg(long)]
         devname: Option<String>,
-        /// Enable write-back caching (kernel buffers writes before sending to mntrs)
+        /// Enable write-back caching (kernel buffers writes before sending to mntrs).
+        /// **Linux / Windows only** — silently ignored on macOS; macFUSE manages
+        /// its own write buffering outside the FUSE writeback capability. The
+        /// flag stays accepted on macOS so mixed-fleet scripts don't fail at
+        /// the CLI layer; a warning is logged at mount time when it is set.
         #[arg(long)]
         write_back_cache: bool,
         /// Raw FUSE option (repeatable), e.g. -o allow_other
@@ -207,9 +211,19 @@ enum Commands {
         /// macOS: ignore Apple Double files (._ prefix, rclone defaults to true)
         #[arg(long, default_value_t = true)]
         noapple_double: bool,
-        /// macOS: ignore Apple extended attributes
-        #[arg(long)]
+        /// macOS: ignore Apple extended attributes (rclone defaults to true)
+        #[arg(long, default_value_t = true)]
         noapple_xattr: bool,
+        /// macOS: skip Finder / Spotlight / FSEvents metadata entries
+        /// (.DS_Store per-directory, .Trashes / .fseventsd /
+        /// .Spotlight-V100 / .TemporaryItems / .DocumentRevisions-V100
+        /// at volume root). Default true so a normal Finder browsing
+        /// session doesn't write a `.DS_Store` per directory into the
+        /// backend. Matches the precedent set by `--noapple-double` /
+        /// `--noapple-xattr` (rclone parity). Library users without the
+        /// CLI default get `false` (no filtering) for least-surprise.
+        #[arg(long, default_value_t = true)]
+        no_macos_metadata: bool,
         /// Consistent hash-based sharding: k of n (e.g. --hash-filter 1/4)
         #[arg(long, value_name = "K/N")]
         hash_filter: Option<String>,
@@ -313,6 +327,17 @@ enum Commands {
     Unmount { target: String },
     /// List active mounts
     List,
+    /// List pending `.dirty` sidecars in a cache dir (issue #395 fix #1).
+    ///
+    /// After an upload failure the daemon leaves a `.dirty` sidecar
+    /// next to the cache file. There's no other CLI surface for these —
+    /// without this command the user has no way to discover that a
+    /// write silently failed to upload. Always returns exit 0 even if
+    /// the dir is empty (a clean cache is the healthy state).
+    Dirty {
+        /// Path to the cache dir to scan (e.g. /var/cache/mntrs)
+        cache_dir: std::path::PathBuf,
+    },
     /// Install systemd service
     Install {
         #[command(subcommand)]
@@ -394,6 +419,7 @@ fn main() -> anyhow::Result<()> {
             links,
             noapple_double,
             noapple_xattr,
+            no_macos_metadata,
             hash_filter,
             mount_case_insensitive,
             max_read_ahead,
@@ -527,6 +553,7 @@ fn main() -> anyhow::Result<()> {
                 links,
                 noapple_double,
                 noapple_xattr,
+                no_macos_metadata,
                 hash_filter,
                 mount_case_insensitive,
                 max_read_ahead,
@@ -559,9 +586,23 @@ fn main() -> anyhow::Result<()> {
         Commands::List => {
             mntrs::cmd::list::list()?;
         }
+        Commands::Dirty { cache_dir } => {
+            mntrs::cmd::dirty::list_dirty(&cache_dir)?;
+        }
         Commands::Install { action } => match action {
             Some(InstallAction::Systemd) | None => {
-                mntrs::cmd::install::systemd()?;
+                #[cfg(target_os = "linux")]
+                {
+                    mntrs::cmd::install::systemd()?;
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = action;
+                    anyhow::bail!(
+                        "`mntrs install` is only supported on Linux; \
+                         this build targets a non-Linux OS"
+                    );
+                }
             }
         },
     }

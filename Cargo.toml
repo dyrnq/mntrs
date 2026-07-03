@@ -56,7 +56,7 @@ foyer-memory = "0.22"
 fuser = "0.17"
 
 [target.'cfg(windows)'.dependencies]
-winfsp = { version = "0.13", features = ["async-io"] }
+winfsp = { version = "0.13", features = ["async-io", "notify"] }
 winfsp-sys = "0.12"
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 widestring = "1"
@@ -141,4 +141,5 @@ path = "tests/platform/windows/winfsp_integration_test.rs"
 [dev-dependencies]
 ctor = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"
 

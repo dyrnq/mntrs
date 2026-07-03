@@ -102,7 +102,22 @@ mntrs_mount() {
     # --vfs-cache-mode full: writeback enabled (so tests 04/05 actually exercise upload).
     # --vfs-write-back: overridable via env (default 1s; 05-crash-recovery sets 30).
     #   Tests must NOT pass --vfs-write-back in "$@" again (clap rejects duplicate).
-    "$MNTRS_BIN" mount \
+    #
+    # RUST_LOG=debug is injected by default so daemon's write: entry /
+    # register_dirty traces land in mount.log. Distinguishes "kernel
+    # absorbed the write" (no trace) from "daemon's write() fired but
+    # cache file was slow to materialize" (trace exists, file appears
+    # shortly). Override via STRESS_RUST_LOG=info for tests that
+    # exercise a high-volume writeback loop and don't need the noise.
+    #
+    # MNTRS_DAEMON_LOG redirects the re-exec'd daemon child's stdio to
+    # the same mount.log. Without this, the daemon detaches its stdio
+    # to /dev/null (per cmd/mount.rs:1157), so the only thing in
+    # mount.log would be the parent process's startup lines.
+    # Setting MNTRS_DAEMON_LOG preserves the daemon's tracing output
+    # alongside the parent's, making post-mortem debugging possible.
+    MNTRS_DAEMON_LOG="$cache_dir/mount.log" \
+    RUST_LOG="${STRESS_RUST_LOG:-debug}" "$MNTRS_BIN" mount \
         "memory:///" \
         "$mnt" \
         --daemon --daemon-wait \
@@ -114,18 +129,31 @@ mntrs_mount() {
         > "$cache_dir/mount.log" 2>&1 \
         || { cat "$cache_dir/mount.log"; fail "mntrs mount failed for $mnt"; }
 
-    # Daemonize may race with FUSE readiness in some kernels.
-    # Wait for the mountpoint to actually serve stat() (max 5s).
+    # Wait for the FUSE mount to actually register with the kernel.
+    # `stat -f $mnt` was previously used here, but it succeeds for any
+    # directory (regular or FUSE-backed) so it can pass BEFORE the FUSE
+    # mount registers in /proc/self/mounts (typically 0.5-2s later on
+    # Debian 13 / kernel 6.12.94). When that happened, the next test
+    # dd/write hit the local empty $mnt/ directory instead of going
+    # through FUSE, and the daemon never saw any CREATE/WRITE events —
+    # test 01/04/05's "0 cache files" failure mode. See memory
+    # stress-2026-07-01-mount-registration-race.md.
+    #
+    # The grep below checks for a mountpoint string in /proc/self/mounts
+    # with a leading space (to avoid substring matches on /tmp/foo/mnt
+    # matching /tmp/foo/mnt2) and a trailing space (to avoid matching
+    # longer paths that share the prefix). 5s budget matches the old
+    # stat-f budget; on a healthy kernel the mount appears within ~1s.
     local i ready=0
     # shellcheck disable=SC2034  # loop counter
     for i in $(seq 1 50); do
-        if stat -f "$mnt" >/dev/null 2>&1; then ready=1; break; fi
+        if grep -F " $mnt " /proc/self/mounts >/dev/null 2>&1; then ready=1; break; fi
         sleep 0.1
     done
     if (( ready == 0 )); then
-        log "mount.log tail after 5s stat timeout:"
+        log "mount.log tail after 5s mount-registration timeout:"
         tail -30 "$cache_dir/mount.log" || true
-        fail "mount $mnt never became ready (see $cache_dir/mount.log)"
+        fail "FUSE mount for $mnt never registered in /proc/self/mounts (see $cache_dir/mount.log)"
     fi
     # Even if stat succeeded, the daemon could have died immediately
     # after the kernel accepted the mount (e.g. FUSE session abort).
@@ -150,6 +178,29 @@ mntrs_unmount() {
     sleep 0.5
     # Final best-effort cleanup of any zombie mount entry
     fusermount3 -qzu "$mnt" 2>/dev/null || true
+}
+
+# ── Cache dir preservation ───────────────────────────────────────────
+# Usage: stress_preserve_cache <cache_dir> <label>
+#
+# Move <cache_dir> to <cache_dir>-debug-<timestamp> so post-mortem
+# inspection is possible after a test failure. The trap's
+# `mntrs_unmount` would otherwise delete the cache dir via
+# `remove_dir_all(cache_dir)` inside cmd::mount, leaving the
+# artifact empty. This helper is meant to be called by tests' EXIT
+# traps BEFORE mntrs_unmount when a failure has been observed.
+#
+# Idempotent: if the dir is already gone, it's a no-op.
+stress_preserve_cache() {
+    local cache_dir="$1"
+    local label="${2:-debug}"
+    if [[ -d "$cache_dir" ]]; then
+        local stamp
+        stamp=$(date +%H%M%S)
+        local preserved="${cache_dir}-${label}-${stamp}"
+        mv "$cache_dir" "$preserved" 2>/dev/null || true
+        log "preserved cache for post-mortem: $preserved"
+    fi
 }
 
 # ── Metrics ──────────────────────────────────────────────────────────

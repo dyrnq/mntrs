@@ -217,6 +217,96 @@ pub(crate) fn canonicalize_list_path(raw: &str) -> String {
     }
 }
 
+/// Resolve a mountpoint to its canonical form so that
+/// `record_mount` / `remove_mount` / `unmount`'s `mounts.txt`
+/// cleanup all see the same string regardless of how the user
+/// typed the symlinked prefix. Issue #384.
+///
+/// On macOS `/tmp` is a symlink to `/private/tmp`, so `/tmp/foo`
+/// and `/private/tmp/foo` are byte-different but refer to the same
+/// directory. Without canonicalization, `mounts.txt` can accumulate
+/// stale entries after a normal mount/unmount round-trip where the
+/// user passes the canonical form on mount and the symlinked form
+/// on unmount (or vice versa): the recorded row is filtered out
+/// by string-equality against the *other* form, the line survives,
+/// and `mntrs list` shows a ghost mount that's already gone.
+///
+/// On Linux this is effectively a no-op for the common case — the
+/// `/tmp` directory is a real directory, and `fs::canonicalize`
+/// returns the input unchanged. macOS is where the symlink
+/// resolution actually matters.
+///
+/// This helper does NOT lowercase. Linux filesystems are case-
+/// sensitive (ext4/xfs/btrfs) and lowercasing would silently merge
+/// genuinely-different files into the same canonical key. macOS
+/// APFS case-insensitivity is a separate, larger concern; see the
+/// open issue thread for that direction. This fix only resolves
+/// symlinks.
+///
+/// Fallback: if `fs::canonicalize` fails (e.g. the mountpoint
+/// directory was already deleted between mount and unmount), the
+/// raw string is returned. `umount(8)` and the `mounts.txt` filter
+/// will surface their own ENOENT-style diagnostic in that case.
+pub(crate) fn canonicalize_mountpoint(mp: &str) -> String {
+    std::fs::canonicalize(mp)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| mp.to_string())
+}
+
+/// Return `s` with any `userinfo` (the `KEY:SECRET@host` form per
+/// RFC 1738) replaced by `***`. The userinfo form
+/// `s3://AKIA...:wJal...@s3.amazonaws.com/bucket` is accepted by
+/// `url::Url::parse` and used to leak the secret through
+/// `tracing::info!(storage_url = ...)` and through opendal error
+/// `Display` chains. Stripping it before any log line keeps the
+/// secret out of MNTRS_DAEMON_LOG (mode 0600 — good), stderr
+/// (mode 0644 — bad — captured by macOS unified log via launchd),
+/// shell history, and Sentry-style log aggregators.
+pub(crate) fn redact_storage_url(s: &str) -> String {
+    match url::Url::parse(s) {
+        Ok(u) if !u.username().is_empty() || u.password().is_some() => {
+            let mut sanitized = url::Url::parse("s3://x@x/").unwrap_or_else(|_| u.clone());
+            if let Some(host) = u.host_str() {
+                let _ = sanitized.set_host(Some(host));
+            }
+            sanitized.set_path(u.path());
+            sanitized.set_username("***").ok();
+            sanitized.set_password(None).ok();
+            sanitized.to_string()
+        }
+        _ => s.to_string(),
+    }
+}
+
+// ── test-only env-mutex ─────────────────────────────────────────
+//
+// Tests in `util::tests` and `cmd::mount::tests_261_2` both mutate
+// process-wide env vars (`HOME`, `XDG_DATA_HOME`, ...) via
+// `std::env::set_var` / `remove_var`. Cargo runs tests in parallel,
+// so two env-mutating tests can race on the same var. We serialize
+// them through a single shared mutex so the env state one test sees
+// is the env state the next test observes.
+//
+// Issue #289 closed the in-`util` race; Issue #384 extended the
+// requirement to the record/remove roundtrip tests in `mount.rs`
+// which also touch `HOME`. The same mutex is shared.
+//
+// The `cfg(test)` gate keeps this out of release builds.
+#[cfg(test)]
+pub(crate) static TESTS_ENV_MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+/// Acquire the shared test env-mutex. Callers MUST drop the guard
+/// before returning from the test body — holding it across an
+/// assertion will deadlock the rest of the suite.
+#[cfg(test)]
+pub(crate) fn tests_env_mutex() -> std::sync::MutexGuard<'static, ()> {
+    TESTS_ENV_MUTEX
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 // ── Unicode NFC normalization (Issue #307) ─────────────────────────
 
 /// Canonicalize a file-name to NFC (Unicode precomposed form).
@@ -458,9 +548,64 @@ pub fn detect_cgroup_memory_limit() -> Option<u64> {
 }
 
 #[cfg(test)]
+mod redact_tests {
+    use super::*;
+    #[test]
+    fn plain_url_unchanged() {
+        assert_eq!(redact_storage_url("s3://bucket/path"), "s3://bucket/path");
+    }
+    #[test]
+    fn userinfo_replaced() {
+        let r = redact_storage_url("s3://AKIA:secret@s3.amazonaws.com/bucket");
+        assert!(!r.contains("AKIA"));
+        assert!(!r.contains("secret"));
+        assert!(r.contains("***"));
+        assert!(r.contains("s3.amazonaws.com"));
+        assert!(r.contains("bucket"));
+    }
+    #[test]
+    fn password_only_replaced() {
+        let r = redact_storage_url("s3://bucket:mysecret@host.example/path/key");
+        assert!(!r.contains("mysecret"));
+        assert!(r.contains("***"));
+        assert!(r.contains("host.example"));
+    }
+    #[test]
+    fn garbage_input_passes_through() {
+        assert_eq!(redact_storage_url("not a url"), "not a url");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+
+    // ── env-mutation serialization (Issue #289) ─────────────────────
+    //
+    // The XDG-helper tests below mutate process-wide env vars
+    // (`XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR`,
+    // `HOME`). Cargo runs tests in parallel by default, so two
+    // tests touching the same var can race — e.g. `data_dir_xdg_data_home_wins`
+    // setting `XDG_DATA_HOME=/custom/data` and `data_dir_no_env_errors`
+    // removing it concurrently. CI hit the race in run 28496095276
+    // (Ok('/custom/data') leaked across the boundary). The local
+    // pre-commit run usually misses the race because the parallel
+    // scheduler happens not to overlap them.
+    //
+    // We don't want to force `--test-threads=1` (slow), so we
+    // serialize the env-mutating tests via a single shared
+    // `OnceLock<Mutex>` that's locked at the top of every
+    // test body that calls `set_var` / `remove_var`.
+    // Issue #384: this same mutex is now `pub(crate)` (see
+    // `TESTS_ENV_MUTEX` above) so tests in other modules can
+    // serialize against the env mutations this module's tests
+    // perform. Alias here for the in-module callers — locking the
+    // shared static is cheaper than re-declaring a second
+    // `OnceLock`.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        super::tests_env_mutex()
+    }
 
     // ── fnmatch ────────────────────────────────────────────────────
 
@@ -579,6 +724,86 @@ mod tests {
         let a = canonicalize_list_path("foo/bar");
         let b = canonicalize_list_path(&a);
         assert_eq!(a, b);
+    }
+
+    // ── canonicalize_mountpoint (Issue #384) ────────────────────────
+    //
+    // On macOS `/tmp` is a symlink to `/private/tmp` — the helper
+    // must collapse those forms so `record_mount` and `remove_mount`
+    // agree byte-for-byte. On Linux the input is typically a real
+    // directory and the helper returns the input unchanged.
+    //
+    // We don't test `/tmp` ↔ `/private/tmp` directly because that
+    // pair is macOS-specific; instead we construct a symlink under
+    // a `tempfile::tempdir()` and assert the helper resolves it.
+    // That way the test passes on every unix platform and still
+    // exercises the symlink-resolution branch.
+
+    // `std::os::unix::fs::symlink` only resolves on unix. Gate the
+    // whole test — the same behavior is implicitly verified by the
+    // live macOS smoke test in `PR mount/umount roundtrip` (the
+    // helper is exercised through `record_mount` / `remove_mount`
+    // on Linux + macOS; the unit test only adds the synthetic
+    // symlink case).
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_mountpoint_resolves_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        symlink(&real, &link).unwrap();
+
+        let resolved = canonicalize_mountpoint(link.to_str().unwrap());
+        // Both forms must point to the same canonical directory.
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&real)
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn canonicalize_mountpoint_no_symlink_is_identity() {
+        // A real directory with no symlinks in the path is
+        // returned in canonical form (which on Linux is the
+        // input; on macOS may differ if the path sits under a
+        // symlinked prefix — we only assert the round-trip
+        // agrees).
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let a = canonicalize_mountpoint(real.to_str().unwrap());
+        let b = canonicalize_mountpoint(&a);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn canonicalize_mountpoint_missing_path_returns_raw() {
+        // fs::canonicalize on a non-existent path returns an
+        // Err. The helper must fall back to the raw string so
+        // record/remove callers don't see a surprising empty
+        // string or panic. The mountpoint in the issue
+        // reproduction could have been deleted between mount
+        // and unmount — that path must still behave
+        // sensibly.
+        let missing = "/this/path/definitely/does/not/exist/mntrs-test";
+        let got = canonicalize_mountpoint(missing);
+        assert_eq!(got, missing);
+    }
+
+    #[test]
+    fn canonicalize_mountpoint_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let first = canonicalize_mountpoint(real.to_str().unwrap());
+        let second = canonicalize_mountpoint(&first);
+        // canonicalize(canonicalize(x)) == canonicalize(x)
+        assert_eq!(first, second);
     }
 
     // ── opendal_to_io_error ─────────────────────────────────────────
@@ -766,8 +991,9 @@ mod tests {
     /// is also set (env precedence).
     #[test]
     fn data_dir_xdg_data_home_wins() {
-        // SAFETY: tests run serially in cargo; setting a unique value
-        // here doesn't collide with other tests.
+        let _g = env_lock();
+        // SAFETY: serialized via `env_lock` against other
+        // env-mutating tests in this module (Issue #289).
         unsafe {
             std::env::set_var("XDG_DATA_HOME", "/custom/data");
             std::env::set_var("HOME", "/home/test");
@@ -783,6 +1009,7 @@ mod tests {
     /// `$XDG_DATA_HOME` is unset.
     #[test]
     fn data_dir_home_fallback() {
+        let _g = env_lock();
         unsafe {
             std::env::remove_var("XDG_DATA_HOME");
             std::env::set_var("HOME", "/home/test");
@@ -795,6 +1022,7 @@ mod tests {
     /// unset — the bug fix: was silently falling back to /tmp.
     #[test]
     fn data_dir_no_env_errors() {
+        let _g = env_lock();
         unsafe {
             std::env::remove_var("XDG_DATA_HOME");
             std::env::remove_var("HOME");
@@ -810,6 +1038,7 @@ mod tests {
     /// Empty XDG_DATA_HOME is treated as unset (XDG spec edge case).
     #[test]
     fn data_dir_empty_xdg_falls_back() {
+        let _g = env_lock();
         unsafe {
             std::env::set_var("XDG_DATA_HOME", "");
             std::env::set_var("HOME", "/home/test");
@@ -824,6 +1053,7 @@ mod tests {
     /// `config_dir()` mirrors data_dir but for XDG_CONFIG_HOME.
     #[test]
     fn config_dir_xdg_config_home_wins() {
+        let _g = env_lock();
         unsafe {
             std::env::set_var("XDG_CONFIG_HOME", "/custom/config");
             std::env::set_var("HOME", "/home/test");
@@ -837,6 +1067,7 @@ mod tests {
 
     #[test]
     fn config_dir_home_fallback() {
+        let _g = env_lock();
         unsafe {
             std::env::remove_var("XDG_CONFIG_HOME");
             std::env::set_var("HOME", "/home/test");
@@ -849,6 +1080,7 @@ mod tests {
     /// Errors if unset — the fix.
     #[test]
     fn runtime_dir_errors_without_xdg() {
+        let _g = env_lock();
         unsafe {
             std::env::remove_var("XDG_RUNTIME_DIR");
             std::env::set_var("HOME", "/home/test");
@@ -863,6 +1095,7 @@ mod tests {
 
     #[test]
     fn runtime_dir_xdg_set() {
+        let _g = env_lock();
         unsafe {
             std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
         }
@@ -872,6 +1105,7 @@ mod tests {
 
     #[test]
     fn runtime_dir_empty_errors() {
+        let _g = env_lock();
         unsafe {
             std::env::set_var("XDG_RUNTIME_DIR", "");
         }

@@ -36,7 +36,10 @@ mntrs_setup
 mkdir -p "$WORK"
 
 mntrs_mount "$MNT" "$CACHE"
-trap 'mntrs_unmount "$MNT"' EXIT
+# Preserve cache dir on EXIT (failure path) so post-mortem is
+# possible — `mntrs_unmount` otherwise calls `remove_dir_all` which
+# wipes the only evidence of what the daemon did/didn't do.
+trap 'stress_preserve_cache "$CACHE" "fail"; mntrs_unmount "$MNT"' EXIT
 
 # ── Pre-generate expected content (same as writers will produce) ─────
 # Deterministic per-file content: 32 bytes of "data_${writer}_${file}..." → md5.
@@ -76,9 +79,20 @@ WRITE_T=$(( $(date +%s) - START ))
 TOTAL_FILES=$(( STRESS_PARALLEL * STRESS_FILES_PP ))
 log "parallel write done in ${WRITE_T}s ($TOTAL_FILES files)"
 
+# ── Force kernel to deliver all writes to FUSE ──────────────────────
+# CI's ubuntu-24.04 kernel (~6.8.x) can hold multi-page writes in
+# page cache for several seconds before forwarding to FUSE. The
+# daemon's write() never fires during that window, so a verification
+# loop reading $MNT/$fname immediately after xargs -P sees files
+# missing. `sync` + 2s drain forces the kernel to flush.
+log "syncing kernel page cache to FUSE ..."
+sync
+sleep 2
+
 # ── Drain writeback ─────────────────────────────────────────────────
 log "waiting for writeback drain ..."
 WAIT_T=0
+DAEMON_BIN="$(basename "$MNTRS_BIN")"
 while [[ -n "$(ls "$CACHE"/*.dirty 2>/dev/null)" ]]; do
     sleep 0.5
     WAIT_T=$((WAIT_T + 1))
@@ -87,6 +101,12 @@ while [[ -n "$(ls "$CACHE"/*.dirty 2>/dev/null)" ]]; do
         log "still dirty after 300s; PENDING_COUNT check:"
         grep -E "pending_count|writeback.*STUCK" "$CACHE/mount.log" | tail -10 || true
         fail "writeback didn't drain within 300s"
+    fi
+    # If daemon died mid-drain, fail fast.
+    if ! pgrep -f "$DAEMON_BIN mount memory" >/dev/null 2>&1; then
+        log "daemon died during writeback drain — last mount.log lines:"
+        tail -30 "$CACHE/mount.log" || true
+        fail "daemon died mid-drain (see $CACHE/mount.log)"
     fi
 done
 DRAIN_T=$(( $(date +%s) - START ))

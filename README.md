@@ -184,7 +184,7 @@ Three-tier cache: **memory → disk → remote**. Block-level (8 MB) indexing. D
 | `--vfs-cache-max-size` | `0` (off) | none (post-#243) | `0` = no LRU | Disk cache upper limit (LRU) |
 | `--vfs-cache-min-free-space` | `0` (off) | none (post-#243) | `0` = no floor check | Min free space before eviction |
 | `--vfs-cache-max-age` | 3600s | — | 3600s | Max cache file age (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
-| `--vfs-cache-mode` | `writes` | — | `writes` | `off` / `minimal` / `writes` / `full` (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
+| `--vfs-cache-mode` | `off` | — | `off` | `off` / `minimal` / `writes` / `full` (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
 | `--vfs-cache-poll-interval` | 60s | — | 60s | Stale-object poll interval (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
 | `--mem-limit` | 256 MB | — | 256 MB | Memory cache upper limit |
 | `--dir-cache-time` | 10s | — | 10s | Directory listing TTL |
@@ -215,7 +215,7 @@ Three-tier cache: **memory → disk → remote**. Block-level (8 MB) indexing. D
 | `--vfs-read-ahead` | 131072 | 131072 | Bytes prefetched past EOF |
 | `--async-read` | false | false | Async reads (FUSE kernel) |
 | `--vfs-fast-fingerprint` | false | false | Fast change detection (size+mtime) |
-| `--vfs-read-wait` | 20ms | 20ms | Sequential read wait threshold |
+| `--vfs-read-wait` | 1s | 1s | Sequential read wait threshold |
 | `--vfs-write-wait` | 1s | 1s | Sequential write wait threshold |
 
 **Adaptive chunk reader**: chunk size doubles on sequential reads, resets to 128 KB on seek. Up to 8 MB cap.
@@ -227,6 +227,11 @@ Three-tier cache: **memory → disk → remote**. Block-level (8 MB) indexing. D
 ### Benchmark (vs rclone)
 
 4/6 leading, 1/6 tie, 1/6 behind (recoverable by matching `--stat-cache-ttl=300`).
+
+The macOS variant lives at `bench/run_all_mac.sh`. See
+`docs/benchmark_macos.md` for methodology and the rclone
+auto-detect path. No CI workflow runs it — see issue #304
+for the GH runner macFUSE kext limitation.
 
 ---
 
@@ -297,7 +302,7 @@ mntrs mount s3://bucket *
 mntrs mount s3://bucket C:\mnt\s3
 ```
 
-CI tested on Windows with 11 WinFSP mount integration tests (covering mount/unmount, write/read, list, rename, setattr, statfs, unicode, and multi-MB roundtrips).
+CI tested on Windows with 31 WinFSP integration tests (covering mount/unmount lifecycle, write/read roundtrip, list/create/delete/rename, setattr/truncate, statfs, nested directories, large-file reads, unicode + NFC normalization, symlink create/get/rename/delete, dirty-cache lifecycle, readdir paging, getattr/statfs cache coalescing, volume flush, and mount-internal scheme variants).
 
 ### Kubernetes (CSI)
 
@@ -417,7 +422,8 @@ cargo build --package mntrs-csi --release
 
 # Benchmarks
 cargo bench                         # micro-benchmarks
-./bench/run_all.sh                  # vs rclone (MinIO)
+./bench/run_all.sh                  # vs rclone (MinIO, Linux)
+./bench/run_all_mac.sh              # macOS variant (manual, see docs/benchmark_macos.md)
 ```
 
 ### CI Matrix (GitHub Actions)
@@ -425,12 +431,13 @@ cargo bench                         # micro-benchmarks
 | Workflow | Environment | Scope |
 |----------|-------------|-------|
 | `CI` | Linux | Build + test + clippy + fmt |
-| `CI - Windows` | Windows | WinFSP + release build + 11 mount integration tests |
+| `CI - Windows` | Windows | WinFSP + release build + 31 mount integration tests |
 | `CI - macOS` | macOS | macFUSE + build + test |
 | `Integration Tests` | Linux | S3 / HDFS / memory mount tests + HDFS Kerberos auth |
 | `CSI Integration Test` | Linux (k3s) | CSI driver e2e with HDFS backend |
 | `CSI e2e` | Linux (k3s) | CSI driver e2e with S3 (MinIO) backend |
 | `Benchmark` | Linux | vs rclone performance (MinIO) |
+| macOS bench (manual) | macOS developer | `bench/run_all_mac.sh` (issue #304 — no GH runner support) |
 
 ---
 

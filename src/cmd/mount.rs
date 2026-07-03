@@ -16,7 +16,6 @@ use std::io::{BufRead, BufReader};
 #[cfg(not(windows))]
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -127,12 +126,19 @@ fn record_mount(storage: &str, mountpoint: &str, read_only: bool) {
         .parent()
         .expect("BUG: mounts_db() path must have a parent directory");
     let _ = std::fs::create_dir_all(dir);
+    // Issue #384: canonicalize the mountpoint so the row written
+    // here and the row filtered by `remove_mount` / `unmount`'s
+    // db cleanup agree byte-for-byte. On macOS `/tmp` is a
+    // symlink to `/private/tmp` — without canonicalization a
+    // user-supplied `/tmp/foo` here and `/private/tmp/foo` in
+    // the unmount path produce a stale entry.
+    let canon_mp = crate::util::canonicalize_mountpoint(mountpoint);
     // Atomically rewrite: tmp + rename (POSIX atomic)
     let tmp = format!("{}.tmp.{}", path, std::process::id());
     let mut lines = Vec::new();
     if let Ok(existing) = std::fs::read_to_string(&path) {
         for l in existing.lines() {
-            if l.split('\0').nth(1) != Some(mountpoint) {
+            if l.split('\0').nth(1) != Some(canon_mp.as_str()) {
                 lines.push(l.to_string());
             }
         }
@@ -141,11 +147,15 @@ fn record_mount(storage: &str, mountpoint: &str, read_only: bool) {
     let user = std::env::var("USER").unwrap_or_else(|_| "?".into());
     let ro = if read_only { "ro" } else { "rw" };
     let backend = storage.split(':').next().unwrap_or("?");
+    // Strip userinfo before writing to mounts.txt — the file is
+    // 0644 by default, and a credentialed URL would otherwise
+    // persist in a world-readable file.
+    let storage_safe = crate::util::redact_storage_url(storage);
     lines.insert(
         0,
         format!(
             "{}\0{}\0{}\0{}\0{}\0{}",
-            storage, mountpoint, pid, user, ro, backend
+            storage_safe, canon_mp, pid, user, ro, backend
         ),
     );
     let content = lines.join("\n") + "\n";
@@ -172,13 +182,18 @@ fn remove_mount(mountpoint: &str) {
     // parallel) where one finishes + unmounts while
     // another is starting can hit it. Atomic rename
     // closes the window for free.
+    // Issue #384: canonicalize the mountpoint before
+    // filtering so the byte-equality match against the row
+    // `record_mount` wrote (also canonicalized) succeeds on
+    // macOS where `/tmp` is a symlink to `/private/tmp`.
+    let canon_mp = crate::util::canonicalize_mountpoint(mountpoint);
     let content = match fs::read_to_string(&path) {
         Ok(c) => c,
         Err(_) => return,
     };
     let filtered: Vec<&str> = content
         .lines()
-        .filter(|l| l.split('\0').nth(1) != Some(mountpoint))
+        .filter(|l| l.split('\0').nth(1) != Some(canon_mp.as_str()))
         .collect();
     let new_body = filtered.join("\n");
     let tmp = format!("{}.tmp.{}", path, std::process::id());
@@ -240,11 +255,29 @@ extern "C" fn cleanup() {
         // in-process bookkeeping update, not an external
         // side effect.
         if !SHUTDOWN_BY_SIGNAL.load(std::sync::atomic::Ordering::Relaxed) {
-            let _ = Command::new("fusermount3")
-                .arg("-u")
-                .arg(mp)
-                .status()
-                .or_else(|_| Command::new("fusermount").arg("-u").arg(mp).status());
+            // Issue #374: reuse the cfg-gated helpers from
+            // `unmount`. Vanilla macOS has no `fusermount*`
+            // binary, so the in-line shell-out was previously
+            // silently failing and leaking the mount on
+            // atexit / SIGTERM paths. The macOS helper falls
+            // back to `umount(8)`; the non-macos unix helper
+            // is byte-identical to the pre-fix Linux chain.
+            //
+            // `cleanup()` is module-level (not under a
+            // `#[cfg(unix)]` block), so the helper references
+            // here use `cfg(all(unix, not(target_os = "macos")))`
+            // / `cfg(target_os = "macos")` to keep Windows
+            // builds untouched (the branches compile to dead
+            // code on Windows). See the same construction at
+            // `unmount.rs::fuse_unmount_via_fusermount`.
+            #[cfg(all(unix, not(target_os = "macos")))]
+            {
+                let _ = crate::cmd::unmount::fuse_unmount_via_fusermount(mp);
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let _ = crate::cmd::unmount::fuse_unmount_macos_with_umount(mp);
+            }
         }
         remove_mount(mp);
     }
@@ -252,7 +285,8 @@ extern "C" fn cleanup() {
 
 /// Simplified mount entry point for CSI plugin.
 /// Uses defaults for all the FUSE tuning parameters.
-/// Check if a path is already a mount point by checking /proc/mounts.
+/// Check if a path is already a mount point by querying the Win32 DOS
+/// device manager.
 ///
 /// Issue #305 Tier 1: previous stub always returned `false`, so
 /// `mount_internal`'s idempotency check let a second `mntrs mount ... V:`
@@ -271,6 +305,16 @@ extern "C" fn cleanup() {
 /// `ERROR_INVALID_FUNCTION` for WinFSP volumes — they don't register
 /// a real NTFS-style volume GUID, so we can't distinguish "unmounted"
 /// from "WinFSP mount" via that API.
+///
+/// Issue #328 race hardening: the first process's `host.mount(V:)`
+/// returns `Ok` once WinFSP's user-mode `DefineDosDeviceW` call has
+/// completed, but there is a small window (observed pre-fix) where a
+/// second process's `QueryDosDeviceW("V:")` still returns 0 — the
+/// kernel-side mountpoint table is briefly invisible cross-process
+/// even though the user-mode call succeeded. We re-poll up to
+/// `IS_MOUNT_POINT_REPOLL_ATTEMPTS` times with `IS_MOUNT_POINT_REPOLL_DELAY_MS`
+/// between attempts so the second mount's idempotency check fires
+/// instead of racing past it into `host.mount()` collision.
 #[cfg(windows)]
 pub fn is_mount_point(path: &str) -> bool {
     use windows::Win32::Storage::FileSystem::QueryDosDeviceW;
@@ -285,57 +329,128 @@ pub fn is_mount_point(path: &str) -> bool {
     // mapped drives use "\Device\LanmanRedirector\..." — ~60 chars).
     let mut buf = [0u16; 1024];
     let wide: Vec<u16> = trimmed.encode_utf16().chain(std::iter::once(0)).collect();
-    let result = unsafe { QueryDosDeviceW(windows::core::PCWSTR(wide.as_ptr()), Some(&mut buf)) };
 
-    // QueryDosDeviceW returns 0 on failure, length (excluding the
-    // null terminator) on success. An empty result string ("")
-    // would be length 0 too but never happens for a real device.
-    if result > 0 {
-        true
-    } else {
-        // Failure: check GetLastError to distinguish unmapped
-        // drive letter (err=2 ERROR_FILE_NOT_FOUND) from
-        // malformed input. Be conservative on unexpected
-        // errors — assume mounted to avoid collisions.
+    for attempt in 0..IS_MOUNT_POINT_REPOLL_ATTEMPTS {
+        let result =
+            unsafe { QueryDosDeviceW(windows::core::PCWSTR(wide.as_ptr()), Some(&mut buf)) };
+
+        // QueryDosDeviceW returns 0 on failure, length (excluding the
+        // null terminator) on success. An empty result string ("")
+        // would be length 0 too but never happens for a real device.
+        if result > 0 {
+            return true;
+        }
+
         let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(2) {
-            false
-        } else {
+        // Distinguish "drive letter not assigned yet" (err=2
+        // ERROR_FILE_NOT_FOUND — the kernel-side table hasn't been
+        // updated cross-process yet) from "drive letter is permanently
+        // unmapped / malformed input" (some other error code).
+        // For err=2 we re-poll; for anything else we treat it as
+        // "mounted" to avoid collisions on weird input. The first
+        // mount's host.mount has either succeeded (in which case the
+        // kernel-side state is propagating) or it has not yet been
+        // attempted by anyone; both cases resolve to "wait and retry"
+        // on err=2 and "fail safe, treat as mounted" otherwise.
+        if err.raw_os_error() != Some(2) {
             tracing::debug!(
                 path,
+                attempt,
                 error = %err,
                 "is_mount_point(windows): QueryDosDeviceW returned unexpected error; treating as mount point"
             );
-            true
+            return true;
+        }
+
+        if attempt + 1 < IS_MOUNT_POINT_REPOLL_ATTEMPTS {
+            tracing::trace!(
+                path,
+                attempt,
+                max = IS_MOUNT_POINT_REPOLL_ATTEMPTS,
+                "is_mount_point(windows): QueryDosDeviceW returned ERROR_FILE_NOT_FOUND; re-polling"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(
+                IS_MOUNT_POINT_REPOLL_DELAY_MS,
+            ));
         }
     }
+
+    // Exhausted retries and still saw ERROR_FILE_NOT_FOUND — the
+    // drive letter is genuinely unmapped as far as the kernel-side
+    // table is concerned. Caller may proceed to host.mount().
+    tracing::trace!(
+        path,
+        attempts = IS_MOUNT_POINT_REPOLL_ATTEMPTS,
+        "is_mount_point(windows): drive letter unmapped after retries"
+    );
+    false
 }
+
+/// Issue #328 race hardening: number of re-poll attempts in
+/// `is_mount_point(windows)` before declaring the drive letter
+/// unmapped. The first mount's `host.mount()` returns Ok once
+/// WinFSP's user-mode `DefineDosDeviceW` has succeeded, but the
+/// kernel-side mountpoint table is briefly invisible to other
+/// processes (we measured ~50-200 ms on a quiet Win10 VM; the 5×
+/// 100 ms budget below = 500 ms ceiling is well under the 10 s
+/// budget imposed by mount-test.ps1 sub-test 13).
+#[cfg(windows)]
+const IS_MOUNT_POINT_REPOLL_ATTEMPTS: u32 = 5;
+#[cfg(windows)]
+const IS_MOUNT_POINT_REPOLL_DELAY_MS: u64 = 100;
 
 ///
 /// Check if a path is already a mount point on macOS.
+///
+/// Issue #376: previously this used `split_whitespace()` and
+/// matched `fields[2]` against the canonical mount path. That
+/// silently broke when the mount point contained whitespace
+/// (e.g. `/Volumes/My Drive/test`), where the path itself got
+/// split across fields and `fields[2]` became `/Volumes/My` — a
+/// false negative on the idempotency check at `mount.rs:856` and
+/// the wait-loops at lines 614, 691, 1918.
+///
+/// macOS `mount(8)` output format is
+/// `<special> on <mount_point> (<opts>)`. We anchor on the literal
+/// substring `on <canonical> (` so whitespace inside the path is
+/// matched verbatim. The trailing ` (` anchor prevents false
+/// matches like `/Volumes/foo` against a line ending in
+/// `/Volumes/foo-bar (...)`.
 #[cfg(target_os = "macos")]
 pub fn is_mount_point(path: &str) -> bool {
     use std::process::Command;
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
+    // Issue #384: route the input through `canonicalize_mountpoint`
+    // so a mountpoint passed as `/tmp/foo` (the user-facing form)
+    // is normalized to `/private/tmp/foo` (the form the kernel
+    // records). Pre-fix an inline `fs::canonicalize(...).unwrap_or`
+    // was used; when canonicalize fails (e.g. the path doesn't
+    // exist yet — a fresh-mount race) the fallback returned the
+    // raw user input, which doesn't match what `mount(8)` printed
+    // and let a second mount slip through (issue #328). The shared
+    // helper handles the failure case uniformly and matches the
+    // fallback semantics used by `record_mount` / `remove_mount` /
+    // `unmount`.
+    let canonical = crate::util::canonicalize_mountpoint(path);
+    let needle = format!("on {} (", canonical);
     let output = Command::new("mount")
         .output()
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default();
-    output.lines().any(|line| {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        fields.len() >= 3 && fields[2] == canonical.to_string_lossy().as_ref()
-    })
+    output.lines().any(|line| line.contains(&needle))
 }
 
 #[cfg(target_os = "linux")]
 pub fn is_mount_point(path: &str) -> bool {
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
-    let canonical_str = canonical.to_string_lossy();
+    // Same #384 fix as the macOS branch — canonicalize via the
+    // shared helper so symlink-resolved inputs (`/tmp/foo` ->
+    // `/private/tmp/foo`) match the kernel's recorded form in
+    // `/proc/mounts`.
+    let canonical = crate::util::canonicalize_mountpoint(path);
     if let Ok(content) = std::fs::read_to_string("/proc/mounts") {
         for line in content.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 && parts[1] == canonical_str.as_ref() {
+            if parts.len() >= 2 && parts[1] == canonical {
                 return true;
             }
         }
@@ -356,13 +471,14 @@ pub fn mount_internal(
     // stage FUSE mount path). Honor it here so cache files land
     // under the operator-chosen persistent path (K8s ReadOnlyRootFS
     // + tmpfs-safe). CLI `mntrs mount` doesn't pass the key, so
-    // we fall back to the original /tmp/mntrs-csi-cache/<slug> path
-    // — that path is NOT tmpfs-safe, but CLI users run locally and
-    // choose where to mount.
-    let cache_dir = opts.get("cache-dir").cloned().unwrap_or_else(|| {
-        let suffix = mountpoint.replace(['/', ':'], "_");
-        format!("/tmp/mntrs-csi-cache/{}", suffix)
-    });
+    // we fall back to `cache_dir_for_mount(mountpoint)`, which is
+    // cfg-isolated: per-user temp on macOS (Issue #382), the
+    // original /tmp path on Linux / other unix (CLI users run
+    // locally and choose where to mount).
+    let cache_dir = opts
+        .get("cache-dir")
+        .cloned()
+        .unwrap_or_else(|| cache_dir_for_mount(mountpoint));
     let _ = std::fs::create_dir_all(&cache_dir);
     // Register mountpoint→cache_dir so unmount_internal can find
     // the same path during cleanup (Bug 30 follow-up).
@@ -452,6 +568,7 @@ pub fn mount_internal(
         false,       // links
         false,       // noapple_double
         false,       // noapple_xattr,
+        false,       // no_macos_metadata (CSI runs on Linux; macOS metadata filter is a no-op)
         None,        // hash_filter
         false,       // mount_case_insensitive
         131072,      // max_read_ahead
@@ -488,13 +605,32 @@ pub fn mount_internal(
     )
 }
 
-/// Simplified unmount entry point for CSI plugin.
-/// Unmount for CSI plugin.
-/// Waits for writeback queue to drain (up to 5 min), then unmounts.
-/// Falls back to lazy unmount if regular unmount fails.
+/// Compute the CLI-fallback cache directory for a mount, used by
+/// `mount_internal` (when `opts["cache-dir"]` is not set) and by
+/// `unmount_internal`'s cleanup. CSI operators that pass
+/// `cache-dir` explicitly in `opts` are unaffected.
+///
+/// Issue #382: macOS launchd always sets `$TMPDIR` to a per-user
+/// mode-0700 path under `/var/folders/.../T/`. The unconditional
+/// `/tmp/mntrs-csi-cache/<slug>` fallback landed on `/private/tmp`
+/// on macOS — world-readable and shared across all users on the
+/// host. Per-user temp avoids the cross-user cache leak on shared
+/// macOS hosts (CI runners, multi-user build servers). Linux and
+/// other unix keep the original `/tmp` path (byte-identical to
+/// pre-fix), so a change to the macOS branch cannot accidentally
+/// regress a Linux CI run.
 fn cache_dir_for_mount(mountpoint: &str) -> String {
     let suffix = mountpoint.replace(['/', ':'], "_");
-    format!("/tmp/mntrs-csi-cache/{}", suffix)
+    #[cfg(target_os = "macos")]
+    {
+        let base = std::env::var("TMPDIR")
+            .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string());
+        format!("{}/mntrs-csi-cache/{}", base.trim_end_matches('/'), suffix)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        format!("/tmp/mntrs-csi-cache/{}", suffix)
+    }
 }
 
 pub fn build_operator_sync(storage_url: &str, opts: &HashMap<String, String>) -> Result<Operator> {
@@ -722,10 +858,11 @@ pub fn mount(
     _no_checksum: bool,
     _no_seek: bool,
     _links: bool,
-    _no_apple_double: bool,
-    _no_apple_xattr: bool,
+    no_apple_double: bool,
+    no_apple_xattr: bool,
+    no_macos_metadata: bool,
     hash_filter: Option<String>,
-    _mount_case_insensitive: bool,
+    mount_case_insensitive: bool,
     _max_read_ahead: u64,
     vfs_read_chunk_size_limit: u64,
     vfs_read_chunk_streams: u32,
@@ -758,17 +895,37 @@ pub fn mount(
     // own dispatcher pool — fuser backend).
     winfsp_dispatcher_threads: u32,
 ) -> Result<()> {
-    // Issue #305 Tier 1: idempotency check at the CLI entry
-    // point. Previously the public `mount` function skipped this
-    // check entirely, so a second `mntrs mount ... V:` proceeded
-    // all the way to `host.mount(mountpoint)` and collided with
-    // the live volume (Win32 STATUS_OBJECT_NAME_COLLISION 0xC0000035
-    // → "0xD0000035"). The CSI path used `mount_internal` which
-    // already had this check, but it was a no-op on Windows because
-    // `is_mount_point` returned false unconditionally.
+    // Issue #328: idempotency check at the CLI entry point.
+    // When V: is already mounted (by an earlier `mntrs mount`
+    // process, or by anything else — WinFSP / SMB / NTFS),
+    // reject this invocation with a clear, non-zero exit
+    // error instead of silently succeeding (which would mask
+    // user confusion) or racing into `host.mount()` and
+    // colliding with STATUS_OBJECT_NAME_COLLISION 0xC0000035
+    // (which used to slip past into the keep-alive loop and
+    // hang forever — see #328 history).
+    //
+    // The CSI path (`mount_internal` at line ~374) keeps the
+    // Ok(())-on-already-mounted behavior because CSI mounts
+    // can be retried idempotently by a sidecar; only the CLI
+    // path is required to fail loudly.
+    //
+    // `is_mount_point` itself re-polls (see IS_MOUNT_POINT_REPOLL_*
+    // constants below) to absorb the brief kernel-side race
+    // window between the first process's `host.mount` returning
+    // Ok and the drive letter becoming visible to a second
+    // process's `QueryDosDeviceW`. We add a final post-check
+    // after `host.mount` succeeds (line ~1583) for the
+    // reverse race — in case the first mount lands between
+    // this idempotency check and our `host.mount`.
     if is_mount_point(mountpoint) {
-        tracing::info!(mountpoint, "already mounted, skipping");
-        return Ok(());
+        tracing::info!(
+            mountpoint,
+            "already mounted, refusing to mount twice (issue #328)"
+        );
+        return Err(anyhow!(
+            "already mounted at {mountpoint}; run `mntrs unmount {mountpoint}` first"
+        ));
     }
 
     // Issue #209: --poll-interval is the legacy rclone alias
@@ -789,7 +946,11 @@ pub fn mount(
     // we need to bisect the mount path.
     let _t_mount = std::time::Instant::now();
     tracing::debug!(
-        backend = %storage_url,
+        // redact any userinfo — the raw `storage_url` may carry
+        // the RFC-1738 form `s3://KEY:SECRET@host/bucket` which
+        // `url::Url::parse` accepts and opendal then echoes
+        // through error messages.
+        backend = %crate::util::redact_storage_url(storage_url),
         mountpoint = %mountpoint,
         "mount: entered, about to build_operator"
     );
@@ -894,7 +1055,9 @@ pub fn mount(
     // RUST_LOG=info. Stripped on `mount --daemon`
     // for parity with `mntrs mount` foreground output.
     tracing::info!(
-        storage_url = %storage_url,
+        // keep secret out of stderr (mode 0644 — captured by
+        // launchd into macOS unified log).
+        storage_url = %crate::util::redact_storage_url(storage_url),
         mountpoint = %mountpoint,
         volname = %volname,
         read_only,
@@ -935,6 +1098,12 @@ pub fn mount(
         // Issue #38: empty pending set; populated on
         // first flush/release.
         writeback_pending: std::sync::Arc::new(dashmap::DashSet::new()),
+        // Issue #325: in-memory symlink target table. Empty at
+        // mount start; populated by `MntrsFs::symlink` when
+        // user-mode code creates a symbolic link (Win32
+        // `New-Item -ItemType SymbolicLink` → WinFSP
+        // `set_reparse_point` → inner.symlink).
+        symlinks: dashmap::DashMap::new(),
         // Issue #132: shared adaptive prefetch window controller.
         backpressure: std::sync::Arc::new(crate::backpressure::BackpressureController::new()),
         // Issue #201: per-mount prefetch budget. Same cap as
@@ -992,8 +1161,9 @@ pub fn mount(
         case_insensitive: vfs_case_insensitive,
         no_implicit_dir,
         use_server_modtime,
-        no_apple_double: false,
-        no_apple_xattr: false,
+        no_apple_double,
+        no_apple_xattr,
+        no_macos_metadata,
         hash_filter: hash_filter.as_ref().and_then(|hf| {
             let mut parts = hf.splitn(2, '/');
             let k: usize = parts.next()?.parse().ok()?;
@@ -1157,15 +1327,34 @@ pub fn mount(
     if std::env::var_os("MNTRS_INTERNAL_DAEMON").is_some() && daemon {
         unsafe {
             let target: i32 = match std::env::var_os("MNTRS_DAEMON_LOG") {
-                Some(p) => std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(p.to_string_lossy().as_ref())
-                    .map(|f| {
+                Some(p) => {
+                    // Issue #391 follow-up: the daemon log carries
+                    // tracing output (file paths, error context,
+                    // even a redacted storage_url still reveals
+                    // bucket + host). Force mode 0o600 on unix so
+                    // a peer user on a shared box can't `tail -f`
+                    // the log. On non-unix we fall back to the
+                    // original default-perms open.
+                    #[cfg(unix)]
+                    let open = {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .mode(0o600)
+                            .open(p.to_string_lossy().as_ref())
+                    };
+                    #[cfg(not(unix))]
+                    let open = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(p.to_string_lossy().as_ref());
+                    open.map(|f| {
                         use std::os::unix::io::IntoRawFd;
                         f.into_raw_fd()
                     })
-                    .unwrap_or(-1),
+                    .unwrap_or(-1)
+                }
                 None => libc::open(c"/dev/null".as_ptr(), libc::O_RDWR),
             };
             if target >= 0 {
@@ -1224,9 +1413,41 @@ pub fn mount(
             MountOption::Exec,
             MountOption::FSName(devname.unwrap_or(volname).to_string()),
         ];
+        // #361: the kernel-side mount option `writeback_cache` is the
+        // legacy libfuse 2 syntax. Modern libfuse 3.7+ (incl. 3.17 on
+        // ubuntu-24.04) honors `InitFlags::FUSE_WRITEBACK_CACHE`
+        // declared in `FuserAdapter::init()` (src/core_fs/fuser.rs:142).
+        // Passing the option name here makes `fusermount3` exit with
+        // "unknown option 'writeback_cache'" before INIT happens, so
+        // the kernel never gets a chance to enable per-inode writeback.
+        //
+        // We rely solely on the INIT capability flag now. The kernel
+        // still controls per-inode writeback opt-in via the inode flag
+        // returned in the lookup/create reply (kernel >= 4.18 honors
+        // this; older kernels silently ignore it and fall back to
+        // synchronous writes).
+        //
+        // The CLI `--write-back-cache` still exists for users who want
+        // the small-write optimization; the `write_back_cache` field
+        // on `FuserAdapter` is what gates the capability declaration.
+        let _ = write_back_cache; // see FuserAdapter::init()
+        // Issue #408 (macos audit, Fix 2): the FUSE writeback
+        // capability is declared in `FuserAdapter::init()`, which is
+        // the Linux/Windows code path. macFUSE has its own kernel-
+        // managed write buffering that the FUSE writeback capability
+        // doesn't gate — on macOS the value is silently ignored.
+        // Surface that as a warn so users copying `--write-back-cache`
+        // invocations from a Linux guide onto a macOS host see
+        // something other than silence. The flag itself stays
+        // visible (not hidden) so a script that runs on a mixed
+        // fleet doesn't fail at the clap layer on macOS hosts.
+        #[cfg(target_os = "macos")]
         if write_back_cache {
-            cfg.mount_options
-                .push(MountOption::CUSTOM("writeback_cache".to_string()));
+            tracing::warn!(
+                "--write-back-cache is ignored on macOS: macFUSE manages its own \
+                 write buffering; the FUSE writeback capability is not exposed \
+                 through macFUSE. Drop the flag on macOS hosts."
+            );
         }
         if allow_root {
             cfg.mount_options
@@ -1234,17 +1455,17 @@ pub fn mount(
         }
         #[cfg(target_os = "macos")]
         {
-            if _no_apple_double {
+            if no_apple_double {
                 cfg.mount_options
                     .push(MountOption::CUSTOM("noappledouble".to_string()));
             }
-            if _no_apple_xattr {
+            if no_apple_xattr {
                 cfg.mount_options
                     .push(MountOption::CUSTOM("noapplexattr".to_string()));
             }
-            if _mount_case_insensitive {
+            if mount_case_insensitive {
                 cfg.mount_options
-                    .push(MountOption::CUSTOM("mount_case_insensitive".to_string()));
+                    .push(MountOption::CUSTOM("case_insensitive".to_string()));
             }
         }
         if default_permissions {
@@ -1459,9 +1680,25 @@ pub fn mount(
             .case_sensitive_search(false)
             .unicode_on_disk(true)
             .persistent_acls(true)
-            .reparse_points(false)
-            .named_streams(false)
-            .extended_attributes(false)
+            // Issue #309: advertise named-stream /
+            // reparse-point / EA capability to the
+            // kernel. The actual callbacks return
+            // sensible defaults (see winfsp.rs) —
+            // `get_stream_info` returns the unnamed
+            // stream per file; reparse and EA
+            // callbacks keep the trait default
+            // (INVALID_DEVICE_REQUEST) because the
+            // backend has no symlink or EA storage
+            // yet. Enabling the flags here is
+            // non-breaking: the kernel only calls
+            // the reparse / EA callbacks when
+            // user-mode requests them, and a
+            // INVALID_DEVICE_REQUEST from the
+            // callback is mapped to a normal "not
+            // supported" error.
+            .reparse_points(true)
+            .named_streams(true)
+            .extended_attributes(true)
             // Issue #305 Tier 1: advertise read-only at the
             // Win32 layer too, and skip post_cleanup for RO
             // mounts — there's nothing to clean up since
@@ -1470,29 +1707,85 @@ pub fn mount(
             .post_cleanup_when_modified_only(!read_only)
             .flush_and_purge_on_cleanup(false)
             .pass_query_directory_pattern(true)
+            // Issue #309: enable the kernel-side
+            // name query path. The adapter's
+            // `get_dir_info_by_name` returns
+            // INVALID_DEVICE_REQUEST today
+            // (the trait default); the kernel
+            // falls back to the per-pattern
+            // enumeration path so this is
+            // non-breaking.
             .pass_query_directory_filename(false);
         tracing::debug!(
             mountpoint,
             volname,
-            "mount(windows): calling FileSystemHost::new"
+            "mount(windows): calling FileSystemHost::new_with_timer"
         );
+        // Issue #360: `new_with_timer` instead of `new` so WinFSP's
+        // threadpool timer polls the adapter's
+        // `NotifyingFileSystemContext::should_notify` every 100 ms
+        // and drains pending `FILE_ACTION_REMOVED` events into
+        // the kernel. Without the timer, PowerShell / Explorer
+        // never learn that a file was deleted and the per-volume
+        // dir cache keeps reporting the deleted entry as
+        // present (`Test-Path` returns True after Remove-Item).
+        //
+        // 100 ms is the rclone mount's notification interval;
+        // small enough that a user typing `Remove-Item` sees the
+        // change within ~1 frame, large enough that the timer
+        // wakeup overhead is negligible on idle mounts.
+        //
+        // `new_with_timer` takes `FileSystemParams` (a superset
+        // of `VolumeParams`) rather than `VolumeParams`; we
+        // build it via `FileSystemParams::default_params(...)`
+        // which mirrors the `FileSystemHost::new` defaults.
+        let fs_params = winfsp::host::FileSystemParams::default_params(vol_params);
         // Annotate the type as `FileSystemHost<_, FineGuard>` so the
         // `start_with_threads` call below resolves to the FineGuard impl
         // (the CoarseGuard impl has the same signature and is also
         // visible, so unannotated inference fails with E0034).
         let mut host: winfsp::host::FileSystemHost<_, winfsp::host::FineGuard> =
-            winfsp::host::FileSystemHost::new(vol_params, adapter)
-                .map_err(|e| anyhow::anyhow!("FileSystemHost::new: {e}"))?;
+            winfsp::host::FileSystemHost::new_with_timer::<_, 100>(fs_params, adapter)
+                .map_err(|e| anyhow::anyhow!("FileSystemHost::new_with_timer: {e}"))?;
         tracing::debug!(
             mountpoint,
             "mount(windows): FileSystemHost::new returned; calling host.mount"
         );
-        host.mount(mountpoint)
-            .map_err(|e| anyhow::anyhow!("host.mount: {e}"))?;
+        host.mount(mountpoint).map_err(|e| {
+            // Issue #328: if the first `is_mount_point` poll raced
+            // past the live volume and we made it to host.mount,
+            // the Win32 kernel returns STATUS_OBJECT_NAME_COLLISION
+            // (0xC0000035). Surface a clear, actionable error
+            // naming the mountpoint instead of the raw NTSTATUS —
+            // mount-test.ps1 sub-test 13 greps stderr for the
+            // mountpoint path as part of its hard assertion.
+            anyhow::anyhow!(
+                "host.mount({mountpoint}) failed: {e}; \
+                 the drive letter is likely already mounted by another process. \
+                 Run `mntrs unmount {mountpoint}` first"
+            )
+        })?;
         tracing::debug!(
             mountpoint,
             "mount(windows): host.mount returned; calling host.start"
         );
+        // Issue #328 sanity check: `host.mount` returned Ok, so
+        // WinFSP thinks the drive letter is ours. Confirm that
+        // `QueryDosDeviceW` also sees the DOS device now — if it
+        // still reports ERROR_FILE_NOT_FOUND, something went wrong
+        // in the kernel-side mountpoint table update and the
+        // keep-alive loop below would hang without anyone able to
+        // talk to V:. Fail loudly so the operator sees a clean
+        // error instead of a silent hang.
+        #[cfg(windows)]
+        if !is_mount_point(mountpoint) {
+            return Err(anyhow!(
+                "host.mount({mountpoint}) returned Ok but the drive letter is \
+                 not visible to QueryDosDeviceW; the WinFSP kernel-side \
+                 mountpoint table may be in an inconsistent state. \
+                 Try `mntrs unmount {mountpoint}` and remount"
+            ));
+        }
         // Issue #249 follow-up: winfsp 0.13 split the old
         // `FspFileSystemStart` step into two — `host.mount` calls
         // `FspFileSystemSetMountPoint` (registers V: with the WinFSP
@@ -1576,9 +1869,22 @@ pub fn mount(
     unsafe {
         libc::atexit(cleanup);
     }
+    // Issue #305 Tier 2: switch from `libc::signal` to
+    // `sigaction` so the handler stays installed across the
+    // first invocation. macOS's libc::signal uses System-V
+    // semantics that reset the disposition to SIG_DFL on
+    // handler return — a second Ctrl+C (the natural user
+    // reaction when the first one appears to hang) silently
+    // kills the daemon, skipping mountpoint unmount + leaving
+    // mounts.txt stale. glibc 2.0+ switched to BSD-style
+    // persistent handlers, so Linux never caught this. SA_RESTART
+    // auto-restarts interrupted syscalls so the FUSE read loop
+    // doesn't return EINTR after a Ctrl+C the user didn't mean
+    // to send. On Windows this branch is unreachable (the
+    // libc::signal call below was already a no-op there).
     unsafe {
-        libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, handler as *const () as libc::sighandler_t);
+        install_sigaction(libc::SIGINT, handler);
+        install_sigaction(libc::SIGTERM, handler);
     }
 
     // Issue #305 Tier 1: route Windows console events through
@@ -1686,11 +1992,31 @@ pub fn mount(
                     return;
                 }
                 tracing::info!("signal received, unmounting...");
-                let _ = Command::new("fusermount3")
-                    .arg("-u")
-                    .arg(&mp)
-                    .status()
-                    .or_else(|_| Command::new("fusermount").arg("-u").arg(&mp).status());
+                // Issue #374: reuse the cfg-gated helpers from
+                // `unmount`. Vanilla macOS has no `fusermount*`
+                // binary, so the in-line shell-out was previously
+                // silently failing and leaking the mount on
+                // SIGINT/SIGTERM paths (the watcher thread is
+                // what runs in the Ctrl-C case). The macOS
+                // helper falls back to `umount(8)`; the
+                // non-macos unix helper is byte-identical to
+                // the pre-fix Linux chain.
+                //
+                // The signal-watcher `spawn()` block is inside
+                // `mount_internal`, which is module-level
+                // (compiles on Windows too) — same reason as
+                // `cleanup()` above. Use `cfg(all(unix,
+                // not(target_os = "macos")))` /
+                // `cfg(target_os = "macos")` to keep Windows
+                // untouched.
+                #[cfg(all(unix, not(target_os = "macos")))]
+                {
+                    let _ = crate::cmd::unmount::fuse_unmount_via_fusermount(&mp);
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = crate::cmd::unmount::fuse_unmount_macos_with_umount(&mp);
+                }
             })
             .ok();
 
@@ -1845,8 +2171,12 @@ fn apply_operator_with_tls(
 }
 
 async fn build_operator(storage_url: &str, opts: &HashMap<String, String>) -> Result<Operator> {
-    let url = url::Url::parse(storage_url)
-        .map_err(|e| anyhow!("invalid storage URL '{storage_url}': {e}"))?;
+    let url = url::Url::parse(storage_url).map_err(|e| {
+        anyhow!(
+            "invalid storage URL '{}': {e}",
+            crate::util::redact_storage_url(storage_url)
+        )
+    })?;
     match url.scheme() {
         #[cfg(not(feature = "sftp"))]
         "sftp" => Err(anyhow!(
@@ -2181,6 +2511,102 @@ extern "C" fn handler(_: i32) {
     SHUTDOWN_BY_SIGNAL.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Install a signal handler that persists across invocations.
+///
+/// Issue #305 Tier 2: `libc::signal()` on macOS uses System-V
+/// semantics that reset the disposition to `SIG_DFL` on handler
+/// return. A second Ctrl+C — the natural user reaction when the
+/// first one appears to hang — silently kills the daemon, skipping
+/// the FUSE unmount and leaving a stale `mounts.txt` entry behind.
+/// glibc 2.0+ switched to BSD-style persistent handlers, so Linux
+/// never caught this. `sigaction` with `SA_RESTART` gives BSD-style
+/// persistence plus auto-restart of interrupted syscalls (so a
+/// Ctrl+C the user didn't mean to send doesn't bubble EINTR up to
+/// the FUSE read loop).
+///
+/// Gated on `#[cfg(unix)]`: `libc::sigaction` / `sigemptyset` /
+/// `sigaddset` / `SA_RESTART` are POSIX-only and don't exist in the
+/// libc crate's Windows target. Windows is unaffected by the
+/// System-V-vs-BSD issue (it never used libc::signal for console
+/// events — those go through `windows::Win32::System::Console`,
+/// which is wired up just above the call site), so the Windows
+/// fallback delegates to the original `libc::signal` call to keep
+/// behaviour byte-identical to pre-fix.
+///
+/// # Safety
+///
+/// `signo` must be a valid signal number (typically `SIGINT` /
+/// `SIGTERM`). `handler` must be a pointer to a function with the
+/// `extern "C" fn(i32)` ABI that is safe to call from a signal
+/// context — only async-signal-safe operations inside.
+#[cfg(unix)]
+unsafe fn install_sigaction(signo: i32, handler: extern "C" fn(i32)) {
+    // SAFETY: `sa_sigaction` is the C function-pointer field of
+    // `sigaction`; the libc bindings require a `sighandler_t` (a
+    // pointer-sized fn-ptr cast). `libc::SIG_DFL` / `SIG_IGN` are
+    // the two magic values; supplying a real fn-ptr is the
+    // standard "install handler" idiom.
+    let handler_ptr = handler as *const () as libc::sighandler_t;
+    // SAFETY: zeroing a `libc::sigaction` is the standard
+    // initialization idiom — every field has a meaningful zero
+    // (`sa_mask` = empty set, `sa_flags` = 0, `sa_sigaction` =
+    // `SIG_DFL`). Edition 2024 requires explicit `unsafe { }`
+    // around unsafe ops even inside an `unsafe fn`.
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = handler_ptr;
+    // SAFETY: `sa_mask` is a `sigset_t`; zero-initializing it via
+    // `sigemptyset` is the standard idiom for "no extra signals
+    // masked during handler execution". `sigaddset` is the only
+    // mutator we need.
+    unsafe {
+        libc::sigemptyset(&mut sa.sa_mask);
+        // Don't block SIGTERM while handling SIGINT (or vice
+        // versa) — a user pressing Ctrl+C twice in quick
+        // succession would otherwise delay the second delivery
+        // by up to one signal mask re-evaluation.
+        libc::sigaddset(&mut sa.sa_mask, libc::SIGINT);
+        libc::sigaddset(&mut sa.sa_mask, libc::SIGTERM);
+    }
+    // SA_RESTART: auto-restart interrupted syscalls so the FUSE
+    // read/write loop doesn't return EINTR to callers after a
+    // benign Ctrl+C. Without it, every read/write needs an
+    // explicit EINTR retry, and a missed EINTR surfaces as a
+    // spurious short-read to the application.
+    sa.sa_flags = libc::SA_RESTART;
+    // SAFETY: `signo` is validated by the caller; `sa` is fully
+    // initialized (zeroed, sigaction set, mask set, flags set).
+    // `libc::sigaction` returns 0 on success and -1 on error; we
+    // don't propagate the failure because a non-critical signal
+    // installation shouldn't fail the mount — pre-fix the
+    // `libc::signal` call also ignored its return value.
+    unsafe {
+        let ret = libc::sigaction(signo, &sa, std::ptr::null_mut());
+        if ret != 0 {
+            tracing::warn!(
+                signo,
+                error = %std::io::Error::last_os_error(),
+                "install_sigaction failed; falling back to default disposition"
+            );
+        }
+    }
+}
+
+/// Windows fallback for `install_sigaction`. The POSIX signal API
+/// doesn't exist on Windows (no `sigaction` / `sigemptyset` /
+/// `SA_RESTART` in the libc crate's Windows target). Windows
+/// console events go through `windows::Win32::System::Console`
+/// (wired up just above the call site in `mount_internal`), so
+/// this is effectively a no-op stub that preserves the original
+/// `libc::signal` semantics for the rare `taskkill /F` path that
+/// does deliver a real `SIGTERM` to a non-console-attached
+/// process. Behaviour is byte-identical to pre-fix.
+#[cfg(not(unix))]
+unsafe fn install_sigaction(signo: i32, handler: extern "C" fn(i32)) {
+    unsafe {
+        libc::signal(signo, handler as *const () as libc::sighandler_t);
+    }
+}
+
 async fn build_webdav(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
     // Prefer explicit --opt endpoint over URL-derived host.
     // When no endpoint opt is given, derive from the URL host
@@ -2272,19 +2698,69 @@ mod tests_261_2 {
     use super::{MOUNT_CACHE_DIR, cache_dir_for_mount};
 
     /// Sanity: the legacy fallback path is unchanged from pre-#261.2.
-    /// CLI `mntrs mount /a/pvc` still gets `/tmp/mntrs-csi-cache/_a_pvc`.
+    /// CLI `mntrs mount /a/pvc` still gets the canonical cache
+    /// directory. Pre-Issue #382 the path was `/tmp/mntrs-csi-cache/...`
+    /// on every platform; post-#382 macOS uses the per-user `$TMPDIR`
+    /// base (cross-user temp-leak fix) while Linux / other unix keep
+    /// the original `/tmp` base.
     #[test]
     fn cache_dir_for_mount_cli_fallback_unchanged() {
         let path = cache_dir_for_mount("/a/pvc-1/globalmount");
-        assert_eq!(path, "/tmp/mntrs-csi-cache/_a_pvc-1_globalmount");
+        #[cfg(target_os = "macos")]
+        let expected = {
+            let base = std::env::var("TMPDIR")
+                .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string());
+            format!(
+                "{}/mntrs-csi-cache/_a_pvc-1_globalmount",
+                base.trim_end_matches('/')
+            )
+        };
+        #[cfg(not(target_os = "macos"))]
+        let expected = "/tmp/mntrs-csi-cache/_a_pvc-1_globalmount";
+        assert_eq!(path, expected);
     }
 
     /// Mountpoint with drive-letter colon (Windows-path-style mountpoint).
     /// Replacement turns `:` into `_` so the suffix is fs-safe.
+    /// (Issue #382 only changes the base directory; the suffix
+    /// derivation is the same on every platform.)
     #[test]
     fn cache_dir_for_mount_colon_replaced() {
         let path = cache_dir_for_mount("C:/mnt");
-        assert_eq!(path, "/tmp/mntrs-csi-cache/C__mnt");
+        #[cfg(target_os = "macos")]
+        let expected = {
+            let base = std::env::var("TMPDIR")
+                .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string());
+            format!("{}/mntrs-csi-cache/C__mnt", base.trim_end_matches('/'))
+        };
+        #[cfg(not(target_os = "macos"))]
+        let expected = "/tmp/mntrs-csi-cache/C__mnt";
+        assert_eq!(path, expected);
+    }
+
+    /// Issue #382: on macOS the cache-dir base is `$TMPDIR` (per-user,
+    /// mode 0700 under `/var/folders/.../T/`), not `/tmp` (which
+    /// resolves to `/private/tmp`, mode 1777, shared across users).
+    /// This test asserts the contract: the returned path's base is
+    /// NOT `/tmp` on macOS.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cache_dir_for_mount_macos_uses_per_user_temp() {
+        let path = cache_dir_for_mount("/some/mount");
+        // Sanity: must not leak into the shared /tmp tree.
+        assert!(
+            !path.starts_with("/tmp/"),
+            "macOS cache_dir_for_mount must not start with /tmp (got {path})"
+        );
+        // Sanity: must land under TMPDIR (or temp_dir fallback) and
+        // carry the canonical suffix.
+        let expected_base = std::env::var("TMPDIR")
+            .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string());
+        let expected_prefix = format!("{}/mntrs-csi-cache/", expected_base.trim_end_matches('/'));
+        assert!(
+            path.starts_with(&expected_prefix),
+            "macOS cache_dir_for_mount must start with {expected_prefix} (got {path})"
+        );
     }
 
     /// Issue #261.2 core: register mountpoint→cache_dir in the global
@@ -2334,10 +2810,18 @@ mod tests_261_2 {
         }
         .unwrap_or_else(|| cache_dir_for_mount(mp));
         assert_eq!(resolved, cache_dir_for_mount(mp));
-        assert_eq!(
-            resolved,
-            "/tmp/mntrs-csi-cache/_tmp_never-registered-mountpoint"
-        );
+        #[cfg(target_os = "macos")]
+        let expected_suffix = {
+            let base = std::env::var("TMPDIR")
+                .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string());
+            format!(
+                "{}/mntrs-csi-cache/_tmp_never-registered-mountpoint",
+                base.trim_end_matches('/')
+            )
+        };
+        #[cfg(not(target_os = "macos"))]
+        let expected_suffix = "/tmp/mntrs-csi-cache/_tmp_never-registered-mountpoint";
+        assert_eq!(resolved, expected_suffix);
     }
 
     /// Map entry wins even if helper would compute a different value.
@@ -2346,9 +2830,25 @@ mod tests_261_2 {
     #[test]
     fn mount_cache_dir_entry_wins_over_helper() {
         let mp = "/mnt/csi/pvc-abc";
-        // Helper would compute: /tmp/mntrs-csi-cache/_mnt_csi_pvc-abc
+        // Helper would compute: the suffix is `_mnt_csi_pvc-abc` on
+        // every platform; the base directory differs on macOS
+        // (Issue #382) so we accept either `/tmp/mntrs-csi-cache/` or
+        // `<TMPDIR>/mntrs-csi-cache/` as the helper output.
         let helper_path = cache_dir_for_mount(mp);
-        assert!(helper_path.starts_with("/tmp/mntrs-csi-cache/"));
+        assert!(
+            helper_path.ends_with("/mntrs-csi-cache/_mnt_csi_pvc-abc"),
+            "helper path should carry canonical suffix (got {helper_path})"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            !helper_path.starts_with("/tmp/"),
+            "macOS helper must not land in shared /tmp (got {helper_path})"
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert!(
+            helper_path.starts_with("/tmp/mntrs-csi-cache/"),
+            "non-macOS helper should land in /tmp/mntrs-csi-cache (got {helper_path})"
+        );
         // CSI registers: /var/lib/mntrs/cache/<encoded_volume_id>
         let csi_path = "/var/lib/mntrs/cache/_s3_bucket_prefix";
         if let Ok(mut map) = MOUNT_CACHE_DIR.lock() {
@@ -2366,5 +2866,141 @@ mod tests_261_2 {
         if let Ok(mut map) = MOUNT_CACHE_DIR.lock() {
             map.remove(mp);
         }
+    }
+
+    // ── Issue #384: record_mount / remove_mount agree on canonical form ──
+    //
+    // Pre-#384: `record_mount` wrote the raw user-supplied mountpoint to
+    // `mounts.txt`, and `remove_mount` filtered on byte-equality against
+    // the raw user-supplied mountpoint. On macOS `/tmp/foo` and
+    // `/private/tmp/foo` are byte-different, so a mount-via-one-form /
+    // unmount-via-the-other-form round trip left a stale entry.
+    //
+    // These tests build a symlink under a tempdir, register the mount
+    // through one of the two forms, then ask `remove_mount` to clean it
+    // up via the *other* form. Post-#384 both callsites canonicalize, so
+    // the row matches and the file ends up empty (or at least stripped
+    // of the registered row).
+    //
+    // We redirect `HOME` to the tempdir so the `mounts_db()` path lands
+    // inside it — `mounts_db()` consults `HOME` / `XDG_DATA_HOME` and we
+    // don't want to pollute the developer's real `~/.local/share/mntrs/`.
+
+    use super::{record_mount, remove_mount};
+    // `std::os::unix::fs::symlink` is only available on unix. The
+    // two tests that use it are already `#[cfg(unix)]`-gated, but
+    // the `use` itself needs its own gate so a Windows build
+    // doesn't choke on the unresolved import (CI run 28526350657).
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    /// Mount via the canonical form, remove via the symlinked form.
+    /// Post-fix this must succeed (the recorded row is in canonical
+    /// form; the filter canonicalizes the request too — they match).
+    #[cfg(unix)]
+    #[test]
+    fn record_remove_symlink_agreement_canonical_then_symlinked() {
+        let _env_lock = crate::util::tests_env_mutex();
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: set_var/remove_var are unsafe in recent rustc. The
+        // mutex above serializes against any other test touching HOME.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+        // Two real dirs joined by a symlink, mimicking /tmp → /private/tmp.
+        let real = home.path().join("real");
+        let link_dir = home.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(&link_dir).unwrap();
+        let target = real.join("mnt");
+        let alias = link_dir.join("mnt");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &alias).unwrap();
+
+        // Canonicalize the target up-front. On macOS `tempdir()` lives
+        // under `/var/folders/...` which is itself a symlink to
+        // `/private/var/folders/...` — `record_mount` runs
+        // `fs::canonicalize` on the input, so the recorded row will
+        // be the canonical form, not the raw `target` string. Assert
+        // against the canonical form so the test reflects what the
+        // implementation actually writes.
+        let canon = std::fs::canonicalize(&target)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        // Record using the canonical form (real path).
+        record_mount("memory:///", target.to_str().unwrap(), false);
+        let db = crate::cmd::mount::mounts_db_path();
+        let contents = std::fs::read_to_string(&db).unwrap();
+        assert!(
+            contents
+                .lines()
+                .any(|l| l.split('\0').nth(1) == Some(canon.as_str())),
+            "recorded row should carry canonical mountpoint {canon:?} (got {contents:?})"
+        );
+        // Remove using the symlinked form (alias). Pre-#384 this would
+        // miss because the recorded row is canonical but the filter
+        // looks for the raw symlinked form.
+        remove_mount(alias.to_str().unwrap());
+        let after = std::fs::read_to_string(&db).unwrap_or_default();
+        assert!(
+            !after
+                .lines()
+                .any(|l| l.split('\0').nth(1) == Some(canon.as_str())),
+            "remove_mount must strip the canonical row even when called with the symlinked form (after: {after:?})"
+        );
+    }
+
+    /// Mount via the symlinked form, remove via the canonical form.
+    /// Same shape as the previous test, exercising the opposite
+    /// direction. After #384 both ends canonicalize, so the row
+    /// matches in either order.
+    #[cfg(unix)]
+    #[test]
+    fn record_remove_symlink_agreement_symlinked_then_canonical() {
+        let _env_lock = crate::util::tests_env_mutex();
+        let home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+        let real = home.path().join("real");
+        let link_dir = home.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(&link_dir).unwrap();
+        let target = real.join("mnt");
+        let alias = link_dir.join("mnt");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &alias).unwrap();
+
+        // Record using the symlinked form (alias). `record_mount`
+        // canonicalizes internally, so the row stored is the
+        // canonical form.
+        record_mount("memory:///", alias.to_str().unwrap(), false);
+        let db = crate::cmd::mount::mounts_db_path();
+        let contents = std::fs::read_to_string(&db).unwrap();
+        // `record_mount` canonicalizes; both the symlinked and the
+        // canonical inputs collapse to the same stored form.
+        let canon = std::fs::canonicalize(&target)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            contents
+                .lines()
+                .any(|l| l.split('\0').nth(1) == Some(canon.as_str())),
+            "recorded row should carry canonical mountpoint {canon:?} (got {contents:?})"
+        );
+        // Remove using the canonical form directly. Should match.
+        remove_mount(&canon);
+        let after = std::fs::read_to_string(&db).unwrap_or_default();
+        assert!(
+            !after
+                .lines()
+                .any(|l| l.split('\0').nth(1) == Some(canon.as_str())),
+            "remove_mount(canonical) must strip the row (after: {after:?})"
+        );
     }
 }
