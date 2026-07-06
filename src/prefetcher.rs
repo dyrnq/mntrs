@@ -44,6 +44,37 @@ pub struct PartQueue {
     cancelled: Arc<AtomicBool>,
 }
 
+/// Outcome of [`PartQueue::push`].
+///
+/// Replaces the older `Result<(), String>` return so callers can
+/// distinguish overlap (recoverable — advance `offset` and retry) from
+/// cancellation / queue-full (exit or park respectively). See issue
+/// #413 for the bug the old shape caused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// Part inserted.
+    Ok,
+    /// Cancellation was signaled; the queue is terminal.
+    Cancelled,
+    /// Queue is full for this part's size; caller should park on the
+    /// condvar and retry.
+    Full,
+    /// New part's offset overlaps the previous part's tail. The part
+    /// was NOT inserted. Caller should advance its offset to
+    /// `back_end` (the previous part's actual end) so the next
+    /// iteration starts past the overlap.
+    Overlap { back_end: u64 },
+}
+
+impl PushOutcome {
+    /// Convenience for callers that just want a "did it land" bool.
+    /// Treats Ok as true; everything else (Cancelled / Full / Overlap)
+    /// as false. The original `Result::is_ok()` semantics.
+    pub fn is_ok(&self) -> bool {
+        matches!(self, PushOutcome::Ok)
+    }
+}
+
 impl PartQueue {
     pub fn new(max_bytes: u64, cancelled: Arc<AtomicBool>) -> Self {
         Self {
@@ -74,36 +105,43 @@ impl PartQueue {
         self.current_bytes + len > self.max_bytes
     }
 
-    /// Non-blocking insert. Returns `Err("prefetcher cancelled")` if
-    /// the queue is terminal (checked first, so a cancel always wins
-    /// over a full-queue retry), or `Err("queue full")` if there is no
-    /// room. The caller is expected to have checked `is_full_for` /
-    /// `is_terminal` and parked on the `Condvar` if needed; the
-    /// re-checks here close the cancel-race window between the
-    /// caller's check and the insert.
-    pub fn push(&mut self, part: Part) -> Result<(), String> {
+    /// Non-blocking insert. Returns a [`PushOutcome`] indicating one of:
+    ///   - [`PushOutcome::Ok`] — part inserted; queue state updated.
+    ///   - [`PushOutcome::Cancelled`] — cancellation was signaled; the
+    ///     queue is terminal and the caller should exit.
+    ///   - [`PushOutcome::Full`] — queue is full for this part's size;
+    ///     caller should park on the [`Condvar`] and retry.
+    ///   - [`PushOutcome::Overlap`] — new part's offset overlaps the
+    ///     previous part's tail. The part was NOT inserted; queue
+    ///     state is unchanged. Caller should advance its `offset` to
+    ///     `back_end` and continue. Treating overlap as terminal here
+    ///     would silently downgrade every FUSE read to a direct
+    ///     remote fetch once the overlap fired (issue #413), so this
+    ///     case is distinct from the cancel/full exits.
+    ///
+    /// Callers are expected to pre-check `is_full_for` / `is_terminal`
+    /// and park on the [`Condvar`] if needed; the re-checks here close
+    /// the cancel-race window between the caller's check and the insert.
+    pub fn push(&mut self, part: Part) -> PushOutcome {
         if self.is_terminal() {
-            return Err("prefetcher cancelled".to_string());
+            return PushOutcome::Cancelled;
         }
         if self.is_full_for(part.data.len() as u64) {
-            return Err("queue full".to_string());
+            return PushOutcome::Full;
         }
         // Audit #3 / PR #405: reject overlapping/duplicate offsets
-        // so the FUSE read path can't serve stale data. The
-        // download thread is supposed to advance `offset` past the
-        // previous part's end before issuing the next read, but a
-        // short read combined with the skip-on-reserve-failure
-        // path (`offset += shrunk`) can land two parts covering the
-        // same range. Returning Err here lets the caller treat it
-        // like a terminal push (advance offset, continue) without
-        // poisoning the queue.
+        // so the FUSE read path can't serve stale data. The download
+        // thread is supposed to advance `offset` past the previous
+        // part's end before issuing the next read, but a short read
+        // combined with the skip-on-reserve-failure path
+        // (`offset += shrunk`) can land two parts covering the same
+        // range. Returning `Overlap` here lets the caller advance
+        // `offset` to `back_end` and continue without poisoning the
+        // queue or killing the download thread.
         if let Some(back) = self.parts.back() {
             let back_end = back.offset + back.data.len() as u64;
             if part.offset < back_end {
-                return Err(format!(
-                    "overlapping offset: new part starts at {} but previous part ends at {}",
-                    part.offset, back_end
-                ));
+                return PushOutcome::Overlap { back_end };
             }
         }
         // Order matters: `push_back` first so any panic on
@@ -116,7 +154,7 @@ impl PartQueue {
         // poison.
         self.parts.push_back(part);
         self.current_bytes += self.parts.back().unwrap().data.len() as u64;
-        Ok(())
+        PushOutcome::Ok
     }
 
     pub fn pop(&mut self, offset: u64) -> Option<Part> {
@@ -220,6 +258,28 @@ pub struct HandlePrefetcher {
 /// Split out of the download loop to keep the try_reserve/success/
 /// shrink branching readable; the function itself is straight-line
 /// (read → push with condvar backpressure, same as the pre-#201
+/// Outcome of `read_and_push` — what the spawn loop should do with
+/// its `offset` and reservation bookkeeping.
+#[derive(Debug)]
+enum ReadAndPushOutcome {
+    /// Part was read and inserted; the caller should advance
+    /// `offset` to the requested end of the read and continue.
+    Ok,
+    /// Cancellation was signaled (either via the cancel flag or the
+    /// queue was already terminal on entry). Caller should release
+    /// its reservation and break out of the download loop.
+    Cancelled,
+    /// The read happened but `push` rejected the part because its
+    /// offset overlapped the previous part's tail. The part was NOT
+    /// inserted; the queue state is unchanged. Caller should release
+    /// its reservation and advance `offset` to `back_end` (the
+    /// previous part's actual end) so the next iteration starts past
+    /// the overlap. The download thread does NOT die — treating
+    /// overlap as terminal silently downgrades every FUSE read to a
+    /// direct remote fetch once the overlap fires (issue #413).
+    Overlap { back_end: u64 },
+}
+
 /// loop body).
 #[allow(clippy::too_many_arguments)]
 fn read_and_push(
@@ -232,7 +292,7 @@ fn read_and_push(
     q: &Arc<Mutex<PartQueue>>,
     cv: &Arc<Condvar>,
     record_fetched: bool,
-) -> bool {
+) -> ReadAndPushOutcome {
     let t0 = Instant::now();
     let result = crate::rt().block_on(async { op.read_with(path).range(offset..end).await });
     let elapsed = t0.elapsed();
@@ -244,7 +304,7 @@ fn read_and_push(
                 p.into_inner()
             });
             qlock.set_error(format!("prefetch read failed: {e}"));
-            return false;
+            return ReadAndPushOutcome::Cancelled;
         }
     };
     let part = Part {
@@ -271,20 +331,39 @@ fn read_and_push(
     // instead of inserting into a queue nobody will read.
     loop {
         if qlock.is_terminal() {
-            return false;
+            return ReadAndPushOutcome::Cancelled;
         }
         if qlock.is_full_for(part_len) {
             qlock = cv.wait(qlock).unwrap();
             continue;
         }
         // Room available. `push` re-checks terminal (cancel may
-        // have raced in between `is_terminal` and here); treat its
-        // Err as terminal so we exit cleanly without panicking on
-        // the race.
-        if qlock.push(part).is_err() {
-            return false;
+        // have raced in between `is_terminal` and here). The four
+        // outcomes map to distinct spawn-loop actions: Ok and
+        // Overlap are recoverable (the download thread continues);
+        // Cancelled and Full exit / park respectively.
+        match qlock.push(part.clone()) {
+            PushOutcome::Ok => return ReadAndPushOutcome::Ok,
+            PushOutcome::Cancelled => return ReadAndPushOutcome::Cancelled,
+            PushOutcome::Full => {
+                // is_full_for was just false; another producer raced
+                // in and filled the queue. Park and retry — the
+                // condvar will notify when a FUSE `pop` frees room.
+                // `Part` is cheap to clone (Bytes is refcounted) so
+                // it's safe to push again after the wait.
+                qlock = cv.wait(qlock).unwrap();
+                continue;
+            }
+            PushOutcome::Overlap { back_end } => {
+                tracing::debug!(
+                    target: "prefetcher",
+                    part_offset = offset,
+                    back_end,
+                    "dropping overlapping part; download thread will advance offset"
+                );
+                return ReadAndPushOutcome::Overlap { back_end };
+            }
         }
-        return true;
     }
 }
 
@@ -400,7 +479,7 @@ impl HandlePrefetcher {
                     // both see a matching counter.
                     inflight.fetch_add(shrunk, std::sync::atomic::Ordering::Relaxed);
                     let shrunk_end = (offset + shrunk).min(file_size);
-                    if !read_and_push(
+                    match read_and_push(
                         &op,
                         &path,
                         offset,
@@ -411,13 +490,31 @@ impl HandlePrefetcher {
                         &cv,
                         offset > 0,
                     ) {
-                        // Read failed or terminal; release the
-                        // reservation we just made and exit.
-                        inflight.fetch_sub(shrunk, std::sync::atomic::Ordering::Relaxed);
-                        ml.release("prefetch", shrunk);
-                        break 'download;
+                        ReadAndPushOutcome::Ok => {
+                            offset = shrunk_end;
+                        }
+                        ReadAndPushOutcome::Cancelled => {
+                            // Read failed or terminal; release the
+                            // reservation we just made and exit.
+                            inflight.fetch_sub(shrunk, std::sync::atomic::Ordering::Relaxed);
+                            ml.release("prefetch", shrunk);
+                            break 'download;
+                        }
+                        ReadAndPushOutcome::Overlap { back_end } => {
+                            // The part we read was redundant (its
+                            // range was already covered by an earlier
+                            // push). Drop the reservation and jump
+                            // past the overlap — `back_end` is the
+                            // exact end of the existing coverage, so
+                            // it's a strictly-better next-offset than
+                            // `shrunk_end` (which would land inside
+                            // the overlap if the earlier part was a
+                            // short read).
+                            inflight.fetch_sub(shrunk, std::sync::atomic::Ordering::Relaxed);
+                            ml.release("prefetch", shrunk);
+                            offset = back_end;
+                        }
                     }
-                    offset = shrunk_end;
                     continue;
                 }
                 // Normal path: reservation succeeded.
@@ -433,14 +530,23 @@ impl HandlePrefetcher {
                 if consecutive_successes >= 4 {
                     bp.set_mem_pressure(false);
                 }
-                if !read_and_push(&op, &path, offset, end, chunk, &bp, &q, &cv, offset > 0) {
-                    // Read failed or terminal; release the
-                    // reservation we just made and exit.
-                    inflight.fetch_sub(chunk, std::sync::atomic::Ordering::Relaxed);
-                    ml.release("prefetch", chunk);
-                    break 'download;
+                match read_and_push(&op, &path, offset, end, chunk, &bp, &q, &cv, offset > 0) {
+                    ReadAndPushOutcome::Ok => {
+                        offset = end;
+                    }
+                    ReadAndPushOutcome::Cancelled => {
+                        // Read failed or terminal; release the
+                        // reservation we just made and exit.
+                        inflight.fetch_sub(chunk, std::sync::atomic::Ordering::Relaxed);
+                        ml.release("prefetch", chunk);
+                        break 'download;
+                    }
+                    ReadAndPushOutcome::Overlap { back_end } => {
+                        inflight.fetch_sub(chunk, std::sync::atomic::Ordering::Relaxed);
+                        ml.release("prefetch", chunk);
+                        offset = back_end;
+                    }
                 }
-                offset = end;
             }
             q.lock()
                 .unwrap_or_else(|p| {
@@ -597,11 +703,13 @@ mod tests {
     #[test]
     fn test_part_queue_push_pop() {
         let mut q = PartQueue::new(1024, false_flag());
-        q.push(Part {
-            offset: 0,
-            data: Bytes::from(vec![0u8; 100]),
-        })
-        .unwrap();
+        assert!(matches!(
+            q.push(Part {
+                offset: 0,
+                data: Bytes::from(vec![0u8; 100]),
+            }),
+            PushOutcome::Ok
+        ));
         let part = q.pop(0).unwrap();
         assert_eq!(part.offset, 0);
         assert_eq!(part.data.len(), 100);
@@ -618,11 +726,13 @@ mod tests {
     #[test]
     fn test_part_queue_discard_stale() {
         let mut q = PartQueue::new(1024, false_flag());
-        q.push(Part {
-            offset: 0,
-            data: Bytes::from(vec![0u8; 50]),
-        })
-        .unwrap();
+        assert!(matches!(
+            q.push(Part {
+                offset: 0,
+                data: Bytes::from(vec![0u8; 50]),
+            }),
+            PushOutcome::Ok
+        ));
         q.set_finished();
         // Pop at offset past the front — discards stale
         let part = q.pop(100);
@@ -649,21 +759,27 @@ mod tests {
     #[test]
     fn test_part_queue_multiple_parts() {
         let mut q = PartQueue::new(1024, false_flag());
-        q.push(Part {
-            offset: 0,
-            data: Bytes::from(vec![0u8; 100]),
-        })
-        .unwrap();
-        q.push(Part {
-            offset: 100,
-            data: Bytes::from(vec![1u8; 100]),
-        })
-        .unwrap();
-        q.push(Part {
-            offset: 200,
-            data: Bytes::from(vec![2u8; 100]),
-        })
-        .unwrap();
+        assert!(matches!(
+            q.push(Part {
+                offset: 0,
+                data: Bytes::from(vec![0u8; 100]),
+            }),
+            PushOutcome::Ok
+        ));
+        assert!(matches!(
+            q.push(Part {
+                offset: 100,
+                data: Bytes::from(vec![1u8; 100]),
+            }),
+            PushOutcome::Ok
+        ));
+        assert!(matches!(
+            q.push(Part {
+                offset: 200,
+                data: Bytes::from(vec![2u8; 100]),
+            }),
+            PushOutcome::Ok
+        ));
 
         let p2 = q.pop(150).unwrap();
         assert_eq!(p2.offset, 100);
@@ -674,37 +790,88 @@ mod tests {
     /// the previous part. Without this guard the FUSE read path can
     /// serve stale data if the downloader lands two parts covering
     /// the same byte range (short read + skip-on-reserve-failure).
+    /// Issue #413: the rejection is `PushOutcome::Overlap { back_end }`
+    /// so the spawn loop can advance `offset` to `back_end` and
+    /// continue instead of killing the download thread.
     #[test]
     fn test_part_queue_rejects_overlapping_offset() {
         let mut q = PartQueue::new(1024, false_flag());
-        q.push(Part {
-            offset: 0,
-            data: Bytes::from(vec![0u8; 100]),
-        })
-        .unwrap();
-        // Same offset as the back's start → exact duplicate.
-        let err = q
-            .push(Part {
+        assert!(matches!(
+            q.push(Part {
                 offset: 0,
-                data: Bytes::from(vec![1u8; 50]),
-            })
-            .unwrap_err();
-        assert!(err.contains("overlapping offset"), "got: {err}");
+                data: Bytes::from(vec![0u8; 100]),
+            }),
+            PushOutcome::Ok
+        ));
+        // Same offset as the back's start → exact duplicate.
+        let overlap = q.push(Part {
+            offset: 0,
+            data: Bytes::from(vec![1u8; 50]),
+        });
+        assert!(
+            matches!(overlap, PushOutcome::Overlap { back_end: 100 }),
+            "expected Overlap {{ back_end: 100 }}, got: {overlap:?}"
+        );
         // Offset inside the previous range (50..149) → partial overlap.
-        let err = q
-            .push(Part {
-                offset: 50,
-                data: Bytes::from(vec![2u8; 50]),
-            })
-            .unwrap_err();
-        assert!(err.contains("overlapping offset"), "got: {err}");
+        let overlap = q.push(Part {
+            offset: 50,
+            data: Bytes::from(vec![2u8; 50]),
+        });
+        assert!(
+            matches!(overlap, PushOutcome::Overlap { back_end: 100 }),
+            "expected Overlap {{ back_end: 100 }}, got: {overlap:?}"
+        );
         // Offset at the previous part's end boundary (== 100) is
         // allowed (the new part starts where the previous one ended).
-        q.push(Part {
-            offset: 100,
-            data: Bytes::from(vec![3u8; 50]),
-        })
-        .unwrap();
+        assert!(matches!(
+            q.push(Part {
+                offset: 100,
+                data: Bytes::from(vec![3u8; 50]),
+            }),
+            PushOutcome::Ok
+        ));
+    }
+
+    /// Issue #413: `Overlap` must NOT mutate the queue. A FUSE worker
+    /// that arrives between the overlap attempt and the spawn loop's
+    /// `offset = back_end` must still see the original part. Verify
+    /// `current_bytes` and `parts.len()` are unchanged across repeated
+    /// overlap attempts, and the surviving part still pops correctly.
+    #[test]
+    fn test_part_queue_overlap_does_not_mutate_queue() {
+        let mut q = PartQueue::new(1024, false_flag());
+        assert!(matches!(
+            q.push(Part {
+                offset: 0,
+                data: Bytes::from(vec![0u8; 100]),
+            }),
+            PushOutcome::Ok
+        ));
+        let before_bytes = q.current_bytes();
+        let before_len = q.parts.len();
+        // Two overlap attempts — neither should insert.
+        let _ = q.push(Part {
+            offset: 0,
+            data: Bytes::from(vec![1u8; 50]),
+        });
+        let _ = q.push(Part {
+            offset: 99,
+            data: Bytes::from(vec![2u8; 50]),
+        });
+        assert_eq!(
+            q.current_bytes(),
+            before_bytes,
+            "current_bytes must not change on overlap"
+        );
+        assert_eq!(
+            q.parts.len(),
+            before_len,
+            "parts.len() must not change on overlap"
+        );
+        // The only part should still pop with the original offset/len.
+        let p = q.pop(0).unwrap();
+        assert_eq!(p.offset, 0);
+        assert_eq!(p.data.len(), 100);
     }
 
     /// Audit #3 / PR #405: recovering from a poisoned mutex must
@@ -742,23 +909,23 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         let mut q = PartQueue::new(100, flag.clone());
         // Fill the queue to capacity.
-        q.push(Part {
-            offset: 0,
-            data: Bytes::from(vec![0u8; 100]),
-        })
-        .unwrap();
-        // Now cancel — next push should fail
+        assert!(matches!(
+            q.push(Part {
+                offset: 0,
+                data: Bytes::from(vec![0u8; 100]),
+            }),
+            PushOutcome::Ok
+        ));
+        // Now cancel — next push should return Cancelled
         // immediately instead of spinning.
         flag.store(true, Ordering::Relaxed);
-        let err = q
-            .push(Part {
-                offset: 100,
-                data: Bytes::from(vec![0u8; 50]),
-            })
-            .unwrap_err();
+        let outcome = q.push(Part {
+            offset: 100,
+            data: Bytes::from(vec![0u8; 50]),
+        });
         assert!(
-            err.contains("cancelled"),
-            "expected cancelled error, got: {err}"
+            matches!(outcome, PushOutcome::Cancelled),
+            "expected Cancelled, got: {outcome:?}"
         );
     }
 
@@ -776,14 +943,13 @@ mod tests {
         let queue = Arc::new(Mutex::new(PartQueue::new(8, cancelled.clone())));
 
         // First part (8 bytes) fills the queue exactly.
-        queue
-            .lock()
-            .unwrap()
-            .push(Part {
+        assert!(matches!(
+            queue.lock().unwrap().push(Part {
                 offset: 0,
                 data: Bytes::from(vec![0u8; 8]),
-            })
-            .unwrap();
+            }),
+            PushOutcome::Ok
+        ));
 
         let q2 = queue.clone();
         let cv2 = cond.clone();
@@ -805,7 +971,11 @@ mod tests {
                     qlock = cv2.wait(qlock).unwrap();
                     continue;
                 }
-                qlock.push(part).ok();
+                // The loop invariants (not terminal, not full) make
+                // this `Ok`; other outcomes would only fire on a
+                // concurrent state change which this single-producer
+                // test can't induce.
+                let _ = qlock.push(part);
                 return true;
             }
         });
