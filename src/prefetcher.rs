@@ -320,16 +320,19 @@ impl HandlePrefetcher {
         // very first prefetch chunk equal to the prior fixed value
         // (no first-read regression) while letting the window grow or
         // shrink based on consumer rate vs producer rate thereafter.
-        let first_chunk = chunk_size;
-        // Audit #3 / PR #405: respect the configured min_window
-        // instead of hardcoding 128 KiB. A controller built with
-        // `with_window(64 * 1024, ...)` should be able to shrink
-        // chunks to 64 KiB under memory pressure; the previous
-        // hardcoded 128 KiB floor made `try_reserve(128 KiB)` fail
-        // and skipped the chunk even when a 64 KiB fetch would have
-        // fit.
+        // Audit #3 / PR #405: respect the controller's configured
+        // min/max_window so a caller-supplied `chunk_size` outside
+        // the configured range doesn't bypass the backpressure
+        // contract. A controller built with `with_window(64*KiB, ...)`
+        // should be able to shrink the first chunk to 64 KiB; the
+        // previous hardcoded 128 KiB floor made `try_reserve(128 KiB)`
+        // fail and skipped the chunk even when a 64 KiB fetch would
+        // have fit. Same logic at the upper end — a `chunk_size`
+        // greater than the controller's `bp_max_window` defeats the
+        // configured ceiling.
         let bp_min_window: u64 = backpressure.min_window();
         let bp_max_window: u64 = backpressure.max_window();
+        let first_chunk = chunk_size.clamp(bp_min_window, bp_max_window);
         std::thread::spawn(move || {
             let mut offset = 0u64;
             // Issue #201: counter for hysteresis. Reset on reserve
@@ -337,13 +340,6 @@ impl HandlePrefetcher {
             // mem_pressure currently set, call `set_mem_pressure(false)`
             // so the EMA can recompute the window naturally.
             let mut consecutive_successes: u32 = 0;
-            // Audit #3 / PR #405: use the controller's configured
-            // min_window (captured above at spawn time). Clamp the
-            // initial chunk to `[bp_min_window, bp_max_window]` so a
-            // caller-supplied `chunk_size` outside the configured
-            // range doesn't bypass the backpressure contract.
-            let _bp_min_window = bp_min_window;
-            let _bp_max_window = bp_max_window;
             'download: while offset < file_size {
                 if c.load(Ordering::Relaxed) {
                     break;
@@ -1006,10 +1002,14 @@ mod tests {
     /// path may grow window above min_window.
     #[test]
     fn try_reserve_succeeds_clears_mem_pressure() {
-        let bp = std::sync::Arc::new(BackpressureController::with_window(
-            128 * 1024,
-            64 * 1024 * 1024,
-        ));
+        // Audit #3 / PR #426 PR: `min_window` MUST equal `chunk_size`
+        // (8 B) — otherwise the F3 clamp in `HandlePrefetcher::new`
+        // (`chunk_size.clamp(bp_min_window, bp_max_window)`) bumps the
+        // first chunk to `bp_min_window` (128 KiB previously), which
+        // exceeds the 8 B queue used by `build_test_hp` and parks
+        // the prefetcher on `cv.wait` with no pop to wake it. Use 8
+        // here so the clamp is a no-op and each push fits the queue.
+        let bp = std::sync::Arc::new(BackpressureController::with_window(8, 64 * 1024 * 1024));
         let ml = crate::mem_limiter::MemoryLimiter::new(1024 * 1024);
         let (hp, _op) = build_test_hp(1024 * 1024, bp.clone());
         let ml_for_assert = ml.clone();
@@ -1018,7 +1018,7 @@ mod tests {
         bp.set_mem_pressure(true);
         assert_eq!(
             bp.current_window(),
-            128 * 1024,
+            8,
             "precondition: mem_pressure(true) pins window to min"
         );
 
@@ -1058,7 +1058,7 @@ mod tests {
                 next_offset += 8;
                 reservations_observed += 1;
             }
-            if bp.current_window() > 128 * 1024 {
+            if bp.current_window() > 8 {
                 observed_min_violation = true;
                 break;
             }
