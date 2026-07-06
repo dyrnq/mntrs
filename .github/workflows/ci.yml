@@ -23,6 +23,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: ci
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install deps
@@ -98,6 +99,7 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: ci
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install deps
