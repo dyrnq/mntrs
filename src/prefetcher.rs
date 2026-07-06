@@ -1042,7 +1042,15 @@ mod tests {
         // reported `observed=0 used=0`. Bound on *elapsed wall time*
         // instead of iteration count so a slow runner gets more
         // iterations rather than failing early.
-        let test_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        //
+        // The deadline is 30 s — well above the dev-box runtime of
+        // <100 ms — to absorb CI cold-start variance (a fully cold
+        // tokio runtime + opendal Memory backend + first fork can
+        // take 10+ s on shared runners, observed on multiple PRs).
+        // The early-exit on `reservations_observed >= 4` (i.e.
+        // hysteresis cleared) bounds the dev-box run; only a CI stall
+        // actually hits the deadline.
+        let test_deadline = std::time::Instant::now() + Duration::from_secs(30);
         while std::time::Instant::now() < test_deadline {
             std::thread::sleep(Duration::from_millis(10));
             // Pop the current head (if any) to free queue space.
