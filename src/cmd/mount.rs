@@ -3081,13 +3081,48 @@ mod tests_261_2 {
 ///   worse than log a missing-version warning).
 #[cfg(target_os = "macos")]
 fn macfuse_kext_loaded() -> Option<String> {
-    let output = std::process::Command::new("kextstat")
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let mut child = std::process::Command::new("kextstat")
         .arg("-l")
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
+
+    // Bound the diagnostic so a wedged `kextstat` (kernel-extension
+    // bus hung, buggy binary, future sandboxing change) cannot block
+    // mount startup indefinitely. 1 s is well above the observed
+    // <10 ms cold path; if it ever legitimately takes longer the
+    // user just gets the no-kext warning (the mount itself is
+    // unaffected — this check is informational only).
+    //
+    // Implemented as a manual `try_wait` poll loop instead of via the
+    // `wait-timeout` crate to keep the dep graph minimal (this is the
+    // only timeout-bounded `Child` call site in the codebase). 10 ms
+    // poll cadence caps the loop at ~100 iterations before the deadline.
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                // Timed out — kill the child and bail out without a
+                // version (the mount will still proceed and the user
+                // will see the standard no-kext warning).
+                let _ = child.kill();
+                let _ = child.wait();
+                tracing::warn!("kextstat did not exit within 1s; assuming macFUSE kext not loaded");
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => return None,
+        }
+    };
+    if !status.success() {
         return None;
     }
+    let output = child.wait_with_output().ok()?;
     parse_macos_kext_version(&String::from_utf8_lossy(&output.stdout))
 }
 
