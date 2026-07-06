@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use crate::backpressure::BackpressureController;
 use crate::mem_limiter::MemoryLimiter;
+use crate::util::LockOrRecover;
 
 /// A chunk of data downloaded from remote.
 #[derive(Clone)]
@@ -239,10 +240,7 @@ fn read_and_push(
     let buf = match result {
         Ok(b) => b,
         Err(e) => {
-            let mut qlock = q.lock().unwrap_or_else(|p| {
-                tracing::warn!("prefetch queue mutex poisoned; recovering");
-                p.into_inner()
-            });
+            let mut qlock = q.lock_or_recover();
             qlock.set_error(format!("prefetch read failed: {e}"));
             return false;
         }
@@ -259,10 +257,7 @@ fn read_and_push(
     if record_fetched {
         bp.record_part_fetched(part_len, elapsed);
     }
-    let mut qlock = q.lock().unwrap_or_else(|p| {
-        tracing::warn!("prefetch queue mutex poisoned; recovering");
-        p.into_inner()
-    });
+    let mut qlock = q.lock_or_recover();
     // Backpressure: park on the Condvar while the queue is full.
     // `cond.wait` releases the queue lock while parked, so a FUSE
     // `pop` can proceed and free room; it re-acquires the lock on
@@ -442,12 +437,7 @@ impl HandlePrefetcher {
                 }
                 offset = end;
             }
-            q.lock()
-                .unwrap_or_else(|p| {
-                    tracing::warn!("prefetch queue mutex poisoned; recovering");
-                    p.into_inner()
-                })
-                .set_finished();
+            q.lock_or_recover().set_finished();
             // Wake any straggler waiter (defensive — the only waiter
             // is this thread, which is now done; but a `cancel` that
             // raced with `set_finished` may have a notify in flight).
@@ -476,10 +466,7 @@ impl HandlePrefetcher {
         // waiter's post-wake `is_terminal` read; the Condvar's own
         // internal sync would also suffice, but the lock makes the
         // ordering explicit and matches the pattern in `pop`.
-        let _g = self.queue.lock().unwrap_or_else(|p| {
-            tracing::warn!("prefetch queue mutex poisoned; recovering");
-            p.into_inner()
-        });
+        let _g = self.queue.lock_or_recover();
         self.cond.notify_all();
     }
 
@@ -503,10 +490,7 @@ impl HandlePrefetcher {
     /// `if elapsed.as_secs_f64() <= 0.0 { return; }` guard skips the
     /// update — no EMA pollution.
     pub fn pop(&self, offset: u64, consume_started: Option<Instant>) -> Option<Part> {
-        let mut g = self.queue.lock().unwrap_or_else(|p| {
-            tracing::warn!("prefetch queue mutex poisoned; recovering");
-            p.into_inner()
-        });
+        let mut g = self.queue.lock_or_recover();
         let before = g.current_bytes();
         let part = g.pop(offset);
         if g.current_bytes() < before {
@@ -557,10 +541,7 @@ impl Drop for HandlePrefetcher {
         self.cancelled.store(true, Ordering::Relaxed);
         // Lock + notify mirrors `cancel()` so a pusher parked on
         // `cond.wait` observes the cancelled flag and exits.
-        let _g = self.queue.lock().unwrap_or_else(|p| {
-            tracing::warn!("prefetch queue mutex poisoned; recovering");
-            p.into_inner()
-        });
+        let _g = self.queue.lock_or_recover();
         self.cond.notify_all();
         drop(_g);
         // Bounded wait for the download thread. 200 ms is a
@@ -725,7 +706,7 @@ mod tests {
         .join();
         // q is now poisoned; unwrap would panic. The recovery idiom
         // (used in the production code) must succeed.
-        let mut g = q.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = q.lock_or_recover();
         // Verify the queue is in a consistent state — empty, not
         // cancelled, not finished. The panic happened before any
         // push, so all flags remain default.
@@ -793,10 +774,7 @@ mod tests {
                 data: Bytes::from(vec![1u8; 8]),
             };
             let part_len = part.data.len() as u64;
-            let mut qlock = q2.lock().unwrap_or_else(|p| {
-                tracing::warn!("prefetch queue mutex poisoned; recovering");
-                p.into_inner()
-            });
+            let mut qlock = q2.lock_or_recover();
             loop {
                 if qlock.is_terminal() {
                     return false; // unexpected — test should free room
@@ -815,10 +793,7 @@ mod tests {
 
         // Free room — this must wake the parked pusher via notify_one.
         let popped = {
-            let mut g = queue.lock().unwrap_or_else(|p| {
-                tracing::warn!("prefetch queue mutex poisoned; recovering");
-                p.into_inner()
-            });
+            let mut g = queue.lock_or_recover();
             let before = g.current_bytes();
             let p = g.pop(0);
             if g.current_bytes() < before {
@@ -836,10 +811,7 @@ mod tests {
         );
 
         // The second part is now in the queue.
-        let g = queue.lock().unwrap_or_else(|p| {
-            tracing::warn!("prefetch queue mutex poisoned; recovering");
-            p.into_inner()
-        });
+        let g = queue.lock_or_recover();
         assert_eq!(g.current_bytes(), 8, "queue should hold the second part");
     }
 
