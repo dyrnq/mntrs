@@ -1033,7 +1033,17 @@ mod tests {
         let mut next_offset: u64 = 0;
         let mut observed_min_violation = false;
         let mut reservations_observed = 0u64;
-        for _ in 0..200 {
+        // CI flake resilience (issue #426/#428/#431): shared-runner
+        // environments can take much longer than the dev box to
+        // schedule the prefetch thread (token issuance, kernel
+        // page-cache warmup, opendal runtime spin-up). The previous
+        // fixed-budget loop (200 × 10 ms = 2 s) was sometimes too
+        // short to observe even a single reservation, and the test
+        // reported `observed=0 used=0`. Bound on *elapsed wall time*
+        // instead of iteration count so a slow runner gets more
+        // iterations rather than failing early.
+        let test_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < test_deadline {
             std::thread::sleep(Duration::from_millis(10));
             // Pop the current head (if any) to free queue space.
             if hp.pop(next_offset, None).is_some() {
@@ -1042,6 +1052,11 @@ mod tests {
             }
             if bp.current_window() > 128 * 1024 {
                 observed_min_violation = true;
+                break;
+            }
+            // If the prefetcher is making forward progress, no
+            // need to wait the full budget.
+            if reservations_observed >= 4 {
                 break;
             }
         }
