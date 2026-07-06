@@ -1472,24 +1472,10 @@ pub fn mount(
         // the small-write optimization; the `write_back_cache` field
         // on `FuserAdapter` is what gates the capability declaration.
         let _ = write_back_cache; // see FuserAdapter::init()
-        // Issue #408 (macos audit, Fix 2): the FUSE writeback
-        // capability is declared in `FuserAdapter::init()`, which is
-        // the Linux/Windows code path. macFUSE has its own kernel-
-        // managed write buffering that the FUSE writeback capability
-        // doesn't gate — on macOS the value is silently ignored.
-        // Surface that as a warn so users copying `--write-back-cache`
-        // invocations from a Linux guide onto a macOS host see
-        // something other than silence. The flag itself stays
-        // visible (not hidden) so a script that runs on a mixed
-        // fleet doesn't fail at the clap layer on macOS hosts.
-        #[cfg(target_os = "macos")]
-        if write_back_cache {
-            tracing::warn!(
-                "--write-back-cache is ignored on macOS: macFUSE manages its own \
-                 write buffering; the FUSE writeback capability is not exposed \
-                 through macFUSE. Drop the flag on macOS hosts."
-            );
-        }
+        // The macOS diagnostic for --write-back-cache is emitted at
+        // the actual capability-declaration site (FuserAdapter::init),
+        // not here, so library users / CSI drivers that bypass this
+        // CLI wrapper still see it.
         if allow_root {
             cfg.mount_options
                 .push(MountOption::CUSTOM("allow_root".to_string()));

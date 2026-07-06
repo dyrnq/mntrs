@@ -140,6 +140,19 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         // `--write-back-cache`. The kernel-side mount option
         // `writeback_cache` at cmd/mount.rs is gated on the same flag.
         if self.write_back_cache {
+            // macFUSE has its own kernel-managed write buffering
+            // outside the FUSE writeback capability — the
+            // InitFlags::FUSE_WRITEBACK_CACHE bit is silently
+            // dropped, so requesting it produces no warning and
+            // no behavior. Warn at the actual capability-declaration
+            // site (not the CLI mount wrapper) so library users /
+            // CSI drivers get the same diagnostic.
+            #[cfg(target_os = "macos")]
+            tracing::warn!(
+                "--write-back-cache is ignored on macOS: macFUSE manages its own \
+                 write buffering; the FUSE writeback capability is not exposed \
+                 through macFUSE. Drop the flag on macOS hosts."
+            );
             let _ = config.add_capabilities(InitFlags::FUSE_WRITEBACK_CACHE);
         }
 
