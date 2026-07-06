@@ -1164,3 +1164,76 @@ mod tests {
         assert_eq!(nfc(""), "");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #420: centralize the mutex poison-recovery idiom.
+//
+// `Mutex::lock()` returns `Err(PoisonError)` if a previous holder of
+// the lock panicked while holding it. The default `unwrap()` panics
+// the new caller, crashing FUSE workers on every subsequent read
+// even though the inner state is still consistent (we never
+// `panic!()` while holding these locks — we recover specifically so a
+// single bad read doesn't propagate). Before this helper, the
+// recovery idiom was copy-pasted at 9 sites in `prefetcher.rs` and 8
+// sites in `core_fs/winfsp.rs`, with at least one audit (PR #405 /
+// commit `d78dd45`) missing a site because the copy-paste drifted.
+// A single trait method makes the recovery uniform and trivially
+// auditable.
+
+use std::sync::{Mutex, MutexGuard};
+
+/// Poison-safe lock helper. Use this in place of `.lock().unwrap()`
+/// on any `Mutex<T>` whose lock holders do not corrupt inner state
+/// on panic (the prefetch queue and the WinFSP getattr cache both
+/// satisfy this invariant — verified by reading the lock-holding
+/// blocks).
+///
+/// `tracing::warn!` is emitted on recovery so a poisoned mutex is
+/// visible in production logs (the existing copy-pasted sites used
+/// the same message string; consolidating it here keeps the wire
+/// format identical).
+pub trait LockOrRecover<T> {
+    fn lock_or_recover(&self) -> MutexGuard<'_, T>;
+}
+
+impl<T> LockOrRecover<T> for Mutex<T> {
+    fn lock_or_recover(&self) -> MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|p| {
+            tracing::warn!("mutex poisoned; recovering");
+            p.into_inner()
+        })
+    }
+}
+
+#[cfg(test)]
+mod lock_or_recover_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn lock_or_recover_returns_guard_on_unpoisoned_mutex() {
+        let m: Arc<Mutex<u64>> = Arc::new(Mutex::new(42));
+        let g = m.lock_or_recover();
+        assert_eq!(*g, 42);
+    }
+
+    /// Poison the mutex by panicking while holding the lock, then
+    /// confirm `lock_or_recover` returns a usable guard instead of
+    /// propagating the poison error. This is the regression scenario
+    /// the helper exists for — the old `.lock().unwrap()` would crash
+    /// here.
+    #[test]
+    fn lock_or_recover_survives_poison() {
+        let m: Arc<Mutex<u64>> = Arc::new(Mutex::new(7));
+        let m2 = m.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = m2.lock().unwrap();
+            panic!("intentional poison for test");
+        })
+        .join();
+        // m is now poisoned. lock_or_recover must still hand back a
+        // guard with the original value intact.
+        let g = m.lock_or_recover();
+        assert_eq!(*g, 7);
+    }
+}
