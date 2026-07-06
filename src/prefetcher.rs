@@ -368,7 +368,14 @@ impl HandlePrefetcher {
                 if ml.try_reserve("prefetch", chunk).is_err() {
                     consecutive_successes = 0;
                     bp.set_mem_pressure(true);
-                    let shrunk = (chunk / 2).max(bp_min_window);
+                    // Halve the chunk, but never grow it past the
+                    // original. `(chunk / 2).max(bp_min_window)` alone
+                    // produces a `shrunk > chunk` whenever
+                    // `chunk < 2 * bp_min_window` (defaults prevent
+                    // this in the production wiring, but a future
+                    // caller / smaller floor would amplify the very
+                    // pressure signal we're trying to relieve).
+                    let shrunk = (chunk / 2).clamp(bp_min_window, chunk);
                     std::thread::sleep(std::time::Duration::from_millis(10));
                     if ml.try_reserve("prefetch", shrunk).is_err() {
                         // Still capped. Skip this chunk — advance
