@@ -274,7 +274,17 @@ fn read_and_push(
             return false;
         }
         if qlock.is_full_for(part_len) {
-            qlock = cv.wait(qlock).unwrap();
+            qlock = cv.wait(qlock).unwrap_or_else(|p| {
+                // The mutex was poisoned while we were parked (another
+                // thread panicked holding it). Recover rather than
+                // unwrapping — the audit fix in d78dd45 covers every
+                // other lock site, this one was missed because the
+                // cv.wait return type (LockResult<MutexGuard>) isn't a
+                // plain Result<MutexGuard>. Symmetry with the surrounding
+                // `q.lock().unwrap_or_else(...)` at line 254.
+                tracing::warn!("prefetch queue mutex poisoned during cv.wait; recovering");
+                p.into_inner()
+            });
             continue;
         }
         // Room available. `push` re-checks terminal (cancel may
