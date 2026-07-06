@@ -106,8 +106,16 @@ impl PartQueue {
                 ));
             }
         }
-        self.current_bytes += part.data.len() as u64;
+        // Order matters: `push_back` first so any panic on
+        // allocation failure (VecDeque growth) propagates BEFORE
+        // `current_bytes` is incremented. Without this, an OOM panic
+        // would poison the mutex with `current_bytes` reflecting
+        // bytes that aren't in the queue — a load-bearing invariant
+        // the poison-recovery idiom in `d78dd45` cannot re-establish
+        // because Rust's Mutex provides no inner-state invariant on
+        // poison.
         self.parts.push_back(part);
+        self.current_bytes += self.parts.back().unwrap().data.len() as u64;
         Ok(())
     }
 
