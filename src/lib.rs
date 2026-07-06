@@ -1029,12 +1029,23 @@ const MACOS_METADATA_NAMES: &[&str] = &[
 /// against the const list is sufficient and avoids false positives
 /// like `myfile.DS_Store.bak`.
 ///
+/// **Case-insensitive (ASCII)**: APFS is case-PRESERVING, so a file
+/// written as `.DS_STORE` (uppercase) or `.ds_store` (lowercase) on
+/// disk is stored verbatim. Without case-folding the filter the
+/// canonical-case list below misses those variants and a
+/// non-Finder writer / sync tool / cross-platform rclone can leak
+/// the metadata file into the backend. \`eq_ignore_ascii_case\`
+/// matches the ASCII subset — case variants with non-ASCII
+/// characters (none in the list) are not a concern.
+///
 /// Platform-neutral Rust code; the function returns false for any
 /// name not in the list. The CLI flag is documented as macOS-
 /// specific, so a Linux mount that happens to have a `.DS_Store`
 /// file (e.g. synced from a macOS host) would still be filtered.
 fn is_macos_metadata(name: &str) -> bool {
-    MACOS_METADATA_NAMES.contains(&name)
+    MACOS_METADATA_NAMES
+        .iter()
+        .any(|m| m.eq_ignore_ascii_case(name))
 }
 
 impl MntrsFs {
@@ -7655,8 +7666,7 @@ mod tests {
             "notes.txt",
             "readme.md",
             "my.DS_Store",
-            "DS_Store",  // missing leading dot
-            ".ds_store", // wrong case (case-sensitive)
+            "DS_Store", // missing leading dot
             ".DS_Store.bak",
             "._DS_Store", // AppleDouble form, not the metadata itself
             ".Trash",     // close but not the canonical .Trashes
@@ -7669,6 +7679,29 @@ mod tests {
             assert!(
                 !is_macos_metadata(n),
                 "non-metadata name should not match: {n:?}"
+            );
+        }
+    }
+
+    /// APFS is case-preserving: a file written as `.DS_STORE` (or
+    /// `.ds_store`) on disk survives sync tools / rclone-on-Linux /
+    /// non-Finder writers verbatim. The filter must catch the case-
+    /// flipped variants so the metadata file doesn't leak through.
+    #[test]
+    fn is_macos_metadata_matches_case_flipped_variants() {
+        for n in [
+            ".DS_STORE",       // uppercase
+            ".ds_store",       // lowercase
+            ".DS_store",       // mixed
+            ".trashes",        // lowercase
+            ".TRASHES",        // uppercase
+            ".FSEVENTSD",      // uppercase
+            ".spotlight-v100", // lowercase
+            ".temporaryitems", // lowercase
+        ] {
+            assert!(
+                is_macos_metadata(n),
+                "case-flipped metadata variant should match: {n:?}"
             );
         }
     }
