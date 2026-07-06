@@ -323,6 +323,7 @@ fn synthesize_self_relative_sd(is_dir: bool) -> [u8; 72] {
 }
 
 use super::{CoreFileAttr, CoreFileType, CoreFilesystem, CoreVolumeStat};
+use crate::util::LockOrRecover;
 
 /// Win32 file attributes derived from CoreFileType + permissions.
 /// Issue #325: a symlink's Win32 attribute bit must include
@@ -818,7 +819,7 @@ impl<F: CoreFilesystem + 'static> WinFspAdapter<F> {
     /// ino would hit the 100 ms TTL entry and report the
     /// file as still present, masking the delete.
     fn invalidate_getattr_cache_ino(&self, ino: u64) {
-        let mut cache = self.getattr_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self.getattr_cache.lock_or_recover();
         if cache.remove(&ino).is_some() {
             tracing::trace!(ino, "winfsp: invalidated getattr cache entry on delete");
         }
@@ -1269,7 +1270,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 let ino = context.ino;
                 let now = Instant::now();
                 let cached: Option<CoreFileAttr> = {
-                    let cache = self.getattr_cache.lock().unwrap_or_else(|e| e.into_inner());
+                    let cache = self.getattr_cache.lock_or_recover();
                     cache.get(&ino).and_then(|(ts, attr)| {
                         if now.duration_since(*ts) < GETATTR_CACHE_TTL {
                             Some(*attr)
@@ -1293,8 +1294,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                         // would also clean entries on the
                         // next miss, but a hard cap is
                         // cheaper than unbounded memory.
-                        let mut cache =
-                            self.getattr_cache.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut cache = self.getattr_cache.lock_or_recover();
                         if cache.len() > 4096 {
                             let cutoff = now.checked_sub(GETATTR_CACHE_TTL).unwrap_or(now);
                             cache.retain(|_, (ts, _)| *ts > cutoff);
@@ -1722,10 +1722,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                         } else {
                             (FILE_NOTIFY_CHANGE_FILE_NAME, FILE_ACTION_REMOVED)
                         };
-                        let mut queue = self
-                            .pending_notifications
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
+                        let mut queue = self.pending_notifications.lock_or_recover();
                         queue.push_back((basename.clone(), filter, action));
                         tracing::trace!(
                             basename = %basename,
@@ -2485,10 +2482,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 // most recent stat) — no growth concern.
                 let now = Instant::now();
                 let cached: Option<CoreVolumeStat> = {
-                    let cache = self
-                        .volume_info_cache
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let cache = self.volume_info_cache.lock_or_recover();
                     cache.as_ref().and_then(|(ts, v)| {
                         if now.duration_since(*ts) < VOLUME_INFO_CACHE_TTL {
                             Some(v.clone())
@@ -2504,10 +2498,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                     }
                     None => {
                         let v = self.inner.statfs(1).map_err(io_err_to_status)?;
-                        *self
-                            .volume_info_cache
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner()) = Some((now, v.clone()));
+                        *self.volume_info_cache.lock_or_recover() = Some((now, v.clone()));
                         tracing::trace!("winfsp::get_volume_info: cache miss; populated");
                         v
                     }
@@ -2998,10 +2989,7 @@ impl<F: CoreFilesystem + 'static> winfsp::filesystem::AsyncFileSystemContext for
 // depends on).
 impl<F: CoreFilesystem + 'static> NotifyingFileSystemContext<()> for WinFspAdapter<F> {
     fn should_notify(&self) -> Option<()> {
-        let queue = self
-            .pending_notifications
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let queue = self.pending_notifications.lock_or_recover();
         if queue.is_empty() { None } else { Some(()) }
     }
 
@@ -3013,10 +3001,7 @@ impl<F: CoreFilesystem + 'static> NotifyingFileSystemContext<()> for WinFspAdapt
         // tick — the worst case is a ~100 ms delay, not
         // loss of an event.
         let drained: Vec<(String, u32, u32)> = {
-            let mut queue = self
-                .pending_notifications
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut queue = self.pending_notifications.lock_or_recover();
             queue.drain(..).collect()
         };
         let count = drained.len();
