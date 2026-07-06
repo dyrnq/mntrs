@@ -3101,25 +3101,22 @@ fn macfuse_kext_loaded() -> Option<String> {
 ///
 /// For each line that contains "macfuse" (covers both 4.x and
 /// 5.x bundle IDs), extract the substring inside the trailing
-/// `(...)`. `rfind` for both `(` and `)` rather than split-on-
-/// whitespace because the address fields don't contain parens
-/// and the line layout is otherwise variable (kextstat output
-/// width changes between macOS releases).
+/// `(...)`. `rsplit_once('(')` / `split_once(')')` instead of
+/// manual index arithmetic because the address fields don't
+/// contain parens and the line layout is otherwise variable
+/// (kextstat output width changes between macOS releases).
 #[cfg(target_os = "macos")]
 fn parse_macos_kext_version(stdout: &str) -> Option<String> {
     for line in stdout.lines() {
         if !line.contains("macfuse") {
             continue;
         }
-        let open = line.rfind('(')?;
-        // `.find(')` on the post-`(` slice keeps us anchored on
-        // the same paren pair even if the address fields contain
-        // a `(` from some future format change.
-        let close_rel = line[open..].find(')')?;
-        let close = open + close_rel;
-        if close > open {
-            return Some(line[open + 1..close].to_string());
-        }
+        // `rsplit_once('(')` anchors on the LAST `(` (the
+        // version one), so any `(` that might appear in the
+        // address / UUID fields to its left is ignored.
+        let (_, after_open) = line.rsplit_once('(')?;
+        let (version, _) = after_open.split_once(')')?;
+        return Some(version.to_string());
     }
     None
 }
