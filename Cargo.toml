@@ -7,36 +7,36 @@ repository = "https://github.com/dyrnq/mntrs"
 description = "Mount remote storage (S3, HDFS, GCS, etc.) to local directory via FUSE"
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
-tokio = { version = "1", features = ["full", "rt-multi-thread"] }
-tokio-util = { version = "0.7", features = ["time"] }
-anyhow = "1"
-tracing = "0.1"
-tracing-subscriber = "0.3"
-url = "2"
-libc = "0.2"
-futures = "0.3"
-once_cell = "1"
+clap = { version = "4.6", features = ["derive"] }
+tokio = { version = "1.52", features = ["full", "rt-multi-thread"] }
+tokio-util = { version = "0.7.18", features = ["time"] }
+anyhow = "1.0.102"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+url = "2.5"
+libc = "0.2.186"
+futures = "0.3.32"
+once_cell = "1.21"
 rustix = { version = "1.1.4", features = ["process", "pipe", "fs", "stdio", "event"] }
 dashmap = "6.2.1"
-moka = { version = "0.12", features = ["sync"] }
+moka = { version = "0.12.15", features = ["sync"] }
 bytes = "1.12.0"
 unicode-normalization = "0.1.25"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "hickory-dns"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "hickory-dns"] }
 opendal = { version = "0.57", features = ["services-s3", "services-gcs", "services-azblob", "services-hdfs-native", "services-webhdfs", "services-oss", "services-cos", "services-obs", "services-b2", "services-vercel-blob", "services-aliyun-drive", "services-fs", "services-memory", "services-webdav", "layers-capability-check"] }
 # Hardware-accelerated CRC32C (x86 CRC32Q via SSE4.2; ARMv8.2-CRC32).
 # Used for disk cache block integrity checks; falls back to a
 # software implementation on CPUs without the corresponding ISA
 # extensions. ~5-10× faster than the hand-rolled poly loop in
 # `crc32c_checksum` for 8 MiB blocks.
-crc32c = "0.6"
+crc32c = "0.6.8"
 # Lock-free MPMC channel for the disk-cache write thread pool.
 # `crossbeam-channel` was already in the dep graph via tokio;
 # pinning a direct version so we can break the dependency if
 # tokio ever drops it. Used by `src/disk_write_pool.rs` to
 # route FUSE-worker `write()` calls to the IO thread pool
 # without the per-write `std::thread::spawn` cost (~10 µs).
-crossbeam-channel = "0.5"
+crossbeam-channel = "0.5.15"
 # LZ4 frame-less block compression for disk-cache files
 # (#4 in DESIGN_VULNS / cache audit). Used by the new
 # block-cache format v2 — full 8 MiB blocks compress at
@@ -47,8 +47,8 @@ crossbeam-channel = "0.5"
 # `lz4_flex` (vs the `lz4` C-binding crate) is pure Rust,
 # no system lz4.so dep, and has comparable perf for our
 # block sizes.
-lz4_flex = "0.13"
-foyer-memory = "0.22"
+lz4_flex = "0.13.1"
+foyer-memory = "0.22.3"
 
 
 
@@ -57,9 +57,9 @@ fuser = "0.17"
 
 [target.'cfg(windows)'.dependencies]
 winfsp = { version = "0.13", features = ["async-io", "notify"] }
-winfsp-sys = "0.12"
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
-widestring = "1"
+winfsp-sys = "0.12.1"
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+widestring = "1.2"
 
 [features]
 default = []
