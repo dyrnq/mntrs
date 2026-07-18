@@ -350,17 +350,23 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         // returned. The cookie is the kernel's
         // "1 + index of last entry delivered".
         //
-        // `inner.readdir` already slices by `offset`
-        // (returns `entries[offset..]`), so we iterate
-        // the returned Vec directly. Earlier revisions
-        // re-sliced with `entries[start..]` where
-        // `start = offset`, which double-subtracted and
-        // returned 0 entries once the offset exceeded
-        // half the directory size — issue #436 (stress
-        // 01-large-dir returned ~510 of 1002 entries).
-        // The kernel then saw EOF early and `find`
-        // under-counted. Removing the redundant slice
-        // restores correct pagination.
+        // Phase 2 (perf-readdir-zero-copy): `inner.readdir`
+        // returns the full materialised Vec wrapped in an
+        // `Arc`. We slice via `&arc[start..]` (a borrow of
+        // the same backing memory, no copy) — pre-fix this
+        // path did `entries[start..].to_vec()` on every page,
+        // which is `O(page_size)` heap allocation. The Arc
+        // is shared across all pagination calls for the same
+        // fh, so `Arc::ptr_eq` holds (verified by regression
+        // test `readdir_zero_copy_same_arc_across_pages`).
+        //
+        // #436: pre-Phase-2 the inner impl pre-sliced and
+        // returned `Vec`, then we iterated entries directly
+        // (after the double-slice bug fix). Phase 2 pushes
+        // the offset arithmetic back into the adapter where
+        // the rclone mount2 `dirStream` pattern lives, so
+        // the slicing cost is `O(1)` instead of `O(N)`
+        // allocations per page.
         //
         // For the pre-#23 fallback (fh=0, the trait
         // default), the implementation re-materialises
@@ -368,8 +374,14 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         // — just slower and subject to the same
         // "list changed between pages" risk as before.
         match self.inner.readdir(ino.into(), fh.into(), offset, 0) {
-            Ok(entries) => {
-                for (offset_i, entry) in entries.iter().enumerate() {
+            Ok(entries_arc) => {
+                let start = offset as usize;
+                let page: &[super::CoreDirEntry] = if start >= entries_arc.len() {
+                    &[]
+                } else {
+                    &entries_arc[start..]
+                };
+                for (offset_i, entry) in page.iter().enumerate() {
                     let i = offset as usize + offset_i;
                     if reply.add(
                         INodeNo(entry.ino),
@@ -402,11 +414,20 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         // path which could allocate a different ino
         // for the same name across pages.
         //
-        // #436: same double-slice fix as readdir.
-        // `inner.readdir` already slices by `offset`,
-        // so we iterate the returned Vec directly.
+        // Phase 2 (perf-readdir-zero-copy): same Arc
+        // slice as readdir — see the readdir handler
+        // comment for the rclone mount2 dirStream
+        // rationale. The `lookup_many` batch below
+        // receives `&[&str]` derived from the slice,
+        // not from a cloned Vec.
         match self.inner.readdir(ino.into(), fh.into(), offset, 0) {
-            Ok(entries) => {
+            Ok(entries_arc) => {
+                let start = offset as usize;
+                let page: &[super::CoreDirEntry] = if start >= entries_arc.len() {
+                    &[]
+                } else {
+                    &entries_arc[start..]
+                };
                 // Issue #29: batch the per-entry lookups
                 // so the implementation can serve the
                 // whole page from its dir_cache
@@ -418,7 +439,7 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
                 // to 0; for `find maxdepth1` it
                 // eliminates the per-entry stat
                 // completely.
-                let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+                let names: Vec<&str> = page.iter().map(|e| e.name.as_str()).collect();
                 let attr_results =
                     self.inner
                         .lookup_many(ino.into(), &names)
@@ -429,7 +450,7 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
                                 .collect()
                         });
                 for (offset_i, (entry, attr_res)) in
-                    entries.iter().zip(attr_results.iter()).enumerate()
+                    page.iter().zip(attr_results.iter()).enumerate()
                 {
                     let i = offset as usize + offset_i;
                     // For each directory entry, do a lookup to get full attr

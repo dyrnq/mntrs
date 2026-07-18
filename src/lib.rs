@@ -497,7 +497,7 @@ pub struct MntrsFs {
     /// because the tests construct multiple `MntrsFs`
     /// instances; a static would leak list state across
     /// mount lifetimes.
-    dir_listers: dashmap::DashMap<u64, Vec<CoreDirEntry>>,
+    dir_listers: dashmap::DashMap<u64, std::sync::Arc<Vec<CoreDirEntry>>>,
     pub(crate) dir_cache_ttl: Duration,
     pub(crate) attr_ttl: Duration,
     pub(crate) stat_cache_ttl: Duration,
@@ -3083,9 +3083,18 @@ impl CoreFilesystem for MntrsFs {
         // releasedir. This keeps the dir-lister lifetime
         // independent of the inode's open-file handles
         // (which serve regular files via `open`/`release`).
+        //
+        // Phase 2 (perf-readdir-zero-copy): wrap the
+        // materialised Vec in an `Arc` so the adapter
+        // can hand back a clone of the Arc (atomic
+        // increment, ~free) on every readdir() page
+        // instead of cloning the entry data. Adapter
+        // slices via `&entries_arc[start..]` — a borrow
+        // of the same backing memory. DashMap stores
+        // the Arc by ownership (no clone on insert).
         let entries = self.readdir_materialise(ino)?;
         let fh = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.dir_listers.insert(fh, entries);
+        self.dir_listers.insert(fh, std::sync::Arc::new(entries));
         Ok(fh)
     }
 
@@ -3095,27 +3104,27 @@ impl CoreFilesystem for MntrsFs {
         fh: u64,
         offset: u64,
         _max: usize,
-    ) -> std::io::Result<Vec<CoreDirEntry>> {
+    ) -> std::io::Result<std::sync::Arc<Vec<CoreDirEntry>>> {
         // Issue #23: serve from the per-fh snapshot.
-        // The FUSE cookie is "index of the last entry
-        // delivered + 1", so `start = offset as usize -
-        // 1` would also work, but the fuser adapter
-        // passes the raw `(i + 1) as u64` it would have
-        // used pre-fix, and we slice from
-        // `entries[start..]` — same semantics as
-        // pre-fix slice-indexing (Bug 32 fix in
-        // ece4391).
-        let start = offset as usize;
+        // Phase 2 (perf-readdir-zero-copy): return the
+        // Arc-backed Vec. Adapter slices via `&arc[start..]`
+        // (no copy); on EOF (offset past end) we hand back
+        // a fresh empty Arc so the adapter's `entries.len()`
+        // check is independent of the DashMap entry.
+        //
+        // Note: `start` is computed by the adapter from the
+        // same `offset` we receive here — we don't pre-slice
+        // because that would force a sub-Arc allocation on
+        // every call. Adapter slices via `&arc[start..]`
+        // (borrow), zero-copy.
+        let _ = offset;
         let entries = self.dir_listers.get(&fh).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("readdir(ino={ino}, fh={fh}): unknown dir-lister handle"),
             )
         })?;
-        if start >= entries.len() {
-            return Ok(Vec::new());
-        }
-        Ok(entries[start..].to_vec())
+        Ok(std::sync::Arc::clone(&entries))
     }
 
     fn releasedir(&self, _ino: u64, fh: u64) -> std::io::Result<()> {
@@ -3148,29 +3157,36 @@ impl CoreFilesystem for MntrsFs {
         fh: u64,
         marker: &str,
     ) -> std::io::Result<Vec<(CoreDirEntry, CoreFileAttr)>> {
-        // Slice the per-fh snapshot by marker. Clone the
-        // Vec out of the DashMap so the shard lock is
-        // released before the (potentially expensive)
-        // batch_lookup below — concurrent ops on
-        // dir_listers should not block on attr lookups.
-        let entries = self
-            .dir_listers
-            .get(&fh)
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("readdir_with_attrs(ino={ino}, fh={fh}): unknown dir-lister handle"),
-                )
-            })?
-            .value()
-            .clone();
+        // Phase 2 (perf-readdir-zero-copy): clone the Arc
+        // out of the DashMap so the shard lock is released
+        // before the (potentially expensive) batch_lookup
+        // below. We don't clone the underlying Vec — only
+        // the Arc header (atomic increment, ~free). Slice
+        // via `&entries[cut..]` (borrow) and iterate by
+        // reference; the per-entry clone into `out` is
+        // unavoidable because the trait signature requires
+        // owned `CoreDirEntry` (WinFSP serialises into the
+        // FSP buffer). Pre-fix this paid a full Vec clone
+        // of the page on top of the per-entry clone.
+        let entries = std::sync::Arc::clone(
+            self.dir_listers
+                .get(&fh)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!(
+                            "readdir_with_attrs(ino={ino}, fh={fh}): unknown dir-lister handle"
+                        ),
+                    )
+                })?
+                .value(),
+        );
         let cut = if marker.is_empty() {
             0
         } else {
             entries.partition_point(|e| e.name.as_str() <= marker)
         };
-        let page: Vec<CoreDirEntry> = entries[cut..].to_vec();
-        drop(entries);
+        let page = &entries[cut..];
 
         // Batch-fetch attrs from dir_cache snapshot
         // (lib.rs::batch_lookup_from_dir_cache). Cold-
@@ -3181,9 +3197,9 @@ impl CoreFilesystem for MntrsFs {
         let attrs = self.batch_lookup_from_dir_cache(ino, &names);
 
         let mut out = Vec::with_capacity(page.len());
-        for (e, attr_res) in page.into_iter().zip(attrs) {
+        for (e, attr_res) in page.iter().zip(attrs) {
             if let Ok(attr) = attr_res {
-                out.push((e, attr));
+                out.push((e.clone(), attr));
             }
             // Skip Err: a name in the lister that disappeared
             // from dir_cache between opendir and
