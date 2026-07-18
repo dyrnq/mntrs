@@ -79,16 +79,29 @@ members = [".", "csi/mntrs-csi"]
 # Kimahriman/hdfs-native#302.
 #
 # Upstream has since implemented the SAME feature (PR #303, merge commit
-# e339b560, 2026-06-23) — equivalent constants/method/default. It is on master
-# but NOT yet in a release: v0.14.0 (2026-06-04) predates it, and no v0.14.1+
-# tag exists as of 2026-06-24. So this fork is kept temporarily (option C).
+# e339b560, 2026-06-23). It's released in hdfs-native v0.14.1 (2026-06-26)
+# and later; v0.14.2 (2026-07-11) is current. The remaining blocker is on
+# the opendal side: PR #7910
+# (`chore(deps): upgrade hdfs-native to 0.14`) merged into apache/opendal
+# master on 2026-07-15, bumping `opendal-service-hdfs-native`'s hdfs-native
+# constraint from `^0.13` to `0.14`. But it's not in any opendal release
+# yet — `opendal 0.58.0` (2026-07-10) still constrains hdfs-native to
+# `^0.13`, and was **yanked** (2026-07-17) for an unrelated macOS dyld
+# bug (#7923, fixed by #7925 in master on 2026-07-17). So `opendal`
+# is currently pinned at the last-safe `0.57.0` — there is nothing to
+# bump to until opendal 0.58.1 (with the #7925 fix) or 0.59.0 (with
+# both #7925 and #7910) ships. Keeping this fork until then.
 #
-# TODO: revert to the crates.io version (delete this [patch.crates-io] block)
-# once BOTH are published:
-#   1. hdfs-native releases a version >= 0.14.1 containing #303, AND
-#   2. opendal upgrades its opendal-service-hdfs-native dep to pull that version.
-# At that point the dyrnq/hdfs-native fork can be archived. See
-# [[hdfs-native-fork-temporary]].
+# Why a `0.57 → 0.58` bump would be a no-op anyway: both 0.57.0 and
+# 0.58.0 of `opendal-service-hdfs-native` constrain hdfs-native to
+# `^0.13`, so cargo resolves the same hdfs-native 0.13.5 from either.
+# The fork's rev (419cd0e, a 0.13.5 + #303 equivalent patch) is what
+# mntrs actually picks.
+#
+# TODO: revert to the crates.io version (delete this [patch.crates-io]
+# block) once opendal publishes a release containing PR #7910. At that
+# point the dyrnq/hdfs-native fork can be archived. Tracking:
+# [[hdfs-native-fork-drop-readiness-2026-07-18]].
 hdfs-native = { git = "https://github.com/dyrnq/hdfs-native.git", rev = "419cd0ea737289232f1b35e2680313d814bf90aa" }
 
 [[bin]]
