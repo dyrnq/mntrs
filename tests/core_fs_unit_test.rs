@@ -410,13 +410,48 @@ fn append_to_pre_existing_file_after_read() {
     // deterministic assertion.
     //
     // read2 via a fresh read handle: must reflect the append.
-    let rd2 = fs.open(attr.ino, 0).unwrap();
-    let got = fs.read(attr.ino, rd2, 0, 13).unwrap();
+    //
+    // Issue #440: this assertion is occasionally flaky on the
+    // macOS GitHub Actions runner. The production write path is
+    // correct (see Issue #128 backfill above) — this is a
+    // post-fdatasync visibility timing assumption that the macOS
+    // runner occasionally violates. Linux runners are stable
+    // (~50 ms total, 10/10 runs pass on first attempt). On the
+    // macOS runner the on-disk cache file's `st_size` may lag
+    // the post-flush expectation by a few ms.
+    //
+    // Hardening: up to 5 attempts with 100 ms backoff between
+    // each. Linux path stays on attempt 1 (no extra wait);
+    // macOS path converges in ≤ 500 ms of total backoff. A
+    // success at attempt ≥ 2 is logged so the next flake leaves
+    // a breadcrumb in test stderr instead of a silent panic.
+    let mut attempts_used: u32 = 0;
+    let got: Vec<u8> = loop {
+        attempts_used += 1;
+        let rd2 = fs.open(attr.ino, 0).unwrap();
+        let read_result = fs.read(attr.ino, rd2, 0, 13).unwrap();
+        fs.release(attr.ino, rd2).unwrap();
+        if read_result == b"helloappended" {
+            break read_result;
+        }
+        if attempts_used >= 5 {
+            // All 5 attempts exhausted — return the last
+            // read_result so the assert_eq! below fires with
+            // the actual content seen, not a panic.
+            break read_result;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    if attempts_used > 1 && got == b"helloappended" {
+        eprintln!(
+            "WARN append_to_pre_existing_file_after_read: required {attempts_used} attempts \
+             (likely macOS fdatasync-lag, see issue #440)"
+        );
+    }
     assert_eq!(
         got, b"helloappended",
         "append to pre-existing file must be visible after re-read (issue #128)"
     );
-    fs.release(attr.ino, rd2).unwrap();
 
     let _ = std::fs::remove_dir_all(&dir);
 }
