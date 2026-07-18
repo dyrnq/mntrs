@@ -348,9 +348,19 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         // time the kernel opened this directory); the
         // fh we receive here is the same fh opendir
         // returned. The cookie is the kernel's
-        // "1 + index of last entry delivered" —
-        // slicing from `offset as usize` matches the
-        // pre-#23 (Bug 32 fix in ece4391) semantics.
+        // "1 + index of last entry delivered".
+        //
+        // `inner.readdir` already slices by `offset`
+        // (returns `entries[offset..]`), so we iterate
+        // the returned Vec directly. Earlier revisions
+        // re-sliced with `entries[start..]` where
+        // `start = offset`, which double-subtracted and
+        // returned 0 entries once the offset exceeded
+        // half the directory size — issue #436 (stress
+        // 01-large-dir returned ~510 of 1002 entries).
+        // The kernel then saw EOF early and `find`
+        // under-counted. Removing the redundant slice
+        // restores correct pagination.
         //
         // For the pre-#23 fallback (fh=0, the trait
         // default), the implementation re-materialises
@@ -359,13 +369,8 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         // "list changed between pages" risk as before.
         match self.inner.readdir(ino.into(), fh.into(), offset, 0) {
             Ok(entries) => {
-                let start = offset as usize;
-                if start >= entries.len() {
-                    reply.ok();
-                    return;
-                }
-                for (offset_i, entry) in entries[start..].iter().enumerate() {
-                    let i = start + offset_i;
+                for (offset_i, entry) in entries.iter().enumerate() {
+                    let i = offset as usize + offset_i;
                     if reply.add(
                         INodeNo(entry.ino),
                         (i + 1) as u64,
@@ -396,14 +401,12 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         // entry was emitted with — vs the pre-#23
         // path which could allocate a different ino
         // for the same name across pages.
+        //
+        // #436: same double-slice fix as readdir.
+        // `inner.readdir` already slices by `offset`,
+        // so we iterate the returned Vec directly.
         match self.inner.readdir(ino.into(), fh.into(), offset, 0) {
             Ok(entries) => {
-                let start = offset as usize;
-                if start >= entries.len() {
-                    reply.ok();
-                    return;
-                }
-                let page = &entries[start..];
                 // Issue #29: batch the per-entry lookups
                 // so the implementation can serve the
                 // whole page from its dir_cache
@@ -415,7 +418,7 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
                 // to 0; for `find maxdepth1` it
                 // eliminates the per-entry stat
                 // completely.
-                let names: Vec<&str> = page.iter().map(|e| e.name.as_str()).collect();
+                let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
                 let attr_results =
                     self.inner
                         .lookup_many(ino.into(), &names)
@@ -426,9 +429,9 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
                                 .collect()
                         });
                 for (offset_i, (entry, attr_res)) in
-                    page.iter().zip(attr_results.iter()).enumerate()
+                    entries.iter().zip(attr_results.iter()).enumerate()
                 {
-                    let i = start + offset_i;
+                    let i = offset as usize + offset_i;
                     // For each directory entry, do a lookup to get full attr
                     let attr = attr_res.as_ref().ok();
                     let fattr = attr.map(from_core_attr).unwrap_or_else(|| {
