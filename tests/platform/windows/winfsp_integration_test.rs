@@ -1127,7 +1127,7 @@ impl CoreFilesystem for CountingCoreFs {
         fh: Option<u64>
     ) -> CoreFileAttr);
     forward!(opendir(ino: u64) -> u64);
-    forward!(readdir(ino: u64, fh: u64, offset: u64, _max: usize) -> Vec<mntrs::core_fs::CoreDirEntry>);
+    forward!(readdir(ino: u64, fh: u64, offset: u64, _max: usize) -> std::sync::Arc<Vec<mntrs::core_fs::CoreDirEntry>>);
     forward!(releasedir(_ino: u64, _fh: u64) -> ());
     forward!(readdir_with_attrs(ino: u64, fh: u64, marker: &str) -> Vec<(mntrs::core_fs::CoreDirEntry, CoreFileAttr)>);
     forward!(open(ino: u64, _flags: u32) -> u64);

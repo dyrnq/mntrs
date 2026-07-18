@@ -498,8 +498,8 @@ fn bug_issue23_readdir_per_fh_snapshot_stable_under_concurrent_mkdir() {
 
     // 1. opendir — materialise the snapshot.
     let fh = CoreFilesystem::opendir(&*fs, 1).unwrap();
-    let page1 = CoreFilesystem::readdir(&*fs, 1, fh, 0, 0).unwrap();
-    let page1_names: Vec<&str> = page1.iter().map(|e| e.name.as_str()).collect();
+    let snapshot = CoreFilesystem::readdir(&*fs, 1, fh, 0, 0).unwrap();
+    let page1_names: Vec<&str> = snapshot.iter().map(|e| e.name.as_str()).collect();
     assert!(
         page1_names.contains(&"a"),
         "first page should list pre-existing 'a' (got {page1_names:?})"
@@ -514,12 +514,20 @@ fn bug_issue23_readdir_per_fh_snapshot_stable_under_concurrent_mkdir() {
     CoreFilesystem::mkdir(&*fs, 1, "b").unwrap();
 
     // 3. Second page read — the kernel paginates by
-    //    re-calling readdir(offset=N). The per-fh
+    //    re-calling readdir(offset=N). Phase 2 (perf-
+    //    readdir-zero-copy) returns the FULL materialised
+    //    Arc on every call; the adapter (or here, the
+    //    test) slices via `&arc[start..]`. The per-fh
     //    snapshot must NOT include the post-snapshot
     //    "b", otherwise the kernel would see a
     //    duplicate / mid-list mutation.
     let start = page1_names.len() as u64;
-    let page2 = CoreFilesystem::readdir(&*fs, 1, fh, start, 0).unwrap();
+    let start_idx = start as usize;
+    let page2: &[mntrs::core_fs::CoreDirEntry] = if start_idx >= snapshot.len() {
+        &[]
+    } else {
+        &snapshot[start_idx..]
+    };
     let page2_names: Vec<&str> = page2.iter().map(|e| e.name.as_str()).collect();
     assert!(
         page2_names.is_empty(),

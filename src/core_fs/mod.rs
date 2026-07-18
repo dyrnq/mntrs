@@ -3,6 +3,7 @@
 //! This module defines the abstraction layer that both fuser (Linux/macOS)
 //! and winfsp (Windows) adapters implement.
 
+use std::sync::Arc;
 use std::time::SystemTime;
 
 /// Platform-independent file type.
@@ -174,13 +175,26 @@ pub trait CoreFilesystem: Send + Sync {
     /// default body because the only public impl
     /// (`MntrsFs`) always has per-fh state available
     /// and slicing is the right primitive.
+    ///
+    /// Returns `Arc<Vec<CoreDirEntry>>` so the adapter can
+    /// slice into the per-fh snapshot without copying the
+    /// entry data on every pagination page (issue
+    /// `perf-readdir-zero-copy`, Phase 2 of the readdir
+    /// investigation that started with #436). The Arc
+    /// is shared across all readdir() calls for the same
+    /// fh — adapter slices via `&entries_arc[start..]`
+    /// which is a borrow of the same backing memory,
+    /// not a fresh allocation. Pre-fix each page paid
+    /// `entries[start..].to_vec()` (O(page_size) copy);
+    /// post-fix only an atomic increment on the Arc
+    /// refcount.
     fn readdir(
         &self,
         ino: u64,
         fh: u64,
         offset: u64,
         _max: usize,
-    ) -> std::io::Result<Vec<CoreDirEntry>>;
+    ) -> std::io::Result<Arc<Vec<CoreDirEntry>>>;
 
     /// Release the per-fh readdir state. The default is
     /// a no-op (no per-fh state to release under the
@@ -217,9 +231,12 @@ pub trait CoreFilesystem: Send + Sync {
         fh: u64,
         marker: &str,
     ) -> std::io::Result<Vec<(CoreDirEntry, CoreFileAttr)>> {
+        // readdir now returns Arc<Vec<...>> — Deref to
+        // Vec is transparent for iteration, so callers
+        // don't need to special-case the type.
         let entries = self.readdir(ino, fh, 0, 0)?;
         let mut out = Vec::with_capacity(entries.len());
-        for e in entries {
+        for e in entries.iter() {
             if !marker.is_empty() && e.name.as_str() <= marker {
                 continue;
             }
@@ -230,7 +247,7 @@ pub trait CoreFilesystem: Send + Sync {
             // Explorer shows "0 bytes / unknown date"
             // instead of just dropping the row.
             match self.getattr(e.ino) {
-                Ok(attr) => out.push((e, attr)),
+                Ok(attr) => out.push((e.clone(), attr)),
                 Err(_) => continue,
             }
         }
