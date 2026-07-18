@@ -1035,6 +1035,132 @@ fn readdir_mixed_files_and_dirs() {
     fs.rmdir(1, "mixed-dir").unwrap();
 }
 
+// ── readdir pagination (issue #436) ──────────────────────────────────
+//
+// Regression test for the fuser-adapter double-slice bug:
+//   src/core_fs/fuser.rs readdir / readdirplus handlers called
+//   `inner.readdir(ino, fh, offset, _)` which already slices by
+//   `offset`, then re-sliced with `entries[start..]` where
+//   `start = offset`. For directories with >102 entries, the
+//   kernel paginates by re-issuing readdir with the previous
+//   page's last d_off; the second slice prematurely returned 0
+//   entries, so the kernel saw EOF and the user saw only ~half
+//   the directory (issue #436: stress 01-large-dir `find count:
+//   got '817', want '1000'`).
+//
+// The `MntrsFs::readdir` inner correctly slices by offset
+// (returns `entries[offset..]`). This test drives the inner
+// with the same pagination pattern the kernel would, and
+// verifies all entries are delivered. The fuser-adapter
+// fix is verified end-to-end by tests/stress/01-large-dir.sh.
+
+/// Kernel page fill for 4 KiB pages with ~40-byte entries ≈ 102.
+const KERNEL_ENTRIES_PER_PAGE: usize = 102;
+
+#[test]
+fn readdir_pagination_inner_delivers_all_entries() {
+    let fs = make_fs();
+    fs.mkdir(1, "big-dir").unwrap();
+    let dir_ino = fs.lookup(1, "big-dir").unwrap().ino;
+
+    // 250 files: 252 entries total (incl . + ..), well above the
+    // 102-entry/page boundary that triggered the original bug.
+    const N_FILES: usize = 250;
+    for i in 0..N_FILES {
+        let name = format!("f_{:03}", i);
+        fs.create(dir_ino, &name, 0o644).unwrap();
+    }
+    let fh = fs.opendir(dir_ino).unwrap();
+
+    // Snapshot the full listing at offset=0 so we know the
+    // ground truth.
+    let full = fs.readdir(dir_ino, fh, 0, 0).unwrap();
+    assert_eq!(
+        full.len(),
+        N_FILES + 2,
+        "snapshot should have {} entries (. + .. + {} files), got {}",
+        N_FILES + 2,
+        N_FILES,
+        full.len()
+    );
+
+    // Simulate kernel pagination: each call returns up to
+    // KERNEL_ENTRIES_PER_PAGE entries, the next call uses the
+    // (count of returned entries) as its offset — same shape
+    // as the fuser adapter's `for (i, ...) { reply.add(ino,
+    // i+1, ...); last_off = i+1; }` cookie increment.
+    let mut delivered: Vec<String> = Vec::new();
+    let mut offset: u64 = 0;
+    let mut calls = 0usize;
+    while calls < 32 {
+        // safety cap: should converge in ceil(N/102) = 3 calls
+        let page = fs.readdir(dir_ino, fh, offset, 0).unwrap();
+        if page.is_empty() {
+            break;
+        }
+        // Kernel would emit up to KERNEL_ENTRIES_PER_PAGE then
+        // signal EOF if buffer fills; here we model that cap
+        // explicitly.
+        let take = page.len().min(KERNEL_ENTRIES_PER_PAGE);
+        for entry in &page[..take] {
+            delivered.push(entry.name.clone());
+        }
+        offset += take as u64;
+        calls += 1;
+    }
+
+    assert_eq!(
+        delivered.len(),
+        N_FILES + 2,
+        "kernel pagination lost entries: delivered {} of {} (after {} calls)",
+        delivered.len(),
+        N_FILES + 2,
+        calls
+    );
+
+    // Same names as the snapshot, in the same order (entries
+    // come back in the order materialise inserted them).
+    let full_names: Vec<&str> = full.iter().map(|e| e.name.as_str()).collect();
+    let delivered_refs: Vec<&str> = delivered.iter().map(|s| s.as_str()).collect();
+    assert_eq!(
+        delivered_refs, full_names,
+        "pagination order should match snapshot"
+    );
+
+    fs.releasedir(dir_ino, fh).unwrap();
+    for i in 0..N_FILES {
+        let name = format!("f_{:03}", i);
+        fs.unlink(dir_ino, &name).unwrap();
+    }
+    fs.rmdir(1, "big-dir").unwrap();
+}
+
+/// Inner readdir with offset past the end returns an empty Vec
+/// (signals EOF). Pre-fix the adapter's double-slice could
+/// confuse this case (offset == end → inner empty → adapter's
+/// start >= len check passed → reply.ok(0 entries)). Post-fix
+/// the same call path is the only EOF signal we use.
+#[test]
+fn readdir_offset_past_end_returns_empty_vec() {
+    let fs = make_fs();
+    fs.mkdir(1, "small").unwrap();
+    let dir_ino = fs.lookup(1, "small").unwrap().ino;
+    fs.create(dir_ino, "only", 0o644).unwrap();
+
+    let fh = fs.opendir(dir_ino).unwrap();
+    // . + .. + 1 file = 3 entries total.
+    let entries = fs.readdir(dir_ino, fh, 1000, 0).unwrap();
+    assert!(
+        entries.is_empty(),
+        "offset past end should yield empty Vec (EOF), got {:?}",
+        entries
+    );
+
+    fs.releasedir(dir_ino, fh).unwrap();
+    fs.unlink(dir_ino, "only").unwrap();
+    fs.rmdir(1, "small").unwrap();
+}
+
 // ── init ──────────────────────────────────────────────────────────────
 
 #[test]
