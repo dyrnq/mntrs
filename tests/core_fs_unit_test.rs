@@ -8,6 +8,7 @@ use mntrs::core_fs::CoreFilesystem;
 use mntrs::new_test_fs;
 use opendal::Operator;
 use opendal::services::Memory;
+use std::sync::Arc;
 
 fn make_fs() -> mntrs::MntrsFs {
     let op = Operator::new(Memory::default()).unwrap().finish();
@@ -1048,14 +1049,31 @@ fn readdir_mixed_files_and_dirs() {
 //   the directory (issue #436: stress 01-large-dir `find count:
 //   got '817', want '1000'`).
 //
-// The `MntrsFs::readdir` inner correctly slices by offset
-// (returns `entries[offset..]`). This test drives the inner
-// with the same pagination pattern the kernel would, and
+// Phase 2 (perf-readdir-zero-copy) reshaped the contract: the
+// trait method now returns `Arc<Vec<CoreDirEntry>>` for the
+// FULL materialised snapshot, and the adapter (or any caller)
+// slices via `&arc[start..]`. This drives the inner + adapter
+// in the same pagination pattern the kernel would, and
 // verifies all entries are delivered. The fuser-adapter
 // fix is verified end-to-end by tests/stress/01-large-dir.sh.
 
 /// Kernel page fill for 4 KiB pages with ~40-byte entries ≈ 102.
 const KERNEL_ENTRIES_PER_PAGE: usize = 102;
+
+/// Adapter-side pagination helper: mirrors the `&arc[start..]`
+/// slicing the fuser adapter does in Phase 2. Returns the
+/// page the kernel would receive.
+fn adapter_page(
+    arc: &[mntrs::core_fs::CoreDirEntry],
+    offset: u64,
+) -> &[mntrs::core_fs::CoreDirEntry] {
+    let start = offset as usize;
+    if start >= arc.len() {
+        &[]
+    } else {
+        &arc[start..]
+    }
+}
 
 #[test]
 fn readdir_pagination_inner_delivers_all_entries() {
@@ -1072,16 +1090,18 @@ fn readdir_pagination_inner_delivers_all_entries() {
     }
     let fh = fs.opendir(dir_ino).unwrap();
 
-    // Snapshot the full listing at offset=0 so we know the
-    // ground truth.
-    let full = fs.readdir(dir_ino, fh, 0, 0).unwrap();
+    // Phase 2 contract: `readdir` returns the FULL materialised
+    // Arc-backed snapshot regardless of `offset`. The adapter
+    // slices it via `&arc[start..]`. So a single call here
+    // gives us the ground truth for all subsequent pages.
+    let snapshot = fs.readdir(dir_ino, fh, 0, 0).unwrap();
     assert_eq!(
-        full.len(),
+        snapshot.len(),
         N_FILES + 2,
         "snapshot should have {} entries (. + .. + {} files), got {}",
         N_FILES + 2,
         N_FILES,
-        full.len()
+        snapshot.len()
     );
 
     // Simulate kernel pagination: each call returns up to
@@ -1094,7 +1114,7 @@ fn readdir_pagination_inner_delivers_all_entries() {
     let mut calls = 0usize;
     while calls < 32 {
         // safety cap: should converge in ceil(N/102) = 3 calls
-        let page = fs.readdir(dir_ino, fh, offset, 0).unwrap();
+        let page = adapter_page(&snapshot, offset);
         if page.is_empty() {
             break;
         }
@@ -1120,10 +1140,10 @@ fn readdir_pagination_inner_delivers_all_entries() {
 
     // Same names as the snapshot, in the same order (entries
     // come back in the order materialise inserted them).
-    let full_names: Vec<&str> = full.iter().map(|e| e.name.as_str()).collect();
+    let snapshot_names: Vec<&str> = snapshot.iter().map(|e| e.name.as_str()).collect();
     let delivered_refs: Vec<&str> = delivered.iter().map(|s| s.as_str()).collect();
     assert_eq!(
-        delivered_refs, full_names,
+        delivered_refs, snapshot_names,
         "pagination order should match snapshot"
     );
 
@@ -1135,30 +1155,97 @@ fn readdir_pagination_inner_delivers_all_entries() {
     fs.rmdir(1, "big-dir").unwrap();
 }
 
-/// Inner readdir with offset past the end returns an empty Vec
-/// (signals EOF). Pre-fix the adapter's double-slice could
-/// confuse this case (offset == end → inner empty → adapter's
-/// start >= len check passed → reply.ok(0 entries)). Post-fix
-/// the same call path is the only EOF signal we use.
+/// Inner readdir with offset past the end signals EOF at the
+/// adapter boundary (the adapter's `start >= arc.len()` check
+/// produces an empty page). Pre-fix the adapter's double-slice
+/// could confuse this case. Post-fix the same call path is
+/// the only EOF signal we use.
 #[test]
-fn readdir_offset_past_end_returns_empty_vec() {
+fn readdir_offset_past_end_signals_eof_at_adapter() {
     let fs = make_fs();
     fs.mkdir(1, "small").unwrap();
     let dir_ino = fs.lookup(1, "small").unwrap().ino;
     fs.create(dir_ino, "only", 0o644).unwrap();
 
     let fh = fs.opendir(dir_ino).unwrap();
+    let snapshot = fs.readdir(dir_ino, fh, 0, 0).unwrap();
     // . + .. + 1 file = 3 entries total.
-    let entries = fs.readdir(dir_ino, fh, 1000, 0).unwrap();
+    assert_eq!(snapshot.len(), 3);
+
+    // Phase 2 contract: inner returns the FULL snapshot — the
+    // EOF signal is computed at the adapter boundary from
+    // `start >= arc.len()`. This is what the fuser adapter
+    // checks in `readdir` / `readdirplus`.
+    let page = adapter_page(&snapshot, 1000);
     assert!(
-        entries.is_empty(),
-        "offset past end should yield empty Vec (EOF), got {:?}",
-        entries
+        page.is_empty(),
+        "offset past end should yield empty page at adapter, got {:?}",
+        page
     );
 
     fs.releasedir(dir_ino, fh).unwrap();
     fs.unlink(dir_ino, "only").unwrap();
     fs.rmdir(1, "small").unwrap();
+}
+
+// ── readdir zero-copy (perf-readdir-zero-copy / Phase 2) ───────────────
+//
+// Verifies the contract that `CoreFilesystem::readdir` returns
+// `Arc<Vec<CoreDirEntry>>` and that the same Arc is handed back
+// across all pagination calls for a single fh — i.e. the adapter
+// slices via `&arc[start..]` (borrow of the same backing memory)
+// instead of `entries[start..].to_vec()` (O(page_size) copy on
+// every page).
+//
+// The pre-fix implementation returned `Vec<CoreDirEntry>`, so this
+// test would not even compile. The post-fix Arc-wrapping means
+// `Arc::ptr_eq` is the right primitive to verify the no-copy
+// contract holds end-to-end.
+
+#[test]
+fn readdir_zero_copy_same_arc_across_pages() {
+    let fs = make_fs();
+    fs.mkdir(1, "zcopy").unwrap();
+    let dir_ino = fs.lookup(1, "zcopy").unwrap().ino;
+    for i in 0..5 {
+        fs.create(dir_ino, &format!("f_{i}"), 0o644).unwrap();
+    }
+    let fh = fs.opendir(dir_ino).unwrap();
+
+    // Two pagination calls on the same fh must hand back the
+    // SAME Arc — same heap allocation, same backing Vec.
+    // Adapter slices via `&arc[start..]` without cloning.
+    let p0: Arc<Vec<mntrs::core_fs::CoreDirEntry>> = fs.readdir(dir_ino, fh, 0, 0).unwrap();
+    let p2: Arc<Vec<mntrs::core_fs::CoreDirEntry>> = fs.readdir(dir_ino, fh, 2, 0).unwrap();
+
+    assert!(
+        Arc::ptr_eq(&p0, &p2),
+        "readdir must return the same Arc-backed Vec across pages, \
+         got distinct allocations (pre-Phase-2 would have cloned)"
+    );
+
+    // The Arc content is the full materialised list (slice
+    // happens at the adapter, not the trait boundary) — both
+    // pages see the full 7 entries (. + .. + 5 files).
+    assert_eq!(p0.len(), 7);
+    assert_eq!(p2.len(), 7);
+
+    // A separate opendir call must mint a fresh Arc — no
+    // shared state across directory handles (each open is its
+    // own snapshot per issue #23).
+    let fh2 = fs.opendir(dir_ino).unwrap();
+    let p3: Arc<Vec<mntrs::core_fs::CoreDirEntry>> = fs.readdir(dir_ino, fh2, 0, 0).unwrap();
+    assert!(
+        !Arc::ptr_eq(&p0, &p3),
+        "separate opendir must mint a fresh Arc, not share with prior fh"
+    );
+
+    fs.releasedir(dir_ino, fh).unwrap();
+    fs.releasedir(dir_ino, fh2).unwrap();
+    for i in 0..5 {
+        fs.unlink(dir_ino, &format!("f_{i}")).unwrap();
+    }
+    fs.rmdir(1, "zcopy").unwrap();
 }
 
 // ── init ──────────────────────────────────────────────────────────────
