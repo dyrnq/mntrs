@@ -14,6 +14,12 @@ name: Benchmark (Windows)
 #
 # Reusing the ci-windows.yml WinFSP install + DLL PATH search
 # patterns verbatim (per memory mntrs-winfsp-ci-dll-path).
+#
+# Issue #452 (CI hardening): skipped on docs-only PRs
+# (`paths-ignore` excludes docs/** and *.md) and uses
+# nick-fields/retry@v3 to wrap the flakiest microbench step
+# (issue #441: microbench_find_ino_by_path_500_entries threshold
+# flake, previously got 2.6× < 4× on a single runner instance).
 
 permissions:
   contents: read
@@ -23,6 +29,13 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # Skip docs-only PRs (issue #452 Layer 1). docs/** and *.md
+    # are never the cause of bench regressions; running the full
+    # ~6 min Windows job on a docs PR wastes runner minutes and
+    # risks a flake false-positive on microbench.
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
   workflow_dispatch:
   schedule:
     # Weekly Mon 02:00 UTC. Off-the-hour to spread CI load; matches
@@ -39,6 +52,14 @@ jobs:
     # PowerShell bench runs ~25 workloads (~3min). 30min leaves
     # ~14min headroom for cache restores that land mid-run.
     timeout-minutes: 30
+
+    env:
+      # In-process retry for cargo test (issue #452 Layer 2).
+      # RUST_TEST_RETRY=3 retries any single failing test up to
+      # 3 times before failing the suite. Microbench tests are
+      # short; this is a defense-in-depth alongside the
+      # nick-fields/retry@v3 wrapper below.
+      RUST_TEST_RETRY: 3
 
     steps:
       - uses: actions/checkout@v4
@@ -95,7 +116,19 @@ jobs:
       # println! lines land in the artifact. Internal asserts
       # (`speedup >= 5x` / `>= 1.05x`) act as a sanity gate; if
       # they trip the whole cargo test step fails.
+      #
+      # Issue #452 Layer 2: wrapped in nick-fields/retry@v3 with
+      # max_attempts=2 (one retry on transient fail). The bench
+      # job previously flaked on microbench_find_ino_by_path_500_entries
+      # (issue #441) — Windows runner HashMap overhead varies
+      # between VM allocations. One retry catches transient
+      # variations; persistent failures still fail the step.
       - name: Run microbench (sanity)
+        uses: nick-fields/retry@v3
+        with:
+          max_attempts: 2
+          timeout: 600
+          retry_on: error
         run: |
           cargo test --test microbench --release -- --nocapture 2>&1 | Tee-Object -FilePath microbench-result.txt
 

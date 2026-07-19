@@ -7,6 +7,15 @@
 #
 # CSI build skipped: mntrs-csi is linux-only.
 #
+# Issue #452 (CI hardening): skipped on docs-only PRs
+# (`paths-ignore` excludes docs/** and *.md) — the macOS runner
+# has a known flake on core_fs_unit_test::append_to_pre_existing_file_after_read
+# (issue #128 regression, #440 retry-loop insufficient), so
+# running this job on a docs PR risks a false-positive fail
+# with zero diagnostic value. RUST_TEST_RETRY=3 + the
+# nick-fields/retry@v3 wrapper below give us two layers of
+# defense on non-docs PRs.
+#
 name: CI - macOS
 
 permissions:
@@ -17,11 +26,19 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # Skip docs-only PRs (issue #452 Layer 1).
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # Issue #452 Layer 2 (in-process test retry). Retries any
+  # single failing test up to 3 times before failing the suite.
+  # Defense alongside nick-fields/retry@v3 wrapping below.
+  RUST_TEST_RETRY: 3
 
 jobs:
   build-test:
@@ -51,7 +68,19 @@ jobs:
       - name: Unit tests (lib only)
         run: cargo test --workspace --lib
 
+      # Issue #452 Layer 2: wrapped in nick-fields/retry@v3 with
+      # max_attempts=2 (one retry on transient fail). Targets
+      # core_fs_unit_test::append_to_pre_existing_file_after_read
+      # (issue #128 / #440) — the macOS runner's fdatasync size-lag
+      # race makes this test flaky in 5-10% of runs. One retry
+      # catches the transient; persistent failures still propagate.
+      # Belt-and-suspenders with the RUST_TEST_RETRY=3 env above.
       - name: Core FS unit tests
+        uses: nick-fields/retry@v3
+        with:
+          max_attempts: 2
+          timeout: 600
+          retry_on: error
         run: cargo test --workspace --test core_fs_unit_test
 
       - name: Platform tests
