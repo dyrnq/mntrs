@@ -12,9 +12,8 @@
 # has a known flake on core_fs_unit_test::append_to_pre_existing_file_after_read
 # (issue #128 regression, #440 retry-loop insufficient), so
 # running this job on a docs PR risks a false-positive fail
-# with zero diagnostic value. RUST_TEST_RETRY=3 + the
-# nick-fields/retry@v3 wrapper below give us two layers of
-# defense on non-docs PRs.
+# with zero diagnostic value. RUST_TEST_RETRY=3 in env gives
+# cargo libtest in-process retry for failing tests.
 #
 name: CI - macOS
 
@@ -68,19 +67,17 @@ jobs:
       - name: Unit tests (lib only)
         run: cargo test --workspace --lib
 
-      # Issue #452 Layer 2: wrapped in nick-fields/retry@v3 with
-      # max_attempts=2 (one retry on transient fail). Targets
+      # Issue #452 Layer 2: relies on RUST_TEST_RETRY=3 env above
+      # (cargo libtest built-in, retries any individual failing test
+      # up to 3 times before failing the suite). Targets
       # core_fs_unit_test::append_to_pre_existing_file_after_read
-      # (issue #128 / #440) — the macOS runner's fdatasync size-lag
-      # race makes this test flaky in 5-10% of runs. One retry
-      # catches the transient; persistent failures still propagate.
-      # Belt-and-suspenders with the RUST_TEST_RETRY=3 env above.
+      # (issue #128 / #440) — macOS fdatasync size-lag race.
+      # NOTE: a `nick-fields/retry@v3` workflow-level wrapper was
+      # attempted first; GHA workflow parser rejects a step with
+      # both `uses:` and a sibling `run:` (`unexpected value 'run'`),
+      # so we keep the in-process retry only. Sufficient for known
+      # in-scope flake per memory ci-flake-history-2026-07-18.
       - name: Core FS unit tests
-        uses: nick-fields/retry@v3
-        with:
-          max_attempts: 2
-          timeout: 600
-          retry_on: error
         run: cargo test --workspace --test core_fs_unit_test
 
       - name: Platform tests

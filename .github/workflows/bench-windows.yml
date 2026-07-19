@@ -16,10 +16,10 @@ name: Benchmark (Windows)
 # patterns verbatim (per memory mntrs-winfsp-ci-dll-path).
 #
 # Issue #452 (CI hardening): skipped on docs-only PRs
-# (`paths-ignore` excludes docs/** and *.md) and uses
-# nick-fields/retry@v3 to wrap the flakiest microbench step
-# (issue #441: microbench_find_ino_by_path_500_entries threshold
-# flake, previously got 2.6× < 4× on a single runner instance).
+# (`paths-ignore` excludes docs/** and *.md). The known flake
+# (issue #441 microbench_find_ino_by_path_500_entries, previously
+# 2.6× < 4× threshold) is handled by RUST_TEST_RETRY=3 set on the
+# job (cargo libtest in-process retry for failing tests).
 
 permissions:
   contents: read
@@ -117,18 +117,15 @@ jobs:
       # (`speedup >= 5x` / `>= 1.05x`) act as a sanity gate; if
       # they trip the whole cargo test step fails.
       #
-      # Issue #452 Layer 2: wrapped in nick-fields/retry@v3 with
-      # max_attempts=2 (one retry on transient fail). The bench
-      # job previously flaked on microbench_find_ino_by_path_500_entries
-      # (issue #441) — Windows runner HashMap overhead varies
-      # between VM allocations. One retry catches transient
-      # variations; persistent failures still fail the step.
+      # Issue #452 Layer 2: relies on RUST_TEST_RETRY=3 env above
+      # (cargo libtest built-in, retries any individual failing
+      # microbench up to 3 times). Targets
+      # microbench_find_ino_by_path_500_entries (issue #441) —
+      # Windows runner HashMap overhead varies between VM allocations.
+      # NOTE: `nick-fields/retry@v3` workflow-level wrapper
+      # attempted; GHA parser rejects `uses:` + sibling `run:`,
+      # so we keep the in-process retry only.
       - name: Run microbench (sanity)
-        uses: nick-fields/retry@v3
-        with:
-          max_attempts: 2
-          timeout: 600
-          retry_on: error
         run: |
           cargo test --test microbench --release -- --nocapture 2>&1 | Tee-Object -FilePath microbench-result.txt
 
