@@ -119,3 +119,21 @@ fn path_hash_thread_safety() {
     let h2 = path_hash("concurrent_test");
     assert_eq!(h1, h2);
 }
+
+// ============================================================
+// Issue #438: FUSE_INIT capability surface regression guard.
+// ============================================================
+//
+// `src/core_fs/fuser.rs::init` requests `InitFlags::FUSE_READDIRPLUS_AUTO`
+// so the kernel can auto-promote `getdents` to `readdirplus` when the
+// caller subsequently needs entry attrs (`ls -la`, `find`, etc.).
+// Without this guard, a future fuser bump that renames the constant
+// (or splits it across a feature flag) would silently drop the cap
+// at compile time and only be caught in a FUSE mount smoke test.
+//
+// `fuser::KernelConfig`'s constructor is crate-private (only built
+// inside `mount2`/`spawn_mount2` — see fuser-0.17.0 src/lib.rs:224),
+// so a direct unit test of "init() set this cap" is not feasible
+// without a real mount. The actual capability pin lives as a
+// `#[cfg(test)] mod` inside `src/core_fs/fuser.rs` so the test
+// compile fails immediately on a fuser API surface change.

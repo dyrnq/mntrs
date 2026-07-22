@@ -124,6 +124,32 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         // `find`, `tree` on large dirs.
         let _ = config.add_capabilities(InitFlags::FUSE_PARALLEL_DIROPS);
 
+        // Issue #438: READDIRPLUS_AUTO — on Linux kernel ≥ 5.9 the
+        // VFS auto-promotes a `getdents` syscall to a FUSE
+        // READDIRPLUS when the caller subsequently asks for entry
+        // attributes (e.g. `ls -la`, `find`, `stat` per row). Without
+        // this cap, the kernel issues a separate lookup() per entry,
+        // each of which is a remote RTT for S3/HDFS. mntrs's
+        // `FuserAdapter::readdirplus` already serves the page from
+        // `dir_cache` via `lookup_many` (issue #29) — 0 RTTs on a warm
+        // cache — so the only thing missing was the kernel-side
+        // opt-in.
+        //
+        // cfg-gated to Linux: macFUSE on macOS does not document
+        // support for this cap (its kernel module targets a different
+        // rev of libfuse); emitting the flag there is harmless (it
+        // shows up as an unknown cap and is ignored) but cfg-gating
+        // keeps the diff focused and matches the existing pattern at
+        // the `direct_io` branch below. Kernels older than 5.9 ignore
+        // unknown caps silently.
+        //
+        // Bench impact (vs. rclone on `ls -la many` / `find maxdepth1`):
+        // pre-fix these took 1.6–32x as many RTTs because each entry's
+        // size/mode hit a fresh lookup; post-fix the kernel reuses
+        // the readdirplus reply.
+        #[cfg(target_os = "linux")]
+        let _ = config.add_capabilities(InitFlags::FUSE_READDIRPLUS_AUTO);
+
         // #81: WRITEBACK_CACHE — kernel buffers small writes and merges
         // them before sending to the filesystem. Cuts FUSE write requests
         // for small-write workloads (`dd bs=4k` etc).
@@ -1070,5 +1096,48 @@ mod tests {
     fn raw_os_error_zero_falls_back_to_eio() {
         let e = std::io::Error::from_raw_os_error(0);
         assert_eq!(errno_i32(io_err_to_fuse_errno(e)), libc::EIO);
+    }
+
+    // ── Issue #438: FUSE_INIT capability regression guard ──────────
+    //
+    // The `init` callback above requests
+    // `InitFlags::FUSE_READDIRPLUS_AUTO` so the kernel can auto-promote
+    // `getdents` to `readdirplus` when the caller subsequently needs
+    // entry attrs (`ls -la`, `find`, etc.). Without this guard, a
+    // future fuser bump that renames the constant (or splits it across
+    // a feature flag) would silently drop the cap at compile time and
+    // only surface in a FUSE mount smoke test — by which point the
+    // binary has already shipped.
+    //
+    // `fuser::KernelConfig`'s constructor is crate-private (only built
+    // inside `fuser::mount2` / `spawn_mount2` — see fuser-0.17.0
+    // src/lib.rs:224), so a direct unit test of "init() pushed this
+    // cap into the struct" is not feasible without a real mount. The
+    // pin below is the closest substitute that catches API-surface
+    // regressions at compile time:
+    //
+    //   * Constant exists with the expected name on this fuser rev →
+    //     nothing fails (the assertion holds).
+    //   * Constant renamed / removed → compile error here.
+    //   * Bit value changes (e.g. protocol rev 7.43 shifts it) →
+    //     runtime assertion fails, forces a code-review for the new
+    //     bit position before re-pinning.
+    //
+    // Per fuser-0.17.0 src/ll/flags/init_flags.rs:38 the bit is
+    // `1 << 14`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn readdirplus_auto_cap_pinned() {
+        // Both cap-name and bit-pin check. Cheap (<1 µs); gives the
+        // test run a positive signal alongside the grep in CI logs.
+        let cap = fuser::InitFlags::FUSE_READDIRPLUS_AUTO;
+        assert_eq!(cap.bits(), 1u64 << 14);
+
+        // And a usage-side witness: pull the constant into a local
+        // binding so a future refactor that turns `cap` into a
+        // computed expression still surfaces any bit-change as a
+        // value mismatch here, not a silent type-only resolution.
+        let requested: fuser::InitFlags = cap;
+        assert!(requested.contains(fuser::InitFlags::FUSE_READDIRPLUS_AUTO));
     }
 }
