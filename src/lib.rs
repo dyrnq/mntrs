@@ -5003,14 +5003,25 @@ impl CoreFilesystem for MntrsFs {
             .await
         });
         if let Err(e) = result {
-            // Map backend "already exists" to io ErrorKind so
-            // the fuser adapter returns EEXIST. Different
-            // backends phrase this slightly differently.
+            // Issue T1-1: map backend "already exists" to io ErrorKind
+            // so the fuser adapter returns EEXIST. Typed-kind matching
+            // only — the prior `format!("{e}").contains("exists")`
+            // substring heuristic was fragile: any backend error whose
+            // message happened to include the word "exists" (e.g.
+            // "object no longer exists because ..." on a delete
+            // race, or "bucket already exists" leak-through on a
+            // different code path) was misclassified as EEXIST and
+            // returned to the caller instead of the real error. The
+            // `opendal_to_io_error` fallback below already maps
+            // `AlreadyExists` to `io::ErrorKind::AlreadyExists`
+            // (util.rs:opendal_to_io_error), so the typed-match path
+            // here is sufficient; the fallback path catches any
+            // typed `AlreadyExists`/`ConditionNotMatch` variants too.
             let kind = e.kind();
             let already_exists = matches!(
                 kind,
                 opendal::ErrorKind::AlreadyExists | opendal::ErrorKind::ConditionNotMatch
-            ) || format!("{e}").to_lowercase().contains("exists");
+            );
             if already_exists {
                 // Issue #268.5 O19: EEXIST is the EXPECTED
                 // return path of create_excl on race. Default
