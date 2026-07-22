@@ -274,6 +274,18 @@ enum Commands {
         #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
         #[arg(long, value_name = "SECS", default_value = "60")]
         daemon_timeout_macos: u64,
+        /// macOS: pass `-o slow_statfs` to macFUSE so the kernel
+        /// doesn't block Finder / Spotlight / diskutil on a slow
+        /// statfs roundtrip. Finder cascades statfs into every
+        /// directory browse; with a remote backend (S3/HDFS/OSS)
+        /// each RTT is 50-300 ms and Finder shows a 5-10s
+        /// beachball. rclone enables slow_statfs by default for
+        /// every macFUSE mount for the same reason. Default true;
+        /// ignored on Linux/Windows.
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+        #[arg(long, default_value_t = true)]
+        slow_statfs: bool,
         /// macOS: volume name shown in Finder sidebar / `diskutil list`.
         /// Default (when unset): `mntrs-<basename(mountpoint)>`, truncated
         /// to 64 chars (macFUSE hard limit). Ignored on Linux/Windows.
@@ -494,6 +506,7 @@ fn main() -> anyhow::Result<()> {
             negative_vncache,
             auto_cache,
             daemon_timeout_macos,
+            slow_statfs,
             volume_name,
             finder_local,
             max_read_ahead,
@@ -653,6 +666,7 @@ fn main() -> anyhow::Result<()> {
                 negative_vncache,
                 auto_cache,
                 daemon_timeout_macos,
+                slow_statfs,
                 volume_name.as_deref(),
                 finder_local,
                 max_read_ahead,
