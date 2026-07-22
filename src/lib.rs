@@ -544,7 +544,6 @@ pub struct MntrsFs {
     pub(crate) umask: Option<u32>,
     pub(crate) dir_perms: u16,
     pub(crate) file_perms: u16,
-    pub(crate) link_perms: u16,
     pub(crate) direct_io: bool,
     /// Issue #257: when `true`, the read path falls back to
     /// a partial on-disk cache file if the backend read fails.
@@ -579,10 +578,7 @@ pub struct MntrsFs {
     pub(crate) no_apple_double: bool,
     pub(crate) no_apple_xattr: bool,
     pub(crate) no_macos_metadata: bool,
-    pub(crate) hash_filter: Option<(usize, usize)>,
     pub(crate) block_norm_dupes: bool,
-    pub(crate) write_wait: Duration,
-    pub(crate) read_wait: Duration,
     pub(crate) handle_caching: Duration,
     pub(crate) cache_poll_interval: Duration,
     pub(crate) disk_total_size: u64,
@@ -694,7 +690,6 @@ pub struct MntrsFs {
     /// (the inner DashMap is already cheap to clone
     /// at the `Arc` level).
     pub(crate) disk_cache_index: Arc<dashmap::DashMap<CacheKey, (u64, std::time::Instant)>>,
-    pub(crate) storage_class: Option<String>,
     /// Multi-level cache (L1 memory → L2 disk block). Unifies the
     /// block-level read path: `read_block` checks L1 first, then L2
     /// (with L1 backfill on L2 hit). `populate` backfills both levels
@@ -6610,7 +6605,6 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         umask: None,
         dir_perms: 0o755,
         file_perms: 0o644,
-        link_perms: 0o777,
         direct_io: false,
         // Issue #257: opt-in stale-on-backend-error. Default
         // off — the test suite asserts the conservative
@@ -6649,10 +6643,7 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         no_apple_double: false,
         no_apple_xattr: false,
         no_macos_metadata: false,
-        hash_filter: None,
         block_norm_dupes: false,
-        write_wait: std::time::Duration::from_secs(0),
-        read_wait: std::time::Duration::from_secs(0),
         cache_poll_interval: std::time::Duration::from_secs(60),
         handle_caching: std::time::Duration::from_secs(0),
         disk_total_size: 0,
@@ -6679,7 +6670,6 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         mem_cache: std::sync::Arc::new(crate::cache::DashMapMemCache::new(0)),
         attr_cache: Default::default(),
         disk_cache_index: disk_cache_index.clone(),
-        storage_class: None,
         multi_cache: {
             let mc: std::sync::Arc<dyn crate::cache::MemCache> =
                 std::sync::Arc::new(crate::cache::DashMapMemCache::new(0));
