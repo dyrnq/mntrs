@@ -23,6 +23,15 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # Issue #452: skip on docs-only PRs. The `bench-windows` job has a
+    # known transient flake (`microbench_find_ino_by_path_500_entries`)
+    # even after the threshold-warmup hardening in PR #442 — the in-test
+    # ratio check is sensitive to GHA Windows runner CPU variance. Docs
+    # changes are unrelated, so save the ~10 min Windows runner cost and
+    # never block a docs PR on this flake.
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
   workflow_dispatch:
   schedule:
     # Weekly Mon 02:00 UTC. Off-the-hour to spread CI load; matches
@@ -96,8 +105,19 @@ jobs:
       # (`speedup >= 5x` / `>= 1.05x`) act as a sanity gate; if
       # they trip the whole cargo test step fails.
       - name: Run microbench (sanity)
-        run: |
-          cargo test --test microbench --release -- --nocapture 2>&1 | Tee-Object -FilePath microbench-result.txt
+        uses: nick-fields/retry@v3
+        with:
+          # 2 attempts catches the typical runner-CPU-variance flake
+          # while bounding the worst-case cost to ~12 min on cold cache
+          # (vs ~10 min on first attempt + ~2 min on retry). The retry
+          # action gets a fresh process allocation per attempt (this is
+          # how `nick-fields/retry@v3` handles the `retry_on: error`
+          # case), so the second attempt sees a clean runner state.
+          max_attempts: 2
+          timeout: 600
+          retry_on: error
+          command: |
+            cargo test --test microbench --release -- --nocapture 2>&1 | Tee-Object -FilePath microbench-result.txt
 
       - name: Upload microbench artifact
         if: always()

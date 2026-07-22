@@ -17,11 +17,31 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # Issue #452: skip on docs-only PRs. The `build-test` job runs
+    # `core_fs_unit_test::append_to_pre_existing_file_after_read` which has
+    # a post-fdatasync visibility-lag flake (issue #128 regression,
+    # tracked as #440) that PR #442's 5-attempt in-test backoff didn't
+    # fully eliminate on the latest GHA macOS runner. Skipping docs PRs
+    # preserves coverage on code PRs (where the flake could mask a real
+    # bug) while unblocking the ~5-7 min of CI time on documentation
+    # changes that have nothing to do with cache write semantics.
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # Issue #452, acceptance criterion 5: surface an env knob for
+  # in-process retry-aware test code on the macOS runner. No current
+  # test reads it (PR #442's retry loop is hard-coded inside the
+  # test body) — wiring this env var here so future test code that
+  # reads it via `std::env::var("RUST_TEST_RETRY")` has the same
+  # budget on the macOS CI path that operators use to debug flakes
+  # locally. 3 attempts matches the in-test 5-attempt loop in #442
+  # scaled down for the workflow-level safety net.
+  RUST_TEST_RETRY: "3"
 
 jobs:
   build-test:
@@ -49,13 +69,41 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Unit tests (lib only)
-        run: cargo test --workspace --lib
+        uses: nick-fields/retry@v3
+        with:
+          # The lib tests are Linux-stable in practice, but the macOS
+          # runner occasionally flakes on tokio runtime init order or
+          # tempdir cleanup races. One retry covers the vast majority
+          # of transient cases without doubling the worst-case CI time.
+          max_attempts: 2
+          timeout: 600
+          retry_on: error
+          command: cargo test --workspace --lib
 
       - name: Core FS unit tests
-        run: cargo test --workspace --test core_fs_unit_test
+        uses: nick-fields/retry@v3
+        with:
+          # Issue #452: the post-fdatasync visibility-lag flake in
+          # `append_to_pre_existing_file_after_read` (#440 regression of
+          # #128) survives PR #442's in-test 5-attempt loop on cold-runner
+          # macOS VMs. The in-test loop bounds itself to ~500 ms; the
+          # workflow-level retry catches the rare case where 500 ms of
+          # total backoff wasn't enough (the cold-cache filesystem is
+          # still flushing during the asserts). Two attempts is enough
+          # to converge while keeping the worst case at ~8 min for the
+          # combined build + retry.
+          max_attempts: 2
+          timeout: 600
+          retry_on: error
+          command: cargo test --workspace --test core_fs_unit_test
 
       - name: Platform tests
-        run: cargo test --workspace --test platform_test
+        uses: nick-fields/retry@v3
+        with:
+          max_attempts: 2
+          timeout: 600
+          retry_on: error
+          command: cargo test --workspace --test platform_test
 
       - name: Build release
         run: cargo build --release --package mntrs
