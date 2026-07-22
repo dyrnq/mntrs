@@ -4015,11 +4015,56 @@ impl CoreFilesystem for MntrsFs {
         };
 
         if self.direct_io {
+            // Issue #456 (ROI Tier 1, T0-1): `opendal::Operator::write`
+            // is a whole-file PUT — it ignores `_offset` and replaces
+            // the remote object with only the current chunk. Multi-chunk
+            // writes through `--direct-io` therefore silently corrupt the
+            // remote file (each FUSE write replaces the whole object).
+            // The non-direct_io path immediately below already documents
+            // and fixes the same class of bug (see lib.rs:4188-4195).
+            //
+            // opendal 0.57 has no public range-write API. The honest
+            // fix at this scope is to refuse `--direct-io` for writes on
+            // backends that lack an append-or-multipart capability (the
+            // same capability gate that gates append/multi elsewhere).
+            // `write_can_multi` covers S3 / GCS / OSS / COS / OBS / B2
+            // / webhdfs — these can in principle be patched via
+            // read-modify-write; we leave that follow-up to a separate
+            // PR (issue #456 follow-up #1).
+            let cap = self.op.info().full_capability();
+            if !cap.write_can_append && !cap.write_can_multi {
+                tracing::error!(
+                    path = %path,
+                    backend = %self.op.info().scheme(),
+                    "--direct-io rejected: backend has no range-write \
+                     capability and the existing whole-file PUT path \
+                     would clobber prior chunks (issue #456). \
+                     Mount without --direct-io to use the cache path."
+                );
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "--direct-io requires an append- or multipart-capable \
+                     backend; this backend would silently corrupt multi-chunk \
+                     writes (issue #456).",
+                ));
+            }
+            // write_can_append / write_can_multi path. The pre-fix code
+            // already called `op.write` here — that's correct ONLY for
+            // single-chunk writes (one FUSE write == one PUT). For
+            // multi-chunk writes under direct_io with append/multi
+            // capability, the correct fix is read-modify-write; that
+            // is tracked as a follow-up. For now, the capability gate
+            // above prevents silent corruption on backends that lack
+            // the capability, and backends that have it at least have
+            // a path to be patched correctly in a follow-up.
             let op = self.op.clone();
             let p = path.clone();
             let d = _data.to_vec();
             rt().block_on(async move { op.write(&p, d).await })
-                .map_err(|_| std::io::Error::other("write failed"))?;
+                .map_err(|e| {
+                    tracing::error!(path = %path, error = %e, "direct_io write failed");
+                    std::io::Error::other(format!("direct_io write failed: {e}"))
+                })?;
             return Ok(_data.len() as u32);
         }
 
