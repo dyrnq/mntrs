@@ -3175,6 +3175,7 @@ fn parse_macos_kext_version(stdout: &str) -> Option<String> {
 /// cost of avoiding a cryptic error.
 ///
 /// Issue #464.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn derive_macos_volname(mountpoint: &str, override_name: Option<&str>) -> String {
     const MAX_VOLNAME_LEN: usize = 64;
     if let Some(name) = override_name {
