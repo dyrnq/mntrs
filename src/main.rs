@@ -236,6 +236,19 @@ enum Commands {
         /// macOS: tell OS the mount is case-insensitive
         #[arg(long)]
         mount_case_insensitive: bool,
+        /// macOS: volume name shown in Finder sidebar / `diskutil list`.
+        /// Default (when unset): `mntrs-<basename(mountpoint)>`, truncated
+        /// to 64 chars (macFUSE hard limit). Ignored on Linux/Windows.
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        #[arg(long, value_name = "NAME")]
+        volume_name: Option<String>,
+        /// macOS: pass `-o local` to macFUSE so the kernel treats the
+        /// mount like a local APFS volume (faster path for repeated
+        /// small-file ops). Default true; ignored on Linux/Windows.
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+        #[arg(long, default_value_t = true)]
+        finder_local: bool,
         /// Max read-ahead in bytes (default: 131072)
         #[arg(long, default_value = "131072")]
         max_read_ahead: u64,
@@ -398,8 +411,11 @@ fn main() -> anyhow::Result<()> {
             daemon,
             daemon_wait,
             daemon_timeout,
+            #[allow(unused_variables)]
+            internal_daemon,
             allow_root,
             allow_idmap,
+            link_perms,
             vfs_cache_max_size,
             mem_limit,
             mem_cache_impl,
@@ -415,7 +431,6 @@ fn main() -> anyhow::Result<()> {
             umask,
             dir_perms,
             file_perms,
-            link_perms,
             allow_non_empty,
             cache_dir,
             direct_io,
@@ -438,6 +453,8 @@ fn main() -> anyhow::Result<()> {
             no_macos_metadata,
             hash_filter,
             mount_case_insensitive,
+            volume_name,
+            finder_local,
             max_read_ahead,
             vfs_read_chunk_size_limit,
             vfs_read_chunk_streams,
@@ -592,6 +609,8 @@ fn main() -> anyhow::Result<()> {
                 no_macos_metadata,
                 hash_filter,
                 mount_case_insensitive,
+                volume_name.as_deref(),
+                finder_local,
                 max_read_ahead,
                 vfs_read_chunk_size_limit,
                 vfs_read_chunk_streams,
