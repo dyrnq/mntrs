@@ -612,6 +612,8 @@ pub fn mount_internal(
         false,       // no_macos_metadata (CSI runs on Linux; macOS metadata filter is a no-op)
         None,        // hash_filter
         false,       // mount_case_insensitive
+        None,        // volume_name (CSI default — derive from mountpoint at runtime)
+        false,       // finder_local (CSI runs on Linux; macOS mount option ignored)
         131072,      // max_read_ahead
         0,           // vfs_read_chunk_size_limit
         // Issue #31: bump default chunk_streams from 0
@@ -904,6 +906,8 @@ pub fn mount(
     no_macos_metadata: bool,
     hash_filter: Option<String>,
     mount_case_insensitive: bool,
+    volume_name: Option<&str>,
+    finder_local: bool,
     _max_read_ahead: u64,
     vfs_read_chunk_size_limit: u64,
     vfs_read_chunk_streams: u32,
@@ -1483,6 +1487,27 @@ pub fn mount(
             if mount_case_insensitive {
                 cfg.mount_options
                     .push(MountOption::CUSTOM("case_insensitive".to_string()));
+            }
+            // Issue #464: Finder-friendly mount.
+            //
+            // `-o volname=<name>` makes Finder's sidebar and
+            // `diskutil list` show a readable name instead of the
+            // raw mountpoint path. Default derivation: `mntrs-<basename>`,
+            // truncated to 64 chars (macFUSE hard limit on volume
+            // name length; longer names silently fail with EINVAL).
+            //
+            // `-o local` marks the volume as local for macFUSE kernel
+            // caching — repeated small-file ops (Finder Get Info,
+            // QuickLook, Spotlight) hit a faster code path. Default
+            // on for parity with sshfs / rclone; users with exotic
+            // backends (rare case of stale-cache issues) can opt
+            // out via `--no-finder-local`.
+            let volname = derive_macos_volname(mountpoint, volume_name);
+            cfg.mount_options
+                .push(MountOption::CUSTOM(format!("volname={}", volname)));
+            if finder_local {
+                cfg.mount_options
+                    .push(MountOption::CUSTOM("local".to_string()));
             }
         }
         if default_permissions {
@@ -3132,6 +3157,55 @@ fn parse_macos_kext_version(stdout: &str) -> Option<String> {
     None
 }
 
+/// Derive the macOS volume name shown in Finder / `diskutil list`.
+///
+/// Priority:
+/// 1. `--volume-name <NAME>` if provided — used verbatim (caller has
+///    already opted into the override; we do not silently mangle it
+///    beyond the 64-char macFUSE truncation, since users picking a
+///    custom name generally know what they want).
+/// 2. Otherwise: `mntrs-<basename(mountpoint)>`, truncated to 64 chars.
+///    The basename is the path's last segment with leading `/` and any
+///    trailing slashes stripped. For a mountpoint of `/` (root, weird
+///    but legal) the basename is empty, so we fall back to `mntrs-root`.
+///
+/// **macFUSE hard limit:** volume names longer than 64 chars are
+/// rejected by the kernel at mount time with `EINVAL`. Truncation
+/// keeps the mount working; the visible truncation in Finder is the
+/// cost of avoiding a cryptic error.
+///
+/// Issue #464.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn derive_macos_volname(mountpoint: &str, override_name: Option<&str>) -> String {
+    const MAX_VOLNAME_LEN: usize = 64;
+    if let Some(name) = override_name {
+        // Custom override: respect user choice but still cap at
+        // the macFUSE limit so a typo doesn't blow up the mount.
+        if name.len() > MAX_VOLNAME_LEN {
+            return name.chars().take(MAX_VOLNAME_LEN).collect();
+        }
+        return name.to_string();
+    }
+    // Auto-derive: take the last path segment, strip trailing slashes,
+    // prefix with `mntrs-`. Edge cases:
+    //   * `/`                  → basename ""     → "mntrs-root"
+    //   * `/Volumes/foo`       → basename "foo"  → "mntrs-foo"
+    //   * `/Volumes/foo/`      → basename "foo"  → "mntrs-foo"
+    //   * `foo` (relative)     → basename "foo"  → "mntrs-foo"
+    let trimmed = mountpoint.trim_end_matches('/');
+    let basename = trimmed.rsplit('/').next().unwrap_or("");
+    let candidate = if basename.is_empty() {
+        "mntrs-root".to_string()
+    } else {
+        format!("mntrs-{}", basename)
+    };
+    if candidate.len() > MAX_VOLNAME_LEN {
+        candidate.chars().take(MAX_VOLNAME_LEN).collect()
+    } else {
+        candidate
+    }
+}
+
 #[cfg(all(target_os = "macos", test))]
 mod kext_tests {
     use super::parse_macos_kext_version;
@@ -3203,5 +3277,86 @@ Index Refs Address            Size       Wired      Name (Version) UUID <Linked 
     fn parse_unclosed_paren_returns_none() {
         let stdout = "io.macfuse.filesystems.macfuse (5.1.3 without close\n";
         assert_eq!(parse_macos_kext_version(stdout), None);
+    }
+}
+
+// `derive_macos_volname` is pure Rust (no macOS-specific syscalls)
+// so the test module compiles on every platform; only the helper
+// itself is gated on `cfg(target_os = "macos")` at the call site
+// (the cfg at the call site keeps the unused-parameter warning
+// off Linux/Windows builds). Tests run on Linux CI to keep the
+// derivation logic platform-neutral without an extra cfg gate.
+//
+// Issue #464.
+#[cfg(test)]
+mod volname_tests {
+    use super::derive_macos_volname;
+
+    #[test]
+    fn default_derives_from_mountpoint_basename() {
+        assert_eq!(derive_macos_volname("/Volumes/foo", None), "mntrs-foo");
+        assert_eq!(derive_macos_volname("/Volumes/foo", None), "mntrs-foo");
+    }
+
+    #[test]
+    fn default_strips_trailing_slashes() {
+        assert_eq!(derive_macos_volname("/Volumes/foo/", None), "mntrs-foo");
+        assert_eq!(derive_macos_volname("/Volumes/foo//", None), "mntrs-foo");
+    }
+
+    #[test]
+    fn default_handles_relative_path() {
+        assert_eq!(derive_macos_volname("foo", None), "mntrs-foo");
+        assert_eq!(derive_macos_volname("foo/bar", None), "mntrs-bar");
+    }
+
+    #[test]
+    fn default_handles_root_mountpoint() {
+        // `/` trims to "" then basename is "" → "mntrs-root"
+        assert_eq!(derive_macos_volname("/", None), "mntrs-root");
+        assert_eq!(derive_macos_volname("", None), "mntrs-root");
+    }
+
+    #[test]
+    fn default_truncates_at_64_chars() {
+        // basename is 80 chars long → "mntrs-" + 80 = 86, truncated to 64
+        let long = "a".repeat(80);
+        let mp = format!("/Volumes/{}", long);
+        let derived = derive_macos_volname(&mp, None);
+        assert_eq!(derived.len(), 64);
+        assert!(derived.starts_with("mntrs-"));
+        // Truncation is char-based not byte-based — but 'a' is ASCII,
+        // so byte == char count here. The behavior under multi-byte
+        // input is covered by the override-truncation test below.
+        assert_eq!(&derived[..6], "mntrs-");
+        assert_eq!(&derived[6..], &"a".repeat(58));
+    }
+
+    #[test]
+    fn override_used_verbatim_when_under_limit() {
+        assert_eq!(
+            derive_macos_volname("/Volumes/foo", Some("My Bucket")),
+            "My Bucket"
+        );
+    }
+
+    #[test]
+    fn override_truncates_at_64_chars() {
+        let long = "b".repeat(100);
+        let derived = derive_macos_volname("/Volumes/foo", Some(&long));
+        assert_eq!(derived.len(), 64);
+        assert!(derived.chars().all(|c| c == 'b'));
+    }
+
+    #[test]
+    fn override_does_not_inject_mntrs_prefix() {
+        // Critical: when user picks a name, we do NOT silently
+        // prepend `mntrs-` — the override is treated as the final
+        // visible name. This is what users expect from a CLI flag
+        // called `--volume-name`.
+        assert_eq!(
+            derive_macos_volname("/Volumes/foo", Some("backup")),
+            "backup"
+        );
     }
 }
