@@ -4634,13 +4634,33 @@ impl CoreFilesystem for MntrsFs {
         Ok(())
     }
     fn release(&self, _ino: u64, fh: u64) -> std::io::Result<()> {
-        // On release, trigger writeback for dirty handles
+        // On release, trigger writeback for dirty handles.
+        //
+        // Issue T0-2 (pre-fix was a single `let-else` requiring
+        // `cache_fd: Some(fd)`): the pre-fix match required all four
+        // conditions — Write + dirty:true + cache_fd:Some. When
+        // `cache_fd` was `None` (open failed in create/create_excl,
+        // because $HOME was unwritable or the cache directory
+        // permission was wrong), the entire block short-circuited
+        // to `was_dirty = false`. The .dirty sidecar was never
+        // written and the writeback was never queued, even though
+        // `dirty=true` means data DOES exist on disk via the
+        // disk-write pool's re-open-and-write fallback path (see
+        // the `Some(_)` / `None` branch in `write()` at
+        // lib.rs:4280-4291).
+        //
+        // Net effect: process close returned Ok to the caller, but
+        // dirty bytes were orphaned on disk with no .dirty sidecar
+        // and never reached the remote. Next-mount recovery didn't
+        // see them either because the sidecar was missing.
+        //
+        // Post-fix: factor the branch into "is dirty" + "fdatasync
+        // when we have an fd". The "queue the writeback" half runs
+        // for every dirty handle, regardless of whether we have an
+        // open fd for fdatasync.
         let was_dirty = if let Some(entry) = self.handles.get(&fh)
             && let crate::FileHandleState::Write {
-                path,
-                dirty: true,
-                cache_fd: Some(fd),
-                ..
+                path, dirty: true, ..
             } = entry.value()
         {
             // Issue #34 (release counterpart to flush):
@@ -4662,7 +4682,20 @@ impl CoreFilesystem for MntrsFs {
             // in the page cache and ride out on the
             // kernel's normal writeback. This matches
             // libfuse passthrough_hp's dup+close pattern.
-            if let Ok(f) = fd.lock()
+            //
+            // Only attempt the fdatasync when we hold the fd.
+            // The `cache_fd: None` path means the open()
+            // at create/create_excl failed; the data was
+            // persisted via the disk-write pool worker
+            // (which re-opens the file), and the
+            // periodic-fsync thread (see #8) is responsible
+            // for durability on that path, not us.
+            let cache_fd_opt = match entry.value() {
+                crate::FileHandleState::Write { cache_fd, .. } => cache_fd.as_ref(),
+                _ => None,
+            };
+            if let Some(fd) = cache_fd_opt
+                && let Ok(f) = fd.lock()
                 && let Err(e) = f.sync_data()
             {
                 tracing::warn!(
