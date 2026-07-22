@@ -281,11 +281,27 @@ enum Commands {
         /// each RTT is 50-300 ms and Finder shows a 5-10s
         /// beachball. rclone enables slow_statfs by default for
         /// every macFUSE mount for the same reason. Default true;
-        /// ignored on Linux/Windows.
+        /// ignored on Linux/Windows. Use `--no-slow-statfs` to
+        /// disable (only useful when the backend is genuinely
+        /// local: memory://, disk://, or a POSIX mountpoint).
         #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
         #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
-        #[arg(long, default_value_t = true)]
+        #[arg(long, action = clap::ArgAction::SetTrue)]
         slow_statfs: bool,
+        /// Negation of `--slow-statfs`. See that flag's docs.
+        /// `ArgAction::SetFalse` + `default_value_t = true` means
+        /// the field is true by default (option fires), and
+        /// `--no-slow-statfs` on the CLI flips it to false (option
+        /// suppressed). The use-site ANDs both fields so the
+        /// default-true semantics are preserved exactly.
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+        #[arg(
+            long = "no-slow-statfs",
+            action = clap::ArgAction::SetFalse,
+            default_value_t = true
+        )]
+        _no_slow_statfs: bool,
         /// macOS: volume name shown in Finder sidebar / `diskutil list`.
         /// Default (when unset): `mntrs-<basename(mountpoint)>`, truncated
         /// to 64 chars (macFUSE hard limit). Ignored on Linux/Windows.
@@ -295,10 +311,26 @@ enum Commands {
         /// macOS: pass `-o local` to macFUSE so the kernel treats the
         /// mount like a local APFS volume (faster path for repeated
         /// small-file ops). Default true; ignored on Linux/Windows.
+        /// Use `--no-finder-local` to disable — useful on remote
+        /// backends where `-o local` interacts poorly with
+        /// `--allow-other` (see issue tracking the readdir quirk).
         #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
         #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
-        #[arg(long, default_value_t = true)]
+        #[arg(long, action = clap::ArgAction::SetTrue)]
         finder_local: bool,
+        /// Negation of `--finder-local`. See that flag's docs.
+        /// `ArgAction::SetFalse` + `default_value_t = true` means
+        /// the field is true by default (option fires), and
+        /// `--no-finder-local` on the CLI flips it to false (option
+        /// suppressed). The use-site ANDs both fields.
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+        #[arg(
+            long = "no-finder-local",
+            action = clap::ArgAction::SetFalse,
+            default_value_t = true
+        )]
+        _no_finder_local: bool,
         /// Max read-ahead in bytes (default: 131072)
         #[arg(long, default_value = "131072")]
         max_read_ahead: u64,
@@ -507,8 +539,10 @@ fn main() -> anyhow::Result<()> {
             auto_cache,
             daemon_timeout_macos,
             slow_statfs,
+            _no_slow_statfs,
             volume_name,
             finder_local,
+            _no_finder_local,
             max_read_ahead,
             vfs_read_chunk_size_limit,
             vfs_read_chunk_streams,
@@ -667,8 +701,10 @@ fn main() -> anyhow::Result<()> {
                 auto_cache,
                 daemon_timeout_macos,
                 slow_statfs,
+                _no_slow_statfs,
                 volume_name.as_deref(),
                 finder_local,
+                _no_finder_local,
                 max_read_ahead,
                 vfs_read_chunk_size_limit,
                 vfs_read_chunk_streams,
