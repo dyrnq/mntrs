@@ -49,6 +49,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use dashmap::DashMap;
 
+use crate::util::LockOrRecover;
+
 /// Cache key: `(ino, block_idx)`. Both are 64-bit because FUSE
 /// inode numbers are u64 and we use 4 MiB blocks (so block_idx
 /// stays well within u64 even for multi-TiB files).
@@ -486,7 +488,7 @@ impl MemCache for DashMapMemCache {
                     break;
                 }
                 let victim = {
-                    let mut order = self.order.lock().unwrap();
+                    let mut order = self.order.lock_or_recover();
                     order.pop_front()
                 };
                 match victim {
@@ -562,7 +564,7 @@ impl MemCache for DashMapMemCache {
         self.by_ino.entry(ino).or_default().insert(key);
         self.used.fetch_add(size, Ordering::Relaxed);
         self.inserts.fetch_add(1, Ordering::Relaxed);
-        self.order.lock().unwrap().push_back(key);
+        self.order.lock_or_recover().push_back(key);
         // Note: we push the key even if it was a re-insert;
         // the LRU queue may thus have stale keys for evicted
         // entries. This is fine because `pop_front` returns
@@ -606,13 +608,13 @@ impl MemCache for DashMapMemCache {
             self.used.fetch_sub(total_removed, Ordering::Relaxed);
         }
         // LRU queue: drain anything matching. O(K) here too.
-        let mut order = self.order.lock().unwrap();
+        let mut order = self.order.lock_or_recover();
         order.retain(|k| k.0 != ino);
     }
 
     fn clear(&self) {
         self.inner.clear();
-        self.order.lock().unwrap().clear();
+        self.order.lock_or_recover().clear();
         self.by_ino.clear();
         self.used.store(0, Ordering::Relaxed);
     }
