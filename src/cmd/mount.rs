@@ -615,6 +615,7 @@ pub fn mount_internal(
         false,       // negative_vncache (CSI: Linux — ignored)
         false,       // auto_cache (CSI: Linux — ignored)
         60,          // daemon_timeout_macos (CSI: Linux — ignored)
+        false,       // slow_statfs (CSI: Linux — ignored)
         None,        // volume_name (CSI default — derive from mountpoint at runtime)
         false,       // finder_local (CSI runs on Linux; macOS mount option ignored)
         131072,      // max_read_ahead
@@ -912,6 +913,7 @@ pub fn mount(
     negative_vncache: bool,
     auto_cache: bool,
     daemon_timeout_macos: u64,
+    slow_statfs: bool,
     volume_name: Option<&str>,
     finder_local: bool,
     _max_read_ahead: u64,
@@ -1546,6 +1548,14 @@ pub fn mount(
                 "daemon_timeout={}",
                 daemon_timeout_macos
             )));
+            // Issue #471: pass `-o slow_statfs` so the kernel
+            // doesn't block Finder / Spotlight / diskutil on a slow
+            // statfs roundtrip. Default true; rclone enables this
+            // for every macFUSE mount for the same reason.
+            if slow_statfs {
+                cfg.mount_options
+                    .push(MountOption::CUSTOM("slow_statfs".to_string()));
+            }
         }
         if default_permissions {
             cfg.mount_options
