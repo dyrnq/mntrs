@@ -616,10 +616,12 @@ pub fn mount_internal(
         false,       // auto_cache (CSI: Linux — ignored)
         60,          // daemon_timeout_macos (CSI: Linux — ignored)
         false,       // slow_statfs (CSI: Linux — ignored)
-        None,        // volume_name (CSI default — derive from mountpoint at runtime)
-        false,       // finder_local (CSI runs on Linux; macOS mount option ignored)
-        131072,      // max_read_ahead
-        0,           // vfs_read_chunk_size_limit
+        true, // no_slow_statfs (CSI: Linux — ignored; both must be true for the option to fire, so the default false on primary leaves it off regardless)
+        None, // volume_name (CSI default — derive from mountpoint at runtime)
+        false, // finder_local (CSI runs on Linux; macOS mount option ignored)
+        true, // no_finder_local (CSI: Linux — ignored; matches the primary=false -> off idiom)
+        131072, // max_read_ahead
+        0,    // vfs_read_chunk_size_limit
         // Issue #31: bump default chunk_streams from 0
         // (serial) to 4. rclone's default
         // --vfs-read-chunk-streams is 4; the bench
@@ -914,8 +916,10 @@ pub fn mount(
     auto_cache: bool,
     daemon_timeout_macos: u64,
     slow_statfs: bool,
+    no_slow_statfs: bool,
     volume_name: Option<&str>,
     finder_local: bool,
+    no_finder_local: bool,
     _max_read_ahead: u64,
     vfs_read_chunk_size_limit: u64,
     vfs_read_chunk_streams: u32,
@@ -1510,10 +1514,20 @@ pub fn mount(
             // on for parity with sshfs / rclone; users with exotic
             // backends (rare case of stale-cache issues) can opt
             // out via `--no-finder-local`.
+            //
+            // `no_finder_local` is a clap `ArgAction::SetFalse` with
+            // `default_value_t = true`, so it is true by default
+            // and `--no-finder-local` flips it to false. The
+            // primary `finder_local` field is clap `SetTrue` (clap
+            // 4 derive: default false -- explicit user action to
+            // opt in, which we don't require since we already
+            // default to on). The use-site therefore tests only
+            // the mirror field. (See the clap negation pattern in
+            // src/main.rs.)
             let volname = derive_macos_volname(mountpoint, volume_name);
             cfg.mount_options
                 .push(MountOption::CUSTOM(format!("volname={}", volname)));
-            if finder_local {
+            if no_finder_local {
                 cfg.mount_options
                     .push(MountOption::CUSTOM("local".to_string()));
             }
@@ -1552,7 +1566,13 @@ pub fn mount(
             // doesn't block Finder / Spotlight / diskutil on a slow
             // statfs roundtrip. Default true; rclone enables this
             // for every macFUSE mount for the same reason.
-            if slow_statfs {
+            //
+            // `no_slow_statfs` is a clap `ArgAction::SetFalse` with
+            // `default_value_t = true` -- true by default, false
+            // when `--no-slow-statfs` is on the CLI. Use-site just
+            // tests that field. (See the clap negation pattern in
+            // src/main.rs.)
+            if no_slow_statfs {
                 cfg.mount_options
                     .push(MountOption::CUSTOM("slow_statfs".to_string()));
             }
