@@ -33,8 +33,19 @@ enum Commands {
         /// Directory cache TTL in seconds (default: 300, matches rclone 5m)
         #[arg(long, default_value = "300")]
         dir_cache_time: u64,
-        /// Attribute cache TTL in seconds (default: 1)
-        #[arg(long, default_value = "1")]
+        /// Attribute cache TTL in seconds (default: 5).
+        ///
+        /// Kernel-side TTL on entry attributes returned by `lookup`,
+        /// `readdirplus`, `getattr`, `create`, etc. 5s lets #467's
+        /// `FUSE_READDIRPLUS_AUTO` cap materialize bench wins
+        /// (`ls -la many`, `find`, `stat ×N`) by letting kernel reuse
+        /// attrs from a single readdir reply instead of re-fetching
+        /// within seconds. Trade-off: out-of-band backend mutations
+        /// (e.g. another client PUTting the same file) are invisible
+        /// to local reads for up to 5s. CSI deployments keep the
+        /// explicit `5` value in `mount_internal` so this stays
+        /// aligned with the CLI default.
+        #[arg(long, default_value = "5")]
         attr_timeout: u64,
         #[arg(long, default_value = "10")]
         type_cache_ttl: u64,
