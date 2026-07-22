@@ -85,7 +85,10 @@ enum Commands {
         /// Allow UID/GID id mapping (Windows only)
         #[arg(long)]
         allow_idmap: bool,
-        /// Permissions for symlinks (octal, default: 0777)
+        /// Permissions for symlinks (octal, default: 0777).
+        /// **No effect in mntrs** — symlink permissions are governed by
+        /// the platform. Accepted for rclone compat. See
+        /// docs/vfs-cache-flags.md.
         #[arg(long, default_value = "777")]
         link_perms: u32,
         /// Max local cache size in MB (default: 0 = off, matches rclone)
@@ -224,7 +227,10 @@ enum Commands {
         /// CLI default get `false` (no filtering) for least-surprise.
         #[arg(long, default_value_t = true)]
         no_macos_metadata: bool,
-        /// Consistent hash-based sharding: k of n (e.g. --hash-filter 1/4)
+        /// Consistent hash-based sharding: k of n (e.g. --hash-filter 1/4).
+        /// **No effect in mntrs** — accepted for rclone compat, no
+        /// backend currently implements consistent hash sharding in
+        /// the dispatch path. See docs/vfs-cache-flags.md.
         #[arg(long, value_name = "K/N")]
         hash_filter: Option<String>,
         /// macOS: tell OS the mount is case-insensitive
@@ -286,12 +292,22 @@ enum Commands {
         /// Metadata file extension
         #[arg(long)]
         vfs_metadata_extension: Option<String>,
+        /// S3-style storage class hint (e.g. STANDARD, GLACIER).
+        /// **No effect in mntrs** — backend upload already picks the
+        /// backend's default storage class. Accepted for rclone
+        /// compat. See docs/vfs-cache-flags.md.
         #[arg(long)]
         storage_class: Option<String>,
-        /// Write wait timeout in seconds (default: 1, matches rclone)
+        /// Write wait timeout in seconds (default: 1, matches rclone).
+        /// **No effect in mntrs** — writeback is governed by
+        /// `--writeback-immediate-threshold`. Accepted for rclone
+        /// compat. See docs/vfs-cache-flags.md.
         #[arg(long, default_value = "1")]
         vfs_write_wait: u64,
-        /// Read wait timeout in seconds (default: 1)
+        /// Read wait timeout in seconds (default: 1).
+        /// **No effect in mntrs** — read backpressure is governed by
+        /// `--vfs-prefetch-threshold`. Accepted for rclone compat.
+        /// See docs/vfs-cache-flags.md.
         #[arg(long, default_value = "1")]
         vfs_read_wait: u64,
         /// Cache poll interval in seconds (default: 60)
@@ -474,6 +490,26 @@ fn main() -> anyhow::Result<()> {
             }
             if vfs_metadata_extension.is_some() {
                 shadow.push("--vfs-metadata-extension");
+            }
+            // T3-12: 5 more rclone-compat flags accepted but with
+            // no daemon effect (audit issue #455). Each only fires
+            // the warn when the user explicitly moved it off its
+            // default — clap applies the default in the destructure
+            // above.
+            if link_perms != 0o777 {
+                shadow.push("--link-perms");
+            }
+            if hash_filter.is_some() {
+                shadow.push("--hash-filter");
+            }
+            if storage_class.is_some() {
+                shadow.push("--storage-class");
+            }
+            if vfs_write_wait != 1 {
+                shadow.push("--vfs-write-wait");
+            }
+            if vfs_read_wait != 1 {
+                shadow.push("--vfs-read-wait");
             }
             if !shadow.is_empty() {
                 tracing::warn!(

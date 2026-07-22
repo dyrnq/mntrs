@@ -1175,7 +1175,6 @@ pub fn mount(
         umask,
         dir_perms: dir_perms.unwrap_or(0o777) as u16,
         file_perms: file_perms.unwrap_or(0o666) as u16,
-        link_perms: link_perms.unwrap_or(0o777) as u16,
         direct_io,
         // Issue #257: opt-in stale-on-backend-error read
         // fallback. Default false. Users who want
@@ -1205,15 +1204,7 @@ pub fn mount(
         no_apple_double,
         no_apple_xattr,
         no_macos_metadata,
-        hash_filter: hash_filter.as_ref().and_then(|hf| {
-            let mut parts = hf.splitn(2, '/');
-            let k: usize = parts.next()?.parse().ok()?;
-            let n: usize = parts.next()?.parse().ok()?;
-            if k == 0 || k > n { None } else { Some((k, n)) }
-        }),
         block_norm_dupes: vfs_block_norm_dupes,
-        write_wait: std::time::Duration::from_secs(vfs_write_wait),
-        read_wait: std::time::Duration::from_secs(vfs_read_wait),
         // Issue #209: cache_poll_interval is set above (line 786-789)
         // to also accept the legacy --poll-interval value.
         handle_caching: std::time::Duration::from_secs(vfs_handle_caching),
@@ -1230,7 +1221,6 @@ pub fn mount(
         mem_cache: mem_cache.clone(),
         attr_cache: dashmap::DashMap::new(),
         disk_cache_index: disk_cache_index.clone(),
-        storage_class: storage_class.map(|s| s.to_string()),
         multi_cache: {
             crate::multi_level_cache::MultiLevelCache::new(
                 mem_cache.clone(),
