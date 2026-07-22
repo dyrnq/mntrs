@@ -76,7 +76,7 @@ jobs:
           # tempdir cleanup races. One retry covers the vast majority
           # of transient cases without doubling the worst-case CI time.
           max_attempts: 2
-          timeout: 600
+          timeout_minutes: 10
           retry_on: error
           command: cargo test --workspace --lib
 
@@ -93,7 +93,7 @@ jobs:
           # to converge while keeping the worst case at ~8 min for the
           # combined build + retry.
           max_attempts: 2
-          timeout: 600
+          timeout_minutes: 10
           retry_on: error
           command: cargo test --workspace --test core_fs_unit_test
 
@@ -101,7 +101,7 @@ jobs:
         uses: nick-fields/retry@v3
         with:
           max_attempts: 2
-          timeout: 600
+          timeout_minutes: 10
           retry_on: error
           command: cargo test --workspace --test platform_test
 

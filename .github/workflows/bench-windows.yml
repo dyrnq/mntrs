@@ -114,7 +114,7 @@ jobs:
           # how `nick-fields/retry@v3` handles the `retry_on: error`
           # case), so the second attempt sees a clean runner state.
           max_attempts: 2
-          timeout: 600
+          timeout_minutes: 10
           retry_on: error
           command: |
             cargo test --test microbench --release -- --nocapture 2>&1 | Tee-Object -FilePath microbench-result.txt
