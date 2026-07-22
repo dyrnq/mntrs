@@ -4265,19 +4265,30 @@ impl CoreFilesystem for MntrsFs {
                     // operators can correlate "write returned
                     // Ok but data didn't upload" with worker
                     // shutdown.
-                    if let Err(e) = tx.send(WritebackTask {
+                    //
+                    // Issue T1-2: also remove the
+                    // `writeback_pending` entry we just inserted
+                    // when the send fails — otherwise the entry
+                    // sits in the DashSet forever, inflating the
+                    // set with phantom pending writes (and
+                    // eventually defeating the `pending.len()`
+                    // operator-warning check below + the
+                    // `flush_dirty` skip-if-empty optimization).
+                    let task = WritebackTask {
                         ino: _ino,
                         remote_path: path.clone(),
                         cache_path: cpath,
                         retry_cycle: 0,
                         per_task_delay: delay,
-                    }) {
+                    };
+                    if let Err(e) = tx.send(task) {
                         tracing::warn!(
                             path = %path,
                             error = %e,
                             "write: writeback enqueue failed; \
                              .dirty sidecar will recover on next mount"
                         );
+                        self.writeback_pending.remove(path.as_str());
                     }
                 }
             }
