@@ -522,7 +522,37 @@ impl DiskWriteJob {
         data: &[u8],
     ) -> std::io::Result<()> {
         use std::io::{Seek, Write};
-        let end = offset + data.len() as u64;
+        // Issue T2-2: `offset + data.len() as u64` overflows in
+        // u64 when offset is close to u64::MAX and data is non-empty.
+        // `end` would wrap to a tiny value, the `end > current_len`
+        // check below would pass as false (the wrapped value is
+        // smaller than current_len), `set_len` would silently
+        // truncate the cache file, and the subsequent `seek +
+        // write_all` would overwrite the start of the file instead
+        // of the requested offset. The FUSE write reply was Ok and
+        // the inodes entry was updated to the (wrapped) end, so the
+        // user sees a truncated file.
+        //
+        // Saturating-add would silently cap to u64::MAX — the same
+        // corruption shape if the cache ever had a file that large.
+        // Refuse the write loudly instead and let the caller decide.
+        // The data size is bounded by FUSE max_write (128 KiB, set in
+        // fuser::KernelConfig) so the cast is safe; the only way to
+        // hit overflow here is a malicious or corrupted FUSE request.
+        let data_len = data.len() as u64;
+        let end = offset.checked_add(data_len).ok_or_else(|| {
+            tracing::error!(
+                path = %remote_path,
+                offset,
+                data_len,
+                "disk cache write rejected: offset + data_len overflows u64 \
+                 (issue T2-2); refusing write to avoid silent truncation"
+            );
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("offset ({offset}) + data_len ({data_len}) overflows u64"),
+            )
+        })?;
         let current_len = f.metadata()?.len();
         // Prefix fetch: when writing at an offset past
         // current length, backfill the missing prefix
