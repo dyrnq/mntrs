@@ -188,7 +188,7 @@ Three-tier cache: **memory → disk → remote**. Block-level (8 MB) indexing. D
 | `--vfs-cache-poll-interval` | 60s | — | 60s | Stale-object poll interval (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
 | `--mem-limit` | 256 MB | — | 256 MB | Memory cache upper limit |
 | `--dir-cache-time` | 10s | — | 10s | Directory listing TTL |
-| `--attr-timeout` | 1s | — | 1s | File attribute TTL (kernel) |
+| `--attr-timeout` | 5s | — | 5s | File attribute TTL (kernel) — bumped 1s→5s (#469) so the #467 FUSE_READDIRPLUS_AUTO cap actually materializes |
 | `--stat-cache-ttl` | 1s | — | 1s | Stat TTL (mntrs internal) |
 | `--type-cache-ttl` | 1s | — | 1s | File-type cache TTL |
 | `--no-modtime` | false | — | false | Disable mtime read/write |
