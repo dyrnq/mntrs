@@ -559,13 +559,13 @@ pub fn mount_internal(
         read_only,
         false,                    // network_mode
         300,                      // dir_cache_time (5min)
-        1,                        // attr_timeout
-        10,                       // type_cache_ttl
-        1,                        // stat_cache_ttl
-        true,                     // allow_other (CSI: Pods access as non-root)
-        false,                    // debug_fuse
-        "mntrs-csi",              // volname
-        None,                     // devname
+        5, // attr_timeout — #469: bumped 1s→5s so #467 FUSE_READDIRPLUS_AUTO cap can materialize bench wins; kernel attr cache survives multi-stat bursts within 5s
+        10, // type_cache_ttl
+        1, // stat_cache_ttl
+        true, // allow_other (CSI: Pods access as non-root)
+        false, // debug_fuse
+        "mntrs-csi", // volname
+        None, // devname
         false, // write_back_cache (CSI: strict write-through; kernel writeback disabled by design — Pod multi-tenancy demands per-FS-message observability)
         &[],   // fuse_options
         &[],   // fuse_flags
