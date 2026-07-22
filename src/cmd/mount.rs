@@ -612,6 +612,9 @@ pub fn mount_internal(
         false,       // no_macos_metadata (CSI runs on Linux; macOS metadata filter is a no-op)
         None,        // hash_filter
         false,       // mount_case_insensitive
+        false,       // negative_vncache (CSI: Linux — ignored)
+        false,       // auto_cache (CSI: Linux — ignored)
+        60,          // daemon_timeout_macos (CSI: Linux — ignored)
         None,        // volume_name (CSI default — derive from mountpoint at runtime)
         false,       // finder_local (CSI runs on Linux; macOS mount option ignored)
         131072,      // max_read_ahead
@@ -906,6 +909,9 @@ pub fn mount(
     no_macos_metadata: bool,
     hash_filter: Option<String>,
     mount_case_insensitive: bool,
+    negative_vncache: bool,
+    auto_cache: bool,
+    daemon_timeout_macos: u64,
     volume_name: Option<&str>,
     finder_local: bool,
     _max_read_ahead: u64,
@@ -1509,6 +1515,37 @@ pub fn mount(
                 cfg.mount_options
                     .push(MountOption::CUSTOM("local".to_string()));
             }
+            // Issue #466: macFUSE-specific kernel cache options.
+            //
+            // `-o negative_vncache` (default off): disables macFUSE's
+            // 5-second negative-vnode cache. With it off, the kernel
+            // re-asks the filesystem on every lookup, so freshly
+            // deleted files disappear immediately in Finder instead
+            // of sitting in cache for 5s. Costs an extra roundtrip
+            // per failed lookup (negligible since we cache stat()
+            // results in InodeEntry already).
+            //
+            // `-o auto_cache` (default off): kernel caches attributes
+            // for the default attr_timeout (1s). Reduces stat() RTTs
+            // for repeated small-file ops.
+            //
+            // `-o daemon_timeout=<N>`: macFUSE kills the mount if the
+            // FUSE session is unresponsive for N seconds. Default 60s
+            // matches macFUSE built-in default; CLI flag is the
+            // surface for CI scripts (set 5s for fast-fail) and
+            // heavy-backend warmup (set 300s).
+            if negative_vncache {
+                cfg.mount_options
+                    .push(MountOption::CUSTOM("negative_vncache".to_string()));
+            }
+            if auto_cache {
+                cfg.mount_options
+                    .push(MountOption::CUSTOM("auto_cache".to_string()));
+            }
+            cfg.mount_options.push(MountOption::CUSTOM(format!(
+                "daemon_timeout={}",
+                daemon_timeout_macos
+            )));
         }
         if default_permissions {
             cfg.mount_options

@@ -236,6 +236,33 @@ enum Commands {
         /// macOS: tell OS the mount is case-insensitive
         #[arg(long)]
         mount_case_insensitive: bool,
+        /// macOS: disable macFUSE's 5s negative-vnode cache.
+        /// When on, the kernel asks the filesystem on every
+        /// lookup (not just the cache). Fixes the Finder
+        /// "delete hangs for 5s" symptom because macFUSE's
+        /// default cache would otherwise keep entries that
+        /// were already removed from the underlying storage.
+        /// Ignored on Linux/Windows.
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        #[arg(long, default_value_t = false)]
+        negative_vncache: bool,
+        /// macOS: pass `-o auto_cache` to macFUSE so the kernel
+        /// caches attributes for the default `attr_timeout`
+        /// (1s). Reduces stat() roundtrips for repeated small-
+        /// file ops (Finder Get Info, Spotlight).
+        /// Ignored on Linux/Windows.
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        #[arg(long, default_value_t = false)]
+        auto_cache: bool,
+        /// macOS: macFUSE daemon timeout in seconds. If the
+        /// FUSE session stops responding for this long,
+        /// macFUSE forcibly unmounts. Default 60s; lower for
+        /// CI fast-fail, higher for heavy-backend warmup.
+        /// Ignored on Linux/Windows.
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+        #[arg(long, value_name = "SECS", default_value = "60")]
+        daemon_timeout_macos: u64,
         /// macOS: volume name shown in Finder sidebar / `diskutil list`.
         /// Default (when unset): `mntrs-<basename(mountpoint)>`, truncated
         /// to 64 chars (macFUSE hard limit). Ignored on Linux/Windows.
@@ -453,6 +480,9 @@ fn main() -> anyhow::Result<()> {
             no_macos_metadata,
             hash_filter,
             mount_case_insensitive,
+            negative_vncache,
+            auto_cache,
+            daemon_timeout_macos,
             volume_name,
             finder_local,
             max_read_ahead,
@@ -609,6 +639,9 @@ fn main() -> anyhow::Result<()> {
                 no_macos_metadata,
                 hash_filter,
                 mount_case_insensitive,
+                negative_vncache,
+                auto_cache,
+                daemon_timeout_macos,
                 volume_name.as_deref(),
                 finder_local,
                 max_read_ahead,
