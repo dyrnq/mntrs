@@ -1107,6 +1107,24 @@ impl MntrsFs {
     /// `list_op`) that external test fakes wouldn't have.
     fn readdir_materialise(&self, ino: u64) -> std::io::Result<Vec<CoreDirEntry>> {
         let path = self.resolve(ino).map(|e| e.path).unwrap_or_default();
+        // Issue #494: claim the parent's inode BEFORE
+        // iterating lister entries. Pre-fix, the first
+        // lister entry's `alloc_ino(name, ...)` consumed
+        // the parent's expected ino (e.g. ino=2 for the
+        // mount root) and overwrote its path mapping
+        // (`inodes[2] = path="hello.txt"` instead of
+        // `path=""`). The subsequent
+        // `batch_lookup_from_dir_cache(parent=2)` then
+        // resolved to "hello.txt/" as the cache key,
+        // missed, fell back to per-name `lookup(2,
+        // "hello.txt")`, and dropped every lister entry
+        // from the readdir reply (only `.` / `..`
+        // survived). Calling `alloc_ino(path, Directory)`
+        // first reserves the next NEXT_INO for the
+        // parent so the child allocs start at the
+        // following slot. Idempotent on the second call
+        // (returns the existing ino for the same path).
+        let _parent_ino = self.alloc_ino(&path, FileType::Directory, 4096);
         // Bug 34: pass the raw inode path; list_op
         // canonicalizes internally. Pre-fix this
         // computed `list_path = format!("{}/", path)`
@@ -1933,13 +1951,14 @@ impl MntrsFs {
             // logged at warn so the operator can see partial
             // results in the daemon log.
             let mut skipped_errors = 0u64;
+            let mut _lister_entries = 0u64;
             while let Some(item) = lister.next().await {
                 if out.len() >= MAX_LIST_ENTRIES {
                     hit_cap = true;
                     break;
                 }
                 let entry = match item {
-                    Ok(e) => e,
+                    Ok(e) => { _lister_entries += 1; e },
                     Err(e) => {
                         skipped_errors += 1;
                         // Sample the first error at warn so
@@ -2068,6 +2087,8 @@ impl MntrsFs {
                      (issue #48, see --max-list-entries knob)"
                 );
             }
+            tracing::debug!(path = %p, lister_entries = _lister_entries, out_len = out.len(),
+                "list_op drained");
             if skipped_errors > 0 {
                 // DESIGN_VULNS #5: aggregate summary so a
                 // partial listing shows up in the daemon log
@@ -2366,7 +2387,10 @@ impl MntrsFs {
 
     /// Full invalidation: remove directory cache and all sub-paths.
     /// Used for rename (both src and dst sides) where we can't cheaply update.
-    fn invalidate_dir_cache(&self, path: &str) {
+    /// Public for tests + external consumers (e.g. write_remote-style
+    /// direct-opendal-write helpers that bypass the mount's create()
+    /// callback and therefore don't get the cache_add_entry hook).
+    pub fn invalidate_dir_cache(&self, path: &str) {
         // Bug 34: canonicalize for dir_cache key parity.
         // Pre-fix this used raw `path` which could
         // disagree with the canonical key list_op used.
