@@ -5852,6 +5852,25 @@ impl CoreFilesystem for MntrsFs {
     /// lookup, no inode cached). This override skips the walk
     /// and uses the paths the adapter already has.
     fn rename_paths(&self, src_path: &str, dst_path: &str) -> std::io::Result<()> {
+        // Issue #495: WinFSP's `rename` callback supplies full
+        // paths with a leading `/` (e.g. `/café_a.txt`); FUSE's
+        // default `rename` calls `do_rename` with the parent-
+        // joined form which has no leading `/`. The backend ops
+        // tolerate the leading `/` (opendal memory treats `/foo`
+        // and `foo` as the same key), but the post-rename cache
+        // migration in `do_rename` keys everything by the raw
+        // `src`/`dst` strings — `attr_cache.remove(&src)`,
+        // `path_to_ino.remove(&src)`, `find_ino_by_path(&src)`,
+        // and `invalidate_dir_cache(&src)` all miss because the
+        // stored keys are `café_a.txt` (no slash). The result:
+        // `attr_cache["café_a.txt"]` and `inodes[3]` keep their
+        // pre-rename pointers, the kernel's follow-up lookup for
+        // the deleted src returns the cached entry, and
+        // `Path::exists(src)` reports the file still present.
+        // Strip the leading `/` here so `do_rename` sees the
+        // same path shape as the FUSE call site.
+        let src_path = src_path.trim_start_matches('/');
+        let dst_path = dst_path.trim_start_matches('/');
         self.do_rename(src_path.to_string(), dst_path.to_string())
     }
 
