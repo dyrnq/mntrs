@@ -1172,7 +1172,17 @@ pub fn mount(
         stat_cache_ttl: std::time::Duration::from_secs(stat_cache_ttl),
         volname: volname.to_string(),
         cache_max_size: vfs_cache_max_size * 1024 * 1024,
-        write_back_delay: std::time::Duration::from_secs(vfs_write_back),
+        // Audit finding A7: docs/durability.md:184-186 documents
+        // `--vfs-write-back 0` as "effectively 1" but the code
+        // took the value verbatim — `Duration::ZERO` means
+        // immediate enqueue, which combined with the unbounded
+        // mpsc channel in writeback.rs:165 turns sustained
+        // backend outages into an OOM firehose. Enforce the
+        // 1 s floor at the destructure so docs and behavior
+        // agree; user can still disable writeback entirely
+        // via `--no-write-back-cache` if they want no
+        // writeback semantics at all.
+        write_back_delay: std::time::Duration::from_secs(vfs_write_back.max(1)),
         // Issue #202: small files skip the 5s delay queue.
         // The per_task_writeback_delay helper at lib.rs:900
         // uses inodes.size vs this threshold to decide
