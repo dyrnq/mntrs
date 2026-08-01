@@ -137,6 +137,14 @@ path = "tests/symlinks_index_test.rs"
 name = "xattr_metadata_test"
 path = "tests/xattr_metadata_test.rs"
 
+# Issue #493 — moved from tests/platform/windows/winfsp_integration_test.rs
+# because `mount_internal` only eagerly validates credentials on Linux;
+# the `assert!(result.is_err())` shape fails on Windows. File is
+# `#![cfg(not(windows))]` so it doesn't compile on Windows.
+[[test]]
+name = "mount_internal_test"
+path = "tests/mount_internal_test.rs"
+
 # Dev-deps for platform tests. `ctor` runs a `#[ctor]` static before
 # each test (lets us init a tracing subscriber so RUST_LOG works in
 # the test binary, which otherwise has no main). `tracing-subscriber`
