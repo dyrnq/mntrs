@@ -78,7 +78,13 @@ mkdir -p "$MNTRS_MNT" "$RCLONE_MNT"
 MEM_CACHE_IMPL="${MEM_CACHE_IMPL:-dashmap}"
 # Write mount for mntrs (default: writes cache mode)
 echo "  $(date -Iseconds): starting mntrs mount (mem-cache-impl=$MEM_CACHE_IMPL)..."
-"$MNTRS_BIN" mount "s3://$BUCKET" "$MNTRS_MNT" \
+# Export MNTRS_DAEMON_LOG + RUST_LOG=info so the daemon's
+# tracing output (Op::unlink timing, Op::readdirplus timing
+# for probes A+D) is captured to a file that the bench
+# workflow can upload as artifact. Without `export` the
+# daemon child doesn't inherit the variable.
+export MNTRS_DAEMON_LOG="${MNTRS_DAEMON_LOG:-/tmp/mntrs-daemon.log}"
+RUST_LOG=info "$MNTRS_BIN" mount "s3://$BUCKET" "$MNTRS_MNT" \
     --opt "endpoint=$ENDPOINT" --opt "access-key=$ACCESS_KEY" \
     --opt "secret-key=$SECRET_KEY" --opt "region=$REGION" \
     --vfs-cache-mode=writes --vfs-write-back=5 \
