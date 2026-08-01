@@ -84,6 +84,7 @@ echo "  $(date -Iseconds): starting mntrs mount (mem-cache-impl=$MEM_CACHE_IMPL)
     --vfs-cache-mode=writes --vfs-write-back=5 \
     --vfs-read-ahead=134217728 --async-read \
     --mem-cache-impl="$MEM_CACHE_IMPL" \
+    ${MNTRS_EXTRA_ARGS:-} \
     --daemon --daemon-wait --daemon-timeout=15 2>&1
 echo "  $(date -Iseconds): mntrs mount returned (exit=$?)"
 
