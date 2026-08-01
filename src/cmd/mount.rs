@@ -1276,10 +1276,10 @@ pub fn mount(
     // (POLLHUP on the parent's r_fd, fired when the child closes its copy of
     // w_fd after the FUSE session is up). Without this wait, the caller
     // (CI script / shell) races the mount: `mountpoint -q` runs before the
-    // child has called spawn_mount2, and the test sees "Transport endpoint
+    // child has called spawn_mount, and the test sees "Transport endpoint
     // is not connected" (issue #62).
     //
-    // The child keeps its w_fd open until just after spawn_mount2 returns
+    // The child keeps its w_fd open until just after spawn_mount returns
     // (see the post-mount block below). The parent has already closed its
     // own w_fd above (so POLLHUP on the parent's r_fd fires iff the child
     // closes its w_fd).
@@ -1677,12 +1677,12 @@ pub fn mount(
         );
         tracing::info!(
             elapsed_ms = _t_mount.elapsed().as_millis() as u64,
-            "mount: after FuserAdapter::new, about to call spawn_mount2"
+            "mount: after FuserAdapter::new, about to call spawn_mount"
         );
-        let session = fuser::spawn_mount2(adapter, mount_path, &cfg)?;
+        let session = fuser::spawn_mount(adapter, mount_path, &cfg)?;
         tracing::info!(
             elapsed_ms = _t_mount.elapsed().as_millis() as u64,
-            "mount: fuser::spawn_mount2 returned (this is where fuser::session prints Mounting)"
+            "mount: fuser::spawn_mount returned (this is where fuser::session prints Mounting)"
         );
         // Store session so unmount_internal can gracefully shut it down
         // instead of leaking the daemon thread via std::mem::forget.
@@ -1694,7 +1694,7 @@ pub fn mount(
             // write — see `set_fuse_notifier` and the write path
             // tracing for details. ENOENT-class errors here just
             // mean the mount didn't reach FUSE_INIT yet (impossible
-            // since spawn_mount2 just returned); treat any failure
+            // since spawn_mount just returned); treat any failure
             // as a soft no-op since the worst case is the kernel
             // using stale attrs for one more op.
             crate::set_fuse_notifier(session.notifier());
@@ -1934,7 +1934,7 @@ pub fn mount(
     // Issue #286 root cause 3: in the re-exec'd child (MNTRS_INTERNAL_DAEMON=1),
     // the parent has already transferred both pipe fds to the child and the
     // child already closed its w_fd copy at line ~1370 (right after
-    // spawn_mount2 returned, to fire parent's POLLHUP). Closing the same fd
+    // spawn_mount returned, to fire parent's POLLHUP). Closing the same fd
     // again here triggers `rustix::io::close` -> EBADF -> panic
     // (`assertion failed: !(-4095..0).contains(&(self.raw as isize))` at
     // rustix 1.1.4 reg.rs:116) -> process exit(101). Also `close(r)` here
@@ -2134,7 +2134,7 @@ pub fn mount(
         //   - unmount_internal() takes the session and calls umount_and_join()
         //   - External fusermount3 -u disconnects the kernel side
         //   - A signal triggers the watcher thread above to call fusermount3 -u
-        // FUSE_SESSION is Unix-only; on WinFSP, spawn_mount2 returns
+        // FUSE_SESSION is Unix-only; on WinFSP, spawn_mount returns
         // immediately and the daemon is supervised differently, so
         // this entire block is Unix-only.
         #[cfg(not(windows))]

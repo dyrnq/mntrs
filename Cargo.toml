@@ -62,7 +62,7 @@ foyer-memory = "0.22.3"
 
 
 [target.'cfg(unix)'.dependencies]
-fuser = "0.17"
+fuser = "0.18"
 
 [target.'cfg(windows)'.dependencies]
 winfsp = { version = "0.13", features = ["async-io", "notify"] }
