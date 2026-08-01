@@ -125,6 +125,7 @@ All `--opt key=value` pairs are passed through to the backend. Common keys:
 | `cacert` / `cert` / `key` / `pass` | TLS (curl-compatible) | mTLS supported |
 | `insecure` | Skip cert verification | `true` |
 | `dfs.namenode.kerberos.*` | HDFS Kerberos config | `hdfs/_HOST@REALM` |
+| `storage-class` | S3 default storage class for uploads (S3 backend only) | `GLACIER_IR` — see [`--storage-class`](#storage-class-s3-backend-only) |
 
 ### TLS / SSL (curl-compatible)
 
@@ -172,6 +173,39 @@ mntrs mount hdfs-jni://namenode:8020 /mnt/hdfs \
   --opt kerberos-ticket-cache-path=/tmp/krb5cc \
   --opt user=hdfs
 ```
+
+---
+
+## `--storage-class` (S3 backend only)
+
+```bash
+mntrs mount s3://bucket /mnt --storage-class=GLACIER_IR
+```
+
+Sets the default S3 storage class for all uploads in this mount.
+The value is forwarded to opendal's S3 builder, which sends
+the `x-amz-storage-class` header on PUT / Copy / Multipart.
+
+Valid values: `STANDARD`, `STANDARD_IA`, `ONEZONE_IA`,
+`INTELLIGENT_TIERING`, `GLACIER_IR`, `GLACIER`,
+`DEEP_ARCHIVE`, `OUTPOSTS`, `REDUCED_REDUNDANCY`. Invalid
+values fail at startup (clap value_parser).
+
+Equivalent `--opt` form: `--opt storage-class=GLACIER_IR`.
+
+**Limitations:**
+
+- **S3 backend only.** OSS / COS / OBS / Azblob / GCS
+  backends silently ignore the value (their respective
+  headers differ; no mntrs flag exists today).
+- **Mount-time only.** All uploads in the mount share the
+  same class. Use a backend lifecycle policy for
+  per-object overrides.
+- **Min storage duration charges** apply for IA / GLACIER
+  classes — see AWS docs.
+
+See [`docs/vfs-cache-flags.md`](docs/vfs-cache-flags.md#-storage-class-wired--s3-backend-only)
+for the full rationale.
 
 ---
 
