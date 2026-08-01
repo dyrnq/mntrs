@@ -12,7 +12,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -59,6 +59,7 @@ impl MultiLevelCache {
         cache_dir: PathBuf,
         disk_cache_index: Arc<DashMap<CacheKey, (u64, Instant)>>,
         direct_io: bool,
+        cache_max_age: Duration,
         metrics: Arc<Metrics>,
     ) -> Self {
         // L2 preheating was attempted here before (issue #130):
@@ -90,7 +91,7 @@ impl MultiLevelCache {
         let _ = direct_io; // (signature compatibility — direct_io handled in get_block)
         Self {
             l1: MemCacheLayer::new(mem_cache),
-            l2: DiskBlockCache::new(cache_dir, disk_cache_index, direct_io),
+            l2: DiskBlockCache::new(cache_dir, disk_cache_index, direct_io, cache_max_age),
             metrics,
         }
     }
@@ -180,7 +181,16 @@ mod tests {
     fn test_mlc(dir: PathBuf) -> MultiLevelCache {
         let mc: Arc<dyn MemCache> = Arc::new(DashMapMemCache::new(0));
         let idx = Arc::new(DashMap::new());
-        MultiLevelCache::new(mc, dir, idx, false, crate::metrics::global())
+        // Duration::ZERO → TTL disabled (issue #507). Pre-existing
+        // tests don't care about age eviction.
+        MultiLevelCache::new(
+            mc,
+            dir,
+            idx,
+            false,
+            Duration::ZERO,
+            crate::metrics::global(),
+        )
     }
 
     #[test]
@@ -448,7 +458,14 @@ mod tests {
         // trusts the on-disk file.
         let mc2: Arc<dyn MemCache> = Arc::new(DashMapMemCache::new(0));
         let idx2 = Arc::new(DashMap::new());
-        let mlc2 = MultiLevelCache::new(mc2, dir.clone(), idx2, false, crate::metrics::global());
+        let mlc2 = MultiLevelCache::new(
+            mc2,
+            dir.clone(),
+            idx2,
+            false,
+            Duration::ZERO,
+            crate::metrics::global(),
+        );
 
         let got_a = mlc2
             .read_block("remote/path/file.bin", 42, 0)
@@ -469,6 +486,75 @@ mod tests {
             .read_block("remote/path/file.bin", 42, 0)
             .expect("L2 should still serve block 0 on second read");
         assert_eq!(got_a2.as_ref(), data_a.as_ref());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #507: L2 entries past `cache_max_age` are treated as
+    /// misses. We exercise L2 directly here (bypassing L1) because
+    /// L1 has no age API — once L1 is warmed with a backfilled
+    /// block, the MLC `read_block` will keep returning L1's copy
+    /// even after the L2 entry is expired. That L1-stale behavior
+    /// is a documented limitation; the L2 path is what this test
+    /// pins.
+    #[test]
+    fn read_block_l2_age_expired_treated_as_miss() {
+        let dir = std::env::temp_dir().join(format!("mntrs-mlc-test-{}-age", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let mc: Arc<dyn MemCache> = Arc::new(DashMapMemCache::new(0));
+        let idx = Arc::new(DashMap::new());
+        let mlc = MultiLevelCache::new(
+            mc,
+            dir.clone(),
+            idx,
+            false,
+            Duration::from_millis(100), // tight TTL
+            crate::metrics::global(),
+        );
+
+        let data = Bytes::from(vec![0xCC; 512]);
+        mlc.l2.put_block("age.bin", 7, 0, data);
+
+        // L2 hit before TTL elapses.
+        assert!(mlc.l2.get_block("age.bin", 7, 0).is_some());
+
+        // Wait past TTL.
+        std::thread::sleep(Duration::from_millis(150));
+
+        // L2 entry is now past max_age → age-expired miss.
+        let got = mlc.l2.get_block("age.bin", 7, 0);
+        assert!(got.is_none(), "age-expired L2 entry must read as None");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #507: when `cache_max_age == 0` (disabled), old entries
+    /// still hit L2 normally. Locks the "0 to disable" CLI help.
+    #[test]
+    fn read_block_l2_zero_max_age_disables_check() {
+        let dir = std::env::temp_dir().join(format!("mntrs-mlc-test-{}-zero", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let mc: Arc<dyn MemCache> = Arc::new(DashMapMemCache::new(0));
+        let idx = Arc::new(DashMap::new());
+        let mlc = MultiLevelCache::new(
+            mc,
+            dir.clone(),
+            idx,
+            false,
+            Duration::ZERO, // disabled
+            crate::metrics::global(),
+        );
+
+        let data = Bytes::from_static(b"old but valid");
+        mlc.l2.put_block("zero.bin", 1, 0, data.clone());
+        // Sleep a little — would expire under any positive TTL.
+        std::thread::sleep(Duration::from_millis(50));
+        let got = mlc
+            .read_block("zero.bin", 1, 0)
+            .expect("TTL=0 must disable age check");
+        assert_eq!(got.as_ref(), b"old but valid");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

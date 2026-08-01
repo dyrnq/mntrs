@@ -1155,6 +1155,10 @@ pub fn mount(
     let disk_cache_index: std::sync::Arc<
         dashmap::DashMap<crate::util::CacheKey, (u64, std::time::Instant)>,
     > = std::sync::Arc::new(dashmap::DashMap::new());
+    // Issue #507: --vfs-cache-max-age plumbing. Compute once and
+    // reuse for both the `MntrsFs::cache_max_age` field and the
+    // `MultiLevelCache::new` L2 TTL (both below).
+    let cache_max_age_for_mlc = std::time::Duration::from_secs(vfs_cache_max_age);
     let fs = MntrsFs {
         op: Arc::new(op),
         inodes: dashmap::DashMap::new(),
@@ -1235,7 +1239,7 @@ pub fn mount(
         cache_poll_interval: std::time::Duration::from_secs(
             poll_interval.unwrap_or(vfs_cache_poll_interval).max(1),
         ),
-        cache_max_age: std::time::Duration::from_secs(vfs_cache_max_age),
+        cache_max_age: cache_max_age_for_mlc,
         cache_min_free_space: vfs_cache_min_free_space * 1024 * 1024,
         exclude_patterns: exclude,
         include_patterns: include,
@@ -1278,6 +1282,11 @@ pub fn mount(
                 cache_dir_path.clone(),
                 disk_cache_index.clone(),
                 direct_io,
+                // Issue #507: --vfs-cache-max-age plumbing. Same value
+                // the MntrsFs struct literal above writes into
+                // `cache_max_age` (L1238) — captured here because the
+                // struct isn't bound to `fs` yet at this point.
+                cache_max_age_for_mlc,
                 crate::metrics::global(),
             )
         },

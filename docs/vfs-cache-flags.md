@@ -37,7 +37,7 @@ below for the composition recipe.
 | CLI flag | MntrsFs field | Status |
 |---|---|---|
 | `--vfs-cache-mode` | `cache_mode: String` | SHADOW |
-| `--vfs-cache-max-age` | `cache_max_age: Duration` | SHADOW |
+| `--vfs-cache-max-age` | `cache_max_age: Duration` | WIRED (issue #507) |
 | `--vfs-read-ahead` | `read_ahead: u64` | SHADOW |
 | `--vfs-fast-fingerprint` | `fast_fingerprint: bool` | SHADOW |
 | `--vfs-case-insensitive` | `case_insensitive: bool` | SHADOW |
@@ -46,11 +46,17 @@ below for the composition recipe.
 | `--vfs-metadata-extension` | `_vfs_metadata_extension: Option<String>` | UNUSED |
 | `--vfs-no-modtime` | `_no_modtime: bool` | UNUSED |
 
-The first six are rclone-shaped knobs we kept for
+The first five are rclone-shaped knobs we kept for
 backward compat with rclone scripts. The last three
 (underscore-prefixed) are placeholders for features that
 were never built; the `_` prefix is the marker that says
-"we know this is dead."
+"we know this is dead." (`--vfs-cache-max-age` was
+previously in this list but was wired in issue #507.)
+
+The "SHADOW" rows below are currently the 5
+rclone-shaped knobs that remain accepted-but-unused.
+The "UNUSED" rows are placeholders the compiler
+guarantees never reach a read site (`_` prefix).
 
 ## Per-flag rationale
 
@@ -63,12 +69,50 @@ controlled by individual knobs — there is no single
 section below for the four-knob composition that maps
 to "no cache" intent.
 
-### `--vfs-cache-max-age` (SHADOW)
+### `--vfs-cache-max-age` (WIRED, issue #507)
 
-rclone's flag governs the single file-level cache TTL.
-mntrs's TTLs are per-layer (`--attr-cache-ttl` for
-stat-cache, `--dir-cache-ttl` for readdir). There is no
-single "max age" — set the per-layer TTLs.
+rclone's flag governs the single file-level cache TTL —
+absolute age from cache write time ("objects older than
+this"), not idle TTL. The implementation matches:
+
+- **L2 `.block` cache**: `DiskBlockCache::get_block`
+  checks filesystem mtime on every L2 hit. Expired
+  entries return `None` and the on-disk `.block` file is
+  removed so the next read refetches from remote. The
+  `MultiLevelCache` caller sees the expired entry as a
+  plain L2 miss (metric counts it as `l2_miss`).
+- **Whole-file cache**: `MntrsFs::read` step 4 checks
+  `cache_path` mtime before serving. Expired whole-file
+  cache files are dropped and the read falls through to
+  block cache + remote fetch.
+- **Background sweep**: `evict_if_needed` (was
+  `evict_lru_if_needed`) runs an age sweep on the write
+  path that removes age-expired entries even when no
+  capacity pressure exists. Required for users who set
+  only `--vfs-cache-max-age` (no `--cache-max-size`).
+- **`.dirty` sidecar guard**: whole-file cache files
+  with a sibling `{cache}.dirty` are **never** swept by
+  the age check — `writeback` is the only legitimate
+  cleaner (`src/writeback.rs:299, 434`).
+- **`0` disables** the check (matches the CLI help
+  `"0 to disable"`). The helper
+  `util::is_cache_file_expired` short-circuits without
+  a syscall so the hot path stays free when TTL is off.
+- **L1 (`mem_cache`) is NOT age-evicted**. The
+  `MemCache` trait has no age API and changing it would
+  touch DashMap / Moka / Foyer impls. L1 remains under
+  `--mem-limit` pressure eviction.
+
+The implementation uses filesystem mtime, not the
+in-memory `disk_cache_index` `Instant` (which is atime
+for LRU). Our writers never `set_len`-bump mtime on read,
+so on-disk mtime is the genuine cache write time — the
+same anchor rclone uses.
+
+mntrs's per-layer TTLs (`--attr-cache-ttl`,
+`--dir-cache-ttl`) are still the right knobs for those
+specific caches; `--vfs-cache-max-age` covers the data
+cache (whole-file + block).
 
 ### `--vfs-read-ahead` (SHADOW)
 

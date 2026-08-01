@@ -450,6 +450,42 @@ pub fn cache_block_path(cache_dir: &Path, path: &str, block_idx: u64) -> PathBuf
     cache_dir.join(format!("{:020x}_{:010x}.block", path_hash(path), block_idx))
 }
 
+// ── Cache age (--vfs-cache-max-age) ──────────────────────────────────
+
+/// Check whether a cache file's mtime is older than `max_age`.
+///
+/// `max_age == Duration::ZERO` short-circuits to `false` (no syscall).
+/// On error (file gone, perm denied, future mtime), returns `false`
+/// (treat as not expired — leave alone, caller's existence check
+/// handles missing-file). Used by both `DiskBlockCache::get_block`
+/// (L2 hit path) and the read-path whole-file cache check, plus the
+/// age sweep in `evict_if_needed`. Centralized so the "what counts
+/// as stale" definition lives in one place — mtime vs atime, rounding
+/// precision, clock-skew handling.
+///
+/// Future mtime (clock skew, NFS mounts) is treated as **not expired**
+/// — conservative: we over-serve a slightly-too-new file rather than
+/// trigger a spurious refetch.
+pub fn is_cache_file_expired(cpath: &Path, max_age: std::time::Duration) -> bool {
+    use std::time::SystemTime;
+    if max_age.is_zero() {
+        return false;
+    }
+    let meta = match std::fs::metadata(cpath) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let mtime = match meta.modified() {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    match SystemTime::now().duration_since(mtime) {
+        Ok(d) => d > max_age,
+        // Future mtime (clock skew, NFS) → not expired. Conservative.
+        Err(_) => false,
+    }
+}
+
 // ── OpenDAL error conversion ────────────────────────────────────────
 
 /// Map an `opendal::Error` into a `std::io::Error` with the closest

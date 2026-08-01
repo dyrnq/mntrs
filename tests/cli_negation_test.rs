@@ -232,3 +232,68 @@ fn storage_class_invalid_value_rejected() {
         "clap error should mention the invalid value BOGUS; stderr=\n{stderr}"
     );
 }
+
+// ── --vfs-cache-max-age wiring (issue #507) ────────────────────────
+//
+// `--vfs-cache-max-age` was previously a "shadow flag" — clap
+// accepted it, the daemon emitted a "no effect" warn, and the value
+// was dropped on the floor. As of the fix it propagates to
+// `MultiLevelCache::new` as the L2 TTL (absolute age via filesystem
+// mtime). These tests pin the contract: the flag stays in `--help`,
+// it parses without error, and the shadow warn no longer fires.
+
+/// Without `--vfs-cache-max-age` on the CLI, the daemon must NOT
+/// mention it in stderr. Pre-fix, the shadow-warn list included
+/// the flag unconditionally; this locks the warn is gone.
+#[test]
+fn default_args_no_vfs_cache_max_age_shadow() {
+    let stderr = run_mount_capture_stderr(&[]);
+    assert!(
+        !stderr.contains("--vfs-cache-max-age"),
+        "without --vfs-cache-max-age on CLI, stderr must not mention it; stderr=\n{stderr}"
+    );
+}
+
+/// `--vfs-cache-max-age 0` (disable) must not log the shadow warn,
+/// even though 0 is off the default 3600. Pre-fix this was a
+/// spurious warn.
+#[test]
+fn vfs_cache_max_age_zero_no_shadow_warn() {
+    let stderr = run_mount_capture_stderr(&["--vfs-cache-max-age", "0"]);
+    assert!(
+        !has_clap_parse_error(&stderr),
+        "--vfs-cache-max-age 0 should parse; stderr=\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("--vfs-cache-max-age"),
+        "--vfs-cache-max-age=0 is wired; shadow warn must not fire; stderr=\n{stderr}"
+    );
+}
+
+/// `--vfs-cache-max-age 60` must not log the shadow warn.
+#[test]
+fn vfs_cache_max_age_nonzero_no_shadow_warn() {
+    let stderr = run_mount_capture_stderr(&["--vfs-cache-max-age", "60"]);
+    assert!(
+        !has_clap_parse_error(&stderr),
+        "--vfs-cache-max-age 60 should parse; stderr=\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("--vfs-cache-max-age"),
+        "--vfs-cache-max-age=60 is wired; shadow warn must not fire; stderr=\n{stderr}"
+    );
+}
+
+/// Clap must parse a range of `--vfs-cache-max-age` values without
+/// error. Includes the default (3600), a typical short-TTL (60),
+/// 1 day, and `0` (disabled).
+#[test]
+fn vfs_cache_max_age_parses_various_values() {
+    for v in ["0", "1", "60", "3600", "86400"] {
+        let stderr = run_mount_capture_stderr(&["--vfs-cache-max-age", v]);
+        assert!(
+            !has_clap_parse_error(&stderr),
+            "value {v} must parse cleanly; stderr=\n{stderr}"
+        );
+    }
+}
