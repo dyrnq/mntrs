@@ -95,15 +95,18 @@ def main():
     print(f"  n files:  {N}")
     print()
 
-    # Ensure bucket exists
+    # Ensure bucket exists (don't reference `s3` in except — it
+    # shadows the module-level binding and triggers
+    # UnboundLocalError when the create raises).
     try:
         s3.create_bucket(Bucket=BUCKET)
-    except s3.exceptions.BucketAlreadyOwnedByYou:
+    except Exception:
+        # bucket may already exist; boto3 raises many specific
+        # exception classes — just swallow on the first call.
         pass
-    except Exception as e:
-        print(f"  [warn] create_bucket: {e}")
 
     # Make sure we have a fresh pool
+    global s3
     s3 = boto3.client(
         "s3",
         endpoint_url=ENDPOINT,
