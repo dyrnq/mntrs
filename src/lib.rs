@@ -631,6 +631,41 @@ pub struct MntrsFs {
     /// it — that's the kernel's job via `get_reparse_point`).
     symlinks: dashmap::DashMap<String, std::path::PathBuf>,
 
+    /// Issue #485: case-insensitive secondary index for `symlinks`.
+    ///
+    /// Keys are `key.to_lowercase()` of the canonical path stored
+    /// in `symlinks`; values are the canonical (mixed-case) key
+    /// verbatim. Lets the three case-insensitive scan sites
+    /// (`lookup`, `batch_lookup_from_dir_cache`, `unlink`) resolve
+    /// in O(1) instead of O(N). The scan itself is retained as a
+    /// fallback so a future insert site that forgets to mirror
+    /// still finds the entry — belt-and-suspenders. The fallback
+    /// also populates this index on success so the next call is
+    /// also O(1) (self-healing).
+    ///
+    /// Maintenance contract: every `symlinks.insert(p, t)` must be
+    /// paired with `symlinks_lower.insert(p.to_lowercase(), p)`;
+    /// every `symlinks.remove(p)` must be paired with
+    /// `symlinks_lower.remove(&p.to_lowercase())`. The two helper
+    /// methods `lookup_symlink_key_case_insensitive` /
+    /// `lookup_symlink_entry_case_insensitive` centralise the
+    /// forward path; the dual-branch remove in `fn unlink` covers
+    /// the dual-case unlink.
+    ///
+    /// No `#[cfg]` gate: mirrors `symlinks` (also unconfigured).
+    /// The three scan sites compile on every platform, so the
+    /// index must exist on every platform.
+    symlinks_lower: dashmap::DashMap<String, String>,
+
+    /// Issue #485: counter incremented by the scan fallback loop
+    /// in `lookup_symlink_key_case_insensitive` /
+    /// `lookup_symlink_entry_case_insensitive`. Tests assert it
+    /// stays at 0 in fast-path cases and >0 after a self-healing
+    /// fallback. Present on production builds too (always 0 in
+    /// normal operation) so the shim method `__symlink_index_diag`
+    /// can be unconditional; 8 bytes per `MntrsFs` is negligible.
+    symlink_scan_count: std::sync::atomic::AtomicUsize,
+
     /// Issue #132: shared adaptive prefetch-window controller. One
     /// instance per `MntrsFs` so every prefetcher (and every FUSE
     /// reader feeding them) shares the same producer-vs-consumer
@@ -2251,19 +2286,13 @@ impl MntrsFs {
                     // (which canonicalizes basename to
                     // uppercase before the IRP reaches us)
                     // still hits.
-                    let canonical_symlink = if self.symlinks.contains_key(&full_path) {
-                        Some(full_path.clone())
-                    } else {
-                        let target_lower = full_path.to_lowercase();
-                        let mut hit: Option<String> = None;
-                        for entry in self.symlinks.iter() {
-                            if entry.key().to_lowercase() == target_lower {
-                                hit = Some(entry.key().clone());
-                                break;
-                            }
-                        }
-                        hit
-                    };
+                    //
+                    // Issue #485: `lookup_symlink_key_case_insensitive`
+                    // is O(1) on the `symlinks_lower` secondary
+                    // index and falls back to a linear scan if
+                    // the index is missing the entry (belt-and-
+                    // suspenders — see helper doc).
+                    let canonical_symlink = self.lookup_symlink_key_case_insensitive(&full_path);
                     if let Some(stored) = canonical_symlink {
                         // `alloc_ino` reuses an existing ino for
                         // the same path (see #325 — it always
@@ -2404,6 +2433,133 @@ impl MntrsFs {
         );
         Ok(())
     }
+
+    /// Issue #485: case-insensitive lookup that returns only the
+    /// canonical stored key.
+    ///
+    /// Used by `batch_lookup_from_dir_cache` and `fn unlink`,
+    /// which need the key to chain into other maps (`path_to_ino`,
+    /// `attr_cache`, `inodes`) rather than the symlink target
+    /// itself.
+    ///
+    /// Fast path: O(1) `symlinks_lower.get(...)`. Fallback: linear
+    /// scan of `symlinks` (belt-and-suspenders — see `symlinks`
+    /// field doc). On fallback success the index is populated so
+    /// the next call is also O(1).
+    fn lookup_symlink_key_case_insensitive(&self, full_path: &str) -> Option<String> {
+        let target_lower = full_path.to_lowercase();
+        if let Some(canonical) = self.symlinks_lower.get(&target_lower) {
+            return Some(canonical.value().clone());
+        }
+        for entry in self.symlinks.iter() {
+            if entry.key().to_lowercase() == target_lower {
+                let canonical = entry.key().clone();
+                self.symlinks_lower
+                    .insert(target_lower.clone(), canonical.clone());
+                // Always-on counter: `#[cfg(test)]` is only set
+                // when the crate compiles its OWN tests, NOT
+                // when it compiles as a dependency for
+                // integration tests — so a cfg-gated increment
+                // would be elided in `cargo test --test ...`
+                // builds. The field is unconditionally present
+                // (8 bytes) so this is safe in production too.
+                self.symlink_scan_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Some(canonical);
+            }
+        }
+        None
+    }
+
+    /// Issue #485: case-insensitive lookup that returns both the
+    /// canonical key AND the target value.
+    ///
+    /// Used by `fn lookup`, which needs both for the ino
+    /// allocation and the `core_attr_for_symlink` call.
+    ///
+    /// Same fast-path / fallback semantics as
+    /// `lookup_symlink_key_case_insensitive`. The two DashMap
+    /// reads are intentionally not held simultaneously — the
+    /// `Ref` guard from `symlinks_lower.get` is `drop`-ed before
+    /// `symlinks.get` is acquired, so the two reads are
+    /// independent even when they hash to the same shard.
+    fn lookup_symlink_entry_case_insensitive(
+        &self,
+        full_path: &str,
+    ) -> Option<(String, std::path::PathBuf)> {
+        let target_lower = full_path.to_lowercase();
+        if let Some(canonical_ref) = self.symlinks_lower.get(&target_lower) {
+            let canonical = canonical_ref.value().clone();
+            // Release the secondary-index read guard before the
+            // primary-index get — see comment above.
+            drop(canonical_ref);
+            if let Some(v) = self.symlinks.get(&canonical) {
+                return Some((canonical, v.value().clone()));
+            }
+        }
+        for entry in self.symlinks.iter() {
+            if entry.key().to_lowercase() == target_lower {
+                let canonical = entry.key().clone();
+                let target = entry.value().clone();
+                self.symlinks_lower
+                    .insert(target_lower.clone(), canonical.clone());
+                // See the matching increment in
+                // `lookup_symlink_key_case_insensitive`: never
+                // gate — integration tests don't see cfg(test).
+                self.symlink_scan_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Some((canonical, target));
+            }
+        }
+        None
+    }
+
+    /// Issue #485: test surface so `tests/symlinks_index_test.rs`
+    /// can drive the case-insensitive helpers directly without
+    /// depending on the full FUSE path. The production-visible
+    /// methods above stay private.
+    ///
+    /// No `#[cfg(test)]` gate: integration tests (`tests/`) compile
+    /// the lib as an external dependency and don't see cfg(test)
+    /// symbols. The double-underscore prefix and `#[doc(hidden)]`
+    /// signal "test-only internal API" — production code has no
+    /// reason to call these.
+    #[doc(hidden)]
+    pub fn __symlink_index_diag(&self) -> (usize, usize, usize) {
+        (
+            self.symlinks.len(),
+            self.symlinks_lower.len(),
+            self.symlink_scan_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Issue #485: test-only passthrough to
+    /// `lookup_symlink_key_case_insensitive` for integration tests
+    /// in `tests/symlinks_index_test.rs`.
+    #[doc(hidden)]
+    pub fn __symlink_lookup_key(&self, full_path: &str) -> Option<String> {
+        self.lookup_symlink_key_case_insensitive(full_path)
+    }
+
+    /// Issue #485: test-only passthrough to
+    /// `lookup_symlink_entry_case_insensitive` for integration
+    /// tests.
+    #[doc(hidden)]
+    pub fn __symlink_lookup_entry(&self, full_path: &str) -> Option<(String, std::path::PathBuf)> {
+        self.lookup_symlink_entry_case_insensitive(full_path)
+    }
+
+    /// Issue #485: test-only entry point for the
+    /// `symlinks_index_self_healing_fallback` test, which
+    /// simulates drift between `symlinks` and `symlinks_lower`
+    /// by directly dropping the secondary-index entry while
+    /// leaving the primary entry intact. Production code never
+    /// calls this — it would defeat the point of the mirror.
+    #[doc(hidden)]
+    pub fn __symlinks_lower_remove_for_test(&self, lower_key: &str) -> bool {
+        self.symlinks_lower.remove(lower_key).is_some()
+    }
 }
 
 use crate::core_fs::{CoreDirEntry, CoreFileAttr, CoreFileType, CoreFilesystem, CoreVolumeStat};
@@ -2493,17 +2649,13 @@ impl CoreFilesystem for MntrsFs {
         // case form than what was stored at create time
         // (e.g. `cmd mklink` lowercase + `DeleteFileW`
         // uppercase). Direct `symlinks.get(&full_path)`
-        // misses; the case-insensitive scan finds the
-        // canonical stored key.
-        let symlink_entry = if let Some(t) = self.symlinks.get(&full_path) {
-            Some((full_path.clone(), t.value().clone()))
-        } else {
-            let target_lower = full_path.to_lowercase();
-            self.symlinks
-                .iter()
-                .find(|e| e.key().to_lowercase() == target_lower)
-                .map(|e| (e.key().clone(), e.value().clone()))
-        };
+        // misses; the case-insensitive helper
+        // (`lookup_symlink_entry_case_insensitive`) finds
+        // the canonical stored key via the `symlinks_lower`
+        // secondary index and falls back to a linear scan
+        // if the index is missing the entry (belt-and-
+        // suspenders — see Issue #485).
+        let symlink_entry = self.lookup_symlink_entry_case_insensitive(&full_path);
         if let Some((stored_path, target)) = symlink_entry {
             // Resolve or allocate an ino for this symlink path
             // so subsequent ops (getattr / setattr / unlink)
@@ -5290,28 +5442,14 @@ impl CoreFilesystem for MntrsFs {
         // through to the backend (which has no file for a
         // symlink) — leaving the in-memory entry in place and
         // `Test-Path` continuing to return True after the
-        // `cleanup` callback. Walk the symlinks map once for a
-        // case-insensitive key match and remap everything off
-        // the canonical stored path.
-        let stored_symlink_path = if self.symlinks.contains_key(&full_path) {
-            Some(full_path.clone())
-        } else {
-            // Case-insensitive fallback: Win32 file names are
-            // case-insensitive at the OS layer, so the cleanup
-            // callback may receive the basename in any case
-            // form. `cmd mklink` lowercases the path on
-            // creation, then `DeleteFileW` re-supplies the
-            // kernel-side canonical (often uppercase) form.
-            let target_lower = full_path.to_lowercase();
-            let mut hit: Option<String> = None;
-            for entry in self.symlinks.iter() {
-                if entry.key().to_lowercase() == target_lower {
-                    hit = Some(entry.key().clone());
-                    break;
-                }
-            }
-            hit
-        };
+        // `cleanup` callback.
+        //
+        // Issue #485: `lookup_symlink_key_case_insensitive` is
+        // O(1) on the `symlinks_lower` secondary index and falls
+        // back to a linear scan if the index is missing the
+        // entry (belt-and-suspenders). The dual-branch remove
+        // below mirrors into `symlinks_lower` accordingly.
+        let stored_symlink_path = self.lookup_symlink_key_case_insensitive(&full_path);
         // Issue #325: if the entry is a symlink, drop it from
         // the in-memory table and bail without touching the
         // backend (there is no backend file for a symlink — see
@@ -5323,8 +5461,20 @@ impl CoreFilesystem for MntrsFs {
             // lowercased-name / uppercased-kernel pair
             // (the Win32 case-insensitive contract) still
             // resolves the right entry.
-            if self.symlinks.remove(&full_path).is_none() {
+            //
+            // Issue #485: mirror the dual-branch remove into
+            // `symlinks_lower`. Each branch knows which key was
+            // actually removed from `symlinks`, so the matching
+            // lowercase key (or the canonical stored form's
+            // lowercase) is the one to drop from the secondary
+            // index. Self-healing fallback elsewhere
+            // (helper docs) keeps a future unpaired insert
+            // visible.
+            if self.symlinks.remove(&full_path).is_some() {
+                self.symlinks_lower.remove(&full_path.to_lowercase());
+            } else {
                 self.symlinks.remove(stored);
+                self.symlinks_lower.remove(&stored.to_lowercase());
             }
             // Use the canonical stored path for the
             // path_to_ino / cache / attr_cache / writeback
@@ -5847,6 +5997,14 @@ impl CoreFilesystem for MntrsFs {
         }
         self.symlinks
             .insert(full_path.clone(), target.to_path_buf());
+        // Issue #485: mirror into the case-insensitive secondary
+        // index so `lookup` / `unlink` / `batch_lookup_from_dir_cache`
+        // can resolve this symlink via O(1) `symlinks_lower.get`
+        // when the kernel supplies a different-case name
+        // (WinFSP / APFS case-preserving). See the field doc for
+        // the maintenance contract.
+        self.symlinks_lower
+            .insert(full_path.to_lowercase(), full_path.clone());
         // Allocate an ino for the symlink entry. We do NOT
         // create a real backend file (opendal memory/s3/hdfs
         // would store a 0-byte placeholder that the kernel
@@ -5969,6 +6127,16 @@ impl CoreFilesystem for MntrsFs {
         // Get-Item (.LinkType=""). Insert via the inodes' path
         // so readlink resolves through the same lookup key.
         self.symlinks.insert(path.clone(), target.to_path_buf());
+        // Issue #485: mirror into the case-insensitive secondary
+        // index. The path passed here is the canonical stored
+        // key (lowercased per the WinFSP adapter convention at
+        // the call site); `to_lowercase()` is a no-op for the
+        // already-lowercased path but is unconditional so a
+        // future caller that stores mixed-case keys works
+        // correctly too. See the field doc for the maintenance
+        // contract.
+        self.symlinks_lower
+            .insert(path.to_lowercase(), path.clone());
         // Mutate the inodes entry's kind in place so subsequent
         // getattr / get_file_info / lookup return Symlink, which
         // makes `core_kind_to_file_attributes` set
@@ -6688,6 +6856,17 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         // tests; populated only by tests that exercise the
         // symlink code paths.
         symlinks: dashmap::DashMap::new(),
+        // Issue #485: case-insensitive secondary index. Empty
+        // default; tests that exercise the fast-path populate it
+        // via the public `CoreFilesystem` API (the field is
+        // private).
+        symlinks_lower: dashmap::DashMap::new(),
+        // Issue #485: scan-fallback counter. Starts at 0;
+        // incremented by the case-insensitive helpers on each
+        // fallback-loop iteration. Always present (8 bytes per
+        // MntrsFs) so the `__symlink_index_diag` shim can be
+        // unconditional; tests read it via that shim.
+        symlink_scan_count: std::sync::atomic::AtomicUsize::new(0),
         // Issue #132: shared adaptive prefetch window controller.
         // Default min=128 KiB matches the read_chunk_size clamp
         // floor (lib.rs `self.read_chunk_size.clamp(131072, 16 MiB)`)

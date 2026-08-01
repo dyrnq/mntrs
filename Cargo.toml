@@ -123,6 +123,13 @@ path = "tests/platform/linux/fuse_integration_test.rs"
 name = "platform_windows_winfsp_integration_test"
 path = "tests/platform/windows/winfsp_integration_test.rs"
 
+# Issue #485 — case-insensitive secondary index for `symlinks`.
+# 6 tests cover the four contract scenarios in the issue body
+# plus self-healing fallback and unlink-mirror completeness.
+[[test]]
+name = "symlinks_index_test"
+path = "tests/symlinks_index_test.rs"
+
 # Dev-deps for platform tests. `ctor` runs a `#[ctor]` static before
 # each test (lets us init a tracing subscriber so RUST_LOG works in
 # the test binary, which otherwise has no main). `tracing-subscriber`
