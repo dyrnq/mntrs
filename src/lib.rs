@@ -958,7 +958,7 @@ impl MntrsFs {
 /// cached from the last getattr/setattr reply, and the next
 /// O_APPEND open issues a write at the wrong offset (clobbering
 /// prior writes — see the trace in issue #89). Called once
-/// from the mount command path after `spawn_mount2` returns
+/// from the mount command path after `spawn_mount` returns
 /// the BackgroundSession. Safe to call multiple times; only
 /// the first call wins.
 ///

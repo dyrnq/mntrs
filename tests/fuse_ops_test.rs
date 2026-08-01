@@ -132,7 +132,7 @@ fn path_hash_thread_safety() {
 // at compile time and only be caught in a FUSE mount smoke test.
 //
 // `fuser::KernelConfig`'s constructor is crate-private (only built
-// inside `mount2`/`spawn_mount2` — see fuser-0.17.0 src/lib.rs:224),
+// inside `mount`/`spawn_mount` — see fuser-0.18.0 src/lib.rs),
 // so a direct unit test of "init() set this cap" is not feasible
 // without a real mount. The actual capability pin lives as a
 // `#[cfg(test)] mod` inside `src/core_fs/fuser.rs` so the test

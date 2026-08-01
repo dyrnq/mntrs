@@ -1110,8 +1110,9 @@ mod tests {
     // binary has already shipped.
     //
     // `fuser::KernelConfig`'s constructor is crate-private (only built
-    // inside `fuser::mount2` / `spawn_mount2` — see fuser-0.17.0
-    // src/lib.rs:224), so a direct unit test of "init() pushed this
+    // inside `fuser::mount` / `spawn_mount` — see fuser-0.18.0
+    // src/lib.rs, file/line may have shifted; the constructor lives
+    // alongside the public mount APIs), so a direct unit test of "init() pushed this
     // cap into the struct" is not feasible without a real mount. The
     // pin below is the closest substitute that catches API-surface
     // regressions at compile time:
