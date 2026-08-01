@@ -3341,16 +3341,19 @@ impl CoreFilesystem for MntrsFs {
             .resolve(ino)
             .map(|e| (e.path, e.size))
             .ok_or(std::io::ErrorKind::NotFound)?;
-        // Defensive size reconciliation (see CoreFilesystem::read history
-        // for the full explanation). inodes is the FUSE-protocol
-        // authoritative size, but the on-disk cache file may have
-        // grown more recently than the inodes entry.
-        let cache_meta_size = std::fs::metadata(crate::cache_path(&self.cache_dir, &path))
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let actual_size = cache_meta_size.max(file_size);
+        // inodes.size is the authoritative size: it's updated
+        // synchronously by the write path (see `MntrsFs::write`
+        // L4357-4365) to `_offset + _data.len()`, which is also
+        // the byte extent the write path passes to `set_len()`
+        // on the cache file (L4224-4227). The pre-fix code did
+        // a per-call `fs::metadata(cache_file)` to take the
+        // `max(inodes.size, cache_file_size)` — but those two
+        // values are equal by construction, so the statx was
+        // pure overhead (~1-2 µs per FUSE read). Audit
+        // finding A2.
+        let actual_size = file_size;
         tracing::debug!(
-            ino, offset, size, file_size, cache_meta_size, actual_size,
+            ino, offset, size, file_size, actual_size,
             path = %path,
             "read: entry"
         );
@@ -4353,10 +4356,25 @@ impl CoreFilesystem for MntrsFs {
         // (the in-memory LRU sort key), not `SystemTime::now()`
         // (the on-disk mtime, which `relatime` doesn't update
         // on read).
-        self.disk_cache_index.insert(
-            (path.clone(), None),
-            (_offset + _data.len() as u64, std::time::Instant::now()),
-        );
+        //
+        // Size: `_offset + _data.len()` is the **new end of
+        // the file** after this write — NOT the cumulative
+        // cache size. A prior write at offset 2 MiB with
+        // 1 MiB of data would have set size = 3 MiB; a
+        // follow-up `pwrite(0, 512 KiB)` (e.g. truncate
+        // + rewrite the first chunk) used to overwrite to
+        // size = 512 KiB, under-counting the actual cache
+        // file extent and making `statfs` `used` lag behind
+        // reality. Use `and_modify(|v| v.0 = v.0.max(new_end))`
+        // so size tracks the high-water mark across writes
+        // (the cache file only grows monotonically here —
+        // the write path doesn't `set_len` to a smaller
+        // value). Audit finding A3.
+        let new_end = _offset + _data.len() as u64;
+        self.disk_cache_index
+            .entry((path.clone(), None))
+            .and_modify(|v| v.0 = v.0.max(new_end))
+            .or_insert((new_end, std::time::Instant::now()));
         // Issue #39: evict BEFORE the pool worker tries to
         // write the cache file. The pre-fix order submitted
         // the job first and evicted after, which raced with
@@ -4612,27 +4630,24 @@ impl CoreFilesystem for MntrsFs {
                 }
                 tracing::debug!(path=%path, "flush queued writeback");
             }
-            // Mark handle clean; writeback happens asynchronously
-            let cache_fd = self.handles.get(&_fh).and_then(|e| {
+            // Mark handle clean; writeback happens asynchronously.
+            // Audit finding A6: pre-fix used `handles.get()` +
+            // `handles.insert(...)` to change ONE bool + ONE
+            // Option<Instant>. The insert cloned `path` (~50 B)
+            // and the `cache_fd` Arc, and reallocated a
+            // `FileHandleState::Write`. Use `and_modify` to
+            // mutate the existing entry in place — no clone,
+            // no allocation, no second shard lock for the
+            // read-then-write.
+            self.handles.entry(_fh).and_modify(|h| {
                 if let crate::FileHandleState::Write {
-                    cache_fd: Some(fd), ..
-                } = e.value()
+                    dirty, dirty_since, ..
+                } = h
                 {
-                    Some(fd.clone())
-                } else {
-                    None
+                    *dirty = false;
+                    *dirty_since = None;
                 }
             });
-            self.handles.insert(
-                _fh,
-                crate::FileHandleState::Write {
-                    path: path.clone(),
-                    cache_fd,
-                    dirty: false,
-                    dirty_since: None,
-                    expires_at: None,
-                },
-            );
         }
         Ok(())
     }
@@ -6054,6 +6069,19 @@ impl CoreFilesystem for MntrsFs {
             // Clean up any open file handles for this inode
             // (actually handles key is fh, not ino; just filter by path)
             self.handles.retain(|_, v| v.path() != path);
+            // Audit finding A4: drop the writeback_pending entry
+            // on inode forget. Without this, the DashSet<String>
+            // accumulates a ~100 B entry per file that the user
+            // wrote to once and never touched again — at 1 M
+            // files that's 100 MiB resident forever. The
+            // success/failure paths already `remove()` after the
+            // writeback completes (or retries exhaust); this is
+            // the missed "user deleted the file / kernel forgot
+            // the inode before writeback fired" path. The entry
+            // may be a phantom here (no actual in-flight
+            // writeback for this ino) — `remove` is a no-op in
+            // that case.
+            self.writeback_pending.remove(&path);
         }
     }
 }
