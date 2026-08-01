@@ -125,6 +125,7 @@ All `--opt key=value` pairs are passed through to the backend. Common keys:
 | `cacert` / `cert` / `key` / `pass` | TLS (curl-compatible) | mTLS supported |
 | `insecure` | Skip cert verification | `true` |
 | `dfs.namenode.kerberos.*` | HDFS Kerberos config | `hdfs/_HOST@REALM` |
+| `storage-class` | S3 default storage class for uploads (S3 backend only) | `GLACIER_IR` — see [`--storage-class`](#storage-class-s3-backend-only) |
 
 ### TLS / SSL (curl-compatible)
 
@@ -172,6 +173,39 @@ mntrs mount hdfs-jni://namenode:8020 /mnt/hdfs \
   --opt kerberos-ticket-cache-path=/tmp/krb5cc \
   --opt user=hdfs
 ```
+
+---
+
+## `--storage-class` (S3 backend only)
+
+```bash
+mntrs mount s3://bucket /mnt --storage-class=GLACIER_IR
+```
+
+Sets the default S3 storage class for all uploads in this mount.
+The value is forwarded to opendal's S3 builder, which sends
+the `x-amz-storage-class` header on PUT / Copy / Multipart.
+
+Valid values: `STANDARD`, `STANDARD_IA`, `ONEZONE_IA`,
+`INTELLIGENT_TIERING`, `GLACIER_IR`, `GLACIER`,
+`DEEP_ARCHIVE`, `OUTPOSTS`, `REDUCED_REDUNDANCY`. Invalid
+values fail at startup (clap value_parser).
+
+Equivalent `--opt` form: `--opt storage-class=GLACIER_IR`.
+
+**Limitations:**
+
+- **S3 backend only.** OSS / COS / OBS / Azblob / GCS
+  backends silently ignore the value (their respective
+  headers differ; no mntrs flag exists today).
+- **Mount-time only.** All uploads in the mount share the
+  same class. Use a backend lifecycle policy for
+  per-object overrides.
+- **Min storage duration charges** apply for IA / GLACIER
+  classes — see AWS docs.
+
+See [`docs/vfs-cache-flags.md`](docs/vfs-cache-flags.md#-storage-class-wired--s3-backend-only)
+for the full rationale.
 
 ---
 
@@ -267,6 +301,52 @@ that are accepted on the CLI but not yet implemented — see
 ---
 
 ## Platform Features
+
+### Object Metadata (xattr)
+
+mntrs exposes backend object metadata as FUSE extended attributes on
+every file **when `--metadata` is passed** (default **off**, matching
+`rclone mount` parity — rclone also defaults `--metadata` to false in
+`mount` and true in `serve`). The attribute names follow
+[rclone's `--metadata`](https://rclone.org/docs/#metadata) convention
+so any tool written for rclone just works:
+
+| xattr name | Source | Notes |
+|------------|--------|-------|
+| `user.etag` | backend ETag | surrounding quotes stripped (S3 returns `"..."` over the wire) |
+| `user.mime_type` | backend `Content-Type` | `user.content-type` is accepted as a backward-compat alias |
+| `user.mtime` | backend `Last-Modified` | ISO-8601 |
+| `user.content_length` | backend object size | decimal bytes |
+| `user.<key>` | backend user metadata | key is normalized: lowercased, dots replaced with underscores (macOS FUSE rejects dots in xattr names) |
+
+**Default is off** to match `rclone mount`. Pass `--metadata` to enable,
+or `--no-metadata` to explicitly disable (accepted for rclone-script
+parity; equivalent to omitting `--metadata`). When disabled, `getxattr`
+returns `ENOSYS` and `listxattr` returns the empty list — avoiding the
+per-call backend `stat()` round-trip the surface otherwise requires.
+
+`listxattr` returns only the attributes the backend actually populated
+for the object — empty for directories, and on backends without an
+ETag/`Content-Type`/`Last-Modified` the corresponding attributes are
+absent rather than stubbed. Names are returned in sorted order so
+`getfattr -d -m '^user\.'` output is deterministic.
+
+Tools that consume this surface:
+
+```bash
+# Show all metadata xattrs for a file
+getfattr -d -m '^user\.' /mnt/s3/path/to/file
+
+# Use it from a script
+etag=$(stat -c %i /mnt/s3/path/to/file >/dev/null 2>&1 && \
+       getfattr --absolute-names -n user.etag /mnt/s3/path/to/file \
+         | awk -F'"' '/^user.etag=/ {print $2}')
+```
+
+FUSE size queries (`size=0` form passed by the kernel to ask "how big
+would this attribute be?") are honored — `getxattr` returns the
+attribute size without copying the value bytes, and an undersized
+buffer returns `ERANGE` instead of truncating.
 
 ### Daemon Mode
 

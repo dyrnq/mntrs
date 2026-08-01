@@ -130,6 +130,13 @@ path = "tests/platform/windows/winfsp_integration_test.rs"
 name = "symlinks_index_test"
 path = "tests/symlinks_index_test.rs"
 
+# Integration test for the rclone-parity xattr metadata surface
+# (issue #465). Exercises `CoreFilesystem::getxattr` /
+# `listxattr` against the in-process `Memory` backend.
+[[test]]
+name = "xattr_metadata_test"
+path = "tests/xattr_metadata_test.rs"
+
 # Issue #493 — moved from tests/platform/windows/winfsp_integration_test.rs
 # because `mount_internal` only eagerly validates credentials on Linux;
 # the `assert!(result.is_err())` shape fails on Windows. File is

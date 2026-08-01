@@ -142,4 +142,93 @@ fn help_lists_both_polarity_flags() {
         help.contains("--no-slow-statfs"),
         "--no-slow-statfs missing from --help"
     );
+    assert!(
+        help.contains("--storage-class"),
+        "--storage-class missing from --help"
+    );
+}
+
+// ── --storage-class wiring (issue #219 follow-up) ────────────────
+//
+// `--storage-class` was previously a "shadow flag" — clap accepted it,
+// the daemon emitted a "no effect" warn, and the value was dropped on
+// the floor. As of the fix it propagates to opendal's S3 builder via
+// the `default_storage_class` setter. These tests pin the contract:
+// the flag stays in `--help`, it parses without error, and the
+// shadow warn no longer fires for it.
+
+/// `mntrs mount --help` must list `--storage-class`. The flag has a
+/// `value_parser` enum (STANDARD, GLACIER, …); clap emits both the
+/// flag line and the possible-values list. Lock both so a future
+/// clap refactor can't silently drop the surface.
+#[test]
+fn help_lists_storage_class_flag() {
+    let out = Command::new(mntrs_bin())
+        .args(["mount", "--help"])
+        .output()
+        .expect("spawn `mntrs mount --help`");
+    assert!(
+        out.status.success(),
+        "`mntrs mount --help` failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        help.contains("--storage-class"),
+        "--storage-class flag line missing from --help"
+    );
+    // value_parser enum: a few canonical names should be in the
+    // help text (clap renders them either in the possible-values
+    // block or in the doc-comment if a value_parser is used).
+    for v in &["STANDARD", "GLACIER", "DEEP_ARCHIVE"] {
+        assert!(
+            help.contains(v),
+            "expected value `{v}` listed in --storage-class help"
+        );
+    }
+}
+
+/// Without `--storage-class` on the CLI, the daemon must NOT emit
+/// the shadow-flag warn mentioning `--storage-class`. (Other shadow
+/// flags may still warn if the user set them off-default; this
+/// assertion is scoped to `--storage-class` only.)
+#[test]
+fn default_args_no_storage_class_shadow() {
+    let stderr = run_mount_capture_stderr(&[]);
+    assert!(
+        !stderr.contains("--storage-class"),
+        "without --storage-class on CLI, shadow warn must not mention it; stderr=\n{stderr}"
+    );
+}
+
+/// `--storage-class=GLACIER` parses cleanly AND must NOT trigger
+/// the shadow warn — the flag is now wired through to the opendal
+/// S3 builder, so the warn would be a regression.
+#[test]
+fn storage_class_glacier_parses_and_no_shadow_warn() {
+    let stderr = run_mount_capture_stderr(&["--storage-class=GLACIER"]);
+    assert!(
+        !has_clap_parse_error(&stderr),
+        "--storage-class=GLACIER should parse without clap error; stderr=\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("shadow") || !stderr.contains("--storage-class"),
+        "--storage-class is now wired; shadow warn must not fire; stderr=\n{stderr}"
+    );
+}
+
+/// `--storage-class=BOGUS` is rejected at startup by clap's
+/// value_parser. The error message must surface the invalid value
+/// so users can see what's wrong without consulting docs.
+#[test]
+fn storage_class_invalid_value_rejected() {
+    let stderr = run_mount_capture_stderr(&["--storage-class=BOGUS"]);
+    assert!(
+        has_clap_parse_error(&stderr),
+        "--storage-class=BOGUS should fail clap value_parser; stderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("BOGUS"),
+        "clap error should mention the invalid value BOGUS; stderr=\n{stderr}"
+    );
 }

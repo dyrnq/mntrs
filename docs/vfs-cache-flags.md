@@ -318,6 +318,67 @@ The kernel-side mount option `writeback_cache` at `mount.rs:1227`
 is gated on the same flag, so the FUSE INIT and libfuse mount
 option stay in sync.
 
+## `--storage-class` (wired — S3 backend only)
+
+`--storage-class` is **NOT** a shadow flag. It was previously in
+the consolidated-warn list but has since been wired through to
+opendal's `default_storage_class` setter on the S3 backend
+(`src/cmd/mount.rs:build_s3`, `opendal-service-s3` 0.58
+`Backend::default_storage_class`). The setter writes the value
+into `config.default_storage_class`; the backend then sends
+the `x-amz-storage-class` header on PUT / Copy / Multipart.
+
+Valid values (clap `value_parser` enforces at startup):
+
+- `STANDARD` — default for most buckets
+- `STANDARD_IA` — infrequent access, ms retrieval, 30-day min
+- `ONEZONE_IA` — single-AZ IA, cheaper than STANDARD_IA
+- `INTELLIGENT_TIERING` — AWS auto-tiers by access pattern
+- `GLACIER_IR` — archive with ms retrieval, 90-day min
+- `GLACIER` — archive, minute-to-hour retrieval, 90-day min
+- `DEEP_ARCHIVE` — cheapest, 12+ hour retrieval, 180-day min
+- `OUTPOSTS` — AWS Outposts buckets only
+- `REDUCED_REDUNDANCY` — legacy; AWS no longer supports new buckets
+
+Example:
+
+```bash
+mntrs mount s3://my-bucket /mnt \
+    --storage-class=GLACIER_IR
+```
+
+Limitations:
+
+- **S3 backend only.** OSS / COS / OBS / Azblob / GCS backends
+  silently ignore the value (their respective headers differ;
+  opendal exposes no equivalent setter for those). For those
+  backends, no mntrs flag exists today.
+- **Mount-time only.** The value is set on the opendal builder
+  at startup and applies to all uploads in that mount. To
+  change per-object, use a backend lifecycle policy.
+- **Objects uploaded before mount started are not affected.**
+  Re-uploading the same key overwrites with the new class;
+  deleting the old object is up to the user.
+- **Min storage duration charges** apply for IA / GLACIER
+  classes — deleting or overwriting to a cheaper class before
+  the minimum duration incurs a prorated charge from AWS.
+
+### Why this was a shadow and isn't anymore
+
+The flag was originally accepted for rclone compat but never
+wired (issue #455 audit identified it). The fix added:
+
+1. `src/main.rs` — clap `value_parser` enum to fail bad values
+   at startup (vs waiting for AWS 400 `InvalidStorageClass`).
+2. `src/main.rs` — inject the value into the `opts` HashMap
+   next to other backend-config keys (`endpoint`, `region`,
+   etc.).
+3. `src/cmd/mount.rs::build_s3` — call
+   `builder.default_storage_class(v)` on the opendal S3 builder.
+
+The flag was removed from the consolidated-warn list (which
+still fires for the remaining `--vfs-*` shadow flags).
+
 ### Related
 
 - #81 — original PR for unconditional WRITEBACK_CACHE

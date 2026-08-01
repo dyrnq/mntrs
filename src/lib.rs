@@ -578,6 +578,18 @@ pub struct MntrsFs {
     pub(crate) no_apple_double: bool,
     pub(crate) no_apple_xattr: bool,
     pub(crate) no_macos_metadata: bool,
+    /// Issue #465 follow-up: gate on the rclone `--metadata`
+    /// surface. When false, `getxattr` returns `Unsupported`
+    /// (the fuser adapter maps to `ENOSYS`) and `listxattr`
+    /// returns the empty list — short-circuiting before the
+    /// per-call backend `stat()` round-trip the surface needs.
+    /// Default false to match `rclone mount` (which also
+    /// defaults to false; `rclone serve` defaults to true).
+    /// Library / test defaults take the conservative value
+    /// (false) — the test that wants the surface on opts in
+    /// explicitly via the `__metadata_set_for_test` shim,
+    /// mirroring the `new_test_fs_evict` pattern at L6849.
+    pub(crate) metadata: bool,
     pub(crate) block_norm_dupes: bool,
     pub(crate) handle_caching: Duration,
     pub(crate) cache_poll_interval: Duration,
@@ -1095,6 +1107,24 @@ impl MntrsFs {
     /// `list_op`) that external test fakes wouldn't have.
     fn readdir_materialise(&self, ino: u64) -> std::io::Result<Vec<CoreDirEntry>> {
         let path = self.resolve(ino).map(|e| e.path).unwrap_or_default();
+        // Issue #494: claim the parent's inode BEFORE
+        // iterating lister entries. Pre-fix, the first
+        // lister entry's `alloc_ino(name, ...)` consumed
+        // the parent's expected ino (e.g. ino=2 for the
+        // mount root) and overwrote its path mapping
+        // (`inodes[2] = path="hello.txt"` instead of
+        // `path=""`). The subsequent
+        // `batch_lookup_from_dir_cache(parent=2)` then
+        // resolved to "hello.txt/" as the cache key,
+        // missed, fell back to per-name `lookup(2,
+        // "hello.txt")`, and dropped every lister entry
+        // from the readdir reply (only `.` / `..`
+        // survived). Calling `alloc_ino(path, Directory)`
+        // first reserves the next NEXT_INO for the
+        // parent so the child allocs start at the
+        // following slot. Idempotent on the second call
+        // (returns the existing ino for the same path).
+        let _parent_ino = self.alloc_ino(&path, FileType::Directory, 4096);
         // Bug 34: pass the raw inode path; list_op
         // canonicalizes internally. Pre-fix this
         // computed `list_path = format!("{}/", path)`
@@ -1921,13 +1951,14 @@ impl MntrsFs {
             // logged at warn so the operator can see partial
             // results in the daemon log.
             let mut skipped_errors = 0u64;
+            let mut _lister_entries = 0u64;
             while let Some(item) = lister.next().await {
                 if out.len() >= MAX_LIST_ENTRIES {
                     hit_cap = true;
                     break;
                 }
                 let entry = match item {
-                    Ok(e) => e,
+                    Ok(e) => { _lister_entries += 1; e },
                     Err(e) => {
                         skipped_errors += 1;
                         // Sample the first error at warn so
@@ -2056,6 +2087,8 @@ impl MntrsFs {
                      (issue #48, see --max-list-entries knob)"
                 );
             }
+            tracing::debug!(path = %p, lister_entries = _lister_entries, out_len = out.len(),
+                "list_op drained");
             if skipped_errors > 0 {
                 // DESIGN_VULNS #5: aggregate summary so a
                 // partial listing shows up in the daemon log
@@ -2354,7 +2387,10 @@ impl MntrsFs {
 
     /// Full invalidation: remove directory cache and all sub-paths.
     /// Used for rename (both src and dst sides) where we can't cheaply update.
-    fn invalidate_dir_cache(&self, path: &str) {
+    /// Public for tests + external consumers (e.g. write_remote-style
+    /// direct-opendal-write helpers that bypass the mount's create()
+    /// callback and therefore don't get the cache_add_entry hook).
+    pub fn invalidate_dir_cache(&self, path: &str) {
         // Bug 34: canonicalize for dir_cache key parity.
         // Pre-fix this used raw `path` which could
         // disagree with the canonical key list_op used.
@@ -5816,6 +5852,25 @@ impl CoreFilesystem for MntrsFs {
     /// lookup, no inode cached). This override skips the walk
     /// and uses the paths the adapter already has.
     fn rename_paths(&self, src_path: &str, dst_path: &str) -> std::io::Result<()> {
+        // Issue #495: WinFSP's `rename` callback supplies full
+        // paths with a leading `/` (e.g. `/café_a.txt`); FUSE's
+        // default `rename` calls `do_rename` with the parent-
+        // joined form which has no leading `/`. The backend ops
+        // tolerate the leading `/` (opendal memory treats `/foo`
+        // and `foo` as the same key), but the post-rename cache
+        // migration in `do_rename` keys everything by the raw
+        // `src`/`dst` strings — `attr_cache.remove(&src)`,
+        // `path_to_ino.remove(&src)`, `find_ino_by_path(&src)`,
+        // and `invalidate_dir_cache(&src)` all miss because the
+        // stored keys are `café_a.txt` (no slash). The result:
+        // `attr_cache["café_a.txt"]` and `inodes[3]` keep their
+        // pre-rename pointers, the kernel's follow-up lookup for
+        // the deleted src returns the cached entry, and
+        // `Path::exists(src)` reports the file still present.
+        // Strip the leading `/` here so `do_rename` sees the
+        // same path shape as the FUSE call site.
+        let src_path = src_path.trim_start_matches('/');
+        let dst_path = dst_path.trim_start_matches('/');
         self.do_rename(src_path.to_string(), dst_path.to_string())
     }
 
@@ -5889,54 +5944,54 @@ impl CoreFilesystem for MntrsFs {
     }
 
     fn getxattr(&self, ino: u64, name: &str) -> std::io::Result<Vec<u8>> {
-        if let Some(InodeEntry { path: p, .. }) = self.resolve(ino) {
-            let op = self.op.clone();
-            let p2 = p.clone();
-            match rt().block_on(async move { op.stat(&p2).await }) {
-                Ok(meta) => match name {
-                    "user.etag" | "s3.etag" => {
-                        meta.etag().map(|e| e.as_bytes().to_vec()).ok_or_else(|| {
-                            std::io::Error::new(std::io::ErrorKind::NotFound, "no etag")
-                        })
-                    }
-                    "user.content-type" | "s3.content-type" => meta
-                        .content_type()
-                        .map(|c| c.as_bytes().to_vec())
-                        .ok_or_else(|| {
-                            std::io::Error::new(std::io::ErrorKind::NotFound, "no content-type")
-                        }),
-                    _ => Err(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "xattr not found",
-                    )),
-                },
-                Err(_) => Err(std::io::Error::other("stat failed")),
-            }
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "ino not found",
-            ))
+        // Issue #465 follow-up: `--metadata` gate (default off,
+        // rclone mount parity). Short-circuit before the
+        // backend stat() — the surface is opt-in to avoid a
+        // per-call round-trip when no caller cares.
+        if !self.metadata {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "xattr metadata disabled (pass --metadata to enable)",
+            ));
         }
+        let entry = self.resolve(ino).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("getxattr: ino {ino} not found"),
+            )
+        })?;
+        let op = self.op.clone();
+        let p = entry.path.clone();
+        let meta = rt()
+            .block_on(async move { op.stat(&p).await })
+            .map_err(|e| std::io::Error::other(format!("stat failed: {e}")))?;
+        xattr_value_for(&meta, name)
     }
 
     fn listxattr(&self, ino: u64) -> std::io::Result<Vec<Vec<u8>>> {
-        if let Some(InodeEntry { kind, .. }) = self.resolve(ino) {
-            if kind == FileType::Directory {
-                return Ok(vec![]);
-            }
-            Ok(vec![
-                b"user.etag".to_vec(),
-                b"user.content-type".to_vec(),
-                b"s3.etag".to_vec(),
-                b"s3.content-type".to_vec(),
-            ])
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "ino not found",
-            ))
+        // Issue #465 follow-up: `--metadata` gate (default off,
+        // rclone mount parity). Empty list when disabled — the
+        // fuser adapter passes that straight to the kernel.
+        if !self.metadata {
+            return Ok(Vec::new());
         }
+        let entry = self.resolve(ino).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("listxattr: ino {ino} not found"),
+            )
+        })?;
+        if entry.kind == FileType::Directory {
+            // Directories: no metadata xattrs (rclone parity —
+            // rclone's --metadata applies to objects only).
+            return Ok(vec![]);
+        }
+        let op = self.op.clone();
+        let p = entry.path.clone();
+        let meta = rt()
+            .block_on(async move { op.stat(&p).await })
+            .map_err(|e| std::io::Error::other(format!("stat failed: {e}")))?;
+        Ok(xattr_names_for(&meta))
     }
 
     // --- Issue #325: symlink / readlink overrides ---
@@ -6430,6 +6485,137 @@ impl MntrsFs {
     }
 }
 
+// Issue #465: free-standing helpers for the xattr metadata
+// pipeline. Free (not associated) because they're not trait
+// methods — they can't live inside `impl CoreFilesystem for
+// MntrsFs`, and there's no clean place for them as
+// `impl MntrsFs` methods that's reachable from the trait
+// methods. Pure functions over `opendal::Metadata`, easy to
+// unit-test in isolation.
+
+/// Map an xattr name to its value bytes for a given
+/// `opendal::Metadata`. Returns `NotFound` for any name not
+/// in the rclone `--metadata` parity set.
+fn xattr_value_for(meta: &opendal::Metadata, name: &str) -> std::io::Result<Vec<u8>> {
+    match name {
+        // `s3.etag` and `s3.content-type` are S3-specific legacy
+        // names kept for backward compat with anyone scripting
+        // against the pre-#465 implementation.
+        "user.etag" | "s3.etag" => match meta.etag() {
+            // S3 wraps the ETag in literal `"..."` per the S3
+            // API contract. Strip the quotes so `xattr -p
+            // user.etag file` shows just the hex digest (matches
+            // what `aws s3api head-object --output text` prints).
+            Some(e) => Ok(strip_etag_quotes(e).as_bytes().to_vec()),
+            None => Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no etag")),
+        },
+        // rclone uses `user.mime_type`; we accept both spellings
+        // for backward compat with anything that scripted
+        // against the pre-#465 `user.content-type`.
+        "user.mime_type" | "user.content-type" | "s3.content-type" => match meta.content_type() {
+            Some(c) => Ok(c.as_bytes().to_vec()),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no content_type",
+            )),
+        },
+        "user.mtime" => match meta.last_modified() {
+            // `Timestamp` impls `Display` (jiff ISO-8601).
+            Some(ts) => Ok(ts.to_string().into_bytes()),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no mtime",
+            )),
+        },
+        // `content_length` is `u64`, not `Option<u64>` — always
+        // present. rclone always lists it; we do the same.
+        "user.content_length" => Ok(meta.content_length().to_string().into_bytes()),
+        // `user.<key>` → custom user metadata (S3: x-amz-meta-*,
+        // Azure: x-ms-meta-*, etc. — opendal flattens these into
+        // a `HashMap<String, String>` keyed on the lowercased
+        // user-defined part). Lookup is by the same normalized
+        // form (lowercase + dots→underscores) that `listxattr`
+        // emitted the name in.
+        name if name.starts_with("user.") => {
+            let normalized = normalize_user_meta_key(&name[5..]);
+            match meta.user_metadata() {
+                Some(map) => match map.get(&normalized) {
+                    Some(v) => Ok(v.as_bytes().to_vec()),
+                    None => Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("user.{normalized} not in user metadata"),
+                    )),
+                },
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no user metadata",
+                )),
+            }
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "xattr not found",
+        )),
+    }
+}
+
+/// Build the sorted list of present xattr names for a file's
+/// metadata. The pre-#465 implementation returned a hardcoded
+/// 4-name list regardless of what the backend had — `xattr -l
+/// file` would advertise xattrs that `getxattr` then rejected
+/// with `NotFound`, violating POSIX. Now: stat once, filter to
+/// fields present, sort, return.
+fn xattr_names_for(meta: &opendal::Metadata) -> Vec<Vec<u8>> {
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    if meta.etag().is_some() {
+        names.push(b"user.etag".to_vec());
+    }
+    if meta.content_type().is_some() {
+        // Only list the canonical rclone name; `user.content-type`
+        // is accepted by `getxattr` as a backward-compat alias
+        // but not re-advertised (avoids `xattr -l file` showing
+        // both spellings for the same value).
+        names.push(b"user.mime_type".to_vec());
+    }
+    if meta.last_modified().is_some() {
+        names.push(b"user.mtime".to_vec());
+    }
+    // `content_length` is always present (u64, not Option); list
+    // unconditionally.
+    names.push(b"user.content_length".to_vec());
+    if let Some(map) = meta.user_metadata() {
+        for key in map.keys() {
+            names.push(format!("user.{key}").into_bytes());
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Strip the surrounding `"..."` from an S3-style ETag.
+/// S3 wraps the hex digest in literal double quotes per the
+/// S3 API contract. E.g. ETag of a single-part upload looks
+/// like `"d41d8cd98f00b204e9800998ecf8427e"`. Strip them so the
+/// xattr value matches what `aws s3api head-object --output
+/// text` prints and what users expect from `xattr -p`.
+fn strip_etag_quotes(s: &str) -> &str {
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+/// Normalize a custom user-metadata key per rclone's mapping
+/// rules (lowercase + dots→underscores). S3 user metadata keys
+/// are case-insensitive at the HTTP header level (the
+/// `x-amz-meta-*` prefix gets normalized by AWS). Lowercase +
+/// dots→underscores matches the canonical xattr naming: dots
+/// are illegal in xattr names on most platforms.
+fn normalize_user_meta_key(s: &str) -> String {
+    s.to_lowercase().replace('.', "_")
+}
+
 impl MntrsFs {
     /// Issue #78: shared rename body — backend op + cache/inode
     /// migration. Inherent method (not on the trait) so both the
@@ -6844,6 +7030,11 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         no_apple_double: false,
         no_apple_xattr: false,
         no_macos_metadata: false,
+        // Issue #465 follow-up: rclone `--metadata` gate,
+        // default off. Tests opt in via
+        // `MntrsFs::__metadata_set_for_test(true)` (mirror
+        // of the `new_test_fs_evict` pattern).
+        metadata: false,
         block_norm_dupes: false,
         cache_poll_interval: std::time::Duration::from_secs(60),
         handle_caching: std::time::Duration::from_secs(0),
@@ -6893,6 +7084,27 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
                 crate::metrics::global(),
             )
         },
+    }
+}
+
+impl MntrsFs {
+    /// Issue #465 follow-up: test-only setter for the
+    /// `--metadata` gate. The default-`new_test_fs` config
+    /// disables the surface (rclone mount parity), so tests
+    /// that want the rclone xattr surface must opt in
+    /// explicitly. Mirror of the `new_test_fs_evict` pattern
+    /// (L6877).
+    ///
+    /// `#[doc(hidden)] pub` (not `#[cfg(test)] pub`) so
+    /// integration tests under `tests/` — which compile
+    /// `mntrs` as an external crate and so do not see
+    /// `#[cfg(test)]` items — can still reach it.
+    /// The double-underscore prefix marks "test-only-public"
+    /// per the convention established by the symlink-index
+    /// test shims (`__symlink_index_diag` etc., issue #485).
+    #[doc(hidden)]
+    pub fn __metadata_set_for_test(&mut self, on: bool) {
+        self.metadata = on;
     }
 }
 
