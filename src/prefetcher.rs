@@ -1000,9 +1000,7 @@ mod tests {
     /// must wake it; `is_download_done()` confirms the thread exited.
     #[test]
     fn handle_prefetcher_cancel_stops_download_thread() {
-        let op = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .finish();
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         // 64 KiB file — large enough that the download thread can't
         // finish before we cancel (8 B chunks × 8192 = 64 KiB).
         let data = vec![42u8; 64 * 1024];
@@ -1059,9 +1057,7 @@ mod tests {
         cap: u64,
         bp: std::sync::Arc<BackpressureController>,
     ) -> (HandlePrefetcher, opendal::Operator) {
-        let op = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .finish();
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         let data = vec![42u8; 64 * 1024];
         crate::rt()
             .block_on(async { op.write("big.bin", data).await })

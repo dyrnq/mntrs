@@ -10,8 +10,8 @@
 
 | Crate | Version | Source | Reason |
 |-------|---------|--------|--------|
-| `opendal` | `0.57` | crates.io | `0.58.0` yanked 2026-07-17 for macOS dyld bug ([apache/opendal#7923](https://github.com/apache/opendal/issues/7923), fix in [#7925](https://github.com/apache/opendal/pull/7925), not yet released). Stay on last-safe `0.57.0`. |
-| `hdfs-native` | `0.13.5` + fork patch | `dyrnq/hdfs-native` git rev `419cd0e` | See [hdfs-native fork workaround](#hdfs-native-fork-dfs-client-use-datanode-hostname) below. Drop the patch when opendal releases with [PR #7910](https://github.com/apache/opendal/pull/7910). |
+| `opendal` | `0.57` (in flight: `0.58.1`) | crates.io | `0.58.1` ships both #7925 (macOS dyld fix) and #7910 (hdfs-native 0.14). Bump pending in feat/opendal-0.58.1. |
+| `hdfs-native` | `0.13.5` + fork patch (drop on opendal 0.58.1 bump) | `dyrnq/hdfs-native` git rev `419cd0e` | See [hdfs-native fork workaround](#hdfs-native-fork-dfs-client-use-datanode-hostname) below. Drop the patch in the same PR that bumps opendal to 0.58.1 — that release contains [PR #7910](https://github.com/apache/opendal/pull/7910) which upgrades hdfs-native to `^0.14`. |
 
 ---
 
@@ -90,9 +90,9 @@ This is the only `Cargo.toml [patch.crates-io]` block we currently carry. It exi
 All four conditions must be true before deleting the `[patch.crates-io]` block:
 
 1. ✅ Upstream `hdfs-native` release with #303 — `v0.14.1` (2026-07-11) onwards.
-2. ⏳ opendal release containing [PR #7910](https://github.com/apache/opendal/pull/7910) — pending (next `0.58.x` or `0.59.x`).
-3. ⏳ That opendal release must also be installable (i.e., not yanked for the macOS dyld bug #7923) — pending `0.58.1` (with #7925 fix) or `0.59.0` (with #7925 + #7910).
-4. ⏳ `Cargo.toml` `opendal` constraint bumped to that version and `cargo update -p opendal` succeeds without breaking any `cargo test` / `cargo build`.
+2. ✅ opendal release containing [PR #7910](https://github.com/apache/opendal/pull/7910) — **`v0.58.1` (2026-07-31)** ships #7910 (verified via crates.io sparse index: `opendal-service-hdfs-native 0.58.1` requires `hdfs-native ^0.14`).
+3. ✅ That opendal release must also be installable (i.e., not yanked for the macOS dyld bug #7923) — **`v0.58.1` includes #7925 fix**.
+4. ⏳ `Cargo.toml` `opendal` constraint bumped to that version and `cargo update -p opendal` succeeds without breaking any `cargo test` / `cargo build`. (In progress: branch `feat/opendal-0.58.1`.)
 
 The block in `Cargo.toml` ([lines ~52-80](../../Cargo.toml)) already comments all of this; this section exists as the human-readable companion.
 

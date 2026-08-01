@@ -34,7 +34,7 @@ fn __init_tracing() {
 /// many private fields to construct by hand here.
 fn make_memory_fs() -> MntrsFs {
     let builder = Memory::default();
-    let op = Operator::new(builder).unwrap().finish();
+    let op = Operator::new(builder).unwrap();
     let cache_dir = std::env::temp_dir().join("mntrs-wintest");
     let _ = std::fs::create_dir_all(&cache_dir);
     mntrs::new_test_fs(op, cache_dir)

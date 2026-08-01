@@ -1312,7 +1312,7 @@ mod disk_cache_crc_tests {
     use opendal::services::Memory;
 
     fn make_fs() -> crate::MntrsFs {
-        let op = Operator::new(Memory::default()).unwrap().finish();
+        let op = Operator::new(Memory::default()).unwrap();
         let cache_dir = std::env::temp_dir().join(format!(
             "mntrs-write-block-test-{}-{:x}",
             std::process::id(),

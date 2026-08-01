@@ -4026,7 +4026,12 @@ impl CoreFilesystem for MntrsFs {
             // / webhdfs — these can in principle be patched via
             // read-modify-write; we leave that follow-up to a separate
             // PR (issue #456 follow-up #1).
-            let cap = self.op.info().full_capability();
+            //
+            // opendal 0.58.1: OperatorInfo::full_capability() was
+            // renamed back to capability() (RFC #7740 — the separate
+            // "full" vs "user" split was removed; the composed
+            // capability already accounts for layers).
+            let cap = self.op.info().capability();
             if !cap.write_can_append && !cap.write_can_multi {
                 tracing::error!(
                     path = %path,
@@ -5047,7 +5052,7 @@ impl CoreFilesystem for MntrsFs {
         // paths (atomic-create workloads). **debug** still,
         // matching create() level.
         tracing::debug!(parent = _parent, name, "FUSE create_excl entry");
-        if !self.op.info().full_capability().write_with_if_not_exists {
+        if !self.op.info().capability().write_with_if_not_exists {
             // Backend doesn't support atomic create — fall back
             // to the regular `create()` (overwrite semantics).
             return self.create(_parent, name, _mode);
@@ -6700,9 +6705,7 @@ mod tests {
     /// cache_max_size is honoured; cache_min_free_space can be 0.
     fn new_test_fs_evict(cache_dir: PathBuf, cache_max_size: u64) -> MntrsFs {
         let mut fs = new_test_fs(
-            opendal::Operator::new(opendal::services::Memory::default())
-                .unwrap()
-                .finish(),
+            opendal::Operator::new(opendal::services::Memory::default()).unwrap(),
             cache_dir,
         );
         fs.cache_max_size = cache_max_size;
@@ -6846,9 +6849,7 @@ mod tests {
     #[test]
     fn default_cache_max_size_is_zero() {
         let dir = scratch_dir("default-cache-max");
-        let op = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .finish();
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         let fs = new_test_fs(op, dir);
         assert_eq!(
             fs.cache_max_size, 0,
@@ -6863,9 +6864,7 @@ mod tests {
     #[test]
     fn default_cache_min_free_space_is_zero() {
         let dir = scratch_dir("default-cache-min");
-        let op = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .finish();
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         let fs = new_test_fs(op, dir);
         assert_eq!(
             fs.cache_min_free_space, 0,
@@ -6885,9 +6884,7 @@ mod tests {
     fn cache_caps_zero_means_evict_lru_is_noop() {
         let dir = scratch_dir("both-zero-noop");
         // new_test_fs post-#243 gives both caps = 0.
-        let op = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .finish();
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         let fs = new_test_fs(op, dir);
         assert_eq!(fs.cache_max_size, 0);
         assert_eq!(fs.cache_min_free_space, 0);
@@ -6926,9 +6923,7 @@ mod tests {
     #[test]
     fn disk_total_size_fallback_blocks_constant() {
         let dir = scratch_dir("dt-fallback");
-        let op = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .finish();
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         let fs = new_test_fs(op, dir);
         assert_eq!(
             fs.disk_total_size, 0,
@@ -7096,16 +7091,12 @@ mod tests {
         // false (default), the cached entry is returned
         // without a backend round-trip.
         let dir = scratch_dir("vfs-refresh-bypass");
-        let op = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .finish();
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         // Pre-create a real file on the memory backend so
         // the backend stat has something to return that's
         // *different* from the cached value.
         let _ = op.clone();
-        let op = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .finish();
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         let op_for_seed = op.clone();
         crate::rt().block_on(async move {
             op_for_seed
@@ -7555,7 +7546,7 @@ mod tests {
         let fs_root = scratch_dir("258-stat-fsroot");
         std::fs::write(fs_root.join("not_a_dir"), b"regular file").unwrap();
         let cfg = opendal::services::Fs::default().root(&fs_root.to_string_lossy());
-        let op = opendal::Operator::new(cfg).unwrap().finish();
+        let op = opendal::Operator::new(cfg).unwrap();
         // Sanity: confirm the backend yields a non-NotFound
         // kind for this scenario (the test would otherwise
         // be testing the wrong thing). The opendal Fs
@@ -7603,9 +7594,7 @@ mod tests {
     #[test]
     fn stat_op_still_runs_implicit_dir_check_on_notfound() {
         let dir = scratch_dir("258-stat-notfound");
-        let op = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .finish();
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         // Memory backend: stat on a non-existent path returns
         // NotFound. Without implicit-dir semantics, stat_op
         // returns None. We need a *dir-shaped* implicit-dir
@@ -7646,9 +7635,7 @@ mod tests {
     #[test]
     fn read_falls_back_to_cache_on_backend_error_when_opted_in() {
         let dir = scratch_dir("257-fallback-ok");
-        let op = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .finish();
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         let fs = new_test_fs(op, dir.clone());
         let mut fs = fs;
         fs.read_stale_on_backend_error = true;
@@ -7683,9 +7670,7 @@ mod tests {
     #[test]
     fn read_passes_through_backend_error_by_default() {
         let dir = scratch_dir("257-no-fallback");
-        let op = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .finish();
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         let fs = new_test_fs(op, dir.clone());
         assert!(
             !fs.read_stale_on_backend_error,
@@ -7726,9 +7711,7 @@ mod tests {
     #[test]
     fn read_rejects_partial_cache_fallback() {
         let dir = scratch_dir("257-partial-reject");
-        let op = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .finish();
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         let fs = new_test_fs(op, dir.clone());
         let mut fs = fs;
         fs.read_stale_on_backend_error = true;
