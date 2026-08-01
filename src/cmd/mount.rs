@@ -904,7 +904,7 @@ pub fn mount(
     min_size: Option<u64>,
     max_depth: Option<usize>,
     ignore_case: bool,
-    _no_modtime: bool,
+    no_modtime: bool,
     use_server_modtime: bool,
     _no_checksum: bool,
     _no_seek: bool,
@@ -1252,6 +1252,12 @@ pub fn mount(
         vfs_refresh,
         case_insensitive: vfs_case_insensitive,
         no_implicit_dir,
+        // Issue #509: `--no-modtime` is now wired (was a shadow
+        // flag under the #455 audit). The CLI default is false
+        // = rclone-parity behavior. When set, both `stat()` and
+        // `readdir()` paths return epoch for mtime instead of
+        // consulting `opendal::Metadata::last_modified()`.
+        no_modtime,
         use_server_modtime,
         no_apple_double,
         no_apple_xattr,
