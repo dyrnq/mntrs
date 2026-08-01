@@ -465,7 +465,17 @@ pub fn spawn(
                             }
                             Ok(Err(e)) if attempt < 4 => {
                                 let backoff_secs = 1u64 << attempt;
-                                tracing::warn!(
+                                // Audit finding A5: per-attempt
+                                // warn was rate-limit-noise on a
+                                // sustained backend outage —
+                                // 5 attempts/cycle × 10 cycles × N
+                                // stuck files drowns out the
+                                // actionable STUCK error below.
+                                // Downgrade to debug; operators
+                                // investigating a specific path
+                                // can still enable
+                                // `RUST_LOG=mntrs::writeback=debug`.
+                                tracing::debug!(
                                     path = %remote,
                                     attempt,
                                     backoff_secs,
@@ -549,7 +559,13 @@ pub fn spawn(
                         );
                         return;
                     }
-                    tracing::warn!(
+                    // Audit finding A5: per-cycle re-enqueue warn had
+                    // the same noise problem — every 5 cycles per
+                    // stuck file, vs the actionable STUCK error
+                    // above that fires once after the cycle budget
+                    // is exhausted. Keep the rate-limited debug for
+                    // root-cause work; demote from warn.
+                    tracing::debug!(
                         path = %remote,
                         cycle = cycle,
                         next_cycle = next_cycle,
