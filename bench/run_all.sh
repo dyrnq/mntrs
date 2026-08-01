@@ -83,8 +83,19 @@ echo "  $(date -Iseconds): starting mntrs mount (mem-cache-impl=$MEM_CACHE_IMPL)
 # for probes A+D) is captured to a file that the bench
 # workflow can upload as artifact. Without `export` the
 # daemon child doesn't inherit the variable.
+#
+# Probe F: also enable MNTRS_OPENDAL_HTTP_LOG so the
+# opendal LoggingLayer wraps every S3 op. The opendal log
+# crate (opendal_layer::logging) emits via the log facade —
+# `RUST_LOG=opendal_layer::logging=debug` lifts those to
+# the daemon log too. Each unlink DELETE will then show
+# the HTTP method, URI, status, body size, and timing —
+# which lets us compare per-DELETE HTTP trace against
+# rclone's S3.DeleteObject to see if mntrs issues extra
+# HEAD/STAT or adds overhead layers rclone doesn't have.
 export MNTRS_DAEMON_LOG="${MNTRS_DAEMON_LOG:-/tmp/mntrs-daemon.log}"
-RUST_LOG=info "$MNTRS_BIN" mount "s3://$BUCKET" "$MNTRS_MNT" \
+export MNTRS_OPENDAL_HTTP_LOG="${MNTRS_OPENDAL_HTTP_LOG:-1}"
+RUST_LOG=info,opendal_layer::logging=debug "$MNTRS_BIN" mount "s3://$BUCKET" "$MNTRS_MNT" \
     --opt "endpoint=$ENDPOINT" --opt "access-key=$ACCESS_KEY" \
     --opt "secret-key=$SECRET_KEY" --opt "region=$REGION" \
     --vfs-cache-mode=writes --vfs-write-back=5 \
