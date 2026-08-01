@@ -123,6 +123,13 @@ path = "tests/platform/linux/fuse_integration_test.rs"
 name = "platform_windows_winfsp_integration_test"
 path = "tests/platform/windows/winfsp_integration_test.rs"
 
+# Integration test for the rclone-parity xattr metadata surface
+# (issue #465). Exercises `CoreFilesystem::getxattr` /
+# `listxattr` against the in-process `Memory` backend.
+[[test]]
+name = "xattr_metadata_test"
+path = "tests/xattr_metadata_test.rs"
+
 # Dev-deps for platform tests. `ctor` runs a `#[ctor]` static before
 # each test (lets us init a tracing subscriber so RUST_LOG works in
 # the test binary, which otherwise has no main). `tracing-subscriber`

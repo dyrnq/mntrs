@@ -5739,54 +5739,38 @@ impl CoreFilesystem for MntrsFs {
     }
 
     fn getxattr(&self, ino: u64, name: &str) -> std::io::Result<Vec<u8>> {
-        if let Some(InodeEntry { path: p, .. }) = self.resolve(ino) {
-            let op = self.op.clone();
-            let p2 = p.clone();
-            match rt().block_on(async move { op.stat(&p2).await }) {
-                Ok(meta) => match name {
-                    "user.etag" | "s3.etag" => {
-                        meta.etag().map(|e| e.as_bytes().to_vec()).ok_or_else(|| {
-                            std::io::Error::new(std::io::ErrorKind::NotFound, "no etag")
-                        })
-                    }
-                    "user.content-type" | "s3.content-type" => meta
-                        .content_type()
-                        .map(|c| c.as_bytes().to_vec())
-                        .ok_or_else(|| {
-                            std::io::Error::new(std::io::ErrorKind::NotFound, "no content-type")
-                        }),
-                    _ => Err(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "xattr not found",
-                    )),
-                },
-                Err(_) => Err(std::io::Error::other("stat failed")),
-            }
-        } else {
-            Err(std::io::Error::new(
+        let entry = self.resolve(ino).ok_or_else(|| {
+            std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "ino not found",
-            ))
-        }
+                format!("getxattr: ino {ino} not found"),
+            )
+        })?;
+        let op = self.op.clone();
+        let p = entry.path.clone();
+        let meta = rt()
+            .block_on(async move { op.stat(&p).await })
+            .map_err(|e| std::io::Error::other(format!("stat failed: {e}")))?;
+        xattr_value_for(&meta, name)
     }
 
     fn listxattr(&self, ino: u64) -> std::io::Result<Vec<Vec<u8>>> {
-        if let Some(InodeEntry { kind, .. }) = self.resolve(ino) {
-            if kind == FileType::Directory {
-                return Ok(vec![]);
-            }
-            Ok(vec![
-                b"user.etag".to_vec(),
-                b"user.content-type".to_vec(),
-                b"s3.etag".to_vec(),
-                b"s3.content-type".to_vec(),
-            ])
-        } else {
-            Err(std::io::Error::new(
+        let entry = self.resolve(ino).ok_or_else(|| {
+            std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "ino not found",
-            ))
+                format!("listxattr: ino {ino} not found"),
+            )
+        })?;
+        if entry.kind == FileType::Directory {
+            // Directories: no metadata xattrs (rclone parity —
+            // rclone's --metadata applies to objects only).
+            return Ok(vec![]);
         }
+        let op = self.op.clone();
+        let p = entry.path.clone();
+        let meta = rt()
+            .block_on(async move { op.stat(&p).await })
+            .map_err(|e| std::io::Error::other(format!("stat failed: {e}")))?;
+        Ok(xattr_names_for(&meta))
     }
 
     // --- Issue #325: symlink / readlink overrides ---
@@ -6260,6 +6244,137 @@ impl MntrsFs {
             "populate_cache_from_backend: populated cache from backend"
         );
     }
+}
+
+// Issue #465: free-standing helpers for the xattr metadata
+// pipeline. Free (not associated) because they're not trait
+// methods — they can't live inside `impl CoreFilesystem for
+// MntrsFs`, and there's no clean place for them as
+// `impl MntrsFs` methods that's reachable from the trait
+// methods. Pure functions over `opendal::Metadata`, easy to
+// unit-test in isolation.
+
+/// Map an xattr name to its value bytes for a given
+/// `opendal::Metadata`. Returns `NotFound` for any name not
+/// in the rclone `--metadata` parity set.
+fn xattr_value_for(meta: &opendal::Metadata, name: &str) -> std::io::Result<Vec<u8>> {
+    match name {
+        // `s3.etag` and `s3.content-type` are S3-specific legacy
+        // names kept for backward compat with anyone scripting
+        // against the pre-#465 implementation.
+        "user.etag" | "s3.etag" => match meta.etag() {
+            // S3 wraps the ETag in literal `"..."` per the S3
+            // API contract. Strip the quotes so `xattr -p
+            // user.etag file` shows just the hex digest (matches
+            // what `aws s3api head-object --output text` prints).
+            Some(e) => Ok(strip_etag_quotes(e).as_bytes().to_vec()),
+            None => Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no etag")),
+        },
+        // rclone uses `user.mime_type`; we accept both spellings
+        // for backward compat with anything that scripted
+        // against the pre-#465 `user.content-type`.
+        "user.mime_type" | "user.content-type" | "s3.content-type" => match meta.content_type() {
+            Some(c) => Ok(c.as_bytes().to_vec()),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no content_type",
+            )),
+        },
+        "user.mtime" => match meta.last_modified() {
+            // `Timestamp` impls `Display` (jiff ISO-8601).
+            Some(ts) => Ok(ts.to_string().into_bytes()),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no mtime",
+            )),
+        },
+        // `content_length` is `u64`, not `Option<u64>` — always
+        // present. rclone always lists it; we do the same.
+        "user.content_length" => Ok(meta.content_length().to_string().into_bytes()),
+        // `user.<key>` → custom user metadata (S3: x-amz-meta-*,
+        // Azure: x-ms-meta-*, etc. — opendal flattens these into
+        // a `HashMap<String, String>` keyed on the lowercased
+        // user-defined part). Lookup is by the same normalized
+        // form (lowercase + dots→underscores) that `listxattr`
+        // emitted the name in.
+        name if name.starts_with("user.") => {
+            let normalized = normalize_user_meta_key(&name[5..]);
+            match meta.user_metadata() {
+                Some(map) => match map.get(&normalized) {
+                    Some(v) => Ok(v.as_bytes().to_vec()),
+                    None => Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("user.{normalized} not in user metadata"),
+                    )),
+                },
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no user metadata",
+                )),
+            }
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "xattr not found",
+        )),
+    }
+}
+
+/// Build the sorted list of present xattr names for a file's
+/// metadata. The pre-#465 implementation returned a hardcoded
+/// 4-name list regardless of what the backend had — `xattr -l
+/// file` would advertise xattrs that `getxattr` then rejected
+/// with `NotFound`, violating POSIX. Now: stat once, filter to
+/// fields present, sort, return.
+fn xattr_names_for(meta: &opendal::Metadata) -> Vec<Vec<u8>> {
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    if meta.etag().is_some() {
+        names.push(b"user.etag".to_vec());
+    }
+    if meta.content_type().is_some() {
+        // Only list the canonical rclone name; `user.content-type`
+        // is accepted by `getxattr` as a backward-compat alias
+        // but not re-advertised (avoids `xattr -l file` showing
+        // both spellings for the same value).
+        names.push(b"user.mime_type".to_vec());
+    }
+    if meta.last_modified().is_some() {
+        names.push(b"user.mtime".to_vec());
+    }
+    // `content_length` is always present (u64, not Option); list
+    // unconditionally.
+    names.push(b"user.content_length".to_vec());
+    if let Some(map) = meta.user_metadata() {
+        for key in map.keys() {
+            names.push(format!("user.{key}").into_bytes());
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Strip the surrounding `"..."` from an S3-style ETag.
+/// S3 wraps the hex digest in literal double quotes per the
+/// S3 API contract. E.g. ETag of a single-part upload looks
+/// like `"d41d8cd98f00b204e9800998ecf8427e"`. Strip them so the
+/// xattr value matches what `aws s3api head-object --output
+/// text` prints and what users expect from `xattr -p`.
+fn strip_etag_quotes(s: &str) -> &str {
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+/// Normalize a custom user-metadata key per rclone's mapping
+/// rules (lowercase + dots→underscores). S3 user metadata keys
+/// are case-insensitive at the HTTP header level (the
+/// `x-amz-meta-*` prefix gets normalized by AWS). Lowercase +
+/// dots→underscores matches the canonical xattr naming: dots
+/// are illegal in xattr names on most platforms.
+fn normalize_user_meta_key(s: &str) -> String {
+    s.to_lowercase().replace('.', "_")
 }
 
 impl MntrsFs {
