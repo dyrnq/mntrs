@@ -60,6 +60,20 @@ fn write_remote(fs: &MntrsFs, path: &str, data: &[u8]) {
     rt_block_on(async move {
         op.write(&p, d).await.unwrap();
     });
+    // Issue #494: WinFSP issues a directory enumeration shortly
+    // after mount (for change-notification bookkeeping). The
+    // resulting dir_cache[""] = empty listing then shadows
+    // subsequent reads for the full `dir_cache_ttl` (10s in
+    // tests). Direct opendal writes bypass the in-mount
+    // create() callback that would call cache_add_entry, so the
+    // cached empty listing stays stale. Invalidate the parent
+    // dir_cache after each write so the next readdir re-lists
+    // the backend. Idempotent — safe to call repeatedly.
+    let parent = std::path::Path::new(path)
+        .parent()
+        .and_then(|p| p.to_str())
+        .unwrap_or("");
+    fs.invalidate_dir_cache(parent);
 }
 
 /// Wait for filesystem to settle.
