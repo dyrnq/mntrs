@@ -613,30 +613,68 @@ pub mod test_helpers {
     use crate::core_fs::CoreFilesystem;
     use crate::core_fs::winfsp::WinFspAdapter;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Mutex;
     use winfsp::host::{FileSystemHost, MountPoint};
 
-    /// Per-test-binary counter that allocates a distinct drive letter for
-    /// each `mount_winfsp` call. Tests run in parallel by default; sharing
-    /// a single drive would race on the WinFSP volume namespace. Counts
-    /// down from `Z:` so we never collide with real system drives (A-C are
-    /// reserved; D onward is fair game on most systems). The pool is sized
-    /// for the 11 mount-touching platform tests + headroom.
+    /// Free list of drive letters available for `mount_winfsp` to lend out.
+    /// Tests run in parallel by default; sharing a single drive would race
+    /// on the WinFSP volume namespace. Counts down from `Z:` so we never
+    /// collide with real system drives (A-C are reserved; D onward is fair
+    /// game on most systems).
     ///
-    /// Note: this is per-process. Different test binaries in the same CI
-    /// job get their own counter, which is fine — each binary's
-    /// `cargo test` invocation is a separate process.
-    static NEXT_DRIVE: AtomicU8 = AtomicU8::new(b'Z');
+    /// Initial state: `[Z, Y, X, W, V, U, T, S, R, Q, P]` — 11 slots. Slots
+    /// are returned to the vec by `MountGuard::Drop`, so a sequential test
+    /// run reuses the same drive letter across tests. With 25
+    /// mount-touching tests in the current suite, sequential `--test-threads=1`
+    /// passes all 25; the pool only fails when more than 11 tests are
+    /// simultaneously inside `mount_winfsp` (true concurrent test threads
+    /// exceeding the cap). If that becomes a problem in practice, expand
+    /// the pool to Z-J (17 slots) — see issue #489.
+    ///
+    /// Per-process: each `cargo test` invocation is its own process, so the
+    /// vec starts full in every test binary.
+    static FREE_DRIVES: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
-    /// Allocate the next free drive letter from `Z:` downward. Returns
-    /// `None` once the pool is exhausted (caller should error).
+    /// Initialise `FREE_DRIVES` on first use with the 11-letter pool.
+    /// We can't use a `const` here because `Mutex::new` is not const, so
+    /// the lazy-init dance happens inside the allocation function. Holding
+    /// the lock for the initial fill is safe (no contention on the very
+    /// first call from a single test thread).
+    fn ensure_pool_initialised(g: &mut Vec<u8>) {
+        if g.is_empty() {
+            // Fill from Z down to P inclusive — preserves the original
+            // "allocate Z first" semantics so existing tests that don't
+            // care about which letter they get still see Z as the
+            // first allocation.
+            for c in (b'P'..=b'Z').rev() {
+                g.push(c);
+            }
+        }
+    }
+
+    /// Allocate one drive letter from the pool. Returns `None` when the
+    /// pool is exhausted (caller should error). Concurrent allocations
+    /// serialise on the pool mutex; the critical section is a single
+    /// `pop()` so contention is negligible.
     fn allocate_drive_letter() -> Option<char> {
-        NEXT_DRIVE
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
-                if c < b'P' { None } else { Some(c - 1) }
-            })
-            .ok()
-            .map(|b| b as char)
+        let mut g = FREE_DRIVES.lock().ok()?;
+        ensure_pool_initialised(&mut g);
+        g.pop().map(|b| b as char)
+    }
+
+    /// Return a previously-allocated drive letter to the pool. Called from
+    /// `MountGuard::Drop` so callers don't have to track lifetimes. We
+    /// de-duplicate (skip push if the letter is already present) to keep
+    /// the invariant simple even if a caller mistakenly drops two guards
+    /// for the same letter — without the check, the pool could grow
+    /// beyond 11 slots and bypass the cap.
+    fn return_drive_letter(c: char) {
+        if let Ok(mut g) = FREE_DRIVES.lock() {
+            let b = c as u8;
+            if !g.contains(&b) {
+                g.push(b);
+            }
+        }
     }
 
     /// Mount a CoreFilesystem on a Windows drive letter (auto-assigned
@@ -691,6 +729,7 @@ pub mod test_helpers {
         Ok(MountGuard::<F> {
             host: Some(host),
             mount_path,
+            drive_letter: Some(drive),
         })
     }
 
@@ -700,12 +739,22 @@ pub mod test_helpers {
     pub struct MountGuard<F: CoreFilesystem + 'static> {
         host: Option<FileSystemHost<WinFspAdapter<F>>>,
         pub mount_path: String,
+        /// Drive letter lent out by `mount_winfsp`. Returned to the
+        /// free list on Drop so subsequent mounts in the same test
+        /// process can reuse it. Stored as `Option<char>` rather than
+        /// `char` so a `MountGuard` constructed by other paths
+        /// (e.g. test fixtures that bypass `mount_winfsp`) doesn't
+        /// have to fabricate a letter.
+        drive_letter: Option<char>,
     }
 
     impl<F: CoreFilesystem + 'static> Drop for MountGuard<F> {
         fn drop(&mut self) {
             if let Some(mut host) = self.host.take() {
                 host.stop();
+            }
+            if let Some(c) = self.drive_letter.take() {
+                return_drive_letter(c);
             }
         }
     }
