@@ -2399,6 +2399,14 @@ async fn build_s3(url: &url::Url, opts: &HashMap<String, String>) -> Result<Oper
     if let Some(v) = opts.get("checksum-algorithm") {
         builder = builder.checksum_algorithm(v);
     }
+    // --storage-class (CLI flag, also accepted via --opt
+    // storage-class=...). opendal S3 setter is no-op on empty
+    // string and writes Some(v.to_string()) into
+    // config.default_storage_class; the backend forwards it as
+    // the `x-amz-storage-class` header on PUT/Copy/Multipart.
+    if let Some(v) = opts.get("storage-class") {
+        builder = builder.default_storage_class(v);
+    }
     apply_operator_with_tls(builder, opts)
 }
 
