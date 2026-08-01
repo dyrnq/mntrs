@@ -44,14 +44,15 @@ below for the composition recipe.
 | `--vfs-links` | `links: bool` | SHADOW |
 | `--vfs-used-is-size` | `_vfs_used_is_size: bool` | UNUSED (`_` prefix) |
 | `--vfs-metadata-extension` | `_vfs_metadata_extension: Option<String>` | UNUSED |
-| `--vfs-no-modtime` | `_no_modtime: bool` | UNUSED |
+| `--no-modtime` | `no_modtime: bool` | WIRED (issue #509) |
 
 The first five are rclone-shaped knobs we kept for
-backward compat with rclone scripts. The last three
+backward compat with rclone scripts. The last two
 (underscore-prefixed) are placeholders for features that
 were never built; the `_` prefix is the marker that says
-"we know this is dead." (`--vfs-cache-max-age` was
-previously in this list but was wired in issue #507.)
+"we know this is dead." (`--vfs-cache-max-age` and
+`--no-modtime` were previously in this list but have since
+been wired in issues #507 and #509.)
 
 The "SHADOW" rows below are currently the 5
 rclone-shaped knobs that remain accepted-but-unused.
@@ -163,13 +164,51 @@ mntrs uses `.dirty` sidecars (writeback queue) plus the
 in-memory `inodes` DashMap (stat cache). The metadata
 extension concept does not apply.
 
-### `--vfs-no-modtime` (UNUSED, `_` prefix)
+### `--no-modtime` (WIRED, issue #509)
 
-The inverse of `--vfs-use-server-modtime`, which IS
-wired (lib.rs:~1333, the inverse of the server-modtime
-flag). This field is a leftover; the "no modtime"
-behavior is already covered by `no_modtime` (the
-non-prefixed alias at L184 of main.rs).
+rclone's flag suppresses both read of backend mtime
+(`vfs/file.go:369-387`'s `ModTime` returns the parent
+dir's mtime) and write of mtime to the backend
+(`vfs/file.go:445-452`'s `SetModTime` is a no-op). The
+rclone perf rationale is "can speed things up" — the
+read side avoids per-file metadata round-trips.
+
+mntrs wires only the read side, because the write side
+is already a no-op in our `setattr` path (issue #306:
+`MntrsFs::setattr` only handles `size`/`truncate`,
+never pushes mtime to the backend). opendal 0.58's
+`WriteOptions` has no `last_modified` setter, and S3
+`LastModified` is server-assigned at PutObject — adding
+the write side would require extending opendal upstream
+and is out of scope here.
+
+The read-side gate lives in two places, both honoring
+the precedence `no_modtime > use_server_modtime`:
+
+- **`stat_op`** (`src/lib.rs:1862-1873`) — when `no_modtime`
+  is set, `mtime` in the returned `FileStat` is `None`
+  regardless of `use_server_modtime`. The kernel then
+  renders epoch mtime (matching the rclone behavior).
+- **`list_op`** (`src/lib.rs:2143-2161`) — analogous
+  gate on the readdir path. Pre-fix, `list_op` always
+  read server mtime, ignoring `use_server_modtime` — a
+  latent consistency bug where `ls -l` and `stat` could
+  disagree for the same file. The fix routes both paths
+  through the same gate.
+
+The CLI field was previously `_no_modtime: bool` (a
+dead-end underscore at `src/cmd/mount.rs:907`); the
+leading underscore has been removed and the value now
+flows into `MntrsFs::no_modtime` (default `false` =
+rclone-parity). Default is "rclone default" — i.e. backend
+mtime is consulted when `--use-server-modtime` is also
+set.
+
+> **Note:** rclone's `--vfs-no-modtime` (with `vfs-` prefix)
+> does not exist in either rclone or mntrs. The previous
+> inventory row claiming `--vfs-no-modtime` existed (lines
+> 47 and 166-170 of the old version) was a documentation
+> bug.
 
 ## `vfs-cache-mode` semantics (canonical: Interpretation 1)
 
