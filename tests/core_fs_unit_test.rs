@@ -48,7 +48,12 @@ fn opendir_releasedir_idempotent() {
 
 #[test]
 fn listxattr_root_is_not_found() {
-    let fs = make_fs();
+    // Issue #465 follow-up: opt into the rclone `--metadata`
+    // surface so listxattr reaches the "unknown ino → NotFound"
+    // path; the default-off gate would otherwise short-circuit
+    // to an empty list before the ino resolution.
+    let mut fs = make_fs();
+    fs.__metadata_set_for_test(true);
     // Root ino (1) is not in the inodes map — listxattr
     // returns NotFound for unknown inos.
     assert!(fs.listxattr(1).is_err());
@@ -56,13 +61,18 @@ fn listxattr_root_is_not_found() {
 
 #[test]
 fn getxattr_missing_ino_is_err() {
-    let fs = make_fs();
+    let mut fs = make_fs();
+    fs.__metadata_set_for_test(true);
     assert!(fs.getxattr(99999, "user.etag").is_err());
 }
 
 #[test]
 fn listxattr_regular_file_has_etag_keys() {
-    let fs = make_fs();
+    // Issue #465 follow-up: opt into the rclone `--metadata`
+    // surface so listxattr returns the backend-populated names
+    // (default-off gate would short-circuit to empty).
+    let mut fs = make_fs();
+    fs.__metadata_set_for_test(true);
     let (attr, _fh) = fs.create(1, "xattr.bin", 0o644).unwrap();
     let names = fs.listxattr(attr.ino).unwrap();
     assert!(!names.is_empty(), "regular file should have xattr names");
