@@ -5455,6 +5455,54 @@ impl CoreFilesystem for MntrsFs {
     }
 
     fn unlink(&self, _parent: u64, name: &str) -> std::io::Result<()> {
+        // ---- Phase 0 concurrency probe (plan #64 step 1) ----
+        // Counts concurrent FUSE unlink callbacks inside mntrs
+        // and the high-water mark. With fuser 0.18's default
+        // n_threads=1 (mount.rs:1468 → session.rs:257) and rm
+        // issuing unlinkat() serially, the expected answer is
+        // max_inflight == 1, which proves Policy B (write-behind)
+        // is mandatory for any batching design to accumulate
+        // >1 key per flush. Sample-capped at 2000 to bound log
+        // volume; once the high-water mark is observed, the
+        // probe becomes silent overhead.
+        static UNLINK_INFLIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static UNLINK_MAX_INFLIGHT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        static UNLINK_PROBE_COUNT: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(0);
+
+        let prev_inflight = UNLINK_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let new_inflight = prev_inflight + 1;
+        let mut cur_max = UNLINK_MAX_INFLIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        while new_inflight > cur_max {
+            match UNLINK_MAX_INFLIGHT.compare_exchange(
+                cur_max,
+                new_inflight,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur_max = actual,
+            }
+        }
+
+        struct UnlinkInflightGuard;
+        impl Drop for UnlinkInflightGuard {
+            fn drop(&mut self) {
+                UNLINK_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _inflight_guard = UnlinkInflightGuard;
+        let probe_n = UNLINK_PROBE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if probe_n < 2000 {
+            tracing::info!(
+                inflight = new_inflight,
+                max_inflight = UNLINK_MAX_INFLIGHT.load(std::sync::atomic::Ordering::Relaxed),
+                "MntrsFs::unlink concurrency probe",
+            );
+        }
+        // ---- end Phase 0 probe ----
+
         let parent_path = self.resolve(_parent).map(|e| e.path).unwrap_or_default();
         // Issue #325: strip leading `/` for root-parented (see
         // create() for the cross-adapter rationale).
