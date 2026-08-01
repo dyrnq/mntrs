@@ -2236,38 +2236,35 @@ fn apply_operator_with_tls(
     builder: impl opendal::Builder,
     opts: &std::collections::HashMap<String, String>,
 ) -> Result<Operator> {
-    // Check for curl-compatible TLS flags: --opt cacert=... --opt cert=...
+    let client = build_mount_http_client(opts)?;
+    apply_operator_with_client(builder, client)
+}
+
+/// Build the mount-scoped `reqwest::Client`. Honours
+/// `--opt insecure|cacert|cert` for TLS overrides; otherwise
+/// returns a clone of the process-wide shared client. Asserts
+/// we are reached from inside `crate::rt()` so the hyper
+/// connector binds to the right runtime (Bug 15, see
+/// `src/http_client.rs` for the root cause writeup).
+///
+/// Extracted from `apply_operator_with_tls` (plan #64 step 3)
+/// so the S3 path can keep the same client around for its
+/// direct `DeleteObjects` calls without re-parsing TLS opts.
+fn build_mount_http_client(
+    opts: &std::collections::HashMap<String, String>,
+) -> Result<reqwest::Client> {
     let insecure = opts.contains_key("insecure");
     let has_tls = insecure || opts.contains_key("cacert") || opts.contains_key("cert");
-    let op = if has_tls {
-        // Bug 15: assert we're being built from inside
-        // crate::rt() before we construct the
-        // reqwest::Client. The non-TLS branch below
-        // gets this guarantee for free from
-        // `crate::http_client::shared()`'s init assertion;
-        // the TLS branch builds a per-mount client
-        // directly, so it needs the same check.
-        //
-        // Why: reqwest::Client's hyper connector binds
-        // to whichever tokio runtime drives the FIRST
-        // .await on a request — not at .build() time.
-        // Today every apply_operator_with_tls caller
-        // runs inside rt_block_on (= crate::rt()), so
-        // the first .await is on the right runtime by
-        // construction. The assertion catches a future
-        // refactor that ever calls apply_operator_with_tls
-        // from a different (or no) tokio runtime, which
-        // would silently bind the hyper connector to
-        // the wrong reactor and produce hard-to-debug
-        // deadlocks in writeback. See src/http_client.rs
-        // for the full root cause writeup (the same
-        // bug pattern caused csi-e2e run 27407577059 to
-        // hang at pending=3).
+    if has_tls {
+        // Bug 15 assertion — see `apply_operator_with_tls`
+        // comment history for the full root cause. Kept here
+        // because every code path that builds a per-mount
+        // reqwest::Client needs the same guard.
         let init_handle = tokio::runtime::Handle::current();
         let expected = crate::rt().handle();
         debug_assert!(
             init_handle.id() == expected.id(),
-            "apply_operator_with_tls TLS branch must be reached from inside crate::rt(); \
+            "build_mount_http_client (TLS branch) must be reached from inside crate::rt(); \
              got a different (or no) tokio runtime — reqwest::Client built here would bind \
              its hyper connector to that other runtime on first .await and deadlock when \
              writeback (which runs in crate::rt()) tries to drive it."
@@ -2289,68 +2286,54 @@ fn apply_operator_with_tls(
                 reqwest::Identity::from_pem(&buf).map_err(|e| anyhow!("invalid cert: {}", e))?;
             rb = rb.identity(identity);
         }
-        let client = rb.build().map_err(|e| anyhow!("build TLS client: {}", e))?;
-        // opendal 0.58.1 migration: HTTP client is no longer a layer
-        // (`HttpClientLayer` was removed in favor of RFC #7740's provider
-        // model). The reqwest::Client is now installed via
-        // `OperationContext::with_http_transport(HttpTransporter::new(ReqwestTransport::new(client)))`
-        // before the user layers are applied — the layers see the
-        // composed context on each operation. `Operator::new` in 0.58.1
-        // returns a ready-to-use Operator; `.layer(...)` consumes self
-        // and returns a new operator; no `.finish()` step.
-        let transport = opendal::HttpTransporter::new(
-            opendal_http_transport_reqwest::ReqwestTransport::new(client),
-        );
-        let ctx = opendal::OperationContext::new().with_http_transport(transport);
-        let op = Operator::new(builder)?
-            .with_context(ctx)
-            .layer(TimeoutLayer::new().with_io_timeout(std::time::Duration::from_secs(30)))
-            .layer(RetryLayer::new().with_max_times(3).with_factor(2.0))
-            .layer(ConcurrentLimitLayer::new(16))
-            .layer(CapabilityCheckLayer::new());
-        // Probe F: optional LoggingLayer. See comment near
-        // the use-statement at the top of mount.rs for what
-        // this surfaces. Guarded by MNTRS_OPENDAL_HTTP_LOG so
-        // it doesn't run in production.
-        if std::env::var_os("MNTRS_OPENDAL_HTTP_LOG").is_some() {
-            op.layer(LoggingLayer::default())
-        } else {
-            op
-        }
+        rb.build().map_err(|e| anyhow!("build TLS client: {}", e))
     } else {
-        // Non-TLS path: still install an explicit reqwest transport via
-        // `with_context` so we never touch opendal's default LazyLock.
-        // Otherwise that client gets instantiated lazily on the first
-        // .await, binding its hyper connector to whichever tokio
-        // runtime Handle::current() happens to be at that moment — and
-        // if writeback (in crate::rt()) ever drives an op that ends up
-        // the first caller, the binding mismatches the rt_block_on /
-        // cmd/mount runtime and we deadlock (see src/http_client.rs for
-        // the full root cause). Using `shared()` here forces the
-        // binding to happen on the first apply_operator_with_tls call,
-        // which always runs inside `crate::rt()` via `rt_block_on`.
-        let transport =
-            opendal::HttpTransporter::new(opendal_http_transport_reqwest::ReqwestTransport::new(
-                crate::http_client::shared().clone(),
-            ));
-        let ctx = opendal::OperationContext::new().with_http_transport(transport);
-        let op = Operator::new(builder)?
-            .with_context(ctx)
-            .layer(TimeoutLayer::new().with_io_timeout(std::time::Duration::from_secs(30)))
-            .layer(RetryLayer::new().with_max_times(3).with_factor(2.0))
-            .layer(ConcurrentLimitLayer::new(16))
-            .layer(CapabilityCheckLayer::new());
-        // Probe F: optional LoggingLayer. See comment near
-        // the use-statement at the top of mount.rs for what
-        // this surfaces. Guarded by MNTRS_OPENDAL_HTTP_LOG so
-        // it doesn't run in production.
-        if std::env::var_os("MNTRS_OPENDAL_HTTP_LOG").is_some() {
-            op.layer(LoggingLayer::default())
-        } else {
-            op
-        }
-    };
-    Ok(op)
+        // Non-TLS path: clone the process-wide shared
+        // client. The shared client's hyper connector was
+        // bound on its first .await (during construction,
+        // gated by `crate::http_client::shared()`'s own
+        // init assertion). Cloning shares the underlying
+        // connector — no rebinding, no Bug 15.
+        Ok(crate::http_client::shared().clone())
+    }
+}
+
+/// Wrap a builder with the standard opendal layer stack
+/// (Timeout → Retry → ConcurrentLimit → CapabilityCheck,
+/// plus optional LoggingLayer) and install the given
+/// `reqwest::Client` via the provider-model transport
+/// (`with_http_transport`). Caller owns the client; we
+/// only clone the inner `Arc`.
+fn apply_operator_with_client(
+    builder: impl opendal::Builder,
+    client: reqwest::Client,
+) -> Result<Operator> {
+    // opendal 0.58.1 migration: HTTP client is no longer a
+    // layer (`HttpClientLayer` was removed in favor of RFC
+    // #7740's provider model). The reqwest::Client is
+    // installed via
+    // `OperationContext::with_http_transport(HttpTransporter::new(ReqwestTransport::new(client)))`
+    // before the user layers are applied — the layers see
+    // the composed context on each operation.
+    let transport = opendal::HttpTransporter::new(
+        opendal_http_transport_reqwest::ReqwestTransport::new(client),
+    );
+    let ctx = opendal::OperationContext::new().with_http_transport(transport);
+    let op = Operator::new(builder)?
+        .with_context(ctx)
+        .layer(TimeoutLayer::new().with_io_timeout(std::time::Duration::from_secs(30)))
+        .layer(RetryLayer::new().with_max_times(3).with_factor(2.0))
+        .layer(ConcurrentLimitLayer::new(16))
+        .layer(CapabilityCheckLayer::new());
+    // Probe F: optional LoggingLayer. See comment near
+    // the use-statement at the top of mount.rs for what
+    // this surfaces. Guarded by MNTRS_OPENDAL_HTTP_LOG so
+    // it doesn't run in production.
+    Ok(if std::env::var_os("MNTRS_OPENDAL_HTTP_LOG").is_some() {
+        op.layer(LoggingLayer::default())
+    } else {
+        op
+    })
 }
 
 async fn build_operator(storage_url: &str, opts: &HashMap<String, String>) -> Result<Operator> {
