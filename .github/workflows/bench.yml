@@ -120,3 +120,11 @@ jobs:
           # so this step is safe to merge before a baseline exists.
           . tests/e2e/bench/check-regression.sh
           check_regression bench-result.txt bench/baseline.txt 0.20
+
+      - name: Upload mntrs daemon log
+        if: matrix.mode == 'bench-comparison' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mntrs-daemon-log-${{ matrix.mem_cache_impl }}
+          path: /tmp/mntrs-daemon.log
+          if-no-files-found: ignore
