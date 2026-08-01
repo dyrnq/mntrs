@@ -6868,14 +6868,30 @@ impl MntrsFs {
                             Ok(false)
                         }
                     };
-                    let del_res = op.delete(&src_clone).await;
-                    if let Err(del_err) = &del_res {
-                        tracing::warn!(
-                            src = %src_clone, dst = %dst_clone, error = %del_err,
-                            "rename fallback: copy ok, delete failed — both visible"
-                        );
+                    // Data-loss fix (plan #64 step 2): only delete
+                    // the source when the copy actually succeeded.
+                    // Previously op.delete ran unconditionally after
+                    // copy_result was computed, including when copy
+                    // returned Ok(false) (read/write/copy failed) —
+                    // leaving the user with the source gone from the
+                    // backend but no destination, a strictly worse
+                    // outcome than leaving the rename as a no-op.
+                    let copied_ok = matches!(copy_result, Ok(true));
+                    if copied_ok {
+                        match op.delete(&src_clone).await {
+                            Ok(()) => {
+                                tracing::debug!(src = %src_clone, "rename fallback: delete src ok")
+                            }
+                            Err(del_err) => tracing::warn!(
+                                src = %src_clone, dst = %dst_clone, error = %del_err,
+                                "rename fallback: copy ok, delete failed — both visible"
+                            ),
+                        }
                     } else {
-                        tracing::debug!(src = %src_clone, "rename fallback: delete src ok");
+                        tracing::debug!(
+                            src = %src_clone,
+                            "rename fallback: copy did not succeed, NOT deleting source"
+                        );
                     }
                     copy_result
                 }
