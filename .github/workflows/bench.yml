@@ -128,3 +128,25 @@ jobs:
           name: mntrs-daemon-log-${{ matrix.mem_cache_impl }}
           path: /tmp/mntrs-daemon.log
           if-no-files-found: ignore
+
+      # PoC: S3 DeleteObjects batching microbenchmark. Compares
+      # 500 × single DELETE (aws s3 rm ≈ opendal `op.delete()`) vs
+      # 1 × `delete-objects` (S3 DeleteObjects ≈ opendal
+      # `BatchDeleter<S3Deleter>` close) vs chunked variants. Tells
+      # us whether integrating a long-lived batch deleter into the
+      # FUSE unlink path can close the 1ms/op vs 0.3ms/op gap to
+      # rclone. Runs only on the bench-comparison × moka row so it
+      # isn't repeated on every A/B cell.
+      - name: Run DeleteObjects batching PoC
+        if: matrix.mode == 'bench-comparison' && matrix.mem_cache_impl == 'moka'
+        run: |
+          ENDPOINT=http://localhost:9000 BUCKET=mntrs-delete-poc \
+            bash bench/delete_batch_poc.sh 2>&1 | tee delete-poc-result.txt
+
+      - name: Upload DeleteObjects PoC result
+        if: matrix.mode == 'bench-comparison' && matrix.mem_cache_impl == 'moka' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: delete-poc-result-${{ matrix.mem_cache_impl }}
+          path: delete-poc-result.txt
+          if-no-files-found: ignore
