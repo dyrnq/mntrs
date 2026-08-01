@@ -817,10 +817,28 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         }
     }
 
-    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, _size: u32, reply: ReplyXattr) {
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         let name = name.to_string_lossy();
         match self.inner.getxattr(ino.into(), &name) {
-            Ok(data) => reply.data(&data),
+            Ok(data) => {
+                // Issue #465: handle the size-query form. POSIX /
+                // FUSE convention: when the kernel passes `size=0`,
+                // the handler must return the required buffer size
+                // via `reply.size(N)` instead of the value itself —
+                // this lets the kernel allocate the right buffer
+                // before a follow-up `getxattr` with the correct
+                // size. The pre-#465 implementation ignored `size`
+                // and always returned the data, which is fine for
+                // ordinary `xattr -p file` callers but breaks
+                // `xattr -p` size preflight on macOS Finder.
+                if size == 0 {
+                    reply.size(data.len() as u32);
+                } else if (size as usize) < data.len() {
+                    reply.error(Errno::ERANGE);
+                } else {
+                    reply.data(&data);
+                }
+            }
             Err(e) => reply.error(io_err_to_fuse_errno(e)),
         }
     }

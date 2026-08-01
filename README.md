@@ -268,6 +268,43 @@ that are accepted on the CLI but not yet implemented — see
 
 ## Platform Features
 
+### Object Metadata (xattr)
+
+mntrs exposes backend object metadata as FUSE extended attributes on every
+file. The attribute names follow [rclone's `--metadata`](https://rclone.org/docs/#metadata)
+convention so any tool written for rclone just works:
+
+| xattr name | Source | Notes |
+|------------|--------|-------|
+| `user.etag` | backend ETag | surrounding quotes stripped (S3 returns `"..."` over the wire) |
+| `user.mime_type` | backend `Content-Type` | `user.content-type` is accepted as a backward-compat alias |
+| `user.mtime` | backend `Last-Modified` | ISO-8601 |
+| `user.content_length` | backend object size | decimal bytes |
+| `user.<key>` | backend user metadata | key is normalized: lowercased, dots replaced with underscores (macOS FUSE rejects dots in xattr names) |
+
+`listxattr` returns only the attributes the backend actually populated
+for the object — empty for directories, and on backends without an
+ETag/`Content-Type`/`Last-Modified` the corresponding attributes are
+absent rather than stubbed. Names are returned in sorted order so
+`getfattr -d -m '^user\.'` output is deterministic.
+
+Tools that consume this surface:
+
+```bash
+# Show all metadata xattrs for a file
+getfattr -d -m '^user\.' /mnt/s3/path/to/file
+
+# Use it from a script
+etag=$(stat -c %i /mnt/s3/path/to/file >/dev/null 2>&1 && \
+       getfattr --absolute-names -n user.etag /mnt/s3/path/to/file \
+         | awk -F'"' '/^user.etag=/ {print $2}')
+```
+
+FUSE size queries (`size=0` form passed by the kernel to ask "how big
+would this attribute be?") are honored — `getxattr` returns the
+attribute size without copying the value bytes, and an undersized
+buffer returns `ERANGE` instead of truncating.
+
 ### Daemon Mode
 
 ```bash
