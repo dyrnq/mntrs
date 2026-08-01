@@ -96,7 +96,7 @@ pub struct FileStat {
     pub mtime: Option<SystemTime>,
 }
 
-/// One entry in the LRU eviction heap in [`MntrsFs::evict_lru_if_needed`].
+/// One entry in the LRU eviction heap in [`MntrsFs::evict_if_needed`].
 ///
 /// Issue #225 refactored this from a 3-tuple
 /// `(std::time::Instant, CacheKey, u64)` whose field order
@@ -745,11 +745,23 @@ pub struct MntrsFs {
 }
 
 impl MntrsFs {
-    /// If `cache_max_size > 0` or `cache_min_free_space > 0`, walk
-    /// `disk_cache_index` (newest to oldest by `atime`) and delete
-    /// the oldest cache files until the total drops below the
-    /// configured limit, or until the cache disk has the
-    /// requested free space, whichever is the tighter constraint.
+    /// If `cache_max_size > 0`, `cache_min_free_space > 0`, or
+    /// `cache_max_age > 0`, walk `disk_cache_index` and evict.
+    ///
+    /// Two eviction regimes share this method (issue #507):
+    ///
+    /// 1. **Capacity-based** (`cache_max_size > 0` /
+    ///    `cache_min_free_space > 0`): pop oldest entries by
+    ///    `atime` until the total drops below the configured
+    ///    limit, or until the cache disk has the requested free
+    ///    space, whichever is the tighter constraint.
+    /// 2. **Age-based** (`cache_max_age > 0`): independently
+    ///    sweep entries whose filesystem mtime is older than
+    ///    `cache_max_age`. Runs even when no capacity pressure
+    ///    exists — a user who sets only `--vfs-cache-max-age`
+    ///    must still see age eviction fire on the write path.
+    ///    `.dirty` sidecars on whole-file cache entries are
+    ///    skipped (writeback is the only legitimate cleaner).
     ///
     /// The index tracks both whole-file cache (`cache_path`,
     /// keyed by `(path, None)`) and per-block cache
@@ -774,8 +786,11 @@ impl MntrsFs {
     /// the eviction completes. The current write is allowed to
     /// push the total briefly over the limit; the *next* write
     /// that observes the breach evicts down to the target.
-    fn evict_lru_if_needed(&self) {
-        if self.cache_max_size == 0 && self.cache_min_free_space == 0 {
+    fn evict_if_needed(&self) {
+        if self.cache_max_size == 0
+            && self.cache_min_free_space == 0
+            && self.cache_max_age.is_zero()
+        {
             return;
         }
 
@@ -838,8 +853,74 @@ impl MntrsFs {
                 cache_max_size = self.cache_max_size,
                 cache_min_free_space = self.cache_min_free_space,
                 total,
-                "evict_lru_if_needed: no work needed"
+                "evict_if_needed: no work needed"
             );
+            // Fall through to the age sweep below — issue #507.
+            // A user who sets only `--vfs-cache-max-age` (no
+            // capacity knob) must still see age eviction fire.
+            // The LRU drain below is skipped because `to_free == 0`.
+        }
+
+        // ── --vfs-cache-max-age sweep (issue #507) ───────────────
+        // Runs independently of capacity pressure: a user who
+        // sets only `--vfs-cache-max-age` (no `--vfs-cache-max-size`)
+        // must still see age eviction fire on the write path.
+        //
+        // Order: age sweep runs before the LRU min-heap build so
+        // age-evicted entries don't double-count in the size
+        // budget. After this sweep, the LRU min-heap (only when
+        // `to_free > 0`) is built from a post-sweep view.
+        //
+        // Whole-file cache entries with a `.dirty` sidecar are
+        // skipped — writeback is the only legitimate cleaner
+        // (`src/writeback.rs:299, 434`). `.block` files don't have
+        // sidecars so they always participate.
+        if !self.cache_max_age.is_zero() {
+            let mut to_remove_age: Vec<crate::util::CacheKey> = Vec::new();
+            for entry in self.disk_cache_index.iter() {
+                let key = entry.key();
+                let cpath = match key.1 {
+                    Some(idx) => crate::cache_block_path(&self.cache_dir, &key.0, idx),
+                    None => crate::cache_path(&self.cache_dir, &key.0),
+                };
+                if !cpath.exists() {
+                    // File already gone (manual rm, prior sweep);
+                    // drop the stale index entry.
+                    to_remove_age.push(key.clone());
+                    continue;
+                }
+                // Whole-file cache with `.dirty` sidecar — skip.
+                if key.1.is_none() && cpath.with_extension("dirty").exists() {
+                    continue;
+                }
+                if crate::util::is_cache_file_expired(&cpath, self.cache_max_age) {
+                    to_remove_age.push(key.clone());
+                }
+            }
+            let removed = to_remove_age.len();
+            for key in &to_remove_age {
+                if let Some(idx) = key.1 {
+                    let cpath = crate::cache_block_path(&self.cache_dir, &key.0, idx);
+                    let _ = std::fs::remove_file(&cpath);
+                } else {
+                    let cpath = crate::cache_path(&self.cache_dir, &key.0);
+                    let _ = std::fs::remove_file(&cpath);
+                    // Whole-file cache has a `.meta` sidecar too.
+                    let _ = std::fs::remove_file(cpath.with_extension("meta"));
+                }
+                self.disk_cache_index.remove(key);
+            }
+            if removed > 0 {
+                tracing::debug!(
+                    removed,
+                    max_age_secs = self.cache_max_age.as_secs(),
+                    "evict_if_needed: age sweep removed entries"
+                );
+            }
+        }
+
+        // LRU drain only when capacity pressure exists.
+        if to_free == 0 {
             return;
         }
 
@@ -912,7 +993,7 @@ impl MntrsFs {
             tracing::warn!(
                 freed,
                 to_free,
-                "evict_lru_if_needed: cache under target after draining index; \
+                "evict_if_needed: cache under target after draining index; \
                  cache file may be truncated"
             );
         }
@@ -3693,118 +3774,147 @@ impl CoreFilesystem for MntrsFs {
         // 4. File-level disk cache (whole file)
         if !self.direct_io {
             let fcpath = crate::cache_path(&self.cache_dir, &path);
-            if fcpath.exists()
-                && let Ok(data) = std::fs::read(&fcpath)
-            {
-                let b = bytes::Bytes::from(data);
-                // Issue #43: if the on-disk file is
-                // SHORTER than the inodes-reported size,
-                // treat the file-level cache as a
-                // partial hit. Returning an empty read
-                // at `offset >= b.len()` while inodes
-                // claims the file is larger produces
-                // kernel-visible EOF in the middle of
-                // the file (the read above reports
-                // b.len() bytes successfully, then a
-                // 0-byte read at the next page — FUSE
-                // then thinks the file is b.len()
-                // bytes, contradicting the getattr
-                // reply). This was the source of the
-                // "100M write but read returns 24M then
-                // hangs" symptom in s3-lifecycle-stress:
-                // a previous mount's writeback didn't
-                // complete, leaving a partial cache
-                // file with inodes.size = 100M.
-                //
-                // The fix: if `b.len() < actual_size`
-                // (the cache is partial), fall through
-                // to the block cache + remote fetch to
-                // backfill. mem_cache is still warmed
-                // with the partial bytes for the next
-                // read in the same region.
-                let cache_is_complete = (b.len() as u64) >= actual_size;
-                tracing::debug!(
-                    path = %path,
-                    offset = offset,
-                    size = size,
-                    cache_bytes = b.len(),
-                    actual_size = actual_size,
-                    cache_is_complete = cache_is_complete,
-                    "read: file-level cache check"
-                );
-                if cache_is_complete {
-                    tracing::debug!(
-                        ino,
-                        cache_bytes = b.len(),
-                        "read: file-level cache hit (complete)"
-                    );
-                    // Bug B fix: bump the in-memory
-                    // LRU sort key on every cache hit.
-                    // The on-disk atime is unreliable
-                    // on `relatime` mount defaults, so
-                    // the LRU sweeper consults the
-                    // in-memory `Instant` recorded
-                    // here (see `bump_in_memory_atime`
-                    // and the field doc on
-                    // `disk_cache_index`).
-                    bump_in_memory_atime(&self.disk_cache_index, &(path.clone(), None));
-                    let start = offset as usize;
-                    let end = (start + size as usize).min(b.len());
-                    let result = if start < b.len() {
-                        b[start..end].to_vec()
-                    } else {
-                        vec![]
-                    };
-                    // Issue #331: store only the block-aligned slice
-                    // (≤ CACHE_BLOCK_SIZE bytes) under the
-                    // (ino, block_idx) key, NOT the entire cache file.
-                    // Pre-fix `b` was the whole file, so the next
-                    // read at the same block_idx via `multi_cache.
-                    // read_block` returned the whole file and the
-                    // caller sliced `data[128K..256K]` = data from
-                    // the START of the file, not from offset 8M.
-                    // `Bytes::slice` is O(1) (refcount), no alloc.
-                    let blk_start = (offset / CACHE_BLOCK_SIZE) * CACHE_BLOCK_SIZE;
-                    if blk_start < b.len() as u64 {
-                        let blk_end = ((blk_start + CACHE_BLOCK_SIZE) as usize).min(b.len());
-                        self.mem_cache.put(
-                            ino,
-                            offset / CACHE_BLOCK_SIZE,
-                            b.slice(blk_start as usize..blk_end),
-                        );
-                    }
-                    return Ok(result);
-                } else {
-                    // Partial cache — warm mem_cache
-                    // for the next read but fall
-                    // through. The mem_cache put is
-                    // best-effort: the block cache +
-                    // remote fetch below will satisfy
-                    // the current request. Clone `b`
-                    // because `b` may be needed for
-                    // the partial-data path below
-                    // (when offset > b.len()).
-                    //
-                    // Issue #331: same block-aligned slice
-                    // treatment as the complete-cache branch
-                    // above — store ≤ CACHE_BLOCK_SIZE bytes
-                    // under (ino, block_idx), not the whole
-                    // (possibly huge) partial cache file.
-                    let blk_start = (offset / CACHE_BLOCK_SIZE) * CACHE_BLOCK_SIZE;
-                    if blk_start < b.len() as u64 {
-                        let blk_end = ((blk_start + CACHE_BLOCK_SIZE) as usize).min(b.len());
-                        self.mem_cache.put(
-                            ino,
-                            offset / CACHE_BLOCK_SIZE,
-                            b.slice(blk_start as usize..blk_end).clone(),
-                        );
-                    }
+            if fcpath.exists() {
+                // ── --vfs-cache-max-age check (issue #507) + .dirty guard ─
+                // Whole-file cache files have a `.dirty` sidecar
+                // while a writeback task is pending. NEVER sweep
+                // those — the writeback worker is the only
+                // legitimate cleaner (`src/writeback.rs:299, 434`).
+                // Sidecar filename is `{fcpath}.dirty` per
+                // `cache_path.with_extension("dirty")` — see
+                // writeback.rs:84. `Duration::ZERO` is the
+                // "disabled" sentinel — helper short-circuits.
+                let dirty_sidecar = fcpath.with_extension("dirty");
+                let skip_for_dirty = dirty_sidecar.exists();
+                if !self.cache_max_age.is_zero()
+                    && !skip_for_dirty
+                    && crate::util::is_cache_file_expired(&fcpath, self.cache_max_age)
+                {
                     tracing::debug!(
                         path = %path,
-                        cache_bytes = b.len(),
-                        inodes_bytes = actual_size,
-                        "file-level cache is partial; falling through to block cache + remote (issue #43)"
+                        fcpath = %fcpath.display(),
+                        max_age_secs = self.cache_max_age.as_secs(),
+                        "read: file-level cache age-expired (treating as miss)"
                     );
+                    let _ = std::fs::remove_file(&fcpath);
+                    // `None` block_idx = whole-file entry in
+                    // `disk_cache_index`.
+                    self.disk_cache_index.remove(&(path.clone(), None));
+                    // Fall through (no return) — the block-cache +
+                    // remote-fetch branch below may still satisfy
+                    // the read (e.g. when partial whole-file data
+                    // is also available).
+                } else if let Ok(data) = std::fs::read(&fcpath) {
+                    let b = bytes::Bytes::from(data);
+                    // Issue #43: if the on-disk file is
+                    // SHORTER than the inodes-reported size,
+                    // treat the file-level cache as a
+                    // partial hit. Returning an empty read
+                    // at `offset >= b.len()` while inodes
+                    // claims the file is larger produces
+                    // kernel-visible EOF in the middle of
+                    // the file (the read above reports
+                    // b.len() bytes successfully, then a
+                    // 0-byte read at the next page — FUSE
+                    // then thinks the file is b.len()
+                    // bytes, contradicting the getattr
+                    // reply). This was the source of the
+                    // "100M write but read returns 24M then
+                    // hangs" symptom in s3-lifecycle-stress:
+                    // a previous mount's writeback didn't
+                    // complete, leaving a partial cache
+                    // file with inodes.size = 100M.
+                    //
+                    // The fix: if `b.len() < actual_size`
+                    // (the cache is partial), fall through
+                    // to the block cache + remote fetch to
+                    // backfill. mem_cache is still warmed
+                    // with the partial bytes for the next
+                    // read in the same region.
+                    let cache_is_complete = (b.len() as u64) >= actual_size;
+                    tracing::debug!(
+                        path = %path,
+                        offset = offset,
+                        size = size,
+                        cache_bytes = b.len(),
+                        actual_size = actual_size,
+                        cache_is_complete = cache_is_complete,
+                        "read: file-level cache check"
+                    );
+                    if cache_is_complete {
+                        tracing::debug!(
+                            ino,
+                            cache_bytes = b.len(),
+                            "read: file-level cache hit (complete)"
+                        );
+                        // Bug B fix: bump the in-memory
+                        // LRU sort key on every cache hit.
+                        // The on-disk atime is unreliable
+                        // on `relatime` mount defaults, so
+                        // the LRU sweeper consults the
+                        // in-memory `Instant` recorded
+                        // here (see `bump_in_memory_atime`
+                        // and the field doc on
+                        // `disk_cache_index`).
+                        bump_in_memory_atime(&self.disk_cache_index, &(path.clone(), None));
+                        let start = offset as usize;
+                        let end = (start + size as usize).min(b.len());
+                        let result = if start < b.len() {
+                            b[start..end].to_vec()
+                        } else {
+                            vec![]
+                        };
+                        // Issue #331: store only the block-aligned slice
+                        // (≤ CACHE_BLOCK_SIZE bytes) under the
+                        // (ino, block_idx) key, NOT the entire cache file.
+                        // Pre-fix `b` was the whole file, so the next
+                        // read at the same block_idx via `multi_cache.
+                        // read_block` returned the whole file and the
+                        // caller sliced `data[128K..256K]` = data from
+                        // the START of the file, not from offset 8M.
+                        // `Bytes::slice` is O(1) (refcount), no alloc.
+                        let blk_start = (offset / CACHE_BLOCK_SIZE) * CACHE_BLOCK_SIZE;
+                        if blk_start < b.len() as u64 {
+                            let blk_end = ((blk_start + CACHE_BLOCK_SIZE) as usize).min(b.len());
+                            self.mem_cache.put(
+                                ino,
+                                offset / CACHE_BLOCK_SIZE,
+                                b.slice(blk_start as usize..blk_end),
+                            );
+                        }
+                        return Ok(result);
+                    } else {
+                        // Partial cache — warm mem_cache
+                        // for the next read but fall
+                        // through. The mem_cache put is
+                        // best-effort: the block cache +
+                        // remote fetch below will satisfy
+                        // the current request. Clone `b`
+                        // because `b` may be needed for
+                        // the partial-data path below
+                        // (when offset > b.len()).
+                        //
+                        // Issue #331: same block-aligned slice
+                        // treatment as the complete-cache branch
+                        // above — store ≤ CACHE_BLOCK_SIZE bytes
+                        // under (ino, block_idx), not the whole
+                        // (possibly huge) partial cache file.
+                        let blk_start = (offset / CACHE_BLOCK_SIZE) * CACHE_BLOCK_SIZE;
+                        if blk_start < b.len() as u64 {
+                            let blk_end = ((blk_start + CACHE_BLOCK_SIZE) as usize).min(b.len());
+                            self.mem_cache.put(
+                                ino,
+                                offset / CACHE_BLOCK_SIZE,
+                                b.slice(blk_start as usize..blk_end).clone(),
+                            );
+                        }
+                        tracing::debug!(
+                            path = %path,
+                            cache_bytes = b.len(),
+                            inodes_bytes = actual_size,
+                            "file-level cache is partial; falling through to block cache + remote (issue #43)"
+                        );
+                    }
                 }
             }
         }
@@ -4586,9 +4696,9 @@ impl CoreFilesystem for MntrsFs {
         // current write is allowed to push the total
         // briefly over the limit; the next write that
         // observes the breach evicts down to the target.
-        // See `evict_lru_if_needed` for the exact size
+        // See `evict_if_needed` for the exact size
         // math.
-        self.evict_lru_if_needed();
+        self.evict_if_needed();
         let written = _data.len() as u32;
 
         // Update inodes size — must CREATE the entry if it doesn't exist.
@@ -6980,7 +7090,7 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         // stale data). Tests that exercise the fallback
         // path opt in explicitly.
         read_stale_on_backend_error: false,
-        cache_max_age: std::time::Duration::from_secs(3600),
+        cache_max_age: std::time::Duration::ZERO, // Issue #507: default off (matches CLI `--vfs-cache-max-age 0` disable). Pre-#507 this was 3600s (matching CLI default), but that fired the age sweep in tests that insert index entries without on-disk files (the sweep then drops the orphan entries, breaking invariants). Tests that exercise age eviction opt in explicitly with `fs.cache_max_age = Duration::from_millis(N)`.
         // Issue #243.3: pre-#243 this was 100 MiB. The 100
         // MiB default contradicted the CLI
         // `--vfs-cache-min-free-space` default of `0` (=
@@ -7062,6 +7172,12 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
                 cache_dir.clone(),
                 disk_cache_index.clone(),
                 false,
+                // Issue #507: test helper. The default
+                // `cache_max_age: Duration::from_secs(3600)` is set
+                // on the struct field above, but tests that want
+                // short TTLs override it after construction
+                // (see `new_test_fs_evict` for the LRU-test path).
+                std::time::Duration::ZERO,
                 crate::metrics::global(),
             )
         },
@@ -7102,7 +7218,11 @@ mod tests {
     }
 
     /// Construct a MntrsFs suitable for disk-cache eviction tests.
-    /// cache_max_size is honoured; cache_min_free_space can be 0.
+    /// cache_max_size is honoured; cache_min_free_space and
+    /// cache_max_age are 0 (issue #507: age sweep would otherwise
+    /// fire when default cache_max_age=3600 is inherited from
+    /// `new_test_fs` and corrupt the disk_cache_index invariant
+    /// these tests assert on).
     fn new_test_fs_evict(cache_dir: PathBuf, cache_max_size: u64) -> MntrsFs {
         let mut fs = new_test_fs(
             opendal::Operator::new(opendal::services::Memory::default()).unwrap(),
@@ -7110,6 +7230,8 @@ mod tests {
         );
         fs.cache_max_size = cache_max_size;
         fs.cache_min_free_space = 0;
+        // Issue #507: LRU tests must not see age-driven eviction.
+        fs.cache_max_age = std::time::Duration::ZERO;
         fs
     }
 
@@ -7121,14 +7243,14 @@ mod tests {
             .insert((path.to_string(), None), (size, atime));
     }
 
-    // ── evict_lru_if_needed ──────────────────────────────────────
+    // ── evict_if_needed ──────────────────────────────────────
 
     #[test]
     fn evict_lru_noop_when_total_under_limit() {
         let dir = scratch_dir("noop");
         let fs = new_test_fs_evict(dir, 10 * 1024 * 1024);
         insert_cache_entry(&fs, "small.bin", 1024, Instant::now());
-        fs.evict_lru_if_needed();
+        fs.evict_if_needed();
         assert_eq!(
             fs.disk_cache_index.len(),
             1,
@@ -7146,7 +7268,7 @@ mod tests {
         insert_cache_entry(&fs, "c.bin", 1024, now - Duration::from_secs(20));
 
         // total = 3072, limit = 2048 → need to free 1024
-        fs.evict_lru_if_needed();
+        fs.evict_if_needed();
         let remaining: u64 = fs.disk_cache_index.iter().map(|e| e.value().0).sum();
         assert!(
             remaining <= 2048,
@@ -7172,7 +7294,7 @@ mod tests {
         insert_cache_entry(&fs, "old.bin", 1024, now - Duration::from_secs(120));
 
         // total = 3072, limit = 1024 → need 2048 freed = 2 entries
-        fs.evict_lru_if_needed();
+        fs.evict_if_needed();
 
         // the newest entry should survive
         assert!(
@@ -7212,7 +7334,7 @@ mod tests {
         }
 
         // total = 1024 + 512 + 512 = 2048, limit = 1024 → free 1024
-        fs.evict_lru_if_needed();
+        fs.evict_if_needed();
 
         let remaining: u64 = fs.disk_cache_index.iter().map(|e| e.value().0).sum();
         assert!(
@@ -7273,7 +7395,7 @@ mod tests {
     }
 
     /// Issue #243.2: when both `cache_max_size` and
-    /// `cache_min_free_space` are 0, `evict_lru_if_needed`
+    /// `cache_min_free_space` are 0, `evict_if_needed`
     /// must short-circuit at L707 and return without
     /// touching `disk_cache_index`. Pins the no-op
     /// behavior so a future change that drops the
@@ -7300,11 +7422,11 @@ mod tests {
         }
         let pre_len = fs.disk_cache_index.len();
         let pre_total: u64 = fs.disk_cache_index.iter().map(|e| e.value().0).sum();
-        fs.evict_lru_if_needed();
+        fs.evict_if_needed();
         assert_eq!(
             fs.disk_cache_index.len(),
             pre_len,
-            "with both caps = 0, evict_lru_if_needed must not touch disk_cache_index"
+            "with both caps = 0, evict_if_needed must not touch disk_cache_index"
         );
         assert_eq!(
             pre_total,
@@ -7578,7 +7700,7 @@ mod tests {
     /// precedent: `LruHeapEntry` field semantics are
     /// self-pinning via named fields. The manual `Ord` impl
     /// must reproduce the **atime-first sort** of the
-    /// original 3-tuple exactly, or `evict_lru_if_needed`
+    /// original 3-tuple exactly, or `evict_if_needed`
     /// pops the wrong entries (silent cache-size
     /// regression). Three cases pin the contract:
     ///
