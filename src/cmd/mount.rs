@@ -610,12 +610,14 @@ pub fn mount_internal(
         false,       // noapple_double
         false,       // noapple_xattr,
         false,       // no_macos_metadata (CSI runs on Linux; macOS metadata filter is a no-op)
-        None,        // hash_filter
-        false,       // mount_case_insensitive
-        false,       // negative_vncache (CSI: Linux — ignored)
-        false,       // auto_cache (CSI: Linux — ignored)
-        60,          // daemon_timeout_macos (CSI: Linux — ignored)
-        false,       // slow_statfs (CSI: Linux — ignored)
+        false, // metadata (CSI: rclone --metadata gate; off by default, parity with rclone mount)
+        false, // _no_metadata (CSI: --no-metadata mirror; intentionally never read here)
+        None,  // hash_filter
+        false, // mount_case_insensitive
+        false, // negative_vncache (CSI: Linux — ignored)
+        false, // auto_cache (CSI: Linux — ignored)
+        60,    // daemon_timeout_macos (CSI: Linux — ignored)
+        false, // slow_statfs (CSI: Linux — ignored)
         true, // no_slow_statfs (CSI: Linux — ignored; both must be true for the option to fire, so the default false on primary leaves it off regardless)
         None, // volume_name (CSI default — derive from mountpoint at runtime)
         false, // finder_local (CSI runs on Linux; macOS mount option ignored)
@@ -910,6 +912,18 @@ pub fn mount(
     no_apple_double: bool,
     no_apple_xattr: bool,
     no_macos_metadata: bool,
+    // Issue #465 follow-up: rclone `--metadata` gate.
+    // `--metadata` enables the rclone-parity xattr surface
+    // (user.etag / user.mime_type / user.mtime /
+    // user.content_length / user.<key>); default off to
+    // match `rclone mount`. `_no_metadata` is the clap
+    // negation mirror (SetFalse in src/main.rs), kept as a
+    // positional so the CLI's `--no-metadata` parses
+    // without surprising the user — we never read it
+    // because `metadata` already encodes the resolved
+    // intent.
+    metadata: bool,
+    _no_metadata: bool,
     hash_filter: Option<String>,
     mount_case_insensitive: bool,
     negative_vncache: bool,
@@ -1230,6 +1244,9 @@ pub fn mount(
         no_apple_double,
         no_apple_xattr,
         no_macos_metadata,
+        // Issue #465 follow-up: rclone `--metadata` gate
+        // (default off; see struct decl at lib.rs L582).
+        metadata,
         block_norm_dupes: vfs_block_norm_dupes,
         // Issue #209: cache_poll_interval is set above (line 786-789)
         // to also accept the legacy --poll-interval value.

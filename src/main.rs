@@ -238,6 +238,29 @@ enum Commands {
         /// CLI default get `false` (no filtering) for least-surprise.
         #[arg(long, default_value_t = true)]
         no_macos_metadata: bool,
+        /// Expose backend object metadata as FUSE extended attributes
+        /// (`user.etag`, `user.mime_type`, `user.mtime`,
+        /// `user.content_length`, `user.<key>` — see the README
+        /// "Object Metadata (xattr)" section for the full table).
+        /// Matches `rclone mount`'s `--metadata` semantics: default
+        /// **off** here (rclone also defaults to false for `mount`;
+        /// `rclone serve` defaults to true). When off, `getxattr`
+        /// returns `ENOSYS` and `listxattr` returns the empty list,
+        /// avoiding the per-call backend `stat()` round-trip the
+        /// surface needs. Pass `--metadata` to enable.
+        ///
+        /// Issue #465: the surface itself shipped unconditionally in
+        /// the prior commit (PR #491); this flag adds the gate.
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        metadata: bool,
+        /// `--no-metadata` mirror. Field starts at false (SetFalse
+        /// defaults to false in clap 4.6). Use-site reads `metadata`
+        /// only; this field exists so clap recognises `--no-metadata`
+        /// on the CLI (matches the `--slow-statfs` / `--no-slow-statfs`
+        /// pair at L277-304) — rclone scripts that pass `--no-metadata`
+        /// don't trigger an "unexpected arg" failure.
+        #[arg(long = "no-metadata", action = clap::ArgAction::SetFalse)]
+        _no_metadata: bool,
         /// Consistent hash-based sharding: k of n (e.g. --hash-filter 1/4).
         /// **No effect in mntrs** — accepted for rclone compat, no
         /// backend currently implements consistent hash sharding in
@@ -533,6 +556,8 @@ fn main() -> anyhow::Result<()> {
             noapple_double,
             noapple_xattr,
             no_macos_metadata,
+            metadata,
+            _no_metadata,
             hash_filter,
             mount_case_insensitive,
             negative_vncache,
@@ -695,6 +720,8 @@ fn main() -> anyhow::Result<()> {
                 noapple_double,
                 noapple_xattr,
                 no_macos_metadata,
+                metadata,
+                _no_metadata,
                 hash_filter,
                 mount_case_insensitive,
                 negative_vncache,
