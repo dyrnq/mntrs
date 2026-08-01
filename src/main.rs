@@ -182,8 +182,10 @@ enum Commands {
         #[arg(long)]
         poll_interval: Option<u64>,
         /// Max age of cached files in seconds (default: 3600, 0 to disable).
-        /// **No effect in mntrs** — TTLs are per-layer (`--attr-cache-ttl`,
-        /// `--dir-cache-ttl`). See docs/vfs-cache-flags.md.
+        /// Cache files older than this are evicted on the next access —
+        /// absolute age from cache write time, matching rclone semantics.
+        /// Note: the in-memory L1 layer (`--mem-limit`) is not age-evicted.
+        /// See docs/vfs-cache-flags.md for the full implementation note.
         #[arg(long, default_value = "3600")]
         vfs_cache_max_age: u64,
         /// Minimum free disk space before triggering cache eviction (MB, default: 0 = off, matches rclone)
@@ -608,9 +610,11 @@ fn main() -> anyhow::Result<()> {
             if vfs_cache_mode != "off" {
                 shadow.push("--vfs-cache-mode");
             }
-            if vfs_cache_max_age != 3600 {
-                shadow.push("--vfs-cache-max-age");
-            }
+            // Issue #507: --vfs-cache-max-age is now wired (was a
+            // shadow flag under the #455 audit). The CLI default
+            // (3600s) and any user override flow into
+            // `MultiLevelCache::new` as the L2 TTL.
+            // (No shadow-warn entry needed here.)
             if vfs_read_ahead != 0 {
                 shadow.push("--vfs-read-ahead");
             }

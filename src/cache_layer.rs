@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -87,6 +87,10 @@ pub(crate) struct DiskBlockCache {
     cache_dir: PathBuf,
     disk_cache_index: Arc<DashMap<CacheKey, (u64, Instant)>>,
     direct_io: bool,
+    /// Absolute max age for entries (issue #507, --vfs-cache-max-age).
+    /// `Duration::ZERO` disables the age check (helper short-circuits,
+    /// so the L2 hot path stays syscall-free).
+    cache_max_age: Duration,
 }
 
 impl DiskBlockCache {
@@ -94,11 +98,13 @@ impl DiskBlockCache {
         cache_dir: PathBuf,
         disk_cache_index: Arc<DashMap<CacheKey, (u64, Instant)>>,
         direct_io: bool,
+        cache_max_age: Duration,
     ) -> Self {
         Self {
             cache_dir,
             disk_cache_index,
             direct_io,
+            cache_max_age,
         }
     }
 }
@@ -131,6 +137,31 @@ impl CacheLayer for DiskBlockCache {
         // decisions.
         let cpath = crate::cache_block_path(&self.cache_dir, path, block_idx);
         if !cpath.exists() {
+            return None;
+        }
+        // ── --vfs-cache-max-age check (issue #507) ─────────────────
+        // Filesystem mtime is our creation time: `write_block` truncates
+        // and writes fresh data without `set_len`-bumping mtime on read
+        // (we never read-bump, only the LRU `bump_in_memory_atime`
+        // updates the in-memory `Instant`). `Duration::ZERO` is the
+        // "disabled" sentinel — the helper short-circuits without a
+        // syscall so the hot path stays free when TTL is off.
+        if !self.cache_max_age.is_zero()
+            && crate::util::is_cache_file_expired(&cpath, self.cache_max_age)
+        {
+            tracing::debug!(
+                path = %path,
+                block_idx = block_idx,
+                cpath = %cpath.display(),
+                max_age_secs = self.cache_max_age.as_secs(),
+                "L2 get_block: age-expired (treating as miss)"
+            );
+            // Drop the expired file + its index entry so the next read
+            // refetches from remote. No `.meta`/`.dirty` sidecar for
+            // `.block` files — nothing else to clean up.
+            let _ = std::fs::remove_file(&cpath);
+            self.disk_cache_index
+                .remove(&(path.to_string(), Some(block_idx)));
             return None;
         }
         tracing::debug!(
@@ -293,7 +324,8 @@ mod tests {
         ));
         let _ = std::fs::create_dir_all(&dir);
         let idx = Arc::new(DashMap::new());
-        let l2 = DiskBlockCache::new(dir.clone(), idx, false);
+        // Duration::ZERO → TTL disabled (issue #507).
+        let l2 = DiskBlockCache::new(dir.clone(), idx, false, Duration::ZERO);
         let data = Bytes::from(vec![0xAB; 4096]);
         assert!(l2.put_block("test/file.bin", 10, 3, data.clone()));
         let got = l2.get_block("test/file.bin", 10, 3).unwrap();
@@ -315,9 +347,71 @@ mod tests {
         ));
         let _ = std::fs::create_dir_all(&dir);
         let idx = Arc::new(DashMap::new());
-        let l2 = DiskBlockCache::new(dir.clone(), idx, true);
+        // direct_io=true short-circuits before any age check;
+        // pass Duration::ZERO so the signature compiles.
+        let l2 = DiskBlockCache::new(dir.clone(), idx, true, Duration::ZERO);
         assert!(!l2.put_block("x", 1, 0, Bytes::from_static(b"data")));
         assert!(l2.get_block("x", 1, 0).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #507: an L2 entry whose filesystem mtime is older than
+    /// `cache_max_age` is treated as a miss on the next read AND the
+    /// on-disk `.block` file is removed so the subsequent read goes
+    /// back to remote. `.block` files have no `.dirty`/`.meta`
+    /// sidecar so cleanup is a single `remove_file`.
+    #[test]
+    fn disk_block_cache_age_expired_returns_none() {
+        let dir =
+            std::env::temp_dir().join(format!("mntrs-cache-layer-test-{}-age", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let idx = Arc::new(DashMap::new());
+        // Tight 100ms TTL — short enough to test in-process.
+        let l2 = DiskBlockCache::new(dir.clone(), idx, false, Duration::from_millis(100));
+        let data = Bytes::from(vec![0xAB; 4096]);
+        assert!(l2.put_block("test/file.bin", 10, 3, data));
+
+        // Hit before TTL elapses.
+        assert!(l2.get_block("test/file.bin", 10, 3).is_some());
+
+        // Wait past TTL.
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Past TTL → age-expired miss AND file removed.
+        assert!(
+            l2.get_block("test/file.bin", 10, 3).is_none(),
+            "age-expired L2 entry must read as None"
+        );
+        let cpath = crate::cache_block_path(&dir, "test/file.bin", 3);
+        assert!(
+            !cpath.exists(),
+            "age-expired .block must be removed on hit-miss"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #507: `cache_max_age == Duration::ZERO` disables the
+    /// check (matches CLI help "0 to disable"). An old entry still
+    /// serves from L2.
+    #[test]
+    fn disk_block_cache_zero_max_age_disables_check() {
+        let dir = std::env::temp_dir().join(format!(
+            "mntrs-cache-layer-test-{}-zero",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let idx = Arc::new(DashMap::new());
+        let l2 = DiskBlockCache::new(dir.clone(), idx, false, Duration::ZERO);
+        let data = Bytes::from(vec![0xCD; 256]);
+        assert!(l2.put_block("p", 1, 0, data.clone()));
+        // Sleep a little — would expire under any positive TTL.
+        std::thread::sleep(Duration::from_millis(50));
+        let got = l2
+            .get_block("p", 1, 0)
+            .expect("TTL=0 must disable age check");
+        assert_eq!(got.as_ref(), data.as_ref());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
