@@ -331,6 +331,20 @@ enum Commands {
             default_value_t = true
         )]
         _no_finder_local: bool,
+        /// Diagnostic (probe): disable `alloc_ino_with_mtime` +
+        /// `format!` String alloc in the readdirplus hot path.
+        /// See diag PR #485 — tests whether 500-entry directory
+        /// listings benefit from skipping per-entry ino allocation
+        /// on the readdirplus batch (where the ino is already
+        /// known from the per-fh snapshot). Default true (production
+        /// behavior). Use `--no-alloc-ino-on-readdirplus` to disable
+        /// for bisection.
+        #[arg(
+            long = "no-alloc-ino-on-readdirplus",
+            action = clap::ArgAction::SetFalse,
+            default_value_t = true
+        )]
+        _no_alloc_ino_on_readdirplus: bool,
         /// Max read-ahead in bytes (default: 131072)
         #[arg(long, default_value = "131072")]
         max_read_ahead: u64,
@@ -543,6 +557,7 @@ fn main() -> anyhow::Result<()> {
             volume_name,
             finder_local,
             _no_finder_local,
+            _no_alloc_ino_on_readdirplus,
             max_read_ahead,
             vfs_read_chunk_size_limit,
             vfs_read_chunk_streams,
@@ -705,6 +720,7 @@ fn main() -> anyhow::Result<()> {
                 volume_name.as_deref(),
                 finder_local,
                 _no_finder_local,
+                _no_alloc_ino_on_readdirplus,
                 max_read_ahead,
                 vfs_read_chunk_size_limit,
                 vfs_read_chunk_streams,

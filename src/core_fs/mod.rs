@@ -100,6 +100,28 @@ pub trait CoreFilesystem: Send + Sync {
         Ok(out)
     }
 
+    /// Batch lookup with pre-allocated ino on each entry.
+    ///
+    /// Probe (#485): in `readdirplus` the per-fh snapshot already
+    /// carries an ino for each entry (allocated by `readdir_materialise`).
+    /// The name-based `lookup_many` path re-allocates that ino via
+    /// `alloc_ino_with_mtime` (3-4 DashMap ops) and a `format!` String
+    /// alloc per entry — pure overhead on the readdirplus hot path.
+    /// This overload passes the entries through so implementations can
+    /// reuse `entry.ino` directly.
+    ///
+    /// Default falls back to `lookup_many` (extracts names from entries).
+    /// `MntrsFs` overrides this to skip the alloc + format when
+    /// `alloc_ino_on_readdirplus` is false.
+    fn lookup_many_with_ino(
+        &self,
+        parent: u64,
+        entries: &[CoreDirEntry],
+    ) -> std::io::Result<Vec<std::io::Result<CoreFileAttr>>> {
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        self.lookup_many(parent, &names)
+    }
+
     /// Forget about an inode (decrement reference count).
     fn forget(&self, _ino: u64, _nlookup: u64) {}
 

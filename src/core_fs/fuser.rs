@@ -87,6 +87,11 @@ pub struct FuserAdapter<F: CoreFilesystem + 'static> {
     pub attr_ttl: Duration,
     pub direct_io: bool,
     pub write_back_cache: bool,
+    /// Diagnostic probe (#485): when false, `readdirplus` skips
+    /// `alloc_ino_with_mtime` + per-entry `format!` in the batch
+    /// lookup path and uses the ino already on the per-fh snapshot
+    /// entry directly. Default true (production behavior).
+    pub alloc_ino_on_readdirplus: bool,
 }
 
 impl<F: CoreFilesystem + 'static> FuserAdapter<F> {
@@ -96,6 +101,7 @@ impl<F: CoreFilesystem + 'static> FuserAdapter<F> {
         attr_ttl: Duration,
         direct_io: bool,
         write_back_cache: bool,
+        alloc_ino_on_readdirplus: bool,
     ) -> Self {
         Self {
             inner,
@@ -103,6 +109,7 @@ impl<F: CoreFilesystem + 'static> FuserAdapter<F> {
             attr_ttl,
             direct_io,
             write_back_cache,
+            alloc_ino_on_readdirplus,
         }
     }
 }
@@ -465,8 +472,17 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
                 // to 0; for `find maxdepth1` it
                 // eliminates the per-entry stat
                 // completely.
-                let names: Vec<&str> = page.iter().map(|e| e.name.as_str()).collect();
-                let attr_results =
+                //
+                // Probe (#485): when `alloc_ino_on_readdirplus`
+                // is false, route the batch through
+                // `lookup_many_with_ino` so the impl
+                // can reuse `entry.ino` from the per-fh
+                // snapshot and skip `alloc_ino_with_mtime`
+                // + per-entry `format!` String alloc.
+                // Production path (default true) keeps
+                // the existing `lookup_many` route.
+                let attr_results = if self.alloc_ino_on_readdirplus {
+                    let names: Vec<&str> = page.iter().map(|e| e.name.as_str()).collect();
                     self.inner
                         .lookup_many(ino.into(), &names)
                         .unwrap_or_else(|_| {
@@ -474,7 +490,16 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
                                 .iter()
                                 .map(|_| Err(std::io::ErrorKind::Other.into()))
                                 .collect()
-                        });
+                        })
+                } else {
+                    self.inner
+                        .lookup_many_with_ino(ino.into(), page)
+                        .unwrap_or_else(|_| {
+                            page.iter()
+                                .map(|_| Err(std::io::ErrorKind::Other.into()))
+                                .collect()
+                        })
+                };
                 for (offset_i, (entry, attr_res)) in
                     page.iter().zip(attr_results.iter()).enumerate()
                 {

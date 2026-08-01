@@ -620,6 +620,7 @@ pub fn mount_internal(
         None, // volume_name (CSI default — derive from mountpoint at runtime)
         false, // finder_local (CSI runs on Linux; macOS mount option ignored)
         true, // no_finder_local (CSI: Linux — ignored; matches the primary=false -> off idiom)
+        true, // alloc_ino_on_readdirplus (CSI: production path; matches the primary=true -> on idiom for the readdirplus ino alloc)
         131072, // max_read_ahead
         0,    // vfs_read_chunk_size_limit
         // Issue #31: bump default chunk_streams from 0
@@ -920,6 +921,10 @@ pub fn mount(
     volume_name: Option<&str>,
     finder_local: bool,
     no_finder_local: bool,
+    // Diagnostic probe (#485): when false, skip `alloc_ino_with_mtime`
+    // and the per-entry `format!` String alloc in the readdirplus
+    // hot path. Default true (production behavior).
+    alloc_ino_on_readdirplus: bool,
     _max_read_ahead: u64,
     vfs_read_chunk_size_limit: u64,
     vfs_read_chunk_streams: u32,
@@ -1168,6 +1173,10 @@ pub fn mount(
         // prefetch and the mem_cache, by design.
         mem_limiter: mem_limiter.clone(),
         dir_cache_ttl: std::time::Duration::from_secs(dir_cache_time),
+        // Probe #485: when false, skip `alloc_ino_with_mtime`
+        // + per-entry `format!` in the readdirplus hot path.
+        // Default true (production behavior).
+        alloc_ino_on_readdirplus,
         attr_ttl: std::time::Duration::from_secs(attr_timeout),
         stat_cache_ttl: std::time::Duration::from_secs(stat_cache_ttl),
         volname: volname.to_string(),
@@ -1684,6 +1693,7 @@ pub fn mount(
             std::time::Duration::from_secs(attr_timeout),
             direct_io,
             write_back_cache,
+            alloc_ino_on_readdirplus,
         );
         tracing::info!(
             elapsed_ms = _t_mount.elapsed().as_millis() as u64,

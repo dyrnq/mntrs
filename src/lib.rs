@@ -499,6 +499,12 @@ pub struct MntrsFs {
     /// mount lifetimes.
     dir_listers: dashmap::DashMap<u64, std::sync::Arc<Vec<CoreDirEntry>>>,
     pub(crate) dir_cache_ttl: Duration,
+    /// Diagnostic probe (#485): when false, `lookup_many_with_ino`
+    /// skips `alloc_ino_with_mtime` and the per-entry `format!`
+    /// String alloc in the readdirplus hot path and uses the
+    /// ino already on the per-fh snapshot entry. Default true
+    /// (production behavior).
+    pub(crate) alloc_ino_on_readdirplus: bool,
     pub(crate) attr_ttl: Duration,
     pub(crate) stat_cache_ttl: Duration,
     pub(crate) volname: String,
@@ -2423,6 +2429,110 @@ impl CoreFilesystem for MntrsFs {
         names: &[&str],
     ) -> std::io::Result<Vec<std::io::Result<CoreFileAttr>>> {
         Ok(self.batch_lookup_from_dir_cache(parent, names))
+    }
+
+    /// Probe (#485): when the readdirplus flag is off, skip
+    /// `alloc_ino_with_mtime` and the per-entry `format!`
+    /// String alloc in `batch_lookup_from_dir_cache`. The
+    /// per-fh snapshot already carries an `ino` for each entry
+    /// (allocated by `readdir_materialise`), so re-allocating
+    /// through `alloc_ino_with_mtime` is pure overhead — the
+    /// short-circuit branch still costs 2 DashMap ops per entry
+    /// (`path_to_ino.get` + `inodes.contains_key`) before
+    /// returning the existing ino.
+    ///
+    /// When the flag is on (production), fall back to the
+    /// existing `lookup_many` path so behavior is unchanged.
+    fn lookup_many_with_ino(
+        &self,
+        parent: u64,
+        entries: &[CoreDirEntry],
+    ) -> std::io::Result<Vec<std::io::Result<CoreFileAttr>>> {
+        if self.alloc_ino_on_readdirplus {
+            let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+            return Ok(self.batch_lookup_from_dir_cache(parent, &names));
+        }
+        // No-alloc path: build attrs from the dir_cache snapshot
+        // + use entry.ino directly. Skips both `alloc_ino_with_mtime`
+        // (3-4 DashMap ops) and the per-entry `format!` String
+        // allocation. The symlink override (issue #325) is the
+        // only branch that needs full_path; build it lazily there.
+        let parent_path = self.resolve(parent).map(|e| e.path).unwrap_or_default();
+        let cache_key = canonicalize_list_path(&parent_path);
+        let cache_key = cache_key.as_str();
+        let cached: Option<dashmap::DashMap<String, DirEntryCacheValue>> =
+            self.dir_cache.get(cache_key).map(|e| e.value().1.clone());
+        let mut out = Vec::with_capacity(entries.len());
+        for entry in entries {
+            // "." / ".." are synthesized by the FUSE adapter; cheap
+            // to construct (same as the production path).
+            if entry.name == "." || entry.name == ".." {
+                let p = if entry.name == "." { parent } else { 1 };
+                out.push(Ok(to_core_attr(&self.make_attr(
+                    p,
+                    4096,
+                    FileType::Directory,
+                    SystemTime::UNIX_EPOCH,
+                ))));
+                continue;
+            }
+            let snapshot_hit = cached
+                .as_ref()
+                .and_then(|entries| entries.get(&entry.name).map(|e| *e.value()));
+            match snapshot_hit {
+                Some(DirEntryCacheValue { mode, size, mtime }) => {
+                    // Issue #325 follow-up: a symlink registered
+                    // via `set_reparse_point` after the snapshot
+                    // was taken needs the canonical ino override.
+                    // Build full_path only for this rare branch
+                    // (the bench `ls -la many` has 500 regular
+                    // files, no symlinks — this path is cold).
+                    let is_symlink = {
+                        let full_path = format!("{}/{}", parent_path, entry.name);
+                        self.symlinks.contains_key(&full_path) || {
+                            let target_lower = full_path.to_lowercase();
+                            let mut hit = false;
+                            for e in self.symlinks.iter() {
+                                if e.key().to_lowercase() == target_lower {
+                                    hit = true;
+                                    break;
+                                }
+                            }
+                            hit
+                        }
+                    };
+                    if is_symlink {
+                        // Delegate to the per-name path so the
+                        // existing symlink ino override stays
+                        // in one place (see
+                        // `batch_lookup_from_dir_cache`).
+                        out.push(self.lookup(parent, &entry.name));
+                        continue;
+                    }
+                    let kind = match mode {
+                        EntryMode::DIR => FileType::Directory,
+                        _ => FileType::RegularFile,
+                    };
+                    // Use entry.ino directly — no `alloc_ino_with_mtime`.
+                    // The per-fh snapshot's ino is the one
+                    // `readdir_materialise` minted, which by
+                    // construction equals what `alloc_ino_with_mtime`
+                    // would return for the same path (issue #325
+                    // reuses the existing ino).
+                    out.push(Ok(to_core_attr(
+                        &self.make_attr(entry.ino, size, kind, mtime),
+                    )));
+                }
+                None => {
+                    // Snapshot miss (entry written after the
+                    // snapshot was taken). Fall through to the
+                    // per-name lookup — same fallback as the
+                    // production path.
+                    out.push(self.lookup(parent, &entry.name));
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn access(&self, _ino: u64, _mask: u32) -> std::io::Result<()> {
@@ -6605,6 +6715,12 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         // until opendir() populates an entry.
         dir_listers: Default::default(),
         dir_cache_ttl: std::time::Duration::from_secs(10),
+        // Probe #485: tests default to the production path (true).
+        // The diagnostic is exercised via the FuserAdapter flag, not
+        // the field directly — keeping the field default true means
+        // single-threaded test paths get the same alloc + format
+        // behavior as production and regressions surface there.
+        alloc_ino_on_readdirplus: true,
         attr_ttl: std::time::Duration::from_secs(1),
         stat_cache_ttl: std::time::Duration::from_secs(10),
         volname: "test".into(),
