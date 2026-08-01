@@ -5,6 +5,16 @@ use anyhow::{Result, anyhow};
 use fuser::MountOption;
 use opendal::Operator;
 use opendal::layers::{CapabilityCheckLayer, ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
+// Probe F: HTTP-level S3 DELETE tracing. Set
+// MNTRS_OPENDAL_HTTP_LOG=1 to wrap the operator with
+// `LoggingLayer`, which emits one tracing event per
+// opendal op (uri, method, status, body size, timing) via
+// the `RUST_LOG=opendal_layer::logging=info` filter. Purpose:
+// compare the per-DELETE HTTP trace against rclone's
+// S3.DeleteObject to see if mntrs issues extra HEAD/STAT
+// or adds overhead layers (retry/timeout/capability-check)
+// that rclone doesn't have.
+use opendal::layers::LoggingLayer;
 #[cfg(feature = "sftp")]
 use opendal::services::Sftp;
 use opendal::services::{
@@ -2292,12 +2302,21 @@ fn apply_operator_with_tls(
             opendal_http_transport_reqwest::ReqwestTransport::new(client),
         );
         let ctx = opendal::OperationContext::new().with_http_transport(transport);
-        Operator::new(builder)?
+        let op = Operator::new(builder)?
             .with_context(ctx)
             .layer(TimeoutLayer::new().with_io_timeout(std::time::Duration::from_secs(30)))
             .layer(RetryLayer::new().with_max_times(3).with_factor(2.0))
             .layer(ConcurrentLimitLayer::new(16))
-            .layer(CapabilityCheckLayer::new())
+            .layer(CapabilityCheckLayer::new());
+        // Probe F: optional LoggingLayer. See comment near
+        // the use-statement at the top of mount.rs for what
+        // this surfaces. Guarded by MNTRS_OPENDAL_HTTP_LOG so
+        // it doesn't run in production.
+        if std::env::var_os("MNTRS_OPENDAL_HTTP_LOG").is_some() {
+            op.layer(LoggingLayer::default())
+        } else {
+            op
+        }
     } else {
         // Non-TLS path: still install an explicit reqwest transport via
         // `with_context` so we never touch opendal's default LazyLock.
@@ -2315,12 +2334,21 @@ fn apply_operator_with_tls(
                 crate::http_client::shared().clone(),
             ));
         let ctx = opendal::OperationContext::new().with_http_transport(transport);
-        Operator::new(builder)?
+        let op = Operator::new(builder)?
             .with_context(ctx)
             .layer(TimeoutLayer::new().with_io_timeout(std::time::Duration::from_secs(30)))
             .layer(RetryLayer::new().with_max_times(3).with_factor(2.0))
             .layer(ConcurrentLimitLayer::new(16))
-            .layer(CapabilityCheckLayer::new())
+            .layer(CapabilityCheckLayer::new());
+        // Probe F: optional LoggingLayer. See comment near
+        // the use-statement at the top of mount.rs for what
+        // this surfaces. Guarded by MNTRS_OPENDAL_HTTP_LOG so
+        // it doesn't run in production.
+        if std::env::var_os("MNTRS_OPENDAL_HTTP_LOG").is_some() {
+            op.layer(LoggingLayer::default())
+        } else {
+            op
+        }
     };
     Ok(op)
 }

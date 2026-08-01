@@ -5648,9 +5648,20 @@ impl CoreFilesystem for MntrsFs {
         // POSIX callers get the right errno
         // (NotFound→ENOENT, IsADirectory→EISDIR, etc.)
         // instead of a blanket EIO.
+        // Probe E: per-stage timing inside the unlink inner path.
+        // 5 marks: t1 (before op.delete), t2 (after op.delete),
+        // t3 (after writeback_pending.remove + cache_file_remove),
+        // t4 (after find_ino_by_path + remove_block_cache_files +
+        // disk_cache_index loop), t5 (after inodes.remove +
+        // path_to_ino.remove + attr_cache.remove + cache_remove_entry
+        // + dir_cache.remove). Emits a single info line with the 4
+        // sub-durations so we can see whether the 1.06ms backend-DELETE
+        // gap is in opendal S3 or in local cache cleanup.
+        let _t1 = std::time::Instant::now();
         let delete_result = rt()
             .block_on(async move { op.delete(&p).await })
             .map_err(|e| opendal_to_io_error(&e, "unlink"));
+        let _t2 = std::time::Instant::now();
 
         // Local cleanup runs UNCONDITIONALLY below — the
         // `?` on `op.delete` that pre-fix hung the rest of
@@ -5687,6 +5698,7 @@ impl CoreFilesystem for MntrsFs {
             );
         }
         let _ = std::fs::remove_file(&cpath);
+        let _t3 = std::time::Instant::now();
         // Clean block-level cache entries (disk + index).
         // O(1) via find_ino_by_path + inodes.get: replaces a
         // full-table scan with a two-hop lookup (path→ino via
@@ -5712,6 +5724,7 @@ impl CoreFilesystem for MntrsFs {
         }
         // The whole-file entry (key `(path, None)`).
         self.disk_cache_index.remove(&(full_path.clone(), None));
+        let _t4 = std::time::Instant::now();
         // Bug E fix: inodes is keyed by the NEXT_INO counter, not
         // path_hash. Use find_ino_by_path to locate the correct ino
         // before removing. path_hash(&full_path) was a no-op
@@ -5746,6 +5759,25 @@ impl CoreFilesystem for MntrsFs {
         // rmdir branch's `invalidate_dir_cache` pattern.
         let parent_canon = canonicalize_list_path(&parent_path);
         self.dir_cache.remove(parent_canon.as_str());
+        let _t5 = std::time::Instant::now();
+
+        // Probe E: emit per-stage breakdown. Sample the first 2000
+        // unlinks so we can correlate against the bench's
+        // 'rm -rf 500 files' hot loop without flooding the log.
+        static UNLINK_INNER_COUNT: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(0);
+        let n = UNLINK_INNER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 2000 {
+            tracing::info!(
+                path = %full_path,
+                delete_us = _t2.duration_since(_t1).as_micros() as u64,
+                cache_file_us = _t3.duration_since(_t2).as_micros() as u64,
+                block_cache_us = _t4.duration_since(_t3).as_micros() as u64,
+                indices_us = _t5.duration_since(_t4).as_micros() as u64,
+                inner_total_us = _t5.duration_since(_t1).as_micros() as u64,
+                "MntrsFs::unlink inner breakdown",
+            );
+        }
 
         // For the WinFSP cleanup callback at winfsp.rs:1032:
         // a NotFound returned here is the "dirty-only"
