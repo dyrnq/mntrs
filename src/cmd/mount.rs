@@ -2245,36 +2245,47 @@ fn apply_operator_with_tls(
             rb = rb.identity(identity);
         }
         let client = rb.build().map_err(|e| anyhow!("build TLS client: {}", e))?;
+        // opendal 0.58.1 migration: HTTP client is no longer a layer
+        // (`HttpClientLayer` was removed in favor of RFC #7740's provider
+        // model). The reqwest::Client is now installed via
+        // `OperationContext::with_http_transport(HttpTransporter::new(ReqwestTransport::new(client)))`
+        // before the user layers are applied — the layers see the
+        // composed context on each operation. `Operator::new` in 0.58.1
+        // returns a ready-to-use Operator; `.layer(...)` consumes self
+        // and returns a new operator; no `.finish()` step.
+        let transport = opendal::HttpTransporter::new(
+            opendal_http_transport_reqwest::ReqwestTransport::new(client),
+        );
+        let ctx = opendal::OperationContext::new().with_http_transport(transport);
         Operator::new(builder)?
-            .layer(opendal::layers::HttpClientLayer::new(
-                opendal::raw::HttpClient::with(client),
-            ))
+            .with_context(ctx)
             .layer(TimeoutLayer::new().with_io_timeout(std::time::Duration::from_secs(30)))
             .layer(RetryLayer::new().with_max_times(3).with_factor(2.0))
             .layer(ConcurrentLimitLayer::new(16))
             .layer(CapabilityCheckLayer::new())
-            .finish()
     } else {
-        // Non-TLS path: still wrap an explicit HttpClientLayer so we never
-        // touch opendal's `GLOBAL_REQWEST_CLIENT` LazyLock. Otherwise that
-        // client gets instantiated lazily on the first .await, binding its
-        // hyper connector to whichever tokio runtime Handle::current()
-        // happens to be at that moment — and if writeback (in crate::rt())
-        // ever drives an op that ends up the first caller, the binding
-        // mismatches the rt_block_on / cmd/mount runtime and we deadlock
-        // (see src/http_client.rs for the full root cause). Using
-        // `shared()` here forces the binding to happen on the first
-        // apply_operator_with_tls call, which always runs inside
-        // `crate::rt()` via `rt_block_on`.
+        // Non-TLS path: still install an explicit reqwest transport via
+        // `with_context` so we never touch opendal's default LazyLock.
+        // Otherwise that client gets instantiated lazily on the first
+        // .await, binding its hyper connector to whichever tokio
+        // runtime Handle::current() happens to be at that moment — and
+        // if writeback (in crate::rt()) ever drives an op that ends up
+        // the first caller, the binding mismatches the rt_block_on /
+        // cmd/mount runtime and we deadlock (see src/http_client.rs for
+        // the full root cause). Using `shared()` here forces the
+        // binding to happen on the first apply_operator_with_tls call,
+        // which always runs inside `crate::rt()` via `rt_block_on`.
+        let transport =
+            opendal::HttpTransporter::new(opendal_http_transport_reqwest::ReqwestTransport::new(
+                crate::http_client::shared().clone(),
+            ));
+        let ctx = opendal::OperationContext::new().with_http_transport(transport);
         Operator::new(builder)?
-            .layer(opendal::layers::HttpClientLayer::new(
-                opendal::raw::HttpClient::with(crate::http_client::shared().clone()),
-            ))
+            .with_context(ctx)
             .layer(TimeoutLayer::new().with_io_timeout(std::time::Duration::from_secs(30)))
             .layer(RetryLayer::new().with_max_times(3).with_factor(2.0))
             .layer(ConcurrentLimitLayer::new(16))
             .layer(CapabilityCheckLayer::new())
-            .finish()
     };
     Ok(op)
 }
@@ -2778,8 +2789,10 @@ async fn build_sftp(url: &url::Url, opts: &HashMap<String, String>) -> Result<Op
     if let Some(v) = opts.get("known_hosts_strategy") {
         builder = builder.known_hosts_strategy(v);
     }
-    // SFTP uses SSH transport (no TLS layer needed).
-    Ok(Operator::new(builder)?.finish())
+    // SFTP uses SSH transport (no HTTP layer / no reqwest client
+    // needed). opendal 0.58.1's Operator::new returns a ready-to-use
+    // Operator; no .finish() step (RFC #7740).
+    Ok(Operator::new(builder)?)
 }
 
 #[cfg(test)]

@@ -73,7 +73,7 @@ impl Harness {
             .build()
             .unwrap();
 
-        let op = Arc::new(Operator::new(Memory::default()).unwrap().finish());
+        let op = Arc::new(Operator::new(Memory::default()).unwrap());
         let inodes: Inodes = Arc::new(dashmap::DashMap::new());
         let disk_cache_index: Arc<dashmap::DashMap<_, _>> = Arc::new(dashmap::DashMap::new());
         let writeback_pending: Arc<dashmap::DashSet<_>> = Arc::new(dashmap::DashSet::new());
@@ -437,8 +437,7 @@ fn dirty_sidecar_lingers_with_no_surface_on_upload_failure() {
                 .access_key_id("AKIAFAKE")
                 .secret_access_key("fake"),
         )
-        .unwrap()
-        .finish(),
+        .unwrap(),
     );
 
     let rt = tokio::runtime::Builder::new_multi_thread()

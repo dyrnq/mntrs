@@ -11,7 +11,7 @@ use opendal::services::Memory;
 use std::sync::Arc;
 
 fn make_fs() -> mntrs::MntrsFs {
-    let op = Operator::new(Memory::default()).unwrap().finish();
+    let op = Operator::new(Memory::default()).unwrap();
     let dir = std::env::temp_dir().join(format!("mntrs-unit-test-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     new_test_fs(op, dir)
@@ -366,7 +366,7 @@ fn open_write_handle_then_read_via_separate_handle() {
 /// `disk_cache_index` Arcs are shared.
 #[test]
 fn append_to_pre_existing_file_after_read() {
-    let op = Operator::new(Memory::default()).unwrap().finish();
+    let op = Operator::new(Memory::default()).unwrap();
     // Pre-existing file on the backend — NOT created via the mount.
     // A mount read of this file populates the block-level cache
     // (mem_cache + .block file) but not the whole-file cache, which
@@ -1283,7 +1283,7 @@ fn releasedir_on_unknown_fh_is_ok() {
 async fn batch_remove_path_removes_tree() {
     use mntrs::new_test_fs;
 
-    let op = Operator::new(Memory::default()).unwrap().finish();
+    let op = Operator::new(Memory::default()).unwrap();
     let dir = std::env::temp_dir().join(format!("mntrs-batch-rm-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let fs = new_test_fs(op.clone(), dir);
@@ -1317,7 +1317,7 @@ async fn batch_remove_path_idempotent_on_missing() {
 
     // Per opendal docs: delete is idempotent; missing target is Ok(()).
     // Verify the wrapper preserves that contract.
-    let op = Operator::new(Memory::default()).unwrap().finish();
+    let op = Operator::new(Memory::default()).unwrap();
     let dir = std::env::temp_dir().join(format!("mntrs-batch-rm-missing-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let fs = new_test_fs(op, dir);
@@ -1328,7 +1328,7 @@ async fn batch_remove_path_idempotent_on_missing() {
 async fn batch_remove_path_normalizes_trailing_slash() {
     use mntrs::new_test_fs;
 
-    let op = Operator::new(Memory::default()).unwrap().finish();
+    let op = Operator::new(Memory::default()).unwrap();
     let dir = std::env::temp_dir().join(format!("mntrs-batch-rm-slash-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let fs = new_test_fs(op.clone(), dir);
