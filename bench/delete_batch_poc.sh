@@ -47,7 +47,10 @@ echo ""
 
 # First let me verify a single delete-objects call works
 echo "--- Sanity: single delete-objects with 1 key ---"
-echo '{"Delete":{"Objects":[{"Key":"poc/t1/file_0001.txt"}],"Quiet":true}}' > /tmp/sanity.json
+# aws s3api --delete parses the JSON as the BODY of the Delete
+# element, not the envelope. So we send {"Objects":[...],"Quiet":true}
+# not {"Delete":{"Objects":[...],"Quiet":true}}.
+echo '{"Objects":[{"Key":"poc/t1/file_0001.txt"}],"Quiet":true}' > /tmp/sanity.json
 out=$(aws --endpoint-url "$ENDPOINT" --no-verify-ssl s3api delete-objects \
     --bucket "$BUCKET" --delete "file:///tmp/sanity.json" 2>&1)
 echo "  output: $out"
@@ -66,7 +69,9 @@ run_batched_delete() {
         python3 -c "
 import json
 keys = [{'Key': f'$PREFIX/${test_name}/file_{i:04d}.txt'} for i in range($begin, $end + 1)]
-print(json.dumps({'Delete': {'Objects': keys, 'Quiet': True}}))
+# aws s3api --delete strips the Delete wrapper, so the JSON must be
+# the body of Delete (Objects + Quiet), not the envelope.
+print(json.dumps({'Objects': keys, 'Quiet': True}))
 " > /tmp/do_input.json
         # Print first chunk to verify format
         if [ $c -eq 0 ]; then
