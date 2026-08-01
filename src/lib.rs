@@ -578,6 +578,18 @@ pub struct MntrsFs {
     pub(crate) no_apple_double: bool,
     pub(crate) no_apple_xattr: bool,
     pub(crate) no_macos_metadata: bool,
+    /// Issue #465 follow-up: gate on the rclone `--metadata`
+    /// surface. When false, `getxattr` returns `Unsupported`
+    /// (the fuser adapter maps to `ENOSYS`) and `listxattr`
+    /// returns the empty list — short-circuiting before the
+    /// per-call backend `stat()` round-trip the surface needs.
+    /// Default false to match `rclone mount` (which also
+    /// defaults to false; `rclone serve` defaults to true).
+    /// Library / test defaults take the conservative value
+    /// (false) — the test that wants the surface on opts in
+    /// explicitly via the `__metadata_set_for_test` shim,
+    /// mirroring the `new_test_fs_evict` pattern at L6849.
+    pub(crate) metadata: bool,
     pub(crate) block_norm_dupes: bool,
     pub(crate) handle_caching: Duration,
     pub(crate) cache_poll_interval: Duration,
@@ -5889,6 +5901,16 @@ impl CoreFilesystem for MntrsFs {
     }
 
     fn getxattr(&self, ino: u64, name: &str) -> std::io::Result<Vec<u8>> {
+        // Issue #465 follow-up: `--metadata` gate (default off,
+        // rclone mount parity). Short-circuit before the
+        // backend stat() — the surface is opt-in to avoid a
+        // per-call round-trip when no caller cares.
+        if !self.metadata {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "xattr metadata disabled (pass --metadata to enable)",
+            ));
+        }
         let entry = self.resolve(ino).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -5904,6 +5926,12 @@ impl CoreFilesystem for MntrsFs {
     }
 
     fn listxattr(&self, ino: u64) -> std::io::Result<Vec<Vec<u8>>> {
+        // Issue #465 follow-up: `--metadata` gate (default off,
+        // rclone mount parity). Empty list when disabled — the
+        // fuser adapter passes that straight to the kernel.
+        if !self.metadata {
+            return Ok(Vec::new());
+        }
         let entry = self.resolve(ino).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -6959,6 +6987,11 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         no_apple_double: false,
         no_apple_xattr: false,
         no_macos_metadata: false,
+        // Issue #465 follow-up: rclone `--metadata` gate,
+        // default off. Tests opt in via
+        // `MntrsFs::__metadata_set_for_test(true)` (mirror
+        // of the `new_test_fs_evict` pattern).
+        metadata: false,
         block_norm_dupes: false,
         cache_poll_interval: std::time::Duration::from_secs(60),
         handle_caching: std::time::Duration::from_secs(0),
@@ -7008,6 +7041,27 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
                 crate::metrics::global(),
             )
         },
+    }
+}
+
+impl MntrsFs {
+    /// Issue #465 follow-up: test-only setter for the
+    /// `--metadata` gate. The default-`new_test_fs` config
+    /// disables the surface (rclone mount parity), so tests
+    /// that want the rclone xattr surface must opt in
+    /// explicitly. Mirror of the `new_test_fs_evict` pattern
+    /// (L6877).
+    ///
+    /// `#[doc(hidden)] pub` (not `#[cfg(test)] pub`) so
+    /// integration tests under `tests/` — which compile
+    /// `mntrs` as an external crate and so do not see
+    /// `#[cfg(test)]` items — can still reach it.
+    /// The double-underscore prefix marks "test-only-public"
+    /// per the convention established by the symlink-index
+    /// test shims (`__symlink_index_diag` etc., issue #485).
+    #[doc(hidden)]
+    pub fn __metadata_set_for_test(&mut self, on: bool) {
+        self.metadata = on;
     }
 }
 

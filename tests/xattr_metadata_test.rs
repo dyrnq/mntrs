@@ -32,6 +32,18 @@ fn make_fs() -> mntrs::MntrsFs {
     new_test_fs(op, dir)
 }
 
+/// Build a `MntrsFs` with the rclone `--metadata` surface
+/// enabled. The default `new_test_fs` config disables the
+/// surface (rclone mount parity: `--metadata` defaults to
+/// false), so tests that exercise the rclone xattr
+/// contract must opt in via the
+/// `__metadata_set_for_test(true)` shim.
+fn enabled_fs() -> mntrs::MntrsFs {
+    let mut fs = make_fs();
+    fs.__metadata_set_for_test(true);
+    fs
+}
+
 /// Write a small file via the public API so we have a real inode to
 /// query. Returns the ino so callers can drive `getxattr`/`listxattr`.
 fn write_file(fs: &mntrs::MntrsFs, name: &str, bytes: &[u8]) -> u64 {
@@ -54,7 +66,7 @@ fn write_file(fs: &mntrs::MntrsFs, name: &str, bytes: &[u8]) -> u64 {
 /// unconditional `user.content_length` only.
 #[test]
 fn listxattr_returns_only_present_fields_for_memory() {
-    let fs = make_fs();
+    let fs = enabled_fs();
     let ino = write_file(&fs, "hello.txt", b"hello");
     let names = fs.listxattr(ino).expect("listxattr ok");
     let name_strs: Vec<String> = names
@@ -75,7 +87,7 @@ fn listxattr_returns_only_present_fields_for_memory() {
 /// `--metadata` applies to objects only).
 #[test]
 fn listxattr_for_directory_is_empty() {
-    let fs = make_fs();
+    let fs = enabled_fs();
     let dir_attr = fs.mkdir(1, "d").expect("mkdir ok");
     let names = fs.listxattr(dir_attr.ino).expect("listxattr ok");
     assert!(
@@ -102,7 +114,7 @@ fn listxattr_for_directory_is_empty() {
 /// integer, not `NotFound`.
 #[test]
 fn getxattr_content_length_returns_decimal_integer() {
-    let fs = make_fs();
+    let fs = enabled_fs();
     let ino = write_file(&fs, "size.txt", b"0123456789");
     let value = fs
         .getxattr(ino, "user.content_length")
@@ -126,7 +138,7 @@ fn getxattr_content_length_returns_decimal_integer() {
 /// error is the right kind (NotFound, not Internal or Other).
 #[test]
 fn getxattr_mime_type_absent_for_memory_returns_notfound() {
-    let fs = make_fs();
+    let fs = enabled_fs();
     let ino = write_file(&fs, "plain.txt", b"plain");
     let err = fs
         .getxattr(ino, "user.mime_type")
@@ -146,7 +158,7 @@ fn getxattr_mime_type_absent_for_memory_returns_notfound() {
 /// mismatch error like `InvalidInput`).
 #[test]
 fn getxattr_content_type_alias_resolves_like_mime_type() {
-    let fs = make_fs();
+    let fs = enabled_fs();
     let ino = write_file(&fs, "alias.txt", b"plain");
     let mime_err = fs
         .getxattr(ino, "user.mime_type")
@@ -170,7 +182,7 @@ fn getxattr_content_type_alias_resolves_like_mime_type() {
 /// failure mode.
 #[test]
 fn getxattr_etag_absent_returns_notfound() {
-    let fs = make_fs();
+    let fs = enabled_fs();
     let ino = write_file(&fs, "no-etag.txt", b"x");
     let err = fs
         .getxattr(ino, "user.etag")
@@ -196,7 +208,7 @@ fn getxattr_etag_absent_returns_notfound() {
 /// backend doesn't populate it, which is the dual contract.
 #[test]
 fn getxattr_mtime_absent_returns_notfound() {
-    let fs = make_fs();
+    let fs = enabled_fs();
     let ino = write_file(&fs, "ts.txt", b"x");
     let err = fs
         .getxattr(ino, "user.mtime")
@@ -221,7 +233,7 @@ fn getxattr_mtime_absent_returns_notfound() {
 /// non-matching cases.
 #[test]
 fn getxattr_unknown_name_returns_notfound() {
-    let fs = make_fs();
+    let fs = enabled_fs();
     let ino = write_file(&fs, "x.txt", b"x");
     let err = fs
         .getxattr(ino, "user.not_a_real_xattr")
@@ -233,7 +245,7 @@ fn getxattr_unknown_name_returns_notfound() {
 /// pre-#465 implementation had a similar guard; we keep it.
 #[test]
 fn getxattr_nonexistent_ino_returns_notfound() {
-    let fs = make_fs();
+    let fs = enabled_fs();
     let err = fs
         .getxattr(999_999, "user.etag")
         .expect_err("unknown ino must error");
@@ -243,7 +255,7 @@ fn getxattr_nonexistent_ino_returns_notfound() {
 /// `listxattr` for a non-existent ino returns `NotFound`.
 #[test]
 fn listxattr_nonexistent_ino_returns_notfound() {
-    let fs = make_fs();
+    let fs = enabled_fs();
     let err = fs.listxattr(999_999).expect_err("unknown ino must error");
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
 }
@@ -269,7 +281,7 @@ fn listxattr_nonexistent_ino_returns_notfound() {
 /// `lib.rs`).
 #[test]
 fn listxattr_output_is_sorted() {
-    let fs = make_fs();
+    let fs = enabled_fs();
     let ino = write_file(&fs, "sort.txt", b"x");
     let names = fs.listxattr(ino).expect("listxattr ok");
     // The single name must be `user.content_length` — and trivially
@@ -279,4 +291,62 @@ fn listxattr_output_is_sorted() {
     let mut sorted = names.clone();
     sorted.sort();
     assert_eq!(names, sorted, "listxattr output must be sorted");
+}
+
+// ── --metadata gate (issue #465 follow-up) ────────────────────────
+
+/// `rclone mount`'s `--metadata` defaults to **false**; mntrs
+/// follows that. On a fresh `new_test_fs` (no opt-in), every
+/// `getxattr` call must short-circuit with
+/// `ErrorKind::Unsupported` — the fuser adapter maps that to
+/// `ENOSYS` for the kernel. This guards against the
+/// regression of accidentally turning the surface back on by
+/// default.
+#[test]
+fn getxattr_disabled_by_default_returns_unsupported() {
+    let fs = make_fs();
+    let ino = write_file(&fs, "off.txt", b"x");
+    let err = fs
+        .getxattr(ino, "user.etag")
+        .expect_err("metadata is disabled by default (rclone mount parity)");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::Unsupported,
+        "disabled xattr must be Unsupported (ENOSYS), got {:?}",
+        err.kind()
+    );
+}
+
+/// Companion to the above for `listxattr`: with the gate off,
+/// the empty list is returned (no stat round-trip, no names
+/// exposed). The fuser adapter passes that straight to the
+/// kernel.
+#[test]
+fn listxattr_disabled_by_default_returns_empty() {
+    let fs = make_fs();
+    let ino = write_file(&fs, "off2.txt", b"x");
+    let names = fs.listxattr(ino).expect("listxattr ok");
+    assert!(
+        names.is_empty(),
+        "disabled listxattr must be empty (no names exposed); got {:?}",
+        names
+    );
+}
+
+/// Opting in via the `__metadata_set_for_test(true)` shim
+/// re-enables the surface — `getxattr` resolves as it did
+/// pre-this-change. This confirms the shim is wired through
+/// and that opt-in is the way out of the default-disabled
+/// contract.
+#[test]
+fn getxattr_enabled_via_test_shim_resolves() {
+    let mut fs = make_fs();
+    fs.__metadata_set_for_test(true);
+    let ino = write_file(&fs, "on.txt", b"on");
+    let value = fs
+        .getxattr(ino, "user.content_length")
+        .expect("content_length resolves when metadata is enabled");
+    let s = String::from_utf8(value).expect("value is utf-8");
+    s.parse::<u64>()
+        .expect("content_length must be a parseable decimal u64");
 }
