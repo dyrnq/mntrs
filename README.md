@@ -217,7 +217,7 @@ Three-tier cache: **memory → disk → remote**. Block-level (8 MB) indexing. D
 |------|-------------|---------------|------------------|-------------|
 | `--vfs-cache-max-size` | `0` (off) | none (post-#243) | `0` = no LRU | Disk cache upper limit (LRU) |
 | `--vfs-cache-min-free-space` | `0` (off) | none (post-#243) | `0` = no floor check | Min free space before eviction |
-| `--vfs-cache-max-age` | 3600s | — | 3600s | Max cache file age (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
+| `--vfs-cache-max-age` | 3600s | — | 3600s | Max cache file age (absolute mtime, 0 disables — see [Cache flags](docs/vfs-cache-flags.md#vfs-cache-max-age-wired-issue-507)) |
 | `--vfs-cache-mode` | `off` | — | `off` | `off` / `minimal` / `writes` / `full` (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
 | `--vfs-cache-poll-interval` | 60s | — | 60s | Stale-object poll interval (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
 | `--mem-limit` | 256 MB | — | 256 MB | Memory cache upper limit |
@@ -292,11 +292,12 @@ sync /mnt/s3/file.txt              # fdatasync → cache file durable on local d
 - **Multipart upload** via `op.writer()` auto-chunks >5 GB
 - **CRC64 integrity** for disk cache
 
-For the full durability model — including the rclone-compat shadow
-fields (`--vfs-cache-mode`, `--vfs-cache-max-age`,
-`--vfs-cache-poll-interval`, `--poll-interval`, `--vfs-refresh`)
-that are accepted on the CLI but not yet implemented — see
-[`docs/durability.md`](docs/durability.md).
+For the full durability model — including the remaining rclone-compat
+shadow fields (`--vfs-cache-mode`, `--vfs-cache-poll-interval`,
+`--poll-interval`, `--vfs-refresh`) that are accepted on the CLI but
+not yet implemented — see [`docs/durability.md`](docs/durability.md).
+`--vfs-cache-max-age` was wired in issue #507; see
+[`docs/vfs-cache-flags.md`](docs/vfs-cache-flags.md#vfs-cache-max-age-wired-issue-507).
 
 ---
 
