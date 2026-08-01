@@ -446,6 +446,14 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         // rationale. The `lookup_many` batch below
         // receives `&[&str]` derived from the slice,
         // not from a cloned Vec.
+        //
+        // Probe D: per-call timing for every readdirplus.
+        // Goal is to detect whether `ls -f many` (33ms vs
+        // 3ms = 11x gap) goes through readdirplus at all
+        // on mntrs. Earlier probes only emitted on the
+        // first page (offset==0 && page.len()>=100), which
+        // misses small workloads. Cap at 2000.
+        let _t_start = std::time::Instant::now();
         match self.inner.readdir(ino.into(), fh.into(), offset, 0) {
             Ok(entries_arc) => {
                 let start = offset as usize;
@@ -454,6 +462,8 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
                 } else {
                     &entries_arc[start..]
                 };
+                let _t_after_readdir = std::time::Instant::now();
+                let page_len = page.len();
                 // Issue #29: batch the per-entry lookups
                 // so the implementation can serve the
                 // whole page from its dir_cache
@@ -475,6 +485,7 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
                                 .map(|_| Err(std::io::ErrorKind::Other.into()))
                                 .collect()
                         });
+                let _t_after_lookup = std::time::Instant::now();
                 for (offset_i, (entry, attr_res)) in
                     page.iter().zip(attr_results.iter()).enumerate()
                 {
@@ -512,7 +523,25 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
                         break;
                     }
                 }
+                let _t_before_reply = std::time::Instant::now();
                 reply.ok();
+                let _t_after_reply = std::time::Instant::now();
+                static READDIRPLUS_TIMING_COUNT: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let n = READDIRPLUS_TIMING_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 2000 {
+                    tracing::info!(
+                        ino = ino.0,
+                        offset = offset,
+                        page_len = page_len,
+                        readdir_us = _t_after_readdir.duration_since(_t_start).as_micros() as u64,
+                        lookup_us =
+                            _t_after_lookup.duration_since(_t_after_readdir).as_micros() as u64,
+                        reply_us =
+                            _t_after_reply.duration_since(_t_before_reply).as_micros() as u64,
+                        "Op::readdirplus timing",
+                    );
+                }
             }
             Err(e) => reply.error(io_err_to_fuse_errno(e)),
         }
@@ -882,8 +911,35 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
     fn unlink(&self, _req: &Request, _parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         // Issue #307: NFC-normalize (see lookup for rationale).
         let name = crate::util::nfc(&name.to_string_lossy());
-        match self.inner.unlink(_parent.into(), &name) {
-            Ok(()) => reply.ok(),
+        // Probe A: per-step timing for every unlink.
+        // The bench rm -rf 500 workload measures 565ms on
+        // mntrs vs 148ms on rclone (3.8x). Each unlink
+        // involves: writeback release (issue #460), backend
+        // DELETE, dir_cache invalidation. We want to know
+        // whether the gap is in self.inner.unlink (backend
+        // roundtrip) or in the reply.write to /dev/fuse
+        // (FUSE IPC). Cap at 2000 to keep log size bounded.
+        let _t_start = std::time::Instant::now();
+        let result = self.inner.unlink(_parent.into(), &name);
+        let _t_after_inner = std::time::Instant::now();
+        match result {
+            Ok(()) => {
+                let _t_before_reply = std::time::Instant::now();
+                reply.ok();
+                let _t_after_reply = std::time::Instant::now();
+                static UNLINK_TIMING_COUNT: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let n = UNLINK_TIMING_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 2000 {
+                    tracing::info!(
+                        name = %name,
+                        inner_us = _t_after_inner.duration_since(_t_start).as_micros() as u64,
+                        reply_us = _t_after_reply.duration_since(_t_before_reply).as_micros() as u64,
+                        total_us = _t_after_inner.duration_since(_t_start).as_micros() as u64,
+                        "Op::unlink timing",
+                    );
+                }
+            }
             Err(e) => reply.error(io_err_to_fuse_errno(e)),
         }
     }
