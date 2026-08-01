@@ -1161,6 +1161,14 @@ pub fn mount(
         // `New-Item -ItemType SymbolicLink` → WinFSP
         // `set_reparse_point` → inner.symlink).
         symlinks: dashmap::DashMap::new(),
+        // Issue #485: case-insensitive secondary index. Empty at
+        // mount start; populated by `MntrsFs::symlink` /
+        // `attach_symlink_to_ino` and drained by `unlink` in
+        // lockstep with `symlinks` (the dual-branch remove in
+        // `unlink` covers the case where `full_path` differs in
+        // case from the canonical stored key).
+        symlinks_lower: dashmap::DashMap::new(),
+        symlink_scan_count: std::sync::atomic::AtomicUsize::new(0),
         // Issue #132: shared adaptive prefetch window controller.
         backpressure: std::sync::Arc::new(crate::backpressure::BackpressureController::new()),
         // Issue #201: per-mount prefetch budget. Same cap as
