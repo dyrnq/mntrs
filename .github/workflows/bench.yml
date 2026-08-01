@@ -140,8 +140,13 @@ jobs:
       - name: Run DeleteObjects batching PoC
         if: matrix.mode == 'bench-comparison' && matrix.mem_cache_impl == 'moka'
         run: |
+          # v5: use boto3 (Go SDK) instead of aws s3 rm in a loop.
+          # boto3 == rclone's underlying SDK → gives the "Go SDK
+          # baseline" so we can isolate opendal's per-op overhead
+          # from S3 server cost. Install boto3 alongside awscli.
+          pip3 install boto3 --quiet 2>&1 | tail -3 || python3 -m pip install boto3 --quiet
           ENDPOINT=http://localhost:9000 BUCKET=mntrs-delete-poc \
-            bash bench/delete_batch_poc.sh 2>&1 | tee delete-poc-result.txt
+            python3 bench/delete_batch_poc.py 2>&1 | tee delete-poc-result.txt
 
       - name: Upload DeleteObjects PoC result
         if: matrix.mode == 'bench-comparison' && matrix.mem_cache_impl == 'moka' && always()
