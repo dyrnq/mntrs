@@ -87,6 +87,17 @@ pub struct FuserAdapter<F: CoreFilesystem + 'static> {
     pub attr_ttl: Duration,
     pub direct_io: bool,
     pub write_back_cache: bool,
+    /// Diagnostic flag (PR-diag #483): when false, `init()` skips
+    /// advertising `InitFlags::FUSE_READDIRPLUS_AUTO`. Default true
+    /// matches production behavior; setting false disables the cap
+    /// so the kernel does NOT auto-promote `getdents` to `readdirplus`
+    /// based on the post-readdir getattr burst. Used to bisect bench
+    /// regressions where `ls -la many` regressed despite #121's
+    /// `batch_lookup_from_dir_cache` fix being in place — see issue
+    /// history on #121 / #232 for the cache-hit path that should
+    /// already cover the workload. Negation CLI:
+    /// `--no-readdirplus-auto`.
+    pub readdirplus_auto: bool,
 }
 
 impl<F: CoreFilesystem + 'static> FuserAdapter<F> {
@@ -96,6 +107,7 @@ impl<F: CoreFilesystem + 'static> FuserAdapter<F> {
         attr_ttl: Duration,
         direct_io: bool,
         write_back_cache: bool,
+        readdirplus_auto: bool,
     ) -> Self {
         Self {
             inner,
@@ -103,6 +115,7 @@ impl<F: CoreFilesystem + 'static> FuserAdapter<F> {
             attr_ttl,
             direct_io,
             write_back_cache,
+            readdirplus_auto,
         }
     }
 }
@@ -148,7 +161,9 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         // size/mode hit a fresh lookup; post-fix the kernel reuses
         // the readdirplus reply.
         #[cfg(target_os = "linux")]
-        let _ = config.add_capabilities(InitFlags::FUSE_READDIRPLUS_AUTO);
+        if self.readdirplus_auto {
+            let _ = config.add_capabilities(InitFlags::FUSE_READDIRPLUS_AUTO);
+        }
 
         // #81: WRITEBACK_CACHE — kernel buffers small writes and merges
         // them before sending to the filesystem. Cuts FUSE write requests

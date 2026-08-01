@@ -72,6 +72,15 @@ enum Commands {
         /// the CLI layer; a warning is logged at mount time when it is set.
         #[arg(long)]
         write_back_cache: bool,
+        /// Diagnostic (PR #483): disable `InitFlags::FUSE_READDIRPLUS_AUTO`.
+        /// When off, the kernel does NOT auto-promote `getdents` to
+        /// `readdirplus` after a directory read — every entry's attr is
+        /// fetched via a separate `lookup` instead of being reused from
+        /// the readdirplus reply. **Bench bisection only**; do not use in
+        /// production. See issue history on #121 / #232 for the
+        /// cache-hit path this diagnostic is meant to verify.
+        #[arg(long = "no-readdirplus-auto", action = clap::ArgAction::SetFalse, default_value_t = true)]
+        _no_readdirplus_auto: bool,
         /// Raw FUSE option (repeatable), e.g. -o allow_other
         #[arg(short = 'o', long = "option", value_name = "OPT", num_args = 0..)]
         option: Vec<String>,
@@ -488,6 +497,7 @@ fn main() -> anyhow::Result<()> {
             volname,
             devname,
             write_back_cache,
+            _no_readdirplus_auto,
             option,
             fuse_flag,
             daemon,
@@ -652,6 +662,7 @@ fn main() -> anyhow::Result<()> {
                 &volname,
                 devname.as_deref(),
                 write_back_cache,
+                _no_readdirplus_auto,
                 &option,
                 &fuse_flag,
                 daemon,

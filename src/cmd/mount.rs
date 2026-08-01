@@ -567,6 +567,7 @@ pub fn mount_internal(
         "mntrs-csi", // volname
         None, // devname
         false, // write_back_cache (CSI: strict write-through; kernel writeback disabled by design — Pod multi-tenancy demands per-FS-message observability)
+        true,  // readdirplus_auto (CSI: keep production default — FUSE_READDIRPLUS_AUTO cap on)
         &[],   // fuse_options
         &[],   // fuse_flags
         false, // daemon (no fork — std::thread::spawn holds session)
@@ -843,6 +844,12 @@ pub fn mount(
     volname: &str,
     devname: Option<&str>,
     write_back_cache: bool,
+    // Diagnostic PR #483: gate `InitFlags::FUSE_READDIRPLUS_AUTO`
+    // emission in `FuserAdapter::init`. Default true (production
+    // behavior, unchanged); CLI `--no-readdirplus-auto` flips it off
+    // for bench bisection. See `core_fs/fuser.rs::FuserAdapter`
+    // field doc for the full rationale.
+    readdirplus_auto: bool,
     fuse_options: &[String],
     fuse_flags: &[String],
     daemon: bool,
@@ -1674,6 +1681,7 @@ pub fn mount(
             std::time::Duration::from_secs(attr_timeout),
             direct_io,
             write_back_cache,
+            readdirplus_auto,
         );
         tracing::info!(
             elapsed_ms = _t_mount.elapsed().as_millis() as u64,

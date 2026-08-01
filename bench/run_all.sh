@@ -76,14 +76,21 @@ echo "  $(date -Iseconds): preparing mount dirs..."
 mkdir -p "$MNTRS_MNT" "$RCLONE_MNT"
 
 MEM_CACHE_IMPL="${MEM_CACHE_IMPL:-dashmap}"
+# Diagnostic PR #484: allow callers (workflow_dispatch input) to inject
+# extra mount args. Empty by default → behavior unchanged for the
+# default PR / main bench runs. The diagnostic dispatches set
+# `MNTRS_EXTRA_MOUNT_ARGS="--no-readdirplus-auto"` to bisect the
+# `ls -la many` bench gap.
+MNTRS_EXTRA_MOUNT_ARGS="${MNTRS_EXTRA_MOUNT_ARGS:-}"
 # Write mount for mntrs (default: writes cache mode)
-echo "  $(date -Iseconds): starting mntrs mount (mem-cache-impl=$MEM_CACHE_IMPL)..."
+echo "  $(date -Iseconds): starting mntrs mount (mem-cache-impl=$MEM_CACHE_IMPL, extra='$MNTRS_EXTRA_MOUNT_ARGS')..."
 "$MNTRS_BIN" mount "s3://$BUCKET" "$MNTRS_MNT" \
     --opt "endpoint=$ENDPOINT" --opt "access-key=$ACCESS_KEY" \
     --opt "secret-key=$SECRET_KEY" --opt "region=$REGION" \
     --vfs-cache-mode=writes --vfs-write-back=5 \
     --vfs-read-ahead=134217728 --async-read \
     --mem-cache-impl="$MEM_CACHE_IMPL" \
+    $MNTRS_EXTRA_MOUNT_ARGS \
     --daemon --daemon-wait --daemon-timeout=15 2>&1
 echo "  $(date -Iseconds): mntrs mount returned (exit=$?)"
 

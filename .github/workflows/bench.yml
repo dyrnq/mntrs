@@ -9,6 +9,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      extra_mount_args:
+        description: 'Extra mntrs mount args (diagnostic PR #484). Default empty. Example: --no-readdirplus-auto'
+        required: false
+        type: string
+        default: ''
   schedule:
     - cron: '0 2 * * 1'
 
@@ -87,6 +93,10 @@ jobs:
         if: matrix.mode == 'bench-comparison'
         env:
           MEM_CACHE_IMPL: ${{ matrix.mem_cache_impl }}
+          # Diagnostic PR #484: workflow_dispatch input lets a manual
+          # dispatch append args to the mntrs mount command. Empty
+          # for default PR / push / schedule runs.
+          MNTRS_EXTRA_MOUNT_ARGS: ${{ inputs.extra_mount_args }}
         run: |
           MNTRS_BIN=./target/release/mntrs RCLONE_MNT=/tmp/rclone-mnt MNTRS_MNT=/tmp/mntrs-bench \
             ENDPOINT=http://localhost:9000 BUCKET=bench-bucket \
