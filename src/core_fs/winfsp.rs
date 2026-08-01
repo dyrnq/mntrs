@@ -2223,10 +2223,16 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                     u16::from_le_bytes(buffer[8..10].try_into().expect("2-byte slice")) as usize;
                 let sub_len =
                     u16::from_le_bytes(buffer[10..12].try_into().expect("2-byte slice")) as usize;
+                let prt_off =
+                    u16::from_le_bytes(buffer[12..14].try_into().expect("2-byte slice")) as usize;
+                let prt_len =
+                    u16::from_le_bytes(buffer[14..16].try_into().expect("2-byte slice")) as usize;
                 let path_buffer_start = 20;
                 let sub_start = path_buffer_start + sub_off;
                 let sub_end = sub_start + sub_len;
-                if sub_end > buffer.len() {
+                let prt_start = path_buffer_start + prt_off;
+                let prt_end = prt_start + prt_len;
+                if sub_end > buffer.len() || prt_end > buffer.len() {
                     return Err(FspError::from(STATUS_INVALID_PARAMETER));
                 }
                 // Decode UTF-16LE → String for storage.
@@ -2239,15 +2245,97 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect();
                 let target = String::from_utf16_lossy(&target_wide);
-                // Hand off to the trait's `symlink` method,
-                // which MntrsFs overrides to register the
-                // target in its in-memory table. We don't go
-                // through `create` here because the file
-                // placeholder was already created by the
-                // earlier `create` callback (the kernel does
-                // NtCreateFile first, then FSCTL_SET_REPARSE_POINT
-                // — same handle, same ino).
                 let ino = context.ino;
+                // Issue #359: cmd.exe's 16-bit IFILEOP subsystem
+                // "deletes" a symlink by re-issuing
+                // FSCTL_SET_REPARSE_POINT with an empty
+                // SubstituteName + empty PrintName on the ino
+                // that's already a symlink, instead of routing
+                // through DeleteFileW (which would fire
+                // delete_reparse_point + cleanup-with-delete).
+                // The legitimate Win32 DeleteFileW path therefore
+                // never gets a chance to clear `MntrsFs::symlinks`,
+                // and `Test-Path` keeps returning True even
+                // though cmd thinks the file is gone. Detect the
+                // signature (empty target + already-symlink ino)
+                // and route through `MntrsFs::unlink`, which has
+                // the canonical cleanup logic.
+                let empty_target = sub_len == 0 && prt_len == 0;
+                let is_already_symlink = self
+                    .inner
+                    .getattr(ino)
+                    .map(|attr| attr.kind == CoreFileType::Symlink)
+                    .unwrap_or(false);
+                if empty_target && is_already_symlink {
+                    // WinFSP passes the FULL PATH here (same
+                    // convention as `cleanup` — see the
+                    // rsplit_once block at line ~1616). NFC +
+                    // lowercase for case-insensitive lookup
+                    // (mirrors the cleanup rationale around
+                    // #325: Win32 file names are
+                    // case-insensitive at the OS layer and the
+                    // kernel may supply the path in any case
+                    // form relative to what `create` originally
+                    // stored).
+                    let full_path = crate::util::nfc(&file_name.to_string_lossy())
+                        .replace('\\', "/")
+                        .to_lowercase();
+                    let (parent_path, basename) = match full_path.rsplit_once('/') {
+                        Some((parent, name)) if !name.is_empty() => {
+                            (parent.to_string(), name.to_string())
+                        }
+                        _ => ("/".to_string(), full_path.clone()),
+                    };
+                    let parent_ino = self.parent_ino_for(&parent_path).unwrap_or(1);
+                    tracing::info!(
+                        ino,
+                        parent_ino,
+                        basename = %basename,
+                        "winfsp::set_reparse_point: empty target on existing symlink — implicit unlink (cmd.exe IFILEOP, issue #359)"
+                    );
+                    // Issue #359: dispatch through
+                    // `MntrsFs::unlink`, which drops
+                    // symlinks / path_to_ino / inodes entries,
+                    // removes the cache placeholder + .dirty
+                    // sidecar, removes attr_cache, removes the
+                    // parent's dir_cache snapshot, and issues
+                    // the backend delete with NotFound
+                    // idempotency. Errors are logged but not
+                    // surfaced — the kernel doesn't expect
+                    // STATUS_* on set_reparse_point success /
+                    // failure, and the symlink registration is
+                    // already gone by the time we return Ok.
+                    if let Err(e) = self.inner.unlink(parent_ino, &basename) {
+                        tracing::warn!(
+                            ino,
+                            basename = %basename,
+                            error = %e,
+                            "winfsp::set_reparse_point: implicit unlink failed (issue #359)"
+                        );
+                    }
+                    // Issue #360: push FILE_ACTION_REMOVED so
+                    // PowerShell / Explorer / cmd `dir` drop
+                    // the entry from their cached dir listings
+                    // without waiting for the next readdir
+                    // refresh. Without this, the dir_cache
+                    // snapshot would still report the symlink
+                    // and a follow-up `Test-Path` could
+                    // surface stale state. Filter is
+                    // FILE_NOTIFY_CHANGE_FILE_NAME for a file
+                    // unlink.
+                    let mut queue = self.pending_notifications.lock_or_recover();
+                    queue.push_back((
+                        basename.clone(),
+                        FILE_NOTIFY_CHANGE_FILE_NAME,
+                        FILE_ACTION_REMOVED,
+                    ));
+                    tracing::trace!(
+                        basename = %basename,
+                        queue_len = queue.len(),
+                        "winfsp::set_reparse_point: queued FILE_ACTION_REMOVED (issue #359)"
+                    );
+                    return Ok(());
+                }
                 // Issue #325: `set_reparse_point` is the second
                 // half of the symlink create flow — the kernel
                 // already called `create` and got a placeholder

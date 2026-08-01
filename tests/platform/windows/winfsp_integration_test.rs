@@ -9,7 +9,10 @@ use opendal::services::Memory;
 
 use mntrs::MntrsFs;
 use mntrs::core_fs::CoreFilesystem;
+use mntrs::core_fs::winfsp::{WinFspAdapter, WinFspHandle};
 use mntrs::core_fs::{CoreFileAttr, CoreVolumeStat};
+
+use winfsp::filesystem::FileSystemContext;
 
 // One-shot tracing subscriber init. The `mntrs.exe` binary
 // initializes a global subscriber in main.rs; the test binary
@@ -683,6 +686,154 @@ fn winfsp_symlink_delete_clears_state() {
     );
 
     drop(guard);
+}
+
+/// Issue #359: cmd.exe's 16-bit IFILEOP subsystem "deletes" a
+/// symlink by re-issuing FSCTL_SET_REPARSE_POINT with an empty
+/// SubstituteName on the ino that's already a symlink, instead of
+/// routing through DeleteFileW (which would fire
+/// `delete_reparse_point` + `cleanup`-with-delete). The legitimate
+/// Win32 DeleteFileW path therefore never gets a chance to clear
+/// `MntrsFs::symlinks`, and `Test-Path` keeps returning True even
+/// though cmd thinks the file is gone.
+///
+/// This test exercises the fix by invoking the WinFSP
+/// `set_reparse_point` callback **directly** with an
+/// empty-target REPARSE_DATA_BUFFER, bypassing both cmd.exe
+/// (cmd path resolution differs from PowerShell per the #325
+/// follow-up — cmd can't even see WinFSP symlinks on this dev
+/// box) and the kernel FSCTL roundtrip (the WinFSP driver
+/// returns `ERROR_INVALID_FUNCTION` for changing an existing
+/// reparse point on some hosts). The fix lives in
+/// `WinFspAdapter::set_reparse_point`'s implicit-unlink branch:
+/// detect `(empty target) && (already-symlink ino)` and route
+/// through `MntrsFs::unlink` instead of
+/// `attach_symlink_to_ino`. Pre-fix the callback would have
+/// called `attach_symlink_to_ino(ino, "")` and the symlinks
+/// map would still hold an entry — the post-FSCTL `getattr`
+/// would still report `kind = Symlink` (the stale entry
+/// resolves the lookup). Post-fix `set_reparse_point` routes
+/// through `MntrsFs::unlink`, which drops the registration
+/// entirely (`symlinks`, `path_to_ino`, `inodes`, cache
+/// placeholder + .dirty sidecar, `attr_cache`, parent's
+/// `dir_cache`, and the backend delete with NotFound
+/// idempotency) and the next `getattr` returns
+/// `kind = RegularFile` / NotFound.
+#[test]
+fn winfsp_symlink_implicit_delete_via_set_reparse_point() {
+    let fs = Arc::new(make_memory_fs());
+
+    // Create the symlink via the trait's `symlink` method instead
+    // of `New-Item -ItemType SymbolicLink`. PowerShell's New-Item
+    // requires SeCreateSymbolicLinkPrivilege (admin-only on
+    // default Windows); the trait path registers the entry in
+    // `MntrsFs::symlinks` without going through the Win32
+    // elevation gate, so the test runs on non-admin hosts too.
+    let target_mp = String::from(r"Z:\_ci_implicit_target.txt");
+    let link_basename = "_ci_implicit_link.txt";
+    let symlink_attr = fs
+        .symlink(1, link_basename, std::path::Path::new(&target_mp))
+        .expect("MntrsFs::symlink must succeed");
+    let link_ino = symlink_attr.ino;
+
+    // Pre-condition: the symlink is registered. `getattr` returns
+    // kind = Symlink because the trait sees the entry in
+    // `symlinks`. This is what `get_security_by_name` would
+    // surface to the kernel as `FILE_ATTRIBUTE_REPARSE_POINT`.
+    let pre = fs
+        .getattr(link_ino)
+        .expect("pre: getattr on symlink ino must succeed");
+    assert_eq!(
+        pre.kind,
+        mntrs::core_fs::CoreFileType::Symlink,
+        "pre: ino {link_ino} should be a symlink before implicit unlink"
+    );
+
+    // Invoke the WinFSP `set_reparse_point` callback directly
+    // with a REPARSE_DATA_BUFFER that has SubstituteNameLength=0
+    // + PrintNameLength=0 — the signature cmd.exe's IFILEOP
+    // emits to "drop the reparse tag". We bypass the kernel
+    // FSCTL routing (unreliable across WinFSP versions on
+    // already-reparse-point files) and call the trait method
+    // directly, which is what the kernel dispatcher would
+    // invoke.
+    //
+    // REPARSE_DATA_BUFFER layout (SymbolicLinkReparseBuffer):
+    //   0..4   ReparseTag            u32  = IO_REPARSE_TAG_SYMLINK
+    //   4..6   ReparseDataLength     u16  = 12 (size after this field)
+    //   6..8   Reserved              u16  = 0
+    //   8..10  SubstituteNameOffset  u16  = 0
+    //   10..12 SubstituteNameLength  u16  = 0  <-- empty target
+    //   12..14 PrintNameOffset       u16  = 0
+    //   14..16 PrintNameLength       u16  = 0  <-- empty target
+    //   16..20 Flags                 u32  = 0
+    // Total: 20 bytes, no PathBuffer.
+    let empty_buf: [u8; 20] = [
+        0x0C, 0x00, 0x00, 0xA0, // ReparseTag = 0xA000000C (SYMLINK)
+        0x0C, 0x00, // ReparseDataLength = 12
+        0x00, 0x00, // Reserved
+        0x00, 0x00, // SubstituteNameOffset = 0
+        0x00, 0x00, // SubstituteNameLength = 0  (empty)
+        0x00, 0x00, // PrintNameOffset = 0
+        0x00, 0x00, // PrintNameLength = 0  (empty)
+        0x00, 0x00, 0x00, 0x00, // Flags = 0
+    ];
+    let adapter = WinFspAdapter::new(fs.clone());
+    // WinFSP passes the FULL PATH in `file_name` (same
+    // convention as `cleanup`). NFC + lowercase for
+    // case-insensitive path matching (mirrors the cleanup
+    // rationale around #325: Win32 file names are
+    // case-insensitive at the OS layer).
+    let full_path =
+        widestring::U16CString::from_str(format!("/{}", link_basename.to_lowercase())).unwrap();
+    let handle = WinFspHandle {
+        ino: link_ino,
+        fh: link_ino,
+        is_dir: false,
+        dir_fh: 0,
+    };
+    adapter
+        .set_reparse_point(&handle, full_path.as_ucstr(), &empty_buf)
+        .expect("set_reparse_point (empty target on existing symlink) must succeed (issue #359)");
+
+    // Post-condition: the symlink registration is gone.
+    // `getattr` must now return NotFound — pre-fix this would
+    // still resolve to kind = Symlink because the callback
+    // called `attach_symlink_to_ino(ino, "")` which inserts
+    // a Symlink entry with target="", keeping the registration
+    // alive. Post-fix `set_reparse_point` routes through
+    // `MntrsFs::unlink`, which drops the registration.
+    let post = fs.getattr(link_ino);
+    match post {
+        Ok(attr) => {
+            assert_ne!(
+                attr.kind,
+                mntrs::core_fs::CoreFileType::Symlink,
+                "post: ino {link_ino} must not be a symlink after implicit unlink — symlinks map still has the entry (issue #359)"
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Even better — the ino is fully GC'd. Either
+            // outcome (NotFound or kind != Symlink) confirms
+            // the symlinks map entry is gone.
+        }
+        Err(e) => panic!("post: getattr returned unexpected error: {e}"),
+    }
+
+    // Backend side: the placeholder cache file (the symlink's
+    // host file written by `create` to satisfy the Win32
+    // reparse-point contract) must also be gone — `MntrsFs::unlink`
+    // issues `op.delete` with NotFound idempotency.
+    let op = fs.op.clone();
+    let backend_present = rt_block_on(async move {
+        op.exists(&format!("/{}", link_basename.to_lowercase()))
+            .await
+            .unwrap_or(true)
+    });
+    assert!(
+        !backend_present,
+        "backend should not have a placeholder for the implicit-unlinked symlink (issue #359)"
+    );
 }
 
 /// Issue #341: deleting a file that is still in the dirty
