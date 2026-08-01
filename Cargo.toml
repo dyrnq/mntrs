@@ -8,7 +8,7 @@ description = "Mount remote storage (S3, HDFS, GCS, etc.) to local directory via
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
-tokio = { version = "1.52", features = ["full", "rt-multi-thread"] }
+tokio = { version = "1", features = ["full", "rt-multi-thread"] }
 tokio-util = { version = "0.7.18", features = ["time"] }
 anyhow = "1.0.102"
 tracing = "0.1.44"
