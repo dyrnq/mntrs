@@ -297,3 +297,65 @@ fn vfs_cache_max_age_parses_various_values() {
         );
     }
 }
+
+// ── --no-modtime wiring (issue #509) ──────────────────────────
+//
+// `--no-modtime` was previously a "shadow flag" — clap accepted
+// it, the README advertised it, the help text listed it, but the
+// value was dropped on the floor at `_no_modtime: bool` (compiler-
+// enforced dead). As of the fix it propagates to `MntrsFs::no_modtime`
+// and gates both `stat_op` and `list_op` mtime paths. These tests
+// pin the contract: the flag stays in `--help`, parses without
+// error, and the shadow-warn no longer fires.
+
+/// Without `--no-modtime` on the CLI, the daemon must NOT
+/// mention it in stderr. Pre-fix, the shadow-warn path was
+/// unaffected for `--no-modtime` (the warn was gated on
+/// non-default values and `_no_modtime` was already a no-op),
+/// but this locks the flag is recognized as wired.
+#[test]
+fn default_args_no_no_modtime_shadow() {
+    let stderr = run_mount_capture_stderr(&[]);
+    assert!(
+        !stderr.contains("--no-modtime"),
+        "without --no-modtime on CLI, shadow warn must not mention it; stderr=\n{stderr}"
+    );
+}
+
+/// `--no-modtime` parses cleanly and must NOT trigger the shadow
+/// warn — the flag is now wired through to `MntrsFs::no_modtime`
+/// (gates both `stat_op` and `list_op` mtime paths).
+#[test]
+fn no_modtime_flag_parses_and_no_shadow_warn() {
+    let stderr = run_mount_capture_stderr(&["--no-modtime"]);
+    assert!(
+        !has_clap_parse_error(&stderr),
+        "--no-modtime should parse without clap error; stderr=\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("shadow") && !stderr.contains("--no-modtime"),
+        "--no-modtime is now wired; shadow warn must not fire; stderr=\n{stderr}"
+    );
+}
+
+/// `mntrs mount --help` must list `--no-modtime`. The flag was
+/// always in the CLI surface (clap accepted it), but a future
+/// refactor that accidentally drops the field would silently
+/// leave users searching for it. Lock the help-line is there.
+#[test]
+fn help_lists_no_modtime_flag() {
+    let out = Command::new(mntrs_bin())
+        .args(["mount", "--help"])
+        .output()
+        .expect("spawn `mntrs mount --help`");
+    assert!(
+        out.status.success(),
+        "`mntrs mount --help` failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        help.contains("--no-modtime"),
+        "--no-modtime flag line missing from --help"
+    );
+}

@@ -225,7 +225,7 @@ Three-tier cache: **memory → disk → remote**. Block-level (8 MB) indexing. D
 | `--attr-timeout` | 5s | — | 5s | File attribute TTL (kernel) — bumped 1s→5s (#469) so the #467 FUSE_READDIRPLUS_AUTO cap actually materializes |
 | `--stat-cache-ttl` | 1s | — | 1s | Stat TTL (mntrs internal) |
 | `--type-cache-ttl` | 1s | — | 1s | File-type cache TTL |
-| `--no-modtime` | false | — | false | Disable mtime read/write |
+| `--no-modtime` | false | — | false | Disable mtime read on `stat`/`readdir` (writes not pushed to backend anyway; #509) |
 | `--use-server-modtime` | false | — | false | Use server-side mtime (vs local cache) |
 | `--no-implicit-dir` | false | — | false | Disable S3 implicit dir fallback |
 | `--direct-io` | false | — | false | Bypass kernel page cache, direct FUSE access |

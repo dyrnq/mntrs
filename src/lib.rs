@@ -575,6 +575,17 @@ pub struct MntrsFs {
     pub(crate) case_insensitive: bool,
     pub(crate) no_implicit_dir: bool,
     pub(crate) use_server_modtime: bool,
+    /// Issue #509: rclone `--no-modtime`. Bidirectional in rclone
+    /// (suppresses both read of backend mtime and write of mtime
+    /// to backend); mntrs only needs the read side because our
+    /// `setattr` path never pushes mtime to the backend
+    /// (`src/lib.rs:~3065` only handles `size`/`truncate`).
+    /// When true, `stat()` and `readdir()` both return
+    /// `None`/epoch for mtime instead of consulting
+    /// `opendal::Metadata::last_modified()`. Performance win:
+    /// avoids per-file metadata round-trips on the lister.
+    /// Default false = rclone-parity behavior.
+    pub(crate) no_modtime: bool,
     pub(crate) no_apple_double: bool,
     pub(crate) no_apple_xattr: bool,
     pub(crate) no_macos_metadata: bool,
@@ -1848,7 +1859,12 @@ impl MntrsFs {
                         EntryMode::DIR => FileType::Directory,
                         _ => FileType::RegularFile,
                     };
-                    let mtime = if self.use_server_modtime {
+                    // Issue #509: `--no-modtime` wins over
+                    // `--use-server-modtime` (rclone parity:
+                    // no_modtime is the unconditional off switch).
+                    let mtime = if self.no_modtime {
+                        None
+                    } else if self.use_server_modtime {
                         meta.last_modified().map(opendal_timestamp_to_system_time)
                     } else {
                         None
@@ -2122,11 +2138,25 @@ impl MntrsFs {
                     }
                 }
                 let size = content_length;
-                let mtime = entry
-                    .metadata()
-                    .last_modified()
-                    .map(opendal_timestamp_to_system_time)
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                // Issue #509: readdir used to always read
+                // server mtime, ignoring `--use-server-modtime`
+                // AND `--no-modtime` — a latent consistency
+                // bug where `ls -l` and `stat` could disagree
+                // for the same file. Now both gates apply:
+                //   * `--no-modtime` → always epoch
+                //   * else `--use-server-modtime` → server mtime
+                //   * else epoch (default)
+                let mtime = if self.no_modtime {
+                    SystemTime::UNIX_EPOCH
+                } else if self.use_server_modtime {
+                    entry
+                        .metadata()
+                        .last_modified()
+                        .map(opendal_timestamp_to_system_time)
+                        .unwrap_or(SystemTime::UNIX_EPOCH)
+                } else {
+                    SystemTime::UNIX_EPOCH
+                };
                 out.push((name, mode, size, mtime));
             }
             // Issue #48: the cap is intentionally
@@ -7136,6 +7166,11 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         vfs_refresh: false,
         case_insensitive: false,
         no_implicit_dir: false,
+        // Issue #509: rclone `--no-modtime` gate. Default false
+        // = rclone-parity (server mtime consulted when
+        // `--use-server-modtime` is also set). Tests that need
+        // the off path set `no_modtime: true` explicitly.
+        no_modtime: false,
         use_server_modtime: false,
         no_apple_double: false,
         no_apple_xattr: false,
@@ -8334,5 +8369,188 @@ mod tests {
                 "case-flipped metadata variant should match: {n:?}"
             );
         }
+    }
+
+    // ── --no-modtime / --use-server-modtime (issue #509) ─────────
+    //
+    // Before the fix, `--no-modtime` was a shadow flag: clap
+    // accepted it, the README advertised it, but the value was
+    // dropped on the floor at `_no_modtime: bool` (compiler-
+    // enforced dead). At the same time, `readdir` path always
+    // read server mtime even when `--use-server-modtime` was
+    // off — a latent consistency bug where `ls -l` and `stat`
+    // could disagree for the same file. Tests below pin the
+    // full fix:
+    //   * `stat_op` honors no_modtime > use_server_modtime
+    //   * `list_op` honors no_modtime > use_server_modtime
+    //   * default (both flags off) returns epoch on both
+    //   * use_server_modtime only returns server mtime on both
+    //   * no_modtime overrides use_server_modtime (rclone parity)
+
+    /// Issue #509: when `--no-modtime` is set, `stat_op`
+    /// returns `mtime = None` regardless of `use_server_modtime`.
+    /// Verifies the unconditional off switch — both flags
+    /// together should still suppress mtime, matching rclone.
+    ///
+    /// Uses the `Fs` backend (real filesystem mtime) because the
+    /// `Memory` backend returns `None` for `last_modified()` —
+    /// the test would otherwise prove nothing about the gate.
+    #[test]
+    fn stat_op_no_modtime_overrides_use_server_modtime() {
+        let dir = scratch_dir("509-stat-no-modtime");
+        let backend_root = scratch_dir("509-stat-fsroot");
+        let cfg = opendal::services::Fs::default().root(&backend_root.to_string_lossy());
+        let op = opendal::Operator::new(cfg).unwrap();
+        // Write a file so the backend has a real mtime to consult.
+        rt().block_on(async {
+            op.write("file.txt", "hello").await.unwrap();
+        });
+        let mut fs = new_test_fs(op, dir);
+        fs.use_server_modtime = true; // would normally turn mtime on
+        fs.no_modtime = true; // but no_modtime wins
+        let result = fs.stat_op("file.txt").expect("file exists");
+        assert!(
+            result.mtime.is_none(),
+            "no_modtime=true must suppress mtime even when \
+             use_server_modtime=true; got {:?}",
+            result.mtime
+        );
+    }
+
+    /// Issue #509: `--use-server-modtime` alone (default
+    /// `no_modtime = false`) returns the server's mtime. This
+    /// is the rclone-parity "show real mtime" path.
+    #[test]
+    fn stat_op_use_server_modtime_returns_server_mtime() {
+        let dir = scratch_dir("509-stat-use-server");
+        let backend_root = scratch_dir("509-stat-fsroot2");
+        let cfg = opendal::services::Fs::default().root(&backend_root.to_string_lossy());
+        let op = opendal::Operator::new(cfg).unwrap();
+        rt().block_on(async {
+            op.write("file.txt", "hello").await.unwrap();
+        });
+        let mut fs = new_test_fs(op, dir);
+        fs.use_server_modtime = true;
+        fs.no_modtime = false;
+        let result = fs.stat_op("file.txt").expect("file exists");
+        assert!(
+            result.mtime.is_some(),
+            "use_server_modtime=true must return server mtime"
+        );
+        // Fs backend mtime is backed by filesystem mtime, which
+        // is "now" — should be after epoch.
+        let mtime = result.mtime.unwrap();
+        assert!(
+            mtime > SystemTime::UNIX_EPOCH,
+            "server mtime must be > epoch; got {:?}",
+            mtime
+        );
+    }
+
+    /// Issue #509: default (both flags off) keeps the rclone
+    /// default of "epoch mtime" — matches the pre-#509 default
+    /// so this isn't a behavior change for existing users.
+    #[test]
+    fn stat_op_default_returns_none_mtime() {
+        let dir = scratch_dir("509-stat-default");
+        let backend_root = scratch_dir("509-stat-fsroot3");
+        let cfg = opendal::services::Fs::default().root(&backend_root.to_string_lossy());
+        let op = opendal::Operator::new(cfg).unwrap();
+        rt().block_on(async {
+            op.write("file.txt", "hello").await.unwrap();
+        });
+        let fs = new_test_fs(op, dir);
+        // Both flags default to false per `new_test_fs`.
+        let result = fs.stat_op("file.txt").expect("file exists");
+        assert!(
+            result.mtime.is_none(),
+            "default (no_modtime=false, use_server_modtime=false) must \
+             return None mtime per rclone default"
+        );
+    }
+
+    /// Issue #509: `list_op` honors `--no-modtime` even when
+    /// `--use-server-modtime` is set. This is the readdir side
+    /// of the same gate — `ls -l` should suppress mtime just
+    /// like `stat` does.
+    #[test]
+    fn list_op_no_modtime_overrides_use_server_modtime() {
+        let dir = scratch_dir("509-list-no-modtime");
+        let backend_root = scratch_dir("509-list-fsroot");
+        let cfg = opendal::services::Fs::default().root(&backend_root.to_string_lossy());
+        let op = opendal::Operator::new(cfg).unwrap();
+        rt().block_on(async {
+            op.write("a.txt", b"foo" as &[u8]).await.unwrap();
+        });
+        let mut fs = new_test_fs(op, dir);
+        fs.use_server_modtime = true; // would normally turn mtime on
+        fs.no_modtime = true; // but no_modtime wins
+        let entries = fs.list_op("").expect("list succeeded");
+        let a = entries
+            .iter()
+            .find(|(name, _, _, _)| name == "a.txt")
+            .expect("a.txt must be in list");
+        assert_eq!(
+            a.3,
+            SystemTime::UNIX_EPOCH,
+            "no_modtime=true must force readdir mtime to epoch; got {:?}",
+            a.3
+        );
+    }
+
+    /// Issue #509: regression — pre-fix, `list_op` always read
+    /// server mtime (ignoring `use_server_modtime`). This made
+    /// `ls -l` and `stat` disagree for the same file. Post-fix
+    /// both paths honor the same gate.
+    #[test]
+    fn list_op_use_server_modtime_returns_server_mtime() {
+        let dir = scratch_dir("509-list-use-server");
+        let backend_root = scratch_dir("509-list-fsroot2");
+        let cfg = opendal::services::Fs::default().root(&backend_root.to_string_lossy());
+        let op = opendal::Operator::new(cfg).unwrap();
+        rt().block_on(async {
+            op.write("a.txt", b"foo" as &[u8]).await.unwrap();
+        });
+        let mut fs = new_test_fs(op, dir);
+        fs.use_server_modtime = true;
+        fs.no_modtime = false;
+        let entries = fs.list_op("").expect("list succeeded");
+        let a = entries
+            .iter()
+            .find(|(name, _, _, _)| name == "a.txt")
+            .expect("a.txt must be in list");
+        assert!(
+            a.3 > SystemTime::UNIX_EPOCH,
+            "use_server_modtime=true must yield server mtime in readdir; got {:?}",
+            a.3
+        );
+    }
+
+    /// Issue #509: default (both flags off) keeps `readdir`
+    /// mtime at epoch — matches pre-#509 `list_op` behavior
+    /// post-fix (the consistency bug fix). Pre-fix this
+    /// returned server mtime, which was the inconsistency.
+    #[test]
+    fn list_op_default_returns_epoch_mtime() {
+        let dir = scratch_dir("509-list-default");
+        let backend_root = scratch_dir("509-list-fsroot3");
+        let cfg = opendal::services::Fs::default().root(&backend_root.to_string_lossy());
+        let op = opendal::Operator::new(cfg).unwrap();
+        rt().block_on(async {
+            op.write("a.txt", b"foo" as &[u8]).await.unwrap();
+        });
+        let fs = new_test_fs(op, dir);
+        let entries = fs.list_op("").expect("list succeeded");
+        let a = entries
+            .iter()
+            .find(|(name, _, _, _)| name == "a.txt")
+            .expect("a.txt must be in list");
+        assert_eq!(
+            a.3,
+            SystemTime::UNIX_EPOCH,
+            "default (no_modtime=false, use_server_modtime=false) must \
+             return epoch mtime in readdir (rclone default); got {:?}",
+            a.3
+        );
     }
 }
