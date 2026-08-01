@@ -29,7 +29,7 @@ use mntrs::MntrsFs;
 use mntrs::core_fs::CoreFilesystem;
 
 fn make_memory_fs() -> MntrsFs {
-    let op = Operator::new(Memory::default()).unwrap().finish();
+    let op = Operator::new(Memory::default()).unwrap();
     let cache_dir = std::env::temp_dir().join(format!(
         "mntrs-bugtest-{}-{:x}",
         std::process::id(),
@@ -208,7 +208,7 @@ fn bug_c_getattr_mtime_is_now_not_epoch() {
 #[test]
 fn bug_d_opendal_to_io_error_preserves_not_found_kind() {
     use opendal::ErrorKind;
-    let op = Operator::new(Memory::default()).unwrap().finish();
+    let op = Operator::new(Memory::default()).unwrap();
     // Force a real NotFound by stat-ing a missing path.
     let err = futures::executor::block_on(async { op.stat("does/not/exist").await })
         .expect_err("stat of missing path should fail");

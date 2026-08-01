@@ -40,21 +40,24 @@ fn opendal_sync_op() -> opendal::Operator {
                  this is a bug in the write path's prefix fetch"
             );
             // Bug 27: SAFETY — Memory::default() +
-            // Operator::new(...).finish() is infallible
-            // for the in-memory backend (no FS, no
-            // network, no auth — just a HashMap behind
-            // an Arc). The `expect` message preserves
-            // the actionable signal if a future opendal
+            // Operator::new(...) is infallible for the
+            // in-memory backend (no FS, no network, no
+            // auth — just a HashMap behind an Arc).
+            // The `expect` message preserves the
+            // actionable signal if a future opendal
             // upgrade changes that contract; bare
             // .unwrap() would produce a context-free
-            // panic on the same condition. This fallback
-            // is itself only reached on a pre-init
-            // access (logged above) and is a defensive
-            // backstop — production code always
-            // initializes the cell first.
+            // panic on the same condition. This
+            // fallback is itself only reached on a
+            // pre-init access (logged above) and is a
+            // defensive backstop — production code
+            // always initializes the cell first.
+            //
+            // opendal 0.58.1: Operator::new() returns
+            // a ready-to-use Operator directly; the
+            // .finish() step was removed (RFC #7740).
             opendal::Operator::new(opendal::services::Memory::default())
                 .expect("BUG: opendal Memory backend Operator::new is infallible")
-                .finish()
         })
         .clone()
 }

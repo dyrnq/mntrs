@@ -23,7 +23,16 @@ moka = { version = "0.12.15", features = ["sync"] }
 bytes = "1.12"
 unicode-normalization = "0.1.25"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "hickory-dns"] }
-opendal = { version = "0.57", features = ["services-s3", "services-gcs", "services-azblob", "services-hdfs-native", "services-webhdfs", "services-oss", "services-cos", "services-obs", "services-b2", "services-vercel-blob", "services-aliyun-drive", "services-fs", "services-memory", "services-webdav", "layers-capability-check"] }
+opendal = { version = "0.58", features = ["services-s3", "services-gcs", "services-azblob", "services-hdfs-native", "services-webhdfs", "services-oss", "services-cos", "services-obs", "services-b2", "services-vercel-blob", "services-aliyun-drive", "services-fs", "services-memory", "services-webdav", "layers-capability-check"] }
+# Reqwest-based HTTP transport for opendal 0.58.1+ (RFC #7740
+# provider model). `HttpClientLayer` was removed in 0.58; the
+# transport is now installed via
+# `OperationContext::with_http_transport(HttpTransporter::new(ReqwestTransport::new(client)))`.
+# The `opendal` facade pulls this in transitively under its default
+# `http-transport-reqwest` feature, but doesn't `pub use` it; we
+# depend on it directly so we can name `ReqwestTransport` in code
+# without depending on opendal's internal type re-exports.
+opendal-http-transport-reqwest = "0.58"
 # Hardware-accelerated CRC32C (x86 CRC32Q via SSE4.2; ARMv8.2-CRC32).
 # Used for disk cache block integrity checks; falls back to a
 # software implementation on CPUs without the corresponding ISA
@@ -71,38 +80,6 @@ sftp = ["opendal/services-sftp"]
 
 [workspace]
 members = [".", "csi/mntrs-csi"]
-
-[patch.crates-io]
-# Fork of hdfs-native 0.13.5 adding `dfs.client.use.datanode.hostname` support,
-# so the client connects to DataNodes via host_name (k8s Service DNS) instead of
-# ip_addr (127.0.0.1 in-container loopback). Original upstream issue:
-# Kimahriman/hdfs-native#302.
-#
-# Upstream has since implemented the SAME feature (PR #303, merge commit
-# e339b560, 2026-06-23). It's released in hdfs-native v0.14.1 (2026-06-26)
-# and later; v0.14.2 (2026-07-11) is current. The remaining blocker is on
-# the opendal side: PR #7910
-# (`chore(deps): upgrade hdfs-native to 0.14`) merged into apache/opendal
-# master on 2026-07-15, bumping `opendal-service-hdfs-native`'s hdfs-native
-# constraint from `^0.13` to `0.14`. But it's not in any opendal release
-# yet — `opendal 0.58.0` (2026-07-10) still constrains hdfs-native to
-# `^0.13`, and was **yanked** (2026-07-17) for an unrelated macOS dyld
-# bug (#7923, fixed by #7925 in master on 2026-07-17). So `opendal`
-# is currently pinned at the last-safe `0.57.0` — there is nothing to
-# bump to until opendal 0.58.1 (with the #7925 fix) or 0.59.0 (with
-# both #7925 and #7910) ships. Keeping this fork until then.
-#
-# Why a `0.57 → 0.58` bump would be a no-op anyway: both 0.57.0 and
-# 0.58.0 of `opendal-service-hdfs-native` constrain hdfs-native to
-# `^0.13`, so cargo resolves the same hdfs-native 0.13.5 from either.
-# The fork's rev (419cd0e, a 0.13.5 + #303 equivalent patch) is what
-# mntrs actually picks.
-#
-# TODO: revert to the crates.io version (delete this [patch.crates-io]
-# block) once opendal publishes a release containing PR #7910. At that
-# point the dyrnq/hdfs-native fork can be archived. Tracking:
-# [[hdfs-native-fork-drop-readiness-2026-07-18]].
-hdfs-native = { git = "https://github.com/dyrnq/hdfs-native.git", rev = "419cd0ea737289232f1b35e2680313d814bf90aa" }
 
 [[bin]]
 name = "mntrs"

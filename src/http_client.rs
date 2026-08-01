@@ -2,23 +2,33 @@
 //!
 //! Why this exists:
 //!
-//! OpenDAL 0.57 ships a `GLOBAL_REWQEST_CLIENT: LazyLock<reqwest::Client>` in
-//! `opendal_core::raw::http_util::client` that the default `HttpClient::default()`
-//! returns. The first time it is instantiated it binds the underlying hyper
-//! connector's TcpStream I/O to whichever tokio runtime the calling thread is
-//! currently inside. All subsequent `.await`s on that client — including from
-//! background writeback workers — must run in that same runtime, or hyper
-//! silently deadlocks waiting for an I/O reactor that nobody is polling
-//! (a 5-minute `unmount_internal` drain, then a CSI gRPC handler stuck
-//! serving the next mount RPC, which is what made csi-e2e run
-//! 27407577059 fail with `pending=3` and `use of closed network
+//! OpenDAL up to 0.57 ships a `GLOBAL_REQWEST_CLIENT: LazyLock<reqwest::Client>`
+//! in `opendal_core::raw::http_util::client` that the default
+//! `HttpClient::default()` returns. The first time it is instantiated it
+//! binds the underlying hyper connector's TcpStream I/O to whichever tokio
+//! runtime the calling thread is currently inside. All subsequent `.await`s
+//! on that client — including from background writeback workers — must run
+//! in that same runtime, or hyper silently deadlocks waiting for an I/O
+//! reactor that nobody is polling (a 5-minute `unmount_internal` drain, then
+//! a CSI gRPC handler stuck serving the next mount RPC, which is what made
+//! csi-e2e run 27407577059 fail with `pending=3` and `use of closed network
 //! connection`).
 //!
-//! The fix is to (a) always pass an explicit client to
-//! `opendal::layers::HttpClientLayer::new(HttpClient::with(client))` so
-//! we never touch opendal's `LazyLock` default, and (b) build that client
-//! once, shared, from inside `crate::rt()` (so all `.await`s on the shared
-//! client bind to the global runtime).
+//! OpenDAL 0.58.1 removed that `LazyLock` (RFC #7740). HTTP transports are
+//! now an explicit `HttpTransport` trait object installed via
+//! `OperationContext::with_http_transport`. The default for "no transport
+//! provided" is an in-process stub — fine for unit tests, but for real
+//! backends (S3, GCS, etc.) you must install one. We install a shared
+//! `reqwest::Client` wrapped in `ReqwestTransport` so we (a) never depend
+//! on a hidden default and (b) build that client once, shared, from inside
+//! `crate::rt()` (so all `.await`s on the shared client bind to the global
+//! runtime).
+//!
+//! The fix is to (a) always wrap our shared client in
+//! `opendal::HttpTransporter::new(opendal::ReqwestTransport::new(client))`
+//! and install it via
+//! `Operator::new(builder)?.with_context(OperationContext::new().with_http_transport(...))`,
+//! and (b) build that client once, shared, from inside `crate::rt()`.
 //!
 //! This module is option (b). All `apply_operator_with_tls` callers in
 //! `src/cmd/mount.rs` use the client returned by [`shared`] regardless of
@@ -113,7 +123,8 @@ pub fn shared() -> &'static reqwest::Client {
             .hickory_dns(true)
             // Build a fresh client per process. `reqwest::Client` is
             // `Clone` (Arc internally), so callers below just clone the
-            // `&'static` and pass it into opendal's `HttpClient::with`.
+            // `&'static` and pass it into opendal's
+            // `ReqwestTransport::new(client)`.
             .build()
             .expect("reqwest::Client::builder().build() must succeed")
     })
