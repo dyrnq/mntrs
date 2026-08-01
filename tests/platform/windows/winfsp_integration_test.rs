@@ -60,6 +60,20 @@ fn write_remote(fs: &MntrsFs, path: &str, data: &[u8]) {
     rt_block_on(async move {
         op.write(&p, d).await.unwrap();
     });
+    // Issue #494: WinFSP issues a directory enumeration shortly
+    // after mount (for change-notification bookkeeping). The
+    // resulting dir_cache[""] = empty listing then shadows
+    // subsequent reads for the full `dir_cache_ttl` (10s in
+    // tests). Direct opendal writes bypass the in-mount
+    // create() callback that would call cache_add_entry, so the
+    // cached empty listing stays stale. Invalidate the parent
+    // dir_cache after each write so the next readdir re-lists
+    // the backend. Idempotent — safe to call repeatedly.
+    let parent = std::path::Path::new(path)
+        .parent()
+        .and_then(|p| p.to_str())
+        .unwrap_or("");
+    fs.invalidate_dir_cache(parent);
 }
 
 /// Wait for filesystem to settle.
@@ -395,6 +409,13 @@ fn winfsp_nfc_create_and_read() {
 /// on both `file_name` and `new_file_name`). Pre-fix the
 /// adapter didn't normalize the rename arguments; now both
 /// names are NFC before `rename_paths` resolves parent inos.
+///
+/// Issue #495: write via the opendal backend (not via the
+/// mount) so the file is already present in the backend
+/// when rename fires. A mount-side write would queue the
+/// upload for `write_back_delay` (1s default in tests) and
+/// the rename's `op.read` fallback would see NotFound on
+/// the not-yet-uploaded src.
 #[test]
 fn winfsp_nfc_rename() {
     let fs = Arc::new(make_memory_fs());
@@ -404,7 +425,7 @@ fn winfsp_nfc_rename() {
 
     let src = "café_a.txt";
     let dst = "café_b.txt";
-    std::fs::write(format!("{mp}{src}"), b"hello").unwrap();
+    write_remote(&fs, src, b"hello");
     std::fs::rename(format!("{mp}{src}"), format!("{mp}{dst}")).unwrap();
 
     // src gone, dst present with same content.

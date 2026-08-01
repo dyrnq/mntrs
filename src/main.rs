@@ -238,6 +238,29 @@ enum Commands {
         /// CLI default get `false` (no filtering) for least-surprise.
         #[arg(long, default_value_t = true)]
         no_macos_metadata: bool,
+        /// Expose backend object metadata as FUSE extended attributes
+        /// (`user.etag`, `user.mime_type`, `user.mtime`,
+        /// `user.content_length`, `user.<key>` — see the README
+        /// "Object Metadata (xattr)" section for the full table).
+        /// Matches `rclone mount`'s `--metadata` semantics: default
+        /// **off** here (rclone also defaults to false for `mount`;
+        /// `rclone serve` defaults to true). When off, `getxattr`
+        /// returns `ENOSYS` and `listxattr` returns the empty list,
+        /// avoiding the per-call backend `stat()` round-trip the
+        /// surface needs. Pass `--metadata` to enable.
+        ///
+        /// Issue #465: the surface itself shipped unconditionally in
+        /// the prior commit (PR #491); this flag adds the gate.
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        metadata: bool,
+        /// `--no-metadata` mirror. Field starts at false (SetFalse
+        /// defaults to false in clap 4.6). Use-site reads `metadata`
+        /// only; this field exists so clap recognises `--no-metadata`
+        /// on the CLI (matches the `--slow-statfs` / `--no-slow-statfs`
+        /// pair at L277-304) — rclone scripts that pass `--no-metadata`
+        /// don't trigger an "unexpected arg" failure.
+        #[arg(long = "no-metadata", action = clap::ArgAction::SetFalse)]
+        _no_metadata: bool,
         /// Consistent hash-based sharding: k of n (e.g. --hash-filter 1/4).
         /// **No effect in mntrs** — accepted for rclone compat, no
         /// backend currently implements consistent hash sharding in
@@ -387,11 +410,19 @@ enum Commands {
         /// Metadata file extension
         #[arg(long)]
         vfs_metadata_extension: Option<String>,
-        /// S3-style storage class hint (e.g. STANDARD, GLACIER).
-        /// **No effect in mntrs** — backend upload already picks the
-        /// backend's default storage class. Accepted for rclone
-        /// compat. See docs/vfs-cache-flags.md.
-        #[arg(long)]
+        /// Default S3 storage class for uploaded objects (e.g.
+        /// `STANDARD`, `STANDARD_IA`, `GLACIER`, `DEEP_ARCHIVE`).
+        /// Maps to opendal's `default_storage_class` on the S3
+        /// builder, which propagates as the `x-amz-storage-class`
+        /// header on PUT/Copy/CreateMultipartUpload. **Only effective
+        /// on the `s3://` backend**; other backends silently ignore
+        /// the value (use their own `--oss-storage-class` etc.).
+        ///
+        /// Valid values: `STANDARD`, `STANDARD_IA`, `ONEZONE_IA`,
+        /// `INTELLIGENT_TIERING`, `GLACIER_IR`, `GLACIER`,
+        /// `DEEP_ARCHIVE`, `OUTPOSTS`, `REDUCED_REDUNDANCY`.
+        /// Invalid values fail at startup (clap value_parser).
+        #[arg(long, value_parser = ["STANDARD", "STANDARD_IA", "ONEZONE_IA", "INTELLIGENT_TIERING", "GLACIER_IR", "GLACIER", "DEEP_ARCHIVE", "OUTPOSTS", "REDUCED_REDUNDANCY"])]
         storage_class: Option<String>,
         /// Write wait timeout in seconds (default: 1, matches rclone).
         /// **No effect in mntrs** — writeback is governed by
@@ -533,6 +564,8 @@ fn main() -> anyhow::Result<()> {
             noapple_double,
             noapple_xattr,
             no_macos_metadata,
+            metadata,
+            _no_metadata,
             hash_filter,
             mount_case_insensitive,
             negative_vncache,
@@ -607,9 +640,6 @@ fn main() -> anyhow::Result<()> {
             if hash_filter.is_some() {
                 shadow.push("--hash-filter");
             }
-            if storage_class.is_some() {
-                shadow.push("--storage-class");
-            }
             if vfs_write_wait != 1 {
                 shadow.push("--vfs-write-wait");
             }
@@ -636,6 +666,14 @@ fn main() -> anyhow::Result<()> {
                         return Err(anyhow::anyhow!("--opt value must be KEY=VAL, got: {kv:?}"));
                     }
                 }
+            }
+            // --storage-class is consumed by the S3 backend builder
+            // (see `build_s3` in src/cmd/mount.rs). Plumb it through
+            // the same opts channel as `--opt storage-class=...` so
+            // the wiring matches every other backend-config key.
+            // Non-S3 backends silently ignore this key.
+            if let Some(sc) = storage_class.as_deref() {
+                opts.insert("storage-class".to_string(), sc.to_string());
             }
             mntrs::cmd::mount::mount(
                 &storage,
@@ -695,6 +733,8 @@ fn main() -> anyhow::Result<()> {
                 noapple_double,
                 noapple_xattr,
                 no_macos_metadata,
+                metadata,
+                _no_metadata,
                 hash_filter,
                 mount_case_insensitive,
                 negative_vncache,
