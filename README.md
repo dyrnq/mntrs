@@ -270,9 +270,12 @@ that are accepted on the CLI but not yet implemented — see
 
 ### Object Metadata (xattr)
 
-mntrs exposes backend object metadata as FUSE extended attributes on every
-file. The attribute names follow [rclone's `--metadata`](https://rclone.org/docs/#metadata)
-convention so any tool written for rclone just works:
+mntrs exposes backend object metadata as FUSE extended attributes on
+every file **when `--metadata` is passed** (default **off**, matching
+`rclone mount` parity — rclone also defaults `--metadata` to false in
+`mount` and true in `serve`). The attribute names follow
+[rclone's `--metadata`](https://rclone.org/docs/#metadata) convention
+so any tool written for rclone just works:
 
 | xattr name | Source | Notes |
 |------------|--------|-------|
@@ -281,6 +284,12 @@ convention so any tool written for rclone just works:
 | `user.mtime` | backend `Last-Modified` | ISO-8601 |
 | `user.content_length` | backend object size | decimal bytes |
 | `user.<key>` | backend user metadata | key is normalized: lowercased, dots replaced with underscores (macOS FUSE rejects dots in xattr names) |
+
+**Default is off** to match `rclone mount`. Pass `--metadata` to enable,
+or `--no-metadata` to explicitly disable (accepted for rclone-script
+parity; equivalent to omitting `--metadata`). When disabled, `getxattr`
+returns `ENOSYS` and `listxattr` returns the empty list — avoiding the
+per-call backend `stat()` round-trip the surface otherwise requires.
 
 `listxattr` returns only the attributes the backend actually populated
 for the object — empty for directories, and on backends without an
