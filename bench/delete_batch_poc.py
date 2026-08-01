@@ -89,24 +89,27 @@ def test_batched(prefix, chunk_size):
 
 
 def main():
+    # `global` must precede any reference to `s3` in this function
+    # (Python SyntaxError otherwise). Declare first, then use.
+    global s3
+
     print(f"=== S3 DELETE: boto3 (Go SDK) vs opendal (Rust) ===")
     print(f"  endpoint: {ENDPOINT}")
     print(f"  bucket:   {BUCKET}")
     print(f"  n files:  {N}")
     print()
 
-    # Ensure bucket exists (don't reference `s3` in except — it
-    # shadows the module-level binding and triggers
-    # UnboundLocalError when the create raises).
+    # Ensure bucket exists. boto3 raises many specific exception
+    # classes (BucketAlreadyOwnedByYou, BucketAlreadyExists, etc.) —
+    # catch broad Exception and swallow on first call.
     try:
         s3.create_bucket(Bucket=BUCKET)
     except Exception:
-        # bucket may already exist; boto3 raises many specific
-        # exception classes — just swallow on the first call.
         pass
 
-    # Make sure we have a fresh pool
-    global s3
+    # Rebuild the client — gives us a clean connection pool
+    # (the create_bucket call may have left state on the first
+    # client we used for setup).
     s3 = boto3.client(
         "s3",
         endpoint_url=ENDPOINT,
