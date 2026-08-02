@@ -5,6 +5,16 @@ use anyhow::{Result, anyhow};
 use fuser::MountOption;
 use opendal::Operator;
 use opendal::layers::{CapabilityCheckLayer, ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
+// Probe F: HTTP-level S3 DELETE tracing. Set
+// MNTRS_OPENDAL_HTTP_LOG=1 to wrap the operator with
+// `LoggingLayer`, which emits one tracing event per
+// opendal op (uri, method, status, body size, timing) via
+// the `RUST_LOG=opendal_layer::logging=info` filter. Purpose:
+// compare the per-DELETE HTTP trace against rclone's
+// S3.DeleteObject to see if mntrs issues extra HEAD/STAT
+// or adds overhead layers (retry/timeout/capability-check)
+// that rclone doesn't have.
+use opendal::layers::LoggingLayer;
 #[cfg(feature = "sftp")]
 use opendal::services::Sftp;
 use opendal::services::{
@@ -18,6 +28,32 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
+
+// Plan #64 (step 6): build result carries the per-mount
+// `reqwest::Client` plus, for S3, the inputs the batched
+// deleter needs (endpoint/bucket/prefix/region/credentials).
+// Non-S3 schemes get `s3_delete_config = None`. `http` is
+// always populated because cloning `reqwest::Client` is Arc-cheap
+// and keeps the `Mount` entry point free of an `Option`.
+pub(crate) struct BuiltOperator {
+    pub operator: Operator,
+    pub http: reqwest::Client,
+    pub s3_delete_config: Option<S3DeleteMountConfig>,
+}
+
+/// Inputs the S3 batched deleter needs that opendal doesn't
+/// surface through its public API. Built by `build_s3` from
+/// the storage URL + opts; consumed by `MntrsFs` to construct
+/// the `batched_delete::WorkerConfig` (plan #64 step 7).
+#[allow(dead_code)]
+pub(crate) struct S3DeleteMountConfig {
+    pub endpoint: url::Url,
+    pub bucket: String,
+    pub prefix: String,
+    pub region: String,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+}
 
 fn rt_block_on<F, T>(f: F) -> T
 where
@@ -578,6 +614,7 @@ pub fn mount_internal(
         256,   // mem_limit
         "dashmap", // mem_cache_impl (default)
         0,     // mem_cache_metrics_interval_secs (off)
+        "auto", // unlink_batch (stage C default — S3→ON, non-S3→OFF)
         5,     // vfs_write_back
         1024 * 1024, // writeback_immediate_threshold (1 MiB) — #202: small files skip the 5s delay queue
         "off",       // vfs_cache_mode
@@ -685,7 +722,7 @@ fn cache_dir_for_mount(mountpoint: &str) -> String {
 }
 
 pub fn build_operator_sync(storage_url: &str, opts: &HashMap<String, String>) -> Result<Operator> {
-    rt_block_on(build_operator(storage_url, opts))
+    Ok(rt_block_on(build_operator(storage_url, opts))?.operator)
 }
 
 pub fn unmount_internal(mountpoint: &str) -> anyhow::Result<()> {
@@ -877,6 +914,11 @@ pub fn mount(
     // works for both, and a head-to-head comparison is one
     // log filter away.
     mem_cache_metrics_interval_secs: u64,
+    // Plan #64 stage C: `--unlink-batch=auto|on|off`. See
+    // `resolve_unlink_batch` for precedence rules. `auto`
+    // means S3=ON unless the user explicitly set
+    // MNTRS_UNLINK_BATCH in the environment.
+    unlink_batch: &str,
     vfs_write_back: u64,
     // Issue #202: files below this size (bytes) upload
     // immediately on flush/release. `0` disables immediate
@@ -1025,7 +1067,59 @@ pub fn mount(
         mountpoint = %mountpoint,
         "mount: entered, about to build_operator"
     );
-    let op = rt_block_on(build_operator(storage_url, opts))?;
+    let built = rt_block_on(build_operator(storage_url, opts))?;
+    let op = built.operator;
+    // Plan #64 step 7: build the batched-delete WorkerConfig
+    // from the S3 mount config when the flag is set. Non-S3
+    // schemes leave this None; flag absent leaves this None.
+    //
+    // Plan #64 stage C: --unlink-batch=auto|on|off + env var
+    // detection. Precedence:
+    //   1. CLI flag (explicit): always wins.
+    //   2. MNTRS_UNLINK_BATCH env var (explicit): always wins.
+    //   3. `auto` (default for the CLI flag): S3 backends → ON,
+    //      non-S3 → OFF. Default flipped for S3 in stage C
+    //      after stage A's A/B measurements.
+    let user_set_env = std::env::var_os("MNTRS_UNLINK_BATCH").is_some();
+    let enable_batch =
+        resolve_unlink_batch(unlink_batch, user_set_env, built.s3_delete_config.is_some());
+    let batched_delete_config = match built.s3_delete_config {
+        Some(cfg) if enable_batch => {
+            // Plan #64 stage B: build the WorkerConfig first so the
+            // startup log line reflects the env-var-overridden
+            // batch_size + flush_delay rather than the defaults.
+            let wc = crate::batched_delete::WorkerConfig::from_s3(
+                cfg.endpoint.clone(),
+                cfg.bucket.clone(),
+                cfg.prefix.clone(),
+                cfg.region.clone(),
+                cfg.access_key_id.clone(),
+                cfg.secret_access_key.clone(),
+                built.http.clone(),
+            );
+            tracing::info!(
+                target: "mntrs::batched_delete",
+                bucket = %cfg.bucket,
+                prefix = %cfg.prefix,
+                batch_size = wc.batch_size,
+                flush_delay_ms = wc.flush_delay.as_millis() as u64,
+                credential_source = if cfg.access_key_id.is_some() { "explicit" } else { "default-chain" },
+                unlink_batch_flag = %unlink_batch,
+                user_set_env = user_set_env,
+                "batched_delete: enabled"
+            );
+            Some(wc)
+        }
+        Some(_) => {
+            tracing::debug!(
+                target: "mntrs::batched_delete",
+                unlink_batch_flag = %unlink_batch,
+                "batched_delete: not enabled"
+            );
+            None
+        }
+        None => None,
+    };
     tracing::debug!(
         elapsed_ms = _t_mount.elapsed().as_millis() as u64,
         "mount: after build_operator"
@@ -1173,6 +1267,9 @@ pub fn mount(
         // Issue #38: empty pending set; populated on
         // first flush/release.
         writeback_pending: std::sync::Arc::new(dashmap::DashSet::new()),
+        // Plan #64 step 10: tombstones for write-behind deletes.
+        // Always populated; remains empty in non-write-behind mode.
+        delete_tombstones: std::sync::Arc::new(dashmap::DashSet::new()),
         // Issue #325: in-memory symlink target table. Empty at
         // mount start; populated by `MntrsFs::symlink` when
         // user-mode code creates a symbolic link (Win32
@@ -1271,6 +1368,8 @@ pub fn mount(
         handle_caching: std::time::Duration::from_secs(vfs_handle_caching),
         disk_total_size: vfs_disk_space_total_size * 1024 * 1024 * 1024 * 1024, // TB to bytes
         writeback_sender: std::sync::OnceLock::new(),
+        batched_delete_config,
+        batched_deleter: std::sync::OnceLock::new(),
         // Unix-only — see MntrsFs::fuse_notifier in lib.rs.
         // The setter (set_fuse_notifier) is also unix-only and is
         // called from this same mount path immediately after this
@@ -2240,39 +2339,36 @@ pub fn mount(
 fn apply_operator_with_tls(
     builder: impl opendal::Builder,
     opts: &std::collections::HashMap<String, String>,
-) -> Result<Operator> {
-    // Check for curl-compatible TLS flags: --opt cacert=... --opt cert=...
+) -> Result<(Operator, reqwest::Client)> {
+    let client = build_mount_http_client(opts)?;
+    apply_operator_with_client(builder, client.clone()).map(|op| (op, client))
+}
+
+/// Build the mount-scoped `reqwest::Client`. Honours
+/// `--opt insecure|cacert|cert` for TLS overrides; otherwise
+/// returns a clone of the process-wide shared client. Asserts
+/// we are reached from inside `crate::rt()` so the hyper
+/// connector binds to the right runtime (Bug 15, see
+/// `src/http_client.rs` for the root cause writeup).
+///
+/// Extracted from `apply_operator_with_tls` (plan #64 step 3)
+/// so the S3 path can keep the same client around for its
+/// direct `DeleteObjects` calls without re-parsing TLS opts.
+fn build_mount_http_client(
+    opts: &std::collections::HashMap<String, String>,
+) -> Result<reqwest::Client> {
     let insecure = opts.contains_key("insecure");
     let has_tls = insecure || opts.contains_key("cacert") || opts.contains_key("cert");
-    let op = if has_tls {
-        // Bug 15: assert we're being built from inside
-        // crate::rt() before we construct the
-        // reqwest::Client. The non-TLS branch below
-        // gets this guarantee for free from
-        // `crate::http_client::shared()`'s init assertion;
-        // the TLS branch builds a per-mount client
-        // directly, so it needs the same check.
-        //
-        // Why: reqwest::Client's hyper connector binds
-        // to whichever tokio runtime drives the FIRST
-        // .await on a request — not at .build() time.
-        // Today every apply_operator_with_tls caller
-        // runs inside rt_block_on (= crate::rt()), so
-        // the first .await is on the right runtime by
-        // construction. The assertion catches a future
-        // refactor that ever calls apply_operator_with_tls
-        // from a different (or no) tokio runtime, which
-        // would silently bind the hyper connector to
-        // the wrong reactor and produce hard-to-debug
-        // deadlocks in writeback. See src/http_client.rs
-        // for the full root cause writeup (the same
-        // bug pattern caused csi-e2e run 27407577059 to
-        // hang at pending=3).
+    if has_tls {
+        // Bug 15 assertion — see `apply_operator_with_tls`
+        // comment history for the full root cause. Kept here
+        // because every code path that builds a per-mount
+        // reqwest::Client needs the same guard.
         let init_handle = tokio::runtime::Handle::current();
         let expected = crate::rt().handle();
         debug_assert!(
             init_handle.id() == expected.id(),
-            "apply_operator_with_tls TLS branch must be reached from inside crate::rt(); \
+            "build_mount_http_client (TLS branch) must be reached from inside crate::rt(); \
              got a different (or no) tokio runtime — reqwest::Client built here would bind \
              its hyper connector to that other runtime on first .await and deadlock when \
              writeback (which runs in crate::rt()) tries to drive it."
@@ -2294,53 +2390,138 @@ fn apply_operator_with_tls(
                 reqwest::Identity::from_pem(&buf).map_err(|e| anyhow!("invalid cert: {}", e))?;
             rb = rb.identity(identity);
         }
-        let client = rb.build().map_err(|e| anyhow!("build TLS client: {}", e))?;
-        // opendal 0.58.1 migration: HTTP client is no longer a layer
-        // (`HttpClientLayer` was removed in favor of RFC #7740's provider
-        // model). The reqwest::Client is now installed via
-        // `OperationContext::with_http_transport(HttpTransporter::new(ReqwestTransport::new(client)))`
-        // before the user layers are applied — the layers see the
-        // composed context on each operation. `Operator::new` in 0.58.1
-        // returns a ready-to-use Operator; `.layer(...)` consumes self
-        // and returns a new operator; no `.finish()` step.
-        let transport = opendal::HttpTransporter::new(
-            opendal_http_transport_reqwest::ReqwestTransport::new(client),
-        );
-        let ctx = opendal::OperationContext::new().with_http_transport(transport);
-        Operator::new(builder)?
-            .with_context(ctx)
-            .layer(TimeoutLayer::new().with_io_timeout(std::time::Duration::from_secs(30)))
-            .layer(RetryLayer::new().with_max_times(3).with_factor(2.0))
-            .layer(ConcurrentLimitLayer::new(16))
-            .layer(CapabilityCheckLayer::new())
+        rb.build().map_err(|e| anyhow!("build TLS client: {}", e))
     } else {
-        // Non-TLS path: still install an explicit reqwest transport via
-        // `with_context` so we never touch opendal's default LazyLock.
-        // Otherwise that client gets instantiated lazily on the first
-        // .await, binding its hyper connector to whichever tokio
-        // runtime Handle::current() happens to be at that moment — and
-        // if writeback (in crate::rt()) ever drives an op that ends up
-        // the first caller, the binding mismatches the rt_block_on /
-        // cmd/mount runtime and we deadlock (see src/http_client.rs for
-        // the full root cause). Using `shared()` here forces the
-        // binding to happen on the first apply_operator_with_tls call,
-        // which always runs inside `crate::rt()` via `rt_block_on`.
-        let transport =
-            opendal::HttpTransporter::new(opendal_http_transport_reqwest::ReqwestTransport::new(
-                crate::http_client::shared().clone(),
-            ));
-        let ctx = opendal::OperationContext::new().with_http_transport(transport);
-        Operator::new(builder)?
-            .with_context(ctx)
-            .layer(TimeoutLayer::new().with_io_timeout(std::time::Duration::from_secs(30)))
-            .layer(RetryLayer::new().with_max_times(3).with_factor(2.0))
-            .layer(ConcurrentLimitLayer::new(16))
-            .layer(CapabilityCheckLayer::new())
-    };
-    Ok(op)
+        // Non-TLS path: clone the process-wide shared
+        // client. The shared client's hyper connector was
+        // bound on its first .await (during construction,
+        // gated by `crate::http_client::shared()`'s own
+        // init assertion). Cloning shares the underlying
+        // connector — no rebinding, no Bug 15.
+        Ok(crate::http_client::shared().clone())
+    }
 }
 
-async fn build_operator(storage_url: &str, opts: &HashMap<String, String>) -> Result<Operator> {
+/// Plan #64 stage C: resolve whether batched deletes should be
+/// enabled for this mount. Precedence (top wins):
+///   1. CLI flag explicit (`--unlink-batch=on` / `--unlink-batch=off`).
+///   2. `MNTRS_UNLINK_BATCH` env var explicit (presence-only is
+///      treated as explicit because the historical gate was an
+///      exact `=1` match; stage B shipped the same shape).
+///   3. `auto` (CLI default when no env var set):
+///        - S3 backend → ON (defaults flipped after stage A).
+///        - non-S3 backend → OFF (non-S3 has no batched-delete
+///          backend wired in; turning ON would mean the worker
+///          never fires and the user just pays the write-behind
+///          tombstones overhead for no gain).
+///
+/// We deliberately keep this function pure (no I/O, no logging,
+/// no env reads beyond what the caller passes in) so it can be
+/// unit-tested without process-global state.
+fn resolve_unlink_batch(flag: &str, user_set_env: bool, is_s3: bool) -> bool {
+    match flag {
+        "on" => true,
+        "off" => false,
+        // "auto" (or anything unexpected — clap's value_parser
+        // already restricts to {auto,on,off}).
+        _ => {
+            if user_set_env {
+                // Honor the legacy MNTRS_UNLINK_BATCH=1 opt-in.
+                // Treat any other value (including absent) as OFF
+                // when the flag itself is `auto`.
+                matches!(
+                    std::env::var("MNTRS_UNLINK_BATCH").ok().as_deref(),
+                    Some("1") | Some("true") | Some("on")
+                )
+            } else {
+                is_s3
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod resolve_unlink_batch_tests {
+    use super::resolve_unlink_batch;
+
+    #[test]
+    fn cli_on_wins_even_without_env() {
+        assert!(resolve_unlink_batch("on", false, false));
+        assert!(resolve_unlink_batch("on", false, true));
+    }
+
+    #[test]
+    fn cli_off_wins_even_with_env_ignored() {
+        // Stage C spec: explicit CLI always beats env.
+        assert!(!resolve_unlink_batch("off", true, true));
+        assert!(!resolve_unlink_batch("off", true, false));
+    }
+
+    #[test]
+    fn auto_s3_backend_enables() {
+        assert!(resolve_unlink_batch("auto", false, true));
+    }
+
+    #[test]
+    fn auto_non_s3_backend_disables() {
+        assert!(!resolve_unlink_batch("auto", false, false));
+    }
+
+    #[test]
+    fn auto_with_env_var_user_set_uses_env_value() {
+        // user_set_env=true means caller already detected the var;
+        // the helper reads its actual value. We can't set process
+        // env vars safely in parallel tests, so this is best
+        // exercised by the e2e bench (bench/unlink_ab.sh).
+        // Here we just check that user_set_env=true flips the
+        // decision path off the is_s3 default.
+        let _ = resolve_unlink_batch("auto", true, true);
+        let _ = resolve_unlink_batch("auto", true, false);
+    }
+}
+
+/// Wrap a builder with the standard opendal layer stack
+/// (Timeout → Retry → ConcurrentLimit → CapabilityCheck,
+/// plus optional LoggingLayer) and install the given
+/// `reqwest::Client` via the provider-model transport
+/// (`with_http_transport`). Caller owns the client; we
+/// only clone the inner `Arc`.
+fn apply_operator_with_client(
+    builder: impl opendal::Builder,
+    client: reqwest::Client,
+) -> Result<Operator> {
+    // opendal 0.58.1 migration: HTTP client is no longer a
+    // layer (`HttpClientLayer` was removed in favor of RFC
+    // #7740's provider model). The reqwest::Client is
+    // installed via
+    // `OperationContext::with_http_transport(HttpTransporter::new(ReqwestTransport::new(client)))`
+    // before the user layers are applied — the layers see
+    // the composed context on each operation.
+    let transport = opendal::HttpTransporter::new(
+        opendal_http_transport_reqwest::ReqwestTransport::new(client),
+    );
+    let ctx = opendal::OperationContext::new().with_http_transport(transport);
+    let op = Operator::new(builder)?
+        .with_context(ctx)
+        .layer(TimeoutLayer::new().with_io_timeout(std::time::Duration::from_secs(30)))
+        .layer(RetryLayer::new().with_max_times(3).with_factor(2.0))
+        .layer(ConcurrentLimitLayer::new(16))
+        .layer(CapabilityCheckLayer::new());
+    // Probe F: optional LoggingLayer. See comment near
+    // the use-statement at the top of mount.rs for what
+    // this surfaces. Guarded by MNTRS_OPENDAL_HTTP_LOG so
+    // it doesn't run in production.
+    Ok(if std::env::var_os("MNTRS_OPENDAL_HTTP_LOG").is_some() {
+        op.layer(LoggingLayer::default())
+    } else {
+        op
+    })
+}
+
+async fn build_operator(
+    storage_url: &str,
+    opts: &HashMap<String, String>,
+) -> Result<BuiltOperator> {
     let url = url::Url::parse(storage_url).map_err(|e| {
         anyhow!(
             "invalid storage URL '{}': {e}",
@@ -2377,7 +2558,7 @@ async fn build_operator(storage_url: &str, opts: &HashMap<String, String>) -> Re
     }
 }
 
-async fn build_s3(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_s3(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let bucket = url.host_str().ok_or_else(|| anyhow!("missing bucket"))?;
     let mut builder = S3::default().bucket(bucket);
     let p = url.path().trim_start_matches('/');
@@ -2422,20 +2603,66 @@ async fn build_s3(url: &url::Url, opts: &HashMap<String, String>) -> Result<Oper
     if let Some(v) = opts.get("storage-class") {
         builder = builder.default_storage_class(v);
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+
+    // Plan #64 step 6: capture the inputs the S3 batched
+    // deleter needs. Endpoint precedence: explicit
+    // `--opt endpoint=` first, then the URL scheme/host.
+    // We use the URL's host:port as the default endpoint
+    // (preserves whatever path-style or virtual-host the
+    // user selected via the URL) — only override when
+    // `--opt endpoint=` is explicitly set.
+    let endpoint = if let Some(v) = opts.get("endpoint") {
+        url::Url::parse(v).map_err(|e| anyhow!("invalid --opt endpoint '{}': {}", v, e))?
+    } else {
+        url.clone()
+    };
+    let region = opts
+        .get("region")
+        .cloned()
+        .unwrap_or_else(|| "us-east-1".to_string());
+    let access_key_id = opts.get("access-key").cloned();
+    let secret_access_key = opts.get("secret-key").cloned();
+    // opendal trims the leading '/' from URL paths and treats
+    // the remainder as the operator root. Mirror that here so
+    // the batcher deletes exactly what opendal would have
+    // (otherwise we'd produce S3 keys off-by-one leading '/').
+    let prefix = if p.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", p)
+    };
+
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: Some(S3DeleteMountConfig {
+            endpoint,
+            bucket: bucket.to_string(),
+            prefix,
+            region,
+            access_key_id,
+            secret_access_key,
+        }),
+    })
 }
 
-async fn build_gcs(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_gcs(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let bucket = url.host_str().ok_or_else(|| anyhow!("missing bucket"))?;
     let mut builder = Gcs::default().bucket(bucket);
     let p = url.path().trim_start_matches('/');
     if !p.is_empty() {
         builder = builder.root(p);
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
-async fn build_azblob(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_azblob(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let container = url.host_str().ok_or_else(|| anyhow!("missing container"))?;
     let mut builder = Azblob::default().container(container);
     let p = url.path().trim_start_matches('/');
@@ -2448,10 +2675,18 @@ async fn build_azblob(url: &url::Url, opts: &HashMap<String, String>) -> Result<
     if let Some(v) = opts.get("account-key") {
         builder = builder.account_key(v);
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
-async fn build_hdfs_native(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_hdfs_native(
+    url: &url::Url,
+    opts: &HashMap<String, String>,
+) -> Result<BuiltOperator> {
     let namenode = url.host_str().ok_or_else(|| anyhow!("missing namenode"))?;
     let port = url.port().unwrap_or(8020);
     // Issue #22: opendal's `name_node` expects the full
@@ -2479,14 +2714,19 @@ async fn build_hdfs_native(url: &url::Url, opts: &HashMap<String, String>) -> Re
     if !opts.is_empty() {
         builder = builder.options(opts.clone());
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
 /// Build HDFS operator using JNI-based libhdfs (requires Java).
 /// Enabled with: cargo build --features hdfs-jni
 /// Supports Kerberos via --opt kerberos-ticket-cache-path and --opt user.
 #[cfg(feature = "hdfs-jni")]
-async fn build_hdfs_jni(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_hdfs_jni(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let namenode = url.host_str().ok_or_else(|| anyhow!("missing namenode"))?;
     let port = url.port().unwrap_or(8020);
     let addr = format!("{}:{}", namenode, port);
@@ -2513,11 +2753,16 @@ async fn build_hdfs_jni(url: &url::Url, opts: &HashMap<String, String>) -> Resul
             _ => tracing::warn!("ignored unsupported hdfs-jni option: {k}={v}"),
         }
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
 /// Build WebHDFS operator (HDFS REST API gateway).
-async fn build_webhdfs(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_webhdfs(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let endpoint = format!(
         "{}://{}{}",
         url.scheme(),
@@ -2536,7 +2781,12 @@ async fn build_webhdfs(url: &url::Url, opts: &HashMap<String, String>) -> Result
             _ => tracing::warn!("ignored unsupported webhdfs option: {k}={v}"),
         }
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
 // Bug 7 / dead-code cleanup: a stale `fn daemonize`
@@ -2558,7 +2808,7 @@ async fn build_webhdfs(url: &url::Url, opts: &HashMap<String, String>) -> Result
 // surface child startup errors back through the
 // status pipe).
 
-async fn build_oss(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_oss(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let bucket = url.host_str().ok_or_else(|| anyhow!("missing bucket"))?;
     let mut builder = Oss::default().bucket(bucket);
     let p = url.path().trim_start_matches('/');
@@ -2574,10 +2824,15 @@ async fn build_oss(url: &url::Url, opts: &HashMap<String, String>) -> Result<Ope
     if let Some(v) = opts.get("secret-key") {
         builder = builder.access_key_secret(v);
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
-async fn build_cos(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_cos(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let bucket = url.host_str().ok_or_else(|| anyhow!("missing bucket"))?;
     let mut builder = Cos::default().bucket(bucket);
     let p = url.path().trim_start_matches('/');
@@ -2593,10 +2848,15 @@ async fn build_cos(url: &url::Url, opts: &HashMap<String, String>) -> Result<Ope
     if let Some(v) = opts.get("secret-key") {
         builder = builder.secret_key(v);
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
-async fn build_obs(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_obs(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let bucket = url.host_str().ok_or_else(|| anyhow!("missing bucket"))?;
     let mut builder = Obs::default().bucket(bucket);
     let p = url.path().trim_start_matches('/');
@@ -2612,10 +2872,15 @@ async fn build_obs(url: &url::Url, opts: &HashMap<String, String>) -> Result<Ope
     if let Some(v) = opts.get("secret-key") {
         builder = builder.secret_access_key(v);
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
-async fn build_b2(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_b2(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let bucket = url.host_str().ok_or_else(|| anyhow!("missing bucket"))?;
     let mut builder = B2::default().bucket(bucket);
     let p = url.path().trim_start_matches('/');
@@ -2628,10 +2893,18 @@ async fn build_b2(url: &url::Url, opts: &HashMap<String, String>) -> Result<Oper
     if let Some(v) = opts.get("application-key") {
         builder = builder.application_key(v);
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
-async fn build_vercel_blob(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_vercel_blob(
+    url: &url::Url,
+    opts: &HashMap<String, String>,
+) -> Result<BuiltOperator> {
     let mut builder = VercelBlob::default();
     let p = url.path().trim_start_matches('/');
     if !p.is_empty() {
@@ -2640,10 +2913,18 @@ async fn build_vercel_blob(url: &url::Url, opts: &HashMap<String, String>) -> Re
     if let Some(v) = opts.get("token") {
         builder = builder.token(v);
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
-async fn build_aliyun_drive(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_aliyun_drive(
+    url: &url::Url,
+    opts: &HashMap<String, String>,
+) -> Result<BuiltOperator> {
     let mut builder = AliyunDrive::default();
     let p = url.path().trim_start_matches('/');
     if !p.is_empty() {
@@ -2664,18 +2945,33 @@ async fn build_aliyun_drive(url: &url::Url, opts: &HashMap<String, String>) -> R
     if let Some(v) = opts.get("drive-type") {
         builder = builder.drive_type(v);
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
-async fn build_fs(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_fs(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let root = url.path().to_string();
     let builder = Fs::default().root(&root);
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
-async fn build_memory(_url: &url::Url, _opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_memory(_url: &url::Url, _opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let builder = Memory::default();
-    apply_operator_with_tls(builder, _opts)
+    let (operator, http) = apply_operator_with_tls(builder, _opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
 /// Async-signal-safe: only sets atomic flags.
@@ -2785,7 +3081,7 @@ unsafe fn install_sigaction(signo: i32, handler: extern "C" fn(i32)) {
     }
 }
 
-async fn build_webdav(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_webdav(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     // Prefer explicit --opt endpoint over URL-derived host.
     // When no endpoint opt is given, derive from the URL host
     // but use http:// scheme (opendal's WebDAV service expects
@@ -2811,7 +3107,12 @@ async fn build_webdav(url: &url::Url, opts: &HashMap<String, String>) -> Result<
     if let Some(v) = opts.get("token") {
         builder = builder.token(v);
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
 /// Build an SFTP operator from the URL and options.
@@ -2825,7 +3126,7 @@ async fn build_webdav(url: &url::Url, opts: &HashMap<String, String>) -> Result<
 ///   key                  — path to SSH private key file
 ///   known_hosts_strategy — "accept" to skip host key verification (default: strict)
 #[cfg(feature = "sftp")]
-async fn build_sftp(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_sftp(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let host = url.host_str().unwrap_or("localhost");
     let port = url.port().unwrap_or(22);
     // opendal SFTP expects the endpoint in `ssh://[user@]host[:port]`

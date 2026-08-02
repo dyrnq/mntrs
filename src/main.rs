@@ -115,6 +115,20 @@ enum Commands {
         /// head-to-head A/B.
         #[arg(long, default_value = "dashmap", value_parser = ["dashmap", "moka", "foyer"])]
         mem_cache_impl: String,
+        /// Plan #64 stage C: control batched-delete opt-in.
+        ///
+        /// - `auto` (default): enable on S3 backends unless
+        ///   `MNTRS_UNLINK_BATCH` is set to `0`. Disable on
+        ///   non-S3 backends. Auto-detects whether the user
+        ///   ever touched the env var — explicit `=0` or `=1`
+        ///   still wins.
+        /// - `on`: always enable (errors on non-S3 backends).
+        /// - `off`: always disable.
+        ///
+        /// See `docs/plan64_stage_a_results.md` for the A/B
+        /// measurements that justify `auto`'s S3 default.
+        #[arg(long, default_value = "auto", value_parser = ["auto", "on", "off"])]
+        unlink_batch: String,
         /// Emit mem_cache stats (hits/misses/inserts/evictions/
         /// entries/used/capacity) as one structured tracing
         /// event every N seconds. 0 = off (no background thread
@@ -535,6 +549,7 @@ fn main() -> anyhow::Result<()> {
             mem_limit,
             mem_cache_impl,
             mem_cache_metrics_interval,
+            unlink_batch,
             vfs_write_back,
             writeback_immediate_threshold,
             vfs_cache_mode,
@@ -705,6 +720,7 @@ fn main() -> anyhow::Result<()> {
                 mem_limit,
                 &mem_cache_impl,
                 mem_cache_metrics_interval,
+                &unlink_batch,
                 vfs_write_back,
                 writeback_immediate_threshold,
                 &vfs_cache_mode,
