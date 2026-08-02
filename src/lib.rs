@@ -1616,7 +1616,6 @@ impl MntrsFs {
     /// can `.await` this without nesting — which would panic
     /// with `Cannot start a runtime from within a runtime`.
     /// Sync callers wrap with `crate::rt().block_on(...)`.
-    #[allow(dead_code)]
     pub(crate) async fn delete_backend_strict(
         &self,
         path: &str,
@@ -1659,7 +1658,6 @@ impl MntrsFs {
     /// callers drop it, treating the FUSE callback success as
     /// the user-visible outcome. Per-key S3 failures are logged
     /// but not propagated.
-    #[allow(dead_code)]
     pub(crate) fn enqueue_backend_delete(
         &self,
         path: &str,
