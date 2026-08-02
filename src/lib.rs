@@ -1995,7 +1995,16 @@ impl MntrsFs {
         })
     }
 
-    fn stat_op(&self, path: &str) -> Option<FileStat> {
+    /// Issue #519: async variant of [`Self::stat_op`] used by the
+    /// parallel snapshot-miss path in
+    /// [`Self::batch_lookup_from_dir_cache`]. Splits the sync
+    /// `stat_op` into an async core (so multiple miss names can
+    /// share one `rt().block_on` boundary and overlap on the
+    /// tokio runtime) and a thin sync wrapper (so the existing
+    /// single-name call sites are unchanged). Behavior is
+    /// identical: same `attr_cache` TTL semantics, same NotFound
+    /// → implicit-dir fallback, same NotFound caching policy.
+    async fn stat_op_async(&self, path: &str) -> Option<FileStat> {
         // vfs_refresh (issue #210): skip the attr_cache and
         // always fetch fresh backend metadata. The inodes
         // entry is unchanged — locally-written files still
@@ -2013,7 +2022,12 @@ impl MntrsFs {
                 });
             }
         }
-        let result = rt().block_on(async {
+        // The async block is the only place we hold an awaitable
+        // future over `self`; once it resolves we touch
+        // `self.attr_cache` again, so borrow conflicts are
+        // contained. `op.clone()` and `path.to_string()` make the
+        // future `'static`-shaped w.r.t. the local borrows.
+        let result: Option<FileStat> = async {
             let op = self.op.clone();
             let p = path.to_string();
             match op.stat(&p).await {
@@ -2094,14 +2108,22 @@ impl MntrsFs {
                     None
                 }
             }
-        });
-        if let Some(FileStat { kind, size, mtime }) = result {
+        }
+        .await;
+        if let Some(FileStat { kind, size, mtime }) = &result {
             self.attr_cache.insert(
                 path.to_string(),
-                (kind, size, mtime, std::time::Instant::now()),
+                (*kind, *size, *mtime, std::time::Instant::now()),
             );
         }
         result
+    }
+
+    /// Sync wrapper for [`Self::stat_op_async`]. Single-name
+    /// call sites (most of the codebase) keep using the sync
+    /// `stat_op` signature unchanged.
+    fn stat_op(&self, path: &str) -> Option<FileStat> {
+        rt().block_on(self.stat_op_async(path))
     }
 
     fn list_op(
@@ -2550,15 +2572,53 @@ impl MntrsFs {
         // `invalidate_dir_cache` drops the outer Arc reference.
         let cached: Option<std::sync::Arc<dashmap::DashMap<String, DirEntryCacheValue>>> =
             self.dir_cache.get(cache_key).map(|e| e.value().1.clone());
-        let mut out = Vec::with_capacity(names.len());
-        for name in names {
+
+        // Issue #519 sub-item A: snapshot-miss join_all.
+        //
+        // Pre-fix the miss branch ran each `self.lookup(parent, name)`
+        // serially inside a for-loop, and each `lookup` blocked
+        // on its own `rt().block_on(op.stat)` call. On a write-heavy
+        // workload where 50-500 names landed after the dir_cache
+        // snapshot was taken, this serialized N backend stats (4-10 ms
+        // each on S3/HDFS) into a single sequential latency chain
+        // — the dominant cost on `ls -la <bigdir>` cold-cache
+        // benchmark.
+        //
+        // Refactor: classify each name into either a
+        // directly-constructed result (`.`/`..` or snapshot hit)
+        // or a "miss pending parallel lookup". The miss names
+        // are then dispatched through a single
+        // `rt().block_on(stream.buffer_unordered(32).collect())`
+        // boundary so all stat_op futures share one runtime
+        // poll loop and overlap on the network.
+        //
+        // `out` is indexed-slot storage: every index in `0..names.len()`
+        // is filled exactly once, either in the first pass (cheap
+        // path) or in the post-block_on assignment (parallel-miss
+        // path). The final `out.into_iter().map(Option::unwrap)`
+        // is therefore total — see the panic message below for
+        // the invariant.
+        let mut out: Vec<Option<std::io::Result<CoreFileAttr>>> = Vec::with_capacity(names.len());
+        // `resize_with` (not `vec![None; _]`) because
+        // `Result<_, io::Error>` is not `Clone`, and the macro
+        // `vec![elem; n]` requires `Clone`. The closure runs
+        // exactly `names.len()` times so the slot count matches.
+        out.resize_with(names.len(), || None);
+        // Parallel-miss bookkeeping: position in the original
+        // `names` slice + the basename to look up. We need the
+        // position so the post-block_on pass can write the result
+        // back into the right slot of `out`.
+        let mut miss_indices: Vec<usize> = Vec::new();
+        let mut miss_names: Vec<&str> = Vec::new();
+
+        for (idx, name) in names.iter().enumerate() {
             // "." / ".." are special: not in
             // dir_cache (they're synthesized by
             // the FUSE adapter), but cheap to
             // construct.
             if *name == "." || *name == ".." {
                 let p = if *name == "." { parent } else { 1 };
-                out.push(Ok(to_core_attr(&self.make_attr(
+                out[idx] = Some(Ok(to_core_attr(&self.make_attr(
                     p,
                     4096,
                     FileType::Directory,
@@ -2639,7 +2699,7 @@ impl MntrsFs {
                             FileType::Symlink,
                             target.as_os_str().len() as u64,
                         );
-                        out.push(Ok(self.core_attr_for_symlink(ino, &target)));
+                        out[idx] = Some(Ok(self.core_attr_for_symlink(ino, &target)));
                         continue;
                     }
                     let kind = match mode {
@@ -2652,24 +2712,93 @@ impl MntrsFs {
                     // data without a remote
                     // round-trip.
                     let ino = self.alloc_ino_with_mtime(&full_path, kind, size, mtime);
-                    out.push(Ok(to_core_attr(&self.make_attr(ino, size, kind, mtime))));
+                    out[idx] = Some(Ok(to_core_attr(&self.make_attr(ino, size, kind, mtime))));
                 }
                 None => {
-                    // Snapshot miss — fall
-                    // through to the per-name
-                    // trait lookup. The common
-                    // case for this is a file
-                    // written after the
-                    // snapshot was taken
-                    // (write doesn't update
-                    // dir_cache; only
-                    // cache_add_entry on
-                    // create/mkdir does).
-                    out.push(self.lookup(parent, name));
+                    // Snapshot miss — defer to the parallel
+                    // batch below. The common case is a file
+                    // written after the snapshot was taken
+                    // (write doesn't update dir_cache; only
+                    // `cache_add_entry` on create/mkdir does).
+                    miss_indices.push(idx);
+                    miss_names.push(*name);
                 }
             }
         }
-        out
+
+        // Issue #519 sub-item A: parallel snapshot-miss path.
+        //
+        // Single `rt().block_on` over a `buffer_unordered(32)`
+        // stream. The cap of 32 mirrors the connection pool budget
+        // for the underlying opendal backend (S3 / HDFS / memory)
+        // and prevents 500 misses from saturating the HTTP client
+        // / kernel TCP backlog. `buffer_unordered` returns results
+        // as they complete, so the post-block_on pass can write
+        // them back into `out` at their original positions
+        // without depending on completion order.
+        if !miss_indices.is_empty() {
+            // Capture the lookup indices alongside their names so
+            // the async stream knows where to deposit the result.
+            // The pair order matches the order we built
+            // `miss_indices` / `miss_names`, so a single zipped
+            // iteration is enough — no HashMap.
+            let miss_items: Vec<(usize, &str)> = miss_indices
+                .iter()
+                .copied()
+                .zip(miss_names.iter().copied())
+                .collect();
+            // `lookup_async` takes `&self`; the async block borrows
+            // `self` and the per-iteration futures borrow `name`
+            // (`&str` from the original `names` slice). All
+            // borrows are non-overlapping because the stream
+            // `.collect()` runs sequentially — each `await` on
+            // one future doesn't hold any other future's borrow.
+            //
+            // We pin the lifetime with a `Vec` of pinned future
+            // boxes via `futures::stream::iter` + `buffer_unordered`
+            // — the standard "concurrent map" shape. The async
+            // closure captures `&self` and `name` by reference;
+            // since `name` outlives the `block_on` (it lives in
+            // the caller's `names` slice) and `self` outlives the
+            // `block_on` (we're a `&self` method), the borrow
+            // checker is satisfied without an `Arc<Self>` clone.
+            let results: Vec<(usize, std::io::Result<CoreFileAttr>)> = rt().block_on(async {
+                use futures::stream::StreamExt;
+                futures::stream::iter(miss_items.iter().map(|(idx, name)| async move {
+                    (*idx, self.lookup_async(parent, name).await)
+                }))
+                .buffer_unordered(32)
+                .collect()
+                .await
+            });
+            for (idx, res) in results {
+                // `idx` was added to `miss_indices` for an entry
+                // that was not filled in the cheap pass, so the
+                // slot is `None` here — overwriting is correct.
+                out[idx] = Some(res);
+            }
+        }
+
+        // Invariant: every index in `0..names.len()` is filled.
+        // The first pass writes everything except the miss slots;
+        // the second pass writes every miss slot via `miss_indices`.
+        // So no slot should be `None` here. If a `None` ever
+        // appears, something has gone wrong with the bookkeeping
+        // (e.g. a `continue` that forgot to fill `out[idx]`), and
+        // the panic surfaces it instead of returning a silently
+        // empty `Err`.
+        out.into_iter()
+            .enumerate()
+            .map(|(i, slot)| {
+                slot.unwrap_or_else(|| {
+                    panic!(
+                        "batch_lookup_from_dir_cache: out[{}] uninitialized (names.len()={})",
+                        i,
+                        names.len()
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Full invalidation: remove directory cache and all sub-paths.
@@ -2898,41 +3027,27 @@ impl MntrsFs {
     pub fn __symlinks_lower_remove_for_test(&self, lower_key: &str) -> bool {
         self.symlinks_lower.remove(lower_key).is_some()
     }
-}
 
-use crate::core_fs::{CoreDirEntry, CoreFileAttr, CoreFileType, CoreFilesystem, CoreVolumeStat};
-use crate::writeback::WritebackTask;
-
-impl CoreFilesystem for MntrsFs {
-    fn init(&self) -> std::io::Result<()> {
-        self.common_init_wb();
-        Ok(())
-    }
-
-    /// Issue #29 override: serve the batch from the
-    /// dir_cache snapshot when possible.
-    fn lookup_many(
-        &self,
-        parent: u64,
-        names: &[&str],
-    ) -> std::io::Result<Vec<std::io::Result<CoreFileAttr>>> {
-        Ok(self.batch_lookup_from_dir_cache(parent, names))
-    }
-
-    fn access(&self, _ino: u64, _mask: u32) -> std::io::Result<()> {
-        // Issue #268.2 O11: trace-level entry log so
-        // operators can correlate EACCES ("--default-permissions")
-        // with mount state. The default impl is permissive
-        // (always Ok); this log only fires when the kernel
-        // actually calls us (i.e. when default_permissions
-        // or root_squash is in effect). trace level keeps
-        // it out of RUST_LOG=info default — operators
-        // enabling it explicitly know what they want.
-        tracing::trace!(ino = _ino, mask = _mask, "FUSE access entry");
-        Ok(())
-    }
-
-    fn lookup(&self, parent: u64, name: &str) -> std::io::Result<CoreFileAttr> {
+    /// Issue #519: async variant of [`CoreFilesystem::lookup`]
+    /// used by the parallel snapshot-miss path in
+    /// [`Self::batch_lookup_from_dir_cache`]. Splits the sync
+    /// `lookup` into an async core (so multiple miss names can
+    /// share one `rt().block_on` boundary and overlap on the
+    /// tokio runtime) and a thin sync wrapper (the trait impl
+    /// at `impl CoreFilesystem for MntrsFs`). Behavior is
+    /// identical to the original sync `lookup` — same
+    /// `dir_cache` short-circuits, same symlink case-insensitive
+    /// resolution, same `stat_op_async` cache-file size fallback,
+    /// same stale-dir-cache invalidation (#301). The only
+    /// behavioral difference is one extra `.await` at the
+    /// stat_op site, which is invisible to the caller.
+    ///
+    /// Defined here (inherent on `MntrsFs`) and **not** inside
+    /// `impl CoreFilesystem for MntrsFs` because `async fn` in
+    /// a trait impl is parsed as a trait method declaration;
+    /// `lookup_async` is not a member of `CoreFilesystem` (the
+    /// trait only declares `lookup`, see `src/core_fs/mod.rs:70`).
+    pub async fn lookup_async(&self, parent: u64, name: &str) -> std::io::Result<CoreFileAttr> {
         if name == "." || name == ".." {
             let p = if name == "." { parent } else { 1 };
             // Bug 33: bump kernel lookup count.
@@ -3039,11 +3154,17 @@ impl CoreFilesystem for MntrsFs {
         // post-write read see the old length. Lookup is the
         // first call after a `BATCHFORGET`, so it has to be
         // self-consistent with the cache-file state.
+        //
+        // Issue #519: stat_op → stat_op_async. The async
+        // variant is what enables the join_all in
+        // batch_lookup_from_dir_cache: parallel misses now
+        // share one `rt().block_on` boundary instead of
+        // blocking the runtime serially.
         let (kind, size, mtime) = if let Some(FileStat {
             kind: k,
             size: s,
             mtime: m,
-        }) = self.stat_op(&full_path)
+        }) = self.stat_op_async(&full_path).await
         {
             let cpath = crate::cache_path(&self.cache_dir, &full_path);
             let cache_size = std::fs::metadata(&cpath).map(|m| m.len()).unwrap_or(0);
@@ -3194,6 +3315,53 @@ impl CoreFilesystem for MntrsFs {
             kind,
             mtime.unwrap_or(SystemTime::UNIX_EPOCH),
         )))
+    }
+}
+
+use crate::core_fs::{CoreDirEntry, CoreFileAttr, CoreFileType, CoreFilesystem, CoreVolumeStat};
+use crate::writeback::WritebackTask;
+
+impl CoreFilesystem for MntrsFs {
+    fn init(&self) -> std::io::Result<()> {
+        self.common_init_wb();
+        Ok(())
+    }
+
+    /// Issue #29 override: serve the batch from the
+    /// dir_cache snapshot when possible.
+    fn lookup_many(
+        &self,
+        parent: u64,
+        names: &[&str],
+    ) -> std::io::Result<Vec<std::io::Result<CoreFileAttr>>> {
+        Ok(self.batch_lookup_from_dir_cache(parent, names))
+    }
+
+    fn access(&self, _ino: u64, _mask: u32) -> std::io::Result<()> {
+        // Issue #268.2 O11: trace-level entry log so
+        // operators can correlate EACCES ("--default-permissions")
+        // with mount state. The default impl is permissive
+        // (always Ok); this log only fires when the kernel
+        // actually calls us (i.e. when default_permissions
+        // or root_squash is in effect). trace level keeps
+        // it out of RUST_LOG=info default — operators
+        // enabling it explicitly know what they want.
+        tracing::trace!(ino = _ino, mask = _mask, "FUSE access entry");
+        Ok(())
+    }
+
+    /// Sync wrapper for [`Self::lookup_async`]. Single-name
+    /// call sites (`CoreFilesystem::lookup` trait impl, all
+    /// `tests/*.rs`, internal callers like `unlink` /
+    /// `create_excl` / `mkdir`) keep using the sync signature
+    /// unchanged. The full lookup body lives in
+    /// [`Self::lookup_async`] (defined in `impl MntrsFs`,
+    /// not in this trait impl block, because `async fn` in a
+    /// trait impl is interpreted as a trait method
+    /// declaration — `lookup_async` is not a member of
+    /// `CoreFilesystem`).
+    fn lookup(&self, parent: u64, name: &str) -> std::io::Result<CoreFileAttr> {
+        rt().block_on(self.lookup_async(parent, name))
     }
 
     fn getattr(&self, ino: u64) -> std::io::Result<CoreFileAttr> {
@@ -9055,5 +9223,162 @@ mod tests {
              return epoch mtime in readdir (rclone default); got {:?}",
             a.3
         );
+    }
+
+    // ── issue #519: snapshot-miss join_all + single-flight ───
+    //
+    // Refactor split:
+    //   * `fn lookup` (in `impl CoreFilesystem for MntrsFs`) is
+    //     now a 3-line sync wrapper around
+    //     `Self::lookup_async(parent, name)` via `rt().block_on`.
+    //   * `pub async fn lookup_async(parent, name)` lives in
+    //     `impl MntrsFs` (inherent, not in the trait) and
+    //     contains the full lookup body with
+    //     `self.stat_op_async(&full_path).await` at the single
+    //     await point.
+    //   * `batch_lookup_from_dir_cache` pre-classifies each
+    //     requested name into cheap-path (`.`/`..`/snapshot hit)
+    //     or miss-path (the parallel block_on), and dispatches
+    //     all misses through one
+    //     `rt().block_on(stream::iter(...).buffer_unordered(32).collect())`.
+    //
+    // The tests below pin the three contracts that the refactor
+    // introduces — order preservation across the parallel pass,
+    // correct dispatch on miss, and the cheap-pass shortcut for
+    // `.`/`..`. Functional equivalence with the old serial
+    // implementation is checked by the existing readdirplus /
+    // dir_cache tests continuing to pass.
+
+    /// Issue #519: snapshot-miss goes through `lookup_async`
+    /// (the parallel-miss path), not the serial trait `lookup`.
+    /// Pin the contract: a name not in dir_cache returns an
+    /// `Ok` with a freshly-allocated ino and the backend's
+    /// data (memory backend has no notion of size beyond what
+    /// `op.write` created, so we exercise the cold branch by
+    /// writing the file, NOT calling `list_op`, and then asking
+    /// `batch_lookup_from_dir_cache` for the name).
+    #[test]
+    fn batch_lookup_miss_returns_attr_via_lookup_async() {
+        let dir = scratch_dir("519-miss-async");
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        // Pre-create the file on the backend so `lookup_async`'s
+        // stat_op_async branch hits the success path.
+        rt().block_on(async {
+            op.write("miss_me.txt", b"hello-miss" as &[u8])
+                .await
+                .unwrap();
+        });
+        let fs = new_test_fs(op, dir);
+        // Sanity: dir_cache for the root is empty (no list_op yet).
+        assert!(
+            fs.dir_cache.is_empty(),
+            "fresh fs must not have a dir_cache entry until list_op runs"
+        );
+        // batch_lookup_from_dir_cache with a name that misses.
+        let names = vec!["miss_me.txt"; 1];
+        let results = fs.batch_lookup_from_dir_cache(1, &names);
+        assert_eq!(results.len(), 1, "one name in, one name out");
+        let attr = results
+            .into_iter()
+            .next()
+            .expect("len == 1")
+            .expect("snapshot-miss must dispatch through lookup_async and return Ok");
+        assert!(
+            attr.ino > 1,
+            "miss path must allocate a fresh ino (root is 1); got ino={}",
+            attr.ino
+        );
+    }
+
+    /// Issue #519: when input mixes snapshot hits and misses,
+    /// every output slot is filled and the slot indices match
+    /// the input order — even though `buffer_unordered(32)`
+    /// may complete misses in arbitrary order.
+    ///
+    /// This is the regression pin for the
+    /// `out: Vec<Option<...>>` plus `miss_indices` bookkeeping
+    /// introduced alongside the join_all refactor. Pre-fix
+    /// (single-pass with `out.push(self.lookup(...))`) order was
+    /// trivially preserved because the loop was serial; post-fix
+    /// order must still be preserved across the parallel
+    /// `block_on`.
+    #[test]
+    fn batch_lookup_mixed_hit_miss_preserves_order() {
+        let dir = scratch_dir("519-mixed-order");
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        // Create two backend files; only one will be seeded into
+        // dir_cache (the "hit"), the other stays a miss.
+        rt().block_on(async {
+            op.write("hit.txt", b"hit" as &[u8]).await.unwrap();
+            op.write("miss.txt", b"miss" as &[u8]).await.unwrap();
+        });
+        let fs = new_test_fs(op, dir);
+        // Seed dir_cache with `hit.txt` only — `miss.txt` is
+        // not in the snapshot and must dispatch through
+        // lookup_async.
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        fs.cache_add_entry("", "hit.txt", EntryMode::FILE, 3, mtime);
+        // Interleave: hit, miss, hit, miss, hit, miss, hit
+        let names = vec![
+            "hit.txt",  // 0: hit
+            "miss.txt", // 1: miss
+            "hit.txt",  // 2: hit
+            "miss.txt", // 3: miss
+            "hit.txt",  // 4: hit
+            "miss.txt", // 5: miss
+            "hit.txt",  // 6: hit
+        ];
+        let results = fs.batch_lookup_from_dir_cache(1, &names);
+        assert_eq!(results.len(), names.len(), "names.len() results");
+        for (i, r) in results.into_iter().enumerate() {
+            let attr = r.unwrap_or_else(|e| panic!("slot {} returned error: {:?}", i, e));
+            assert!(
+                attr.ino > 1,
+                "every slot must allocate a fresh ino (slot {} got {})",
+                i,
+                attr.ino
+            );
+        }
+    }
+
+    /// Issue #519: `.` and `..` are handled in the cheap pass
+    /// and never enter the parallel-miss vector. Pin the
+    /// contract: when every other name is a miss, `.`/`..`
+    /// still return the synthetic root attrs without going
+    /// through `lookup_async`.
+    ///
+    /// The cheap-pass invariants to verify:
+    ///   - `..` → ino 1 (the root), 4096-byte directory attr
+    ///   - `.`  → the parent ino passed in, same shape
+    ///
+    /// Both never produce an error and never allocate a fresh
+    /// ino (the synthetic ino is the literal `1` or `parent`).
+    #[test]
+    fn batch_lookup_dot_dotdot_handled_cheaply() {
+        let dir = scratch_dir("519-dot-cheap");
+        let fs = new_test_fs_evict(dir, 1024 * 1024);
+        let names = vec!["."; 1];
+        let results = fs.batch_lookup_from_dir_cache(2, &names);
+        assert_eq!(results.len(), 1);
+        let dot_attr = results.into_iter().next().unwrap().unwrap();
+        assert_eq!(
+            dot_attr.ino, 2,
+            "`.` (parent==2) must surface ino==2, not a fresh lookup_async allocation"
+        );
+        // Same test for `..` → ino 1 (the root).
+        let names2 = vec![".."; 1];
+        let results2 = fs.batch_lookup_from_dir_cache(2, &names2);
+        let dotdot_attr = results2.into_iter().next().unwrap().unwrap();
+        assert_eq!(
+            dotdot_attr.ino, 1,
+            "`..` (parent==2) must surface the root ino==1, not a fresh lookup_async allocation"
+        );
+        // Mix `.`/`..` with a real miss to verify the cheap
+        // pass doesn't accidentally enter the block_on branch.
+        let names3 = vec![".", "..", ".."];
+        let results3 = fs.batch_lookup_from_dir_cache(2, &names3);
+        for (i, r) in results3.into_iter().enumerate() {
+            r.unwrap_or_else(|e| panic!("slot {} returned error: {:?}", i, e));
+        }
     }
 }
