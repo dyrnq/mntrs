@@ -1063,12 +1063,42 @@ pub fn mount(
     );
     let built = rt_block_on(build_operator(storage_url, opts))?;
     let op = built.operator;
-    // Plan #64 step 6/7: `http` and `s3_delete_config` will be
-    // plumbed into MntrsFs in step 7. Capture now so the value
-    // is owned by the mount frame and we don't have to revisit
-    // this site when adding the MntrsFs fields.
-    let _mount_http = built.http;
-    let _mount_s3_delete_config = built.s3_delete_config;
+    // Plan #64 step 7: build the batched-delete WorkerConfig
+    // from the S3 mount config when the flag is set. Non-S3
+    // schemes leave this None; flag absent leaves this None.
+    let batched_delete_config = match built.s3_delete_config {
+        Some(cfg)
+            if std::env::var_os("MNTRS_UNLINK_BATCH").as_deref()
+                == Some(std::ffi::OsStr::new("1")) =>
+        {
+            tracing::info!(
+                target: "mntrs::batched_delete",
+                bucket = %cfg.bucket,
+                prefix = %cfg.prefix,
+                batch_size = crate::batched_delete::DEFAULT_BATCH_SIZE,
+                flush_delay_ms = crate::batched_delete::DEFAULT_FLUSH_DELAY.as_millis() as u64,
+                credential_source = if cfg.access_key_id.is_some() { "explicit" } else { "default-chain" },
+                "batched_delete: enabled (MNTRS_UNLINK_BATCH=1)"
+            );
+            Some(crate::batched_delete::WorkerConfig::from_s3(
+                cfg.endpoint,
+                cfg.bucket,
+                cfg.prefix,
+                cfg.region,
+                cfg.access_key_id,
+                cfg.secret_access_key,
+                built.http,
+            ))
+        }
+        Some(_) => {
+            tracing::debug!(
+                target: "mntrs::batched_delete",
+                "batched_delete: not enabled (set MNTRS_UNLINK_BATCH=1 to opt in)"
+            );
+            None
+        }
+        None => None,
+    };
     tracing::debug!(
         elapsed_ms = _t_mount.elapsed().as_millis() as u64,
         "mount: after build_operator"
@@ -1304,6 +1334,8 @@ pub fn mount(
         handle_caching: std::time::Duration::from_secs(vfs_handle_caching),
         disk_total_size: vfs_disk_space_total_size * 1024 * 1024 * 1024 * 1024, // TB to bytes
         writeback_sender: std::sync::OnceLock::new(),
+        batched_delete_config,
+        batched_deleter: std::sync::OnceLock::new(),
         // Unix-only — see MntrsFs::fuse_notifier in lib.rs.
         // The setter (set_fuse_notifier) is also unix-only and is
         // called from this same mount path immediately after this

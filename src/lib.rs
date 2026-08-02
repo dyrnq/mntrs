@@ -596,6 +596,22 @@ pub struct MntrsFs {
     pub(crate) cache_poll_interval: Duration,
     pub(crate) disk_total_size: u64,
     writeback_sender: std::sync::OnceLock<writeback::Sender>,
+    /// Plan #64 step 7: per-mount config for the S3 batched
+    /// deleter. `Some(_)` only when (a) the backend is S3 and (b)
+    /// `MNTRS_UNLINK_BATCH=1` is set; `None` for non-S3 backends
+    /// or when batching is disabled (default off). Set once in
+    /// `common_init_wb` if `batched_delete_config.is_some()` and
+    /// `batched_delete::spawn` returns `Ok`.
+    #[allow(dead_code)]
+    pub(crate) batched_delete_config: Option<batched_delete::WorkerConfig>,
+    /// Plan #64 step 7: long-lived batched-delete handle.
+    /// `OnceLock` because the worker task must be spawned from
+    /// inside `rt()` (see `common_init_wb`'s `crate::rt().block_on`
+    /// wrapper). `None` for non-S3, or when batching is disabled,
+    /// or when the worker fails to spawn (e.g. signer build
+    /// failure — recoverable; logged + counter increments).
+    #[allow(dead_code)]
+    pub(crate) batched_deleter: std::sync::OnceLock<batched_delete::BatchedDeleter>,
     /// #89: FUSE kernel notifier for attr cache invalidation after
     /// writes. Set once in `set_fuse_notifier()` from the mount
     /// command path. The write handler calls
@@ -1282,6 +1298,32 @@ impl MntrsFs {
             delay,
         );
         self.writeback_sender.set(tx).ok();
+
+        // Plan #64 step 7: spawn the S3 batched-delete worker when
+        // config is present. Worker joins the same tokio runtime
+        // (`crate::rt()`) as the writeback worker above — blocking
+        // briefly here is acceptable because callers are
+        // mount()/session start, not FUSE callbacks. Failures are
+        // logged and the deleter stays absent (callers fall back
+        // to opendal).
+        if let Some(cfg) = self.batched_delete_config.as_ref() {
+            // `spawn` is sync (it builds a tokio task and returns
+            // immediately); the worker runs on `crate::rt()`. No
+            // block_on needed here — `spawn` itself just creates
+            // an mpsc pair and an mpsc::Sender, all cheap.
+            match crate::batched_delete::spawn(cfg.clone()) {
+                Ok((deleter, _handle)) => {
+                    self.batched_deleter.set(deleter).ok();
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "mntrs::batched_delete",
+                        error = %e,
+                        "batched_delete: failed to spawn worker; falling back to opendal delete path"
+                    );
+                }
+            }
+        }
 
         // Recover writeback queue from dirty sidecars.
         // Do NOT delete .dirty here — the upload completion handler
@@ -7137,6 +7179,12 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         handle_caching: std::time::Duration::from_secs(0),
         disk_total_size: 0,
         writeback_sender: std::sync::OnceLock::new(),
+        // Plan #64 step 7: tests don't exercise the batched
+        // deleter (no S3 backend in tests). Leave None / empty;
+        // the gating helpers in step 8 fall back to opendal
+        // path when these are absent.
+        batched_delete_config: None,
+        batched_deleter: std::sync::OnceLock::new(),
         #[cfg(not(windows))]
         fuse_notifier: std::sync::OnceLock::new(),
         writeback_pending: Arc::new(dashmap::DashSet::new()),

@@ -160,6 +160,7 @@ pub(crate) struct BatchedDeleter {
 /// Construction-time config. Built by `cmd/mount.rs::build_s3` after
 /// parsing the storage URL and CLI options; passed to
 /// `batched_delete::spawn`.
+#[derive(Clone)]
 pub(crate) struct WorkerConfig {
     pub endpoint: url::Url,
     pub bucket: String,
