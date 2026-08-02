@@ -52,14 +52,27 @@ parse_time() {
     awk -v m="$m_part" -v s="$s_part" 'BEGIN { printf "%.4f", m * 60 + s }'
 }
 
-# parse_winners: extract "Result: mntrs=43  rclone=32  tie=5  (N tests)"
-# line from a bench result file. Sets globals M, R, T, N.
+# parse_winners: extract the winner-count line from a bench
+# result file. Sets globals M, R, T, N. Accepts both formats:
+#
+#   - old (Windows, baseline.txt):
+#       Result: mntrs=43  rclone=32  tie=5  (80 tests)
+#
+#   - new (render_table.py at bench/render_table.py:121):
+#       Result (mntrs vs rclone): mntrs=53  rclone=31  tie=19  skip=5  (108 tests)
+#
+# The new format was introduced when render_table.py started
+# rendering a 3-column mntrs/rclone/tie/skip footer; check-regression
+# only matched the old one, so every bench that went through
+# render_table.py reported `mntrs wins 0 vs baseline N (100% drop)`
+# regardless of the actual results. Issue surfaced on PR #512 once
+# the mkdir + mountpoint-polling fix let the bench run end-to-end.
 parse_winners() {
     local file="$1"
     local line
-    line=$(grep -E '^[[:space:]]*Result:[[:space:]]*mntrs=' "$file" | head -1 || true)
+    line=$(grep -E '^[[:space:]]*Result[[:space:]]*(\([^)]*\))?:[[:space:]]*mntrs=' "$file" | head -1 || true)
     if [ -z "$line" ]; then
-        echo "::warning::check_regression: no 'Result:' line in $file"
+        echo "::warning::check_regression: no 'Result ... mntrs=...' line in $file"
         M=0; R=0; T=0; N=0
         return 0
     fi
