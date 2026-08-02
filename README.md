@@ -312,9 +312,20 @@ mntrs `--release`):
 **Semantics**: write-behind. The user's `rm` returns success
 before S3 confirms the delete. Per-key failures are logged, not
 surfaced. A tombstone in lookup/getattr/readdir masks the
-in-flight delete from the local FUSE view until the S3 response
-arrives. `rmdir` is a barrier (enqueue + flush().await) so the
-directory's deletes don't outlive the rmdir callback.
+in-flight delete from the local FUSE view; the worker removes
+the tombstone on every per-key ack (success, idempotent
+NotFound, or permanent failure with an `error!` line). `rmdir`
+is a barrier (enqueue + flush().await) so the directory's
+deletes don't outlive the rmdir callback.
+
+**Recreate-after-rm**: `rm X && touch X` works without ENOENT.
+`create()` and `mkdir()` call `BatchedDeleter::cancel_pending()`
+before `op.write` — drains any queued S3 DELETE for the path,
+removes the tombstone, and completes the cancelled oneshot with
+`ErrorKind::Interrupted`. Without this the in-flight S3 DELETE
+would race the new write and either wipe the freshly created
+file (data loss) or leave lookup returning ENOENT until the
+worker acked the original delete.
 
 **Tuning**:
 

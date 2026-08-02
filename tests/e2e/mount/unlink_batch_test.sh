@@ -168,6 +168,26 @@ echo "  rm elapsed_ms: $(( (T1 - T0) / 1000000 ))"
 #    and ensures we observe the post-rmdir state).
 sleep 0.5
 
+# 4b. Plan #64 stage C: recreate-after-rm must NOT return
+#     ENOENT. Without the tombstone-on-ack + cancel_pending
+#     fix, the tombstone would outlive the S3 delete and
+#     `cat <recreated_file>` would fail. Mounted with batched
+#     deletes enabled so this exercises the production path.
+echo "--- recreate-after-rm ---"
+T0=$(date +%s%N)
+echo "stage_c_recreate_payload" > "$MP/rmtest/file_0001.txt"
+cat "$MP/rmtest/file_0001.txt" > /tmp/stage_c_recreate_got.txt
+T1=$(date +%s%N)
+echo "  recreate elapsed_ms: $(( (T1 - T0) / 1000000 ))"
+if ! diff -q /tmp/stage_c_recreate_got.txt <(echo "stage_c_recreate_payload") >/dev/null; then
+    echo "  recreate-after-rm FAIL: got '$(cat /tmp/stage_c_recreate_got.txt)'"
+    MOUNT_TEST_FAILED=1
+else
+    echo "  recreate-after-rm OK"
+fi
+rm -f /tmp/stage_c_recreate_got.txt
+rm -f "$MP/rmtest/file_0001.txt"
+
 # 5. Verify the S3 backend is empty.
 echo "--- verify S3 backend state ---"
 if [ "$VERIFY" = "aws" ]; then

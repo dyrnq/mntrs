@@ -170,6 +170,25 @@ impl Pending {
 struct Shared {
     pending: Mutex<Pending>,
     accepting: AtomicBool,
+    /// Tombstones for paths that have an in-flight write-behind
+    /// delete. Owned by MntrsFs (test + production constructors
+    /// both pre-build a DashSet and pass its Arc clone here) so
+    /// lookup/getattr/readdir on the FUSE side and worker success
+    /// paths on the deleter side see the same set. The worker
+    /// clears an entry whenever it acks a per-key result (success,
+    /// NotFound idempotent, or permanent failure with an error
+    /// log).
+    ///
+    /// Plan #64 step 10 originally kept tombstones insert-only
+    /// with a `TODO` for result-driven cleanup (see lib.rs:5891
+    /// history). Stage C default-ON made that TODO a correctness
+    /// bug: rm-then-create same path returned ENOENT because the
+    /// tombstone outlived the S3 delete. Real fix landed as part
+    /// of stage C: worker removes on every per-key ack, and
+    /// `cancel_pending` clears tombstone + drops the queued job
+    /// without sending the S3 DELETE (called from create() before
+    /// op.write).
+    tombs: std::sync::Arc<dashmap::DashSet<String>>,
 }
 
 // ===== Public handle =====
@@ -282,11 +301,13 @@ enum Control {
 
 pub(crate) fn spawn(
     config: WorkerConfig,
+    tombs: std::sync::Arc<dashmap::DashSet<String>>,
 ) -> std::io::Result<(BatchedDeleter, tokio::task::JoinHandle<()>)> {
     let (tx, rx) = mpsc::channel::<Control>(64);
     let shared = Arc::new(Shared {
         pending: Mutex::new(Pending::new()),
         accepting: AtomicBool::new(true),
+        tombs,
     });
     let deleter = BatchedDeleter {
         shared: shared.clone(),
@@ -346,6 +367,69 @@ impl BatchedDeleter {
             let _ = self.flush_tx.try_send(Control::Wake);
         }
         Some(rx)
+    }
+
+    /// Cancel any pending delete for `relative_path`. Used by
+    /// `MntrsFs::create()` (and `mkdir()`) before the new
+    /// op.write fires, so a create-after-rm doesn't hit two
+    /// problems at once:
+    ///
+    ///   1. lookup/getattr/readdir still see the tombstone (the
+    ///      write-behind S3 delete hasn't landed yet, so the
+    ///      path may still exist on the backend).
+    ///   2. without cancel, the in-flight delete would race the
+    ///      new write and either delete the freshly created
+    ///      object (data loss) or, idempotent-NotFound the new
+    ///      object (false "tombstone leaked" — worse, kernel
+    ///      would surface ENOENT to the user).
+    ///
+    /// Sync (no need to await the worker): under the pending
+    /// mutex we drain matching jobs and complete their oneshots
+    /// with `Err(ErrorKind::Interrupted)` so any strict-mode
+    /// caller sees a cancel rather than a phantom success. The
+    /// tombstone entry is also removed here — by the time this
+    /// returns, the next lookup will not see the deleted path
+    /// as gone.
+    ///
+    /// Returns the number of pending jobs cancelled (0 if no
+    /// delete was queued for this path).
+    pub(crate) fn cancel_pending(&self, relative_path: &str) -> usize {
+        let mut cancelled = 0usize;
+        {
+            let mut pending = self.shared.pending.lock().expect("pending mutex poisoned");
+            let mut kept = Vec::with_capacity(pending.jobs.len());
+            for job in pending.jobs.drain(..) {
+                if job.relative_path == relative_path {
+                    let _ = job.result_tx.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "batched_deleter: cancelled by recreate",
+                    )));
+                    cancelled += 1;
+                } else {
+                    kept.push(job);
+                }
+            }
+            pending.jobs = kept;
+            if pending.is_empty() {
+                pending.clear_deadline();
+            }
+        }
+        // Tombstone clear is unconditional: even if no job was
+        // pending, the FUSE-side lookup will hit it if the user
+        // did `rm file; sleep 50ms; touch file` (50ms < flush
+        // deadline of 5ms would race, but if user pre-set
+        // MNTRS_BATCH_FLUSH_DELAY_MS=10 or higher, the tombstone
+        // outlives the queue). Clearing on every create() call
+        // is the safest invariant.
+        self.shared.tombs.remove(relative_path);
+        cancelled
+    }
+
+    /// Read-only access to the tombstone set for FUSE-side
+    /// filters (lookup, getattr, readdir). Cheap clone of the
+    /// Arc — no copy of the underlying DashSet.
+    pub(crate) fn tombstones(&self) -> std::sync::Arc<dashmap::DashSet<String>> {
+        self.shared.tombs.clone()
     }
 
     /// Force-flush all currently pending keys. Used by the rmdir
@@ -604,6 +688,31 @@ async fn flush_one_batch(
     );
 
     for (job, result) in batch.into_iter().zip(outcome) {
+        // Same tombstone-cleanup-on-ack policy as do_flush_all.
+        // Centralised here so the two flush paths stay in lockstep;
+        // if we ever add a third path, both helpers must converge
+        // on it. `result` is `io::Result<()>`; success clears the
+        // tombstone silently, NotFound/AlreadyExists clear it
+        // silently (idempotent outcome), and any other error logs
+        // an `error!` line then clears the tombstone so the user
+        // can see the object again.
+        match &result {
+            Ok(()) => {
+                shared.tombs.remove(&job.relative_path);
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound) => {
+                shared.tombs.remove(&job.relative_path);
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "mntrs::batched_delete",
+                    path = %job.relative_path,
+                    error = %e,
+                    "batched_delete: per-key delete failed; clearing tombstone so object becomes visible again"
+                );
+                shared.tombs.remove(&job.relative_path);
+            }
+        }
         let _ = job.result_tx.send(result);
     }
 }
@@ -640,6 +749,34 @@ async fn do_flush_all(
         FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
         KEYS_TOTAL.fetch_add(batch.len() as u64, Ordering::Relaxed);
         for (job, result) in batch.into_iter().zip(outcome) {
+            // Plan #64 stage C: tombstone cleanup is part of the
+            // per-key ack path. Every terminal outcome clears
+            // its tombstone — success, NotFound (idempotent),
+            // and permanent failures alike. Without this the
+            // FUSE side's lookup/getattr/readdir filters would
+            // keep masking the path even after the worker
+            // confirmed the delete landed on S3, and a
+            // recreate would return ENOENT until the user
+            // worked around it. See flush_one_batch for the
+            // canonical implementation — mirrored here to keep
+            // the lock-and-send pattern local to each flush site.
+            match &result {
+                Ok(()) => {
+                    shared.tombs.remove(&job.relative_path);
+                }
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound) => {
+                    shared.tombs.remove(&job.relative_path);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "mntrs::batched_delete",
+                        path = %job.relative_path,
+                        error = %e,
+                        "batched_delete: per-key delete failed; clearing tombstone so object becomes visible again"
+                    );
+                    shared.tombs.remove(&job.relative_path);
+                }
+            }
             let _ = job.result_tx.send(result);
         }
         total += succeeded as usize + not_found as usize + failed as usize;
@@ -647,18 +784,33 @@ async fn do_flush_all(
 }
 
 fn fail_all_pending(shared: &Shared) {
-    let mut pending = shared.pending.lock().expect("pending mutex poisoned");
-    let count = pending.jobs.len() as u64;
-    pending.jobs.clear();
-    pending.clear_deadline();
-    drop(pending);
+    let jobs = {
+        let mut pending = shared.pending.lock().expect("pending mutex poisoned");
+        pending.clear_deadline();
+        std::mem::take(&mut pending.jobs)
+    };
+    let count = jobs.len() as u64;
     if count > 0 {
         SHUTDOWN_LOST_TOTAL.fetch_add(count, Ordering::Relaxed);
+        // Plan #64 stage C: tombstones for shutdown-lost keys must
+        // be cleared. Without this, the FUSE side's lookup would
+        // keep masking paths whose S3 delete never went out, and a
+        // subsequent `touch <path>` would return ENOENT until the
+        // mount restarts.
+        for job in &jobs {
+            shared.tombs.remove(&job.relative_path);
+        }
         tracing::warn!(
             target: "mntrs::batched_delete",
             lost = count,
             "batched_delete: shutdown dropped pending deletes"
         );
+    }
+    for job in jobs {
+        let _ = job.result_tx.send(Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "batched_deleter: shutdown lost",
+        )));
     }
 }
 
@@ -1247,15 +1399,18 @@ mod tests {
 
     #[tokio::test]
     async fn enqueue_returns_none_after_shutdown() {
-        let (deleter, _h) = spawn(WorkerConfig::from_s3(
-            url::Url::parse("http://localhost:9000").unwrap(),
-            "b".into(),
-            "/".into(),
-            "us-east-1".into(),
-            Some("ak".into()),
-            Some("sk".into()),
-            reqwest::Client::new(),
-        ))
+        let (deleter, _h) = spawn(
+            WorkerConfig::from_s3(
+                url::Url::parse("http://localhost:9000").unwrap(),
+                "b".into(),
+                "/".into(),
+                "us-east-1".into(),
+                Some("ak".into()),
+                Some("sk".into()),
+                reqwest::Client::new(),
+            ),
+            std::sync::Arc::new(dashmap::DashSet::new()),
+        )
         .unwrap();
         let clone = deleter.clone();
         deleter.shutdown(false).await;
@@ -1265,17 +1420,110 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_then_drop_exits_worker() {
-        let (deleter, handle) = spawn(WorkerConfig::from_s3(
-            url::Url::parse("http://localhost:9000").unwrap(),
-            "b".into(),
-            "/".into(),
-            "us-east-1".into(),
-            Some("ak".into()),
-            Some("sk".into()),
-            reqwest::Client::new(),
-        ))
+        let (deleter, handle) = spawn(
+            WorkerConfig::from_s3(
+                url::Url::parse("http://localhost:9000").unwrap(),
+                "b".into(),
+                "/".into(),
+                "us-east-1".into(),
+                Some("ak".into()),
+                Some("sk".into()),
+                reqwest::Client::new(),
+            ),
+            std::sync::Arc::new(dashmap::DashSet::new()),
+        )
         .unwrap();
         drop(deleter);
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    // ===== Plan #64 stage C: tombstone lifecycle =====
+
+    /// cancel_pending drains matching queued jobs and clears the
+    /// tombstone without sending an S3 DELETE. Reproduces the
+    /// `rm X && touch X` race: write-behind enqueue at rm time
+    /// inserts the tombstone, then create() calls cancel_pending
+    /// to free the path before op.write. Without this the
+    /// in-flight S3 DELETE would race the new write.
+    #[test]
+    fn cancel_pending_drains_jobs_and_clears_tombstone() {
+        let tombs = std::sync::Arc::new(dashmap::DashSet::<String>::new());
+        // Stub deleter — we don't even need a worker; cancel_pending
+        // only touches Shared.pending + Shared.tombs under the lock.
+        let shared = std::sync::Arc::new(Shared {
+            pending: Mutex::new(Pending::new()),
+            accepting: AtomicBool::new(true),
+            tombs: tombs.clone(),
+        });
+        let (tx, _rx) = mpsc::channel::<Control>(8);
+        let deleter = BatchedDeleter {
+            shared: shared.clone(),
+            flush_tx: tx,
+        };
+
+        // Simulate what unlink does: enqueue + tombstone.
+        tombs.insert("p".into());
+        {
+            let mut pending = shared.pending.lock().unwrap();
+            let (otx, _orx) = oneshot::channel();
+            pending.jobs.push(PendingDelete {
+                relative_path: "p".into(),
+                result_tx: otx,
+            });
+        }
+        assert!(tombs.contains("p"));
+
+        // MntrsFs::create calls cancel_pending before op.write.
+        let n = deleter.cancel_pending("p");
+        assert_eq!(n, 1, "exactly the one queued job must be cancelled");
+        assert!(
+            !tombs.contains("p"),
+            "tombstone must be cleared so lookup returns ENOENT → OK"
+        );
+        assert!(
+            shared.pending.lock().unwrap().jobs.is_empty(),
+            "queue must be drained"
+        );
+    }
+
+    /// cancel_pending is a no-op for paths that aren't queued and
+    /// not tombstoned — but it does clear a tombstone if present
+    /// (the FUSE side may have stale state from a prior failure).
+    #[test]
+    fn cancel_pending_unknown_path_clears_stale_tombstone() {
+        let tombs = std::sync::Arc::new(dashmap::DashSet::<String>::new());
+        let shared = std::sync::Arc::new(Shared {
+            pending: Mutex::new(Pending::new()),
+            accepting: AtomicBool::new(true),
+            tombs: tombs.clone(),
+        });
+        let (tx, _rx) = mpsc::channel::<Control>(8);
+        let deleter = BatchedDeleter {
+            shared: shared.clone(),
+            flush_tx: tx,
+        };
+        tombs.insert("stale".into());
+        let n = deleter.cancel_pending("stale");
+        assert_eq!(n, 0);
+        assert!(!tombs.contains("stale"));
+    }
+
+    /// cancel_pending on an absent path is a clean no-op.
+    #[test]
+    fn cancel_pending_absent_path_is_noop() {
+        let tombs = std::sync::Arc::new(dashmap::DashSet::<String>::new());
+        let shared = std::sync::Arc::new(Shared {
+            pending: Mutex::new(Pending::new()),
+            accepting: AtomicBool::new(true),
+            tombs: tombs.clone(),
+        });
+        let (tx, _rx) = mpsc::channel::<Control>(8);
+        let deleter = BatchedDeleter {
+            shared: shared.clone(),
+            flush_tx: tx,
+        };
+        let n = deleter.cancel_pending("never-existed");
+        assert_eq!(n, 0);
+        assert!(tombs.is_empty());
     }
 }

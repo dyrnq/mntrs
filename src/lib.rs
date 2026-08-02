@@ -650,11 +650,15 @@ pub struct MntrsFs {
     /// paths so the user can't observe the in-flight delete.
     /// Removed on successful S3 response; on permanent per-key
     /// failure, removed + relevant caches invalidated + error
-    /// logged so the object becomes visible again.
+    /// logged so the object becomes visible again. Also removed
+    /// by `cancel_pending` (called from create/mkdir) so a
+    /// create-after-rm doesn't hit ENOENT.
     ///
     /// Process crash loses tombstones → possible orphan objects
     /// on the backend. Documented limitation of opt-in
-    /// write-behind (default off; MNTRS_UNLINK_BATCH=1).
+    /// write-behind (default off for non-S3 / MNTRS_UNLINK_BATCH=0,
+    /// on for S3 mounts under `--unlink-batch=auto` since plan #64
+    /// stage C).
     #[allow(dead_code)]
     delete_tombstones: std::sync::Arc<dashmap::DashSet<String>>,
 
@@ -1343,7 +1347,7 @@ impl MntrsFs {
             // immediately); the worker runs on `crate::rt()`. No
             // block_on needed here — `spawn` itself just creates
             // an mpsc pair and an mpsc::Sender, all cheap.
-            match crate::batched_delete::spawn(cfg.clone()) {
+            match crate::batched_delete::spawn(cfg.clone(), self.delete_tombstones.clone()) {
                 Ok((deleter, _handle)) => {
                     self.batched_deleter.set(deleter).ok();
                 }
@@ -5291,6 +5295,37 @@ impl CoreFilesystem for MntrsFs {
         // **debug** not info — high frequency under shell
         // scripts. Default RUST_LOG=info must stay quiet.
         tracing::debug!(path = %full_path, "FUSE create entry");
+        // Plan #64 stage C: create-after-rm safety. If a previous
+        // unlink put this path into the tombstone set (write-behind
+        // S3 delete hasn't landed yet), cancel the in-flight delete
+        // so the new write doesn't race against it. Without this:
+        //   * lookup/getattr still see the tombstone → `cat` returns
+        //     ENOENT (the symptom in mount-tests (s3) step 10).
+        //   * the in-flight S3 DELETE could land AFTER our op.write
+        //     and wipe the freshly created object.
+        // cancel_pending clears both the tombstone and any pending
+        // queued job; subsequent lookup sees the path as writable,
+        // and no DeleteObjects is sent for it.
+        if self.delete_tombstones.contains(&full_path) {
+            if let Some(deleter) = self.batched_deleter.get() {
+                let cancelled = deleter.cancel_pending(&full_path);
+                if cancelled > 0 {
+                    tracing::debug!(
+                        target: "mntrs::batched_delete",
+                        path = %full_path,
+                        cancelled,
+                        "batched_delete: cancelled in-flight delete due to recreate"
+                    );
+                }
+            } else {
+                // No batcher (non-S3 or batching disabled). The
+                // tombstone is local to this MntrsFs and the previous
+                // delete already landed on opendal. Clearing here is
+                // belt-and-braces in case the tombstone outlived a
+                // failed delete in some edge case.
+                self.delete_tombstones.remove(&full_path);
+            }
+        }
         // Issue #57: ensure the parent directory exists
         // on hierarchical backends (HDFS, local fs,
         // WebHDFS) before issuing the write. Flat-
@@ -5554,6 +5589,16 @@ impl CoreFilesystem for MntrsFs {
         // mkdirs in a tight loop. Default RUST_LOG=info
         // must not show per-file mkdir lines.
         tracing::debug!(path = %full_path, "FUSE mkdir entry");
+        // Plan #64 stage C: same recreate safety as create().
+        // `rmdir foo && mkdir foo` shouldn't hit ENOENT from the
+        // tombstone or race the in-flight delete.
+        if self.delete_tombstones.contains(&full_path) {
+            if let Some(deleter) = self.batched_deleter.get() {
+                let _ = deleter.cancel_pending(&full_path);
+            } else {
+                self.delete_tombstones.remove(&full_path);
+            }
+        }
         // Recursively create the entire path (parents + leaf).
         // Bug A fix: a single create_dir on "a/b/c/" leaves "a/" and
         // "a/b/" un-created on flat-namespace backends, so subsequent
