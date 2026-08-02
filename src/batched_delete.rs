@@ -170,6 +170,14 @@ impl Pending {
 struct Shared {
     pending: Mutex<Pending>,
     accepting: AtomicBool,
+    /// Initial deadline applied when the buffer transitions from
+    /// empty → non-empty in `enqueue`. Mirrors `WorkerConfig::flush_delay`
+    /// (env: `MNTRS_BATCH_FLUSH_DELAY_MS`, default 50 ms) so a single
+    /// unlink pays at most this much latency before its S3 DELETE is
+    /// requested, while an `rm -rf` burst gets a wide enough window to
+    /// accumulate large batches. The rmdir barrier (`Control::Flush`)
+    /// bypasses this deadline entirely via `do_flush_all`.
+    flush_delay: Duration,
     /// Tombstones for paths that have an in-flight write-behind
     /// delete. Owned by MntrsFs (test + production constructors
     /// both pre-build a DashSet and pass its Arc clone here) so
@@ -307,6 +315,7 @@ pub(crate) fn spawn(
     let shared = Arc::new(Shared {
         pending: Mutex::new(Pending::new()),
         accepting: AtomicBool::new(true),
+        flush_delay: config.flush_delay,
         tombs,
     });
     let deleter = BatchedDeleter {
@@ -349,11 +358,16 @@ impl BatchedDeleter {
         let was_empty = pending.is_empty();
         pending.jobs.push(job);
         if was_empty {
-            // Tight deadline: small enough that an interactive
-            // `rm file.txt` doesn't perceive the latency, large
-            // enough that an `rm -rf` burst can accumulate in the
-            // window.
-            pending.reset_deadline(Duration::from_millis(5));
+            // Use the configured flush_delay (env:
+            // MNTRS_BATCH_FLUSH_DELAY_MS, default 50ms) rather than
+            // a hard-coded 5ms. For an `rm file.txt` single-file
+            // call the user pays at most `flush_delay` latency
+            // before the S3 DELETE is requested; for an `rm -rf`
+            // burst the wider window lets more keys accumulate
+            // per batch and halves the number of S3 roundtrips.
+            // The rmdir barrier (`Control::Flush`) bypasses this
+            // deadline entirely via `do_flush_all`.
+            pending.reset_deadline(self.shared.flush_delay);
         }
         drop(pending);
 
@@ -1453,6 +1467,7 @@ mod tests {
         let shared = std::sync::Arc::new(Shared {
             pending: Mutex::new(Pending::new()),
             accepting: AtomicBool::new(true),
+            flush_delay: Duration::from_millis(50),
             tombs: tombs.clone(),
         });
         let (tx, _rx) = mpsc::channel::<Control>(8);
@@ -1495,6 +1510,7 @@ mod tests {
         let shared = std::sync::Arc::new(Shared {
             pending: Mutex::new(Pending::new()),
             accepting: AtomicBool::new(true),
+            flush_delay: Duration::from_millis(50),
             tombs: tombs.clone(),
         });
         let (tx, _rx) = mpsc::channel::<Control>(8);
@@ -1515,6 +1531,7 @@ mod tests {
         let shared = std::sync::Arc::new(Shared {
             pending: Mutex::new(Pending::new()),
             accepting: AtomicBool::new(true),
+            flush_delay: Duration::from_millis(50),
             tombs: tombs.clone(),
         });
         let (tx, _rx) = mpsc::channel::<Control>(8);
