@@ -59,30 +59,6 @@ use reqsign_core::{Context, ProvideCredentialChain, Signer};
 use reqsign_file_read_tokio::TokioFileRead;
 use tokio::sync::{mpsc, oneshot};
 
-// ===== Counters =====
-
-static FLUSHES_TOTAL: AtomicU64 = AtomicU64::new(0);
-static KEYS_TOTAL: AtomicU64 = AtomicU64::new(0);
-static FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
-static SHUTDOWN_LOST_TOTAL: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct MetricsSnapshot {
-    pub flushes_total: u64,
-    pub keys_total: u64,
-    pub failures_total: u64,
-    pub shutdown_lost_total: u64,
-}
-
-pub(crate) fn metrics_snapshot() -> MetricsSnapshot {
-    MetricsSnapshot {
-        flushes_total: FLUSHES_TOTAL.load(Ordering::Relaxed),
-        keys_total: KEYS_TOTAL.load(Ordering::Relaxed),
-        failures_total: FAILURES_TOTAL.load(Ordering::Relaxed),
-        shutdown_lost_total: SHUTDOWN_LOST_TOTAL.load(Ordering::Relaxed),
-    }
-}
-
 // ===== Constants =====
 
 /// S3 hard limit: at most 1000 object identifiers per DeleteObjects
@@ -91,12 +67,66 @@ pub(crate) fn metrics_snapshot() -> MetricsSnapshot {
 /// request.
 pub(crate) const HARD_MAX_KEYS_PER_REQUEST: usize = 1000;
 
+// Plan #64 stage B: per-mount tuning knobs surfaced via
+// environment variables. Defaults preserve the values that the
+// original plan #64 baseline used.
 pub(crate) const DEFAULT_BATCH_SIZE: usize = 100;
 pub(crate) const DEFAULT_FLUSH_DELAY: Duration = Duration::from_millis(50);
 pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const DEFAULT_MAX_RETRIES: u32 = 3;
 pub(crate) const DEFAULT_RETRY_FACTOR: f64 = 2.0;
 pub(crate) const DEFAULT_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+
+// ===== Counters (plan #64 stage B) =====
+//
+// Process-static counters, like writeback::PENDING_COUNT. Read
+// from any thread via the public accessor functions below.
+
+static FLUSHES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static KEYS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHUTDOWN_LOST_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SINGLE_KEY_BATCHES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static MAX_BATCH_SIZE_OBSERVED: AtomicU64 = AtomicU64::new(0);
+
+/// Plan #64 stage B: snapshot of batched_delete counters.
+/// Exposed for `/metrics` and Stage C observability.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CounterSnapshot {
+    pub flushes_total: u64,
+    pub keys_total: u64,
+    pub failures_total: u64,
+    pub shutdown_lost_total: u64,
+    pub single_key_batches_total: u64,
+    pub max_batch_size_observed: u64,
+}
+
+pub(crate) fn snapshot() -> CounterSnapshot {
+    CounterSnapshot {
+        flushes_total: FLUSHES_TOTAL.load(Ordering::Relaxed),
+        keys_total: KEYS_TOTAL.load(Ordering::Relaxed),
+        failures_total: FAILURES_TOTAL.load(Ordering::Relaxed),
+        shutdown_lost_total: SHUTDOWN_LOST_TOTAL.load(Ordering::Relaxed),
+        single_key_batches_total: SINGLE_KEY_BATCHES_TOTAL.load(Ordering::Relaxed),
+        max_batch_size_observed: MAX_BATCH_SIZE_OBSERVED.load(Ordering::Relaxed),
+    }
+}
+
+/// Read an env var with a default. Used for stage B tuning
+/// knobs (`MNTRS_BATCH_FLUSH_DELAY_MS`, `MNTRS_BATCH_SIZE`).
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(default)
+}
 
 // ===== Pending types =====
 
@@ -197,6 +227,15 @@ impl WorkerConfig {
         secret_access_key: Option<String>,
         http: reqwest::Client,
     ) -> Self {
+        // Plan #64 stage B: honor MNTRS_BATCH_SIZE and
+        // MNTRS_BATCH_FLUSH_DELAY_MS env vars for per-mount
+        // tuning. Defaults preserve plan #64 baseline.
+        let batch_size = env_usize("MNTRS_BATCH_SIZE", DEFAULT_BATCH_SIZE).clamp(1, 1000);
+        let flush_delay_ms = env_u64(
+            "MNTRS_BATCH_FLUSH_DELAY_MS",
+            DEFAULT_FLUSH_DELAY.as_millis() as u64,
+        );
+        let flush_delay = Duration::from_millis(flush_delay_ms.clamp(1, 10_000));
         Self {
             endpoint,
             bucket,
@@ -205,8 +244,8 @@ impl WorkerConfig {
             access_key_id,
             secret_access_key,
             http,
-            batch_size: DEFAULT_BATCH_SIZE,
-            flush_delay: DEFAULT_FLUSH_DELAY,
+            batch_size,
+            flush_delay,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_retries: DEFAULT_MAX_RETRIES,
             retry_factor: DEFAULT_RETRY_FACTOR,
@@ -418,12 +457,31 @@ async fn worker_loop(config: WorkerConfig, shared: Arc<Shared>, mut rx: mpsc::Re
                     if drain {
                         let _ = do_flush_all(&config, &signer, &shared).await;
                     } else {
+                        // Lost without drain — record how many.
+                        let lost = {
+                            let mut p = shared.pending.lock().expect("pending mutex poisoned");
+                            let n = p.jobs.len() as u64;
+                            p.jobs.clear();
+                            n
+                        };
+                        if lost > 0 {
+                            SHUTDOWN_LOST_TOTAL.fetch_add(lost, Ordering::Relaxed);
+                        }
                         fail_all_pending(&shared);
                     }
                     let _ = done.send(());
                     break;
                 }
                 None => {
+                    // Channel closed without explicit shutdown — same
+                    // accounting as drain=false: lost keys count.
+                    let lost = {
+                        let p = shared.pending.lock().expect("pending mutex poisoned");
+                        p.jobs.len() as u64
+                    };
+                    if lost > 0 {
+                        SHUTDOWN_LOST_TOTAL.fetch_add(lost, Ordering::Relaxed);
+                    }
                     fail_all_pending(&shared);
                     break;
                 }
@@ -512,6 +570,23 @@ async fn flush_one_batch(
 
     FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
     KEYS_TOTAL.fetch_add(batch.len() as u64, Ordering::Relaxed);
+    if batch.len() == 1 {
+        SINGLE_KEY_BATCHES_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    // Update max batch size (lock-free CAS).
+    let bs = batch.len() as u64;
+    let mut cur = MAX_BATCH_SIZE_OBSERVED.load(Ordering::Relaxed);
+    while bs > cur {
+        match MAX_BATCH_SIZE_OBSERVED.compare_exchange_weak(
+            cur,
+            bs,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => cur = observed,
+        }
+    }
     let (succeeded, not_found, failed) = count_outcome(&outcome);
     if failed > 0 {
         FAILURES_TOTAL.fetch_add(failed, Ordering::Relaxed);
@@ -1137,14 +1212,37 @@ mod tests {
     }
 
     #[test]
-    fn metrics_snapshot_is_const_default() {
-        // Default Snapshot is zero (no I/O). The live counts grow
+    fn counter_snapshot_is_const_default() {
+        // Default snapshot is zero (no I/O). The live counts grow
         // as the worker runs; this only asserts the struct itself.
-        let s = MetricsSnapshot::default();
+        let s = CounterSnapshot::default();
         assert_eq!(s.flushes_total, 0);
         assert_eq!(s.keys_total, 0);
         assert_eq!(s.failures_total, 0);
         assert_eq!(s.shutdown_lost_total, 0);
+        assert_eq!(s.single_key_batches_total, 0);
+        assert_eq!(s.max_batch_size_observed, 0);
+    }
+
+    #[test]
+    fn env_override_parsing_round_trip() {
+        // Stage B tuning: just verify the parsing helpers behave.
+        // We cannot test the from_s3 env application without
+        // mutating process-global env (which races with parallel
+        // tests). The end-to-end env behavior is verified by
+        // bench/unlink_ab.sh with MNTRS_BATCH_FLUSH_DELAY_MS=10.
+        // The bare `unsafe` here is local to test scaffolding.
+        unsafe {
+            std::env::set_var("MNTRS_TEST_BATCH_SIZE", "25");
+            std::env::set_var("MNTRS_TEST_FLUSH_DELAY", "7");
+        }
+        assert_eq!(env_usize("MNTRS_TEST_BATCH_SIZE", 100), 25);
+        assert_eq!(env_u64("MNTRS_TEST_FLUSH_DELAY", 50), 7);
+        assert_eq!(env_usize("MNTRS_TEST_MISSING_VAR", 99), 99);
+        unsafe {
+            std::env::remove_var("MNTRS_TEST_BATCH_SIZE");
+            std::env::remove_var("MNTRS_TEST_FLUSH_DELAY");
+        }
     }
 
     #[tokio::test]

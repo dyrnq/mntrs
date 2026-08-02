@@ -132,8 +132,12 @@ echo "--- mounting three impls ---"
 mount_mntrs "$MNTRS_MNT" "$BUCKET_UNB" "$DAEMON_UNB" || { echo "FAIL: unbatched mount"; exit 1; }
 echo "  mntrs-unbatched: OK"
 # Batched mount must inherit MNTRS_UNLINK_BATCH=1 in its env.
-MNTRS_UNLINK_BATCH=1 mount_mntrs "$MNTRS_BAT_MNT" "$BUCKET_BAT" "$DAEMON_BAT" || { echo "FAIL: batched mount"; exit 1; }
-echo "  mntrs-batched:   OK (MNTRS_UNLINK_BATCH=1)"
+# Stage B: MNTRS_BATCH_FLUSH_DELAY_MS=10 lowers the deadline-driven
+# flush window from 50ms to 10ms — eliminates the small-workload
+# overhead discovered in stage A (single-file was 0.50x).
+MNTRS_UNLINK_BATCH=1 MNTRS_BATCH_FLUSH_DELAY_MS=10 \
+    mount_mntrs "$MNTRS_BAT_MNT" "$BUCKET_BAT" "$DAEMON_BAT" || { echo "FAIL: batched mount"; exit 1; }
+echo "  mntrs-batched:   OK (MNTRS_UNLINK_BATCH=1, MNTRS_BATCH_FLUSH_DELAY_MS=10)"
 mount_rclone "$RCLONE_MNT" "$BUCKET_RCL" || { echo "FAIL: rclone mount"; exit 1; }
 echo "  rclone:          OK"
 
@@ -243,15 +247,18 @@ echo "=========================================="
 echo " Batch metrics from $DAEMON_BAT:"
 echo "=========================================="
 if [ -f "$DAEMON_BAT" ]; then
-    FLUSH_LINES=$(grep -c 'batched_delete: flush' "$DAEMON_BAT" 2>/dev/null || echo 0)
-    # Multi-key: any batch_size >= 2 (single digit OR multi-digit).
-    MULTI=$(grep 'batched_delete: flush' "$DAEMON_BAT" | grep -cE 'batch_size=([2-9]|[1-9][0-9]+)' || echo 0)
-    if [ "$FLUSH_LINES" -gt 0 ]; then
+    FLUSH_LINES=$(grep -c 'batched_delete: flush' "$DAEMON_BAT" 2>/dev/null | head -1)
+    FLUSH_LINES=${FLUSH_LINES:-0}
+    MULTI=$(grep 'batched_delete: flush' "$DAEMON_BAT" | grep -cE 'batch_size=([2-9]|[1-9][0-9]+)' 2>/dev/null | head -1)
+    MULTI=${MULTI:-0}
+    if [ "$FLUSH_LINES" -gt 0 ] 2>/dev/null; then
         MAX_BS=$(grep -oE 'batch_size=[0-9]+' "$DAEMON_BAT" | awk -F= '{print $2}' | sort -n | tail -1)
         MEAN_BS=$(grep -oE 'batch_size=[0-9]+' "$DAEMON_BAT" | awk -F= '{sum+=$2; n++} END {if(n>0) printf "%.1f", sum/n; else print 0}')
         SINGLE=$(grep -oE 'batch_size=[0-9]+' "$DAEMON_BAT" | awk -F= '$2==1 {n++} END {print n+0}')
-        FAIL_K=$(grep -cE 'batched_delete.*failed=[1-9]' "$DAEMON_BAT" 2>/dev/null || echo 0)
-        RETRY=$(grep -cE 'batched_delete.*retries=[1-9]' "$DAEMON_BAT" 2>/dev/null || echo 0)
+        FAIL_K=$(grep -cE 'batched_delete.*failed=[1-9]' "$DAEMON_BAT" 2>/dev/null | head -1)
+        FAIL_K=${FAIL_K:-0}
+        RETRY=$(grep -cE 'batched_delete.*retries=[1-9]' "$DAEMON_BAT" 2>/dev/null | head -1)
+        RETRY=${RETRY:-0}
         echo "  flushes:               $FLUSH_LINES"
         echo "  multi-key (>=2):       $MULTI"
         echo "  max batch_size:        $MAX_BS"

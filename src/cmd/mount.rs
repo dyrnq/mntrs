@@ -1071,24 +1071,28 @@ pub fn mount(
             if std::env::var_os("MNTRS_UNLINK_BATCH").as_deref()
                 == Some(std::ffi::OsStr::new("1")) =>
         {
+            // Plan #64 stage B: build the WorkerConfig first so the
+            // startup log line reflects the env-var-overridden
+            // batch_size + flush_delay rather than the defaults.
+            let wc = crate::batched_delete::WorkerConfig::from_s3(
+                cfg.endpoint.clone(),
+                cfg.bucket.clone(),
+                cfg.prefix.clone(),
+                cfg.region.clone(),
+                cfg.access_key_id.clone(),
+                cfg.secret_access_key.clone(),
+                built.http.clone(),
+            );
             tracing::info!(
                 target: "mntrs::batched_delete",
                 bucket = %cfg.bucket,
                 prefix = %cfg.prefix,
-                batch_size = crate::batched_delete::DEFAULT_BATCH_SIZE,
-                flush_delay_ms = crate::batched_delete::DEFAULT_FLUSH_DELAY.as_millis() as u64,
+                batch_size = wc.batch_size,
+                flush_delay_ms = wc.flush_delay.as_millis() as u64,
                 credential_source = if cfg.access_key_id.is_some() { "explicit" } else { "default-chain" },
                 "batched_delete: enabled (MNTRS_UNLINK_BATCH=1)"
             );
-            Some(crate::batched_delete::WorkerConfig::from_s3(
-                cfg.endpoint,
-                cfg.bucket,
-                cfg.prefix,
-                cfg.region,
-                cfg.access_key_id,
-                cfg.secret_access_key,
-                built.http,
-            ))
+            Some(wc)
         }
         Some(_) => {
             tracing::debug!(

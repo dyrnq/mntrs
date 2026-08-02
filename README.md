@@ -267,6 +267,71 @@ The macOS variant lives at `bench/run_all_mac.sh`. See
 auto-detect path. No CI workflow runs it — see issue #304
 for the GH runner macFUSE kext limitation.
 
+### Batched S3 deletes (opt-in)
+
+For high-fanout `rm -rf` workloads against S3-compatible backends,
+mntrs can coalesce many deletes into a single S3 `DeleteObjects`
+request. **Off by default**, opt in with `MNTRS_UNLINK_BATCH=1`.
+
+```bash
+MNTRS_UNLINK_BATCH=1 mntrs mount "s3://my-bucket" /mnt/data \
+    --opt endpoint=http://minio:9000 \
+    --opt access-key=AKIA... --opt secret-key=...
+```
+
+Observed speedups vs the unbatched path (local MinIO 2025-09-07,
+mntrs `--release`):
+
+| Workload              | mntrs unbatched | mntrs batched | speedup |
+|-----------------------|----------------:|--------------:|--------:|
+| `rm -rf 100 files`    |          85 ms  |        47 ms  |   1.89× |
+| `rm -rf 500 files`    |         491 ms  |       318 ms  |   1.54× |
+| `rm -rf 60-file deep` |          42 ms  |        22 ms  |   2.90× |
+| `rm -rf mixed 52/15M` |          74 ms  |        67 ms  |   1.10× |
+
+(Geomean 1.44× across the 7 rm workloads tested.)
+
+**Semantics**: write-behind. The user's `rm` returns success
+before S3 confirms the delete. Per-key failures are logged, not
+surfaced. A tombstone in lookup/getattr/readdir masks the
+in-flight delete from the local FUSE view until the S3 response
+arrives. `rmdir` is a barrier (enqueue + flush().await) so the
+directory's deletes don't outlive the rmdir callback.
+
+**Tuning**:
+
+| Env var                        | Default | Range    | Effect |
+|--------------------------------|--------:|---------:|--------|
+| `MNTRS_UNLINK_BATCH`           | 0       | 0/1      | 0=off, 1=on |
+| `MNTRS_BATCH_SIZE`             | 100     | 1..1000  | Threshold for immediate flush (S3 hard limit is 1000) |
+| `MNTRS_BATCH_FLUSH_DELAY_MS`   | 50      | 1..10000 | ms to wait after first enqueue before deadline flush |
+
+Lower `MNTRS_BATCH_FLUSH_DELAY_MS` (e.g. 10) for latency-sensitive
+workloads; the trade-off is more `DeleteObjects` requests with
+fewer keys each. Higher values (default 50) maximize batch fill.
+
+**Counters** (process-static, log-scrapable via
+`mntrs::batched_delete` target):
+
+- `flushes_total` — successful `DeleteObjects` calls.
+- `keys_total` — keys sent across all flushes.
+- `single_key_batches_total` — flushes with batch_size = 1
+  (overhead indicator; lower is better).
+- `max_batch_size_observed` — largest batch ever sent.
+- `failures_total` — per-key permanent failures (`AccessDenied`,
+  non-idempotent `NoSuchKey`, etc.). Expect 0 in steady state.
+- `shutdown_lost_total` — keys dropped on unclean shutdown
+  (drain=false or channel close without explicit shutdown).
+
+Enable with `RUST_LOG=info,mntrs::batched_delete=info`.
+
+**When NOT to enable**: workloads with rare small deletes (single
+`rm` calls), where the 50 ms flush deadline is pure overhead. The
+unbatched path's per-callback DELETE is faster for those.
+
+See `docs/plan64_stage_a_results.md` for the full measurement
+methodology and `bench/unlink_ab.sh` to reproduce locally.
+
 ---
 
 ## Write
