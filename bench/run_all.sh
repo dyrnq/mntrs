@@ -79,7 +79,7 @@ echo "  data prepared: $(du -sh $DATA_DIR | awk '{print $1}')"
 echo ""
 echo "--- Mounting ---"
 echo "  $(date -Iseconds): preparing mount dirs..."
-mkdir -p "$MNTRS_MNT" "$RCLONE_MNT"
+mkdir -p "$MNTRS_MNT" "$RCLONE_MNT" "$MNTRS_BATCH_MNT"
 
 MEM_CACHE_IMPL="${MEM_CACHE_IMPL:-dashmap}"
 # Write mount for mntrs (default: writes cache mode)
@@ -145,6 +145,38 @@ else
   echo "  mntrs mount: FAILED — mount table:"
   mount | grep mntrs || true
   echo "  mntrs mount: FAILED (check errors above)"
+fi
+# Plan #64 follow-up: PR #511's bench-comparison step failed
+# because of two bugs in this script:
+#   1. (line 82, fixed in 7f9002e parent) `mkdir -p` only
+#      covered MNTRS_MNT and RCLONE_MNT — MNTRS_BATCH_MNT was
+#      missing. fuser immediately errors with `os error 2` (the
+#      target directory does not exist) and the daemon exits
+#      before --daemon-wait returns success.
+#   2. (this block) post-mount readiness check for
+#      MNTRS_BATCH_MNT was missing. Even with #1 fixed, CI
+#      runners are slower than --daemon-wait's local return
+#      value suggests, so poll until the mountpoint shows up.
+# Symptom of either bug: `bench/run_all.sh:447: $MNTRS_BATCH_MNT/
+# rmtest_single.txt: No such file or directory` — every
+# mntrs-batched row was silently dropped, regression script
+# then reported "mntrs wins 0 vs baseline 43 (100% drop)".
+if mountpoint -q "$MNTRS_BATCH_MNT"; then
+  echo "  mntrs-batched mount: OK"
+else
+  # Poll for up to 10s before giving up. CI runners are slower
+  # than the local --daemon-wait return value suggests.
+  for i in $(seq 1 20); do
+    sleep 0.5
+    mountpoint -q "$MNTRS_BATCH_MNT" && break
+  done
+  if mountpoint -q "$MNTRS_BATCH_MNT"; then
+    echo "  mntrs-batched mount: OK (delayed ${i} polls)"
+  else
+    echo "  mntrs-batched mount: FAILED — mount table:"
+    mount | grep mntrs || true
+    echo "  mntrs-batched mount: FAILED; subsequent bench rows for mntrs-batched will be empty"
+  fi
 fi
 if mountpoint -q "$RCLONE_MNT" || mount | grep -q "$RCLONE_MNT"; then
   echo "  rclone mount: OK"
