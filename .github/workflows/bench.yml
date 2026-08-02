@@ -120,3 +120,38 @@ jobs:
           # so this step is safe to merge before a baseline exists.
           . tests/e2e/bench/check-regression.sh
           check_regression bench-result.txt bench/baseline.txt 0.20
+
+      - name: Upload mntrs daemon log
+        if: matrix.mode == 'bench-comparison' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mntrs-daemon-log-${{ matrix.mem_cache_impl }}
+          path: /tmp/mntrs-daemon.log
+          if-no-files-found: ignore
+
+      # PoC: S3 DeleteObjects batching microbenchmark. Compares
+      # 500 × single DELETE (aws s3 rm ≈ opendal `op.delete()`) vs
+      # 1 × `delete-objects` (S3 DeleteObjects ≈ opendal
+      # `BatchDeleter<S3Deleter>` close) vs chunked variants. Tells
+      # us whether integrating a long-lived batch deleter into the
+      # FUSE unlink path can close the 1ms/op vs 0.3ms/op gap to
+      # rclone. Runs only on the bench-comparison × moka row so it
+      # isn't repeated on every A/B cell.
+      - name: Run DeleteObjects batching PoC
+        if: matrix.mode == 'bench-comparison' && matrix.mem_cache_impl == 'moka'
+        run: |
+          # v5: use boto3 (Go SDK) instead of aws s3 rm in a loop.
+          # boto3 == rclone's underlying SDK → gives the "Go SDK
+          # baseline" so we can isolate opendal's per-op overhead
+          # from S3 server cost. Install boto3 alongside awscli.
+          pip3 install boto3 --quiet 2>&1 | tail -3 || python3 -m pip install boto3 --quiet
+          ENDPOINT=http://localhost:9000 BUCKET=mntrs-delete-poc \
+            python3 bench/delete_batch_poc.py 2>&1 | tee delete-poc-result.txt
+
+      - name: Upload DeleteObjects PoC result
+        if: matrix.mode == 'bench-comparison' && matrix.mem_cache_impl == 'moka' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: delete-poc-result-${{ matrix.mem_cache_impl }}
+          path: delete-poc-result.txt
+          if-no-files-found: ignore
