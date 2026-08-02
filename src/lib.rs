@@ -464,11 +464,21 @@ pub struct MntrsFs {
     /// doesn't ref-count root and never sends forget
     /// for it.
     lookup_count: dashmap::DashMap<u64, u64>,
+    // Issue #515: inner DashMap wrapped in Arc so the per-page
+    // clone in `batch_lookup_from_dir_cache` (src/lib.rs:2530)
+    // becomes a refcount bump instead of a deep copy. O(page *
+    // directory size) String allocs on `ls -la <bigdir>` were
+    // cancelling the `Arc<Vec<CoreDirEntry>>` zero-copy win from
+    // issue #444. Read sites (`list_op` cache hit, `cache_add_entry`
+    // borrow) auto-deref through Arc and need no change. Write
+    // sites that construct the inner map wrap in `Arc::new(...)`
+    // before inserting — the type system forces every constructor
+    // site, so a missed update won't compile.
     dir_cache: dashmap::DashMap<
         String,
         (
             std::time::Instant,
-            dashmap::DashMap<String, DirEntryCacheValue>,
+            std::sync::Arc<dashmap::DashMap<String, DirEntryCacheValue>>,
         ),
     >,
     /// Local on-disk cache directory. `pub` so integration tests
@@ -2395,8 +2405,12 @@ impl MntrsFs {
                 )
             })
             .collect();
-        self.dir_cache
-            .insert(path.to_string(), (std::time::Instant::now(), dir_entries));
+        // Issue #515: wrap in Arc so the per-page clone in
+        // batch_lookup_from_dir_cache is a refcount bump.
+        self.dir_cache.insert(
+            path.to_string(),
+            (std::time::Instant::now(), std::sync::Arc::new(dir_entries)),
+        );
 
         // Also pre-populate attr_cache for every entry. The FUSE
         // kernel follows `readdir` with one `lookup` per entry, and
@@ -2461,11 +2475,13 @@ impl MntrsFs {
             let (_, entries) = entry.value();
             entries.insert(name.to_string(), DirEntryCacheValue { mode, size, mtime });
         } else {
+            // Issue #515: cold-path construction wraps in Arc to match
+            // the type change at the dir_cache field declaration.
             let entries: dashmap::DashMap<String, DirEntryCacheValue> = dashmap::DashMap::new();
             entries.insert(name.to_string(), DirEntryCacheValue { mode, size, mtime });
             self.dir_cache.insert(
                 parent_path.to_string(),
-                (std::time::Instant::now(), entries),
+                (std::time::Instant::now(), std::sync::Arc::new(entries)),
             );
         }
     }
@@ -2525,7 +2541,14 @@ impl MntrsFs {
         // lookup will hit.
         let cache_key = canonicalize_list_path(&parent_path);
         let cache_key = cache_key.as_str();
-        let cached: Option<dashmap::DashMap<String, DirEntryCacheValue>> =
+        // Issue #515: clone of the inner Arc<DashMap> is a
+        // refcount bump — `ls -la <bigdir>` no longer pays an
+        // O(page * directory size) String-alloc tax per readdir
+        // page. The DashMap entries inside remain shared between
+        // the cached snapshot and `list_op`'s in-flight writes,
+        // which is fine: `cache_add_entry` only inserts, and
+        // `invalidate_dir_cache` drops the outer Arc reference.
+        let cached: Option<std::sync::Arc<dashmap::DashMap<String, DirEntryCacheValue>>> =
             self.dir_cache.get(cache_key).map(|e| e.value().1.clone());
         let mut out = Vec::with_capacity(names.len());
         for name in names {
@@ -2747,6 +2770,15 @@ impl MntrsFs {
     /// field doc). On fallback success the index is populated so
     /// the next call is also O(1).
     fn lookup_symlink_key_case_insensitive(&self, full_path: &str) -> Option<String> {
+        // Issue #515: short-circuit before allocating the
+        // lowercased path when no symlinks are registered.
+        // On Linux/S3 mounts `symlinks` is permanently empty —
+        // the unconditional `to_lowercase()` was a wasted
+        // String alloc per FUSE lookup. `symlinks_lower` is
+        // the derived index and is empty iff `symlinks` is.
+        if self.symlinks.is_empty() {
+            return None;
+        }
         let target_lower = full_path.to_lowercase();
         if let Some(canonical) = self.symlinks_lower.get(&target_lower) {
             return Some(canonical.value().clone());
@@ -2787,6 +2819,12 @@ impl MntrsFs {
         &self,
         full_path: &str,
     ) -> Option<(String, std::path::PathBuf)> {
+        // Issue #515: short-circuit when no symlinks are
+        // registered — see the matching guard in
+        // `lookup_symlink_key_case_insensitive` for rationale.
+        if self.symlinks.is_empty() {
+            return None;
+        }
         let target_lower = full_path.to_lowercase();
         if let Some(canonical_ref) = self.symlinks_lower.get(&target_lower) {
             let canonical = canonical_ref.value().clone();
@@ -8369,6 +8407,104 @@ mod tests {
         assert_eq!(
             attr.mtime, mtime,
             "mtime is the dir_cache's server-side modtime (not the cache file's mtime)"
+        );
+    }
+
+    // ── issue #515: dir_cache inner Arc-ize ────────────────
+    //
+    // The inner DashMap<String, DirEntryCacheValue> is now
+    // wrapped in Arc so the per-page clone in
+    // `batch_lookup_from_dir_cache` is a refcount bump instead
+    // of a deep copy. The contract this test pins: the cloned
+    // Arc from `dir_cache.get(...).value().1.clone()` points at
+    // the same allocation as the stored value — i.e. a second
+    // `cache_add_entry` insert is visible through both the
+    // clone and the original guard, proving no snapshot was
+    // detached. Pre-fix this would have been a deep copy and
+    // the clone would not see the second insert.
+
+    #[test]
+    fn dir_cache_inner_is_arc_shared_not_deep_copied() {
+        use crate::util::canonicalize_list_path;
+        use std::sync::Arc;
+        let dir = scratch_dir("515-dir-cache-arc");
+        let fs = new_test_fs_evict(dir, 1024 * 1024);
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        fs.cache_add_entry("", "first", EntryMode::FILE, 100, mtime);
+        let parent_key = canonicalize_list_path("");
+
+        // Take a clone (the very code path `batch_lookup_from_dir_cache`
+        // uses) and an `Arc::ptr_eq` check against the stored value.
+        let clone_arc: Arc<dashmap::DashMap<String, DirEntryCacheValue>> = fs
+            .dir_cache
+            .get(&parent_key)
+            .expect("dir_cache seeded by cache_add_entry")
+            .value()
+            .1
+            .clone();
+        let stored_arc = fs
+            .dir_cache
+            .get(&parent_key)
+            .expect("dir_cache still present")
+            .value()
+            .1
+            .clone();
+        assert!(
+            Arc::ptr_eq(&clone_arc, &stored_arc),
+            "clone must share the inner DashMap allocation (refcount bump), \
+             not deep-copy — otherwise issue #444's readdir zero-copy win is \
+             cancelled by `ls -la <bigdir>` per-page String-alloc storm"
+        );
+
+        // Mutate the shared inner map through `cache_add_entry`
+        // (which holds an `&DashMap` reference and inserts into
+        // it). With deep-copy semantics the cloned `clone_arc`
+        // would NOT see the new entry; with shared-Arc
+        // semantics it must.
+        fs.cache_add_entry("", "second", EntryMode::FILE, 200, mtime);
+        assert!(
+            clone_arc.contains_key("second"),
+            "clone Arc must observe the new entry — proves the clone shares \
+             the inner allocation, not a snapshot"
+        );
+        assert_eq!(
+            clone_arc.get("second").unwrap().size,
+            200,
+            "shared entry carries the correct size"
+        );
+    }
+
+    /// Issue #515: when no symlinks are registered, the
+    /// case-insensitive helpers short-circuit before allocating
+    /// a lowercased String. This is the `Linux/S3` mount
+    /// steady-state. Pre-fix every FUSE lookup paid one String
+    /// alloc for the `to_lowercase()` call; post-fix it returns
+    /// None immediately when `symlinks.is_empty()`.
+    #[test]
+    fn lookup_symlink_short_circuits_when_empty() {
+        let dir = scratch_dir("515-symlink-short-circuit");
+        let fs = new_test_fs_evict(dir, 1024 * 1024);
+        // symlinks starts empty in a fresh fs.
+        assert!(fs.symlinks.is_empty(), "fresh fs must have empty symlinks");
+        assert!(
+            fs.symlinks_lower.is_empty(),
+            "derived index must agree with primary"
+        );
+        // Both helpers return None without touching to_lowercase
+        // (we can't observe the alloc directly, but the result
+        // must still be None — and importantly the public test
+        // helpers `__symlinks_lower_*` aren't called here).
+        assert!(fs.__symlink_lookup_key("any/path.txt").is_none());
+        assert!(fs.__symlink_lookup_entry("any/path.txt").is_none());
+        // After inserting a symlink, the helper must work
+        // normally — short-circuit only fires when empty.
+        fs.symlinks
+            .insert("a/link".into(), std::path::PathBuf::from("/target"));
+        fs.symlinks_lower.insert("a/link".into(), "a/link".into());
+        assert_eq!(
+            fs.__symlink_lookup_key("A/link").as_deref(),
+            Some("a/link"),
+            "non-empty path: case-insensitive lookup must still resolve"
         );
     }
 
