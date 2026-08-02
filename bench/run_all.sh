@@ -12,6 +12,12 @@ REGION="${REGION:-us-east-1}"
 MNTRS_BIN="${MNTRS_BIN:-./target/release/mntrs}"
 MNTRS_MNT="${MNTRS_MNT:-/tmp/mntrs-bench}"
 RCLONE_MNT="${RCLONE_MNT:-/tmp/rclone-bench}"
+# Plan #64 step 12: a second mntrs mount with the batched
+# deleter enabled, on an isolated S3 prefix so the rm -rf
+# rows compare apples-to-apples (one impl's deletes don't
+# race another's readdir caching).
+MNTRS_BATCH_MNT="${MNTRS_BATCH_MNT:-/tmp/mntrs-bench-batch}"
+BATCH_BUCKET="${BATCH_BUCKET:-$BUCKET-batch}"
 MEM_MNT="/tmp/mntrs-mem-bench"
 RESULT_TMP="$(mktemp /tmp/bench-results-XXXXXX)"
 
@@ -104,6 +110,24 @@ RUST_LOG=info,opendal_layer::logging=debug "$MNTRS_BIN" mount "s3://$BUCKET" "$M
     --daemon --daemon-wait --daemon-timeout=15 2>&1
 echo "  $(date -Iseconds): mntrs mount returned (exit=$?)"
 
+# Plan #64 step 12: second mntrs mount with the batched
+# deleter enabled. Separate S3 prefix (BATCH_BUCKET) so the
+# rm -rf workload is not corrupted by the unbatched mount's
+# deletes. Same TLS, same client pool, same daemon log
+# surface so the only delta is the batching.
+echo "  $(date -Iseconds): starting mntrs-batched mount (MNTRS_UNLINK_BATCH=1)..."
+export MNTRS_BATCH_DAEMON_LOG="${MNTRS_BATCH_DAEMON_LOG:-/tmp/mntrs-daemon-batch.log}"
+MNTRS_UNLINK_BATCH=1 \
+RUST_LOG=info,mntrs::batched_delete=info \
+"$MNTRS_BIN" mount "s3://$BATCH_BUCKET" "$MNTRS_BATCH_MNT" \
+    --opt "endpoint=$ENDPOINT" --opt "access-key=$ACCESS_KEY" \
+    --opt "secret-key=$SECRET_KEY" --opt "region=$REGION" \
+    --vfs-cache-mode=writes --vfs-write-back=5 \
+    --vfs-read-ahead=134217728 --async-read \
+    --mem-cache-impl="$MEM_CACHE_IMPL" \
+    --daemon --daemon-wait --daemon-timeout=15 2>&1
+echo "  $(date -Iseconds): mntrs-batched mount returned (exit=$?)"
+
 # rclone mount (writes cache mode for fair comparison)
 echo "  $(date -Iseconds): setting up rclone config..."
 rclone config create bench s3 provider Minio \
@@ -136,6 +160,12 @@ echo ""
 echo "--- Uploading test data ---"
 uv tool install awscli 2>/dev/null || pip3 install awscli 2>/dev/null || true
 AWS_ACCESS_KEY_ID="$ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$SECRET_KEY"   aws --endpoint-url "$ENDPOINT" --no-verify-ssl s3 mb "s3://$BUCKET" 2>/dev/null || true
+# Plan #64 step 12: separate bucket for the batched mntrs
+# mount so its deletes don't corrupt the unbatched mntrs
+# and rclone readdir caches. The shared-prefix layout
+# pre-fix meant `rm -rf` on the unbatched mount made the
+# rclone row race against already-missing keys.
+AWS_ACCESS_KEY_ID="$ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$SECRET_KEY"   aws --endpoint-url "$ENDPOINT" --no-verify-ssl s3 mb "s3://$BATCH_BUCKET" 2>/dev/null || true
 rm -rf /tmp/bench-upload
 mkdir -p /tmp/bench-upload
 cp "$DATA_DIR"/1K.bin "$DATA_DIR"/4K.bin "$DATA_DIR"/64K.bin "$DATA_DIR"/1M.bin "$DATA_DIR"/10M.bin "$DATA_DIR"/100M.bin /tmp/bench-upload/
@@ -392,17 +422,16 @@ CATEGORY="Lseek"
 bench "lseek 100M" "mntrs" bash -c "exec 3<'$MNTRS_MNT/100M.bin'; dd bs=1 seek=1000 count=0 of=/dev/null 2>/dev/null <&3; exec 3>&-"
 bench "lseek 100M" "rclone" bash -c "exec 3<'$RCLONE_MNT/100M.bin'; dd bs=1 seek=1000 count=0 of=/dev/null 2>/dev/null <&3; exec 3>&-"
 
-# ---- Table ----
-python3 "$SCRIPT_DIR/render_table.py" "$RESULT_TMP"
-if [ -f /tmp/rclone-bench.log ]; then echo "=== rclone log ===" >> "$RESULT_TMP"; cat /tmp/rclone-bench.log >> "$RESULT_TMP"; fi
-rm -f "$RESULT_TMP"
+# Plan #64 step 12: table render moved to end of file so
+# the rm -rf rows below (which are appended to RESULT_TMP)
+# are included. The pre-existing render at this point in
+# the script lost every rm result, making the rm workload
+# invisible in the artifact.
+echo ""; echo "=== 20.5 placeholder (table render deferred to EOF) ==="
 
-# ---- Summary ----
-echo ""
+# ---- Summary (placeholder; final summary is at EOF) ----
 ELAPSED=$(( $(date +%s) - START_TIME ))
-echo "============================================"
-printf " %d tests: %d passed, %d failed (%ds)\n" "$TOTAL" "$PASS" "$FAIL" "$ELAPSED"
-echo "============================================"
+echo "  (intermediate): $TOTAL tests so far, $FAIL failed"
 
 # ============================================================
 # rm -rf multi-dimensional benchmarks (issue #134)
@@ -412,70 +441,95 @@ _recreate_rm_data() {
     case "$label" in
         single)
             echo "single" > "$MNTRS_MNT/rmtest_single.txt" 2>/dev/null
-            echo "single" > "$RCLONE_MNT/rmtest_single.txt" 2>/dev/null ;;
+            echo "single" > "$RCLONE_MNT/rmtest_single.txt" 2>/dev/null
+            # Plan #64 step 12: populate the batched mount so its
+            # `mntrs-batched` row sees the same starting state.
+            echo "single" > "$MNTRS_BATCH_MNT/rmtest_single.txt" 2>/dev/null ;;
         empty_dir)
             rmdir "$MNTRS_MNT/rmtest_empty" 2>/dev/null; mkdir -p "$MNTRS_MNT/rmtest_empty" 2>/dev/null
-            rmdir "$RCLONE_MNT/rmtest_empty" 2>/dev/null; mkdir -p "$RCLONE_MNT/rmtest_empty" 2>/dev/null ;;
+            rmdir "$RCLONE_MNT/rmtest_empty" 2>/dev/null; mkdir -p "$RCLONE_MNT/rmtest_empty" 2>/dev/null
+            rmdir "$MNTRS_BATCH_MNT/rmtest_empty" 2>/dev/null; mkdir -p "$MNTRS_BATCH_MNT/rmtest_empty" 2>/dev/null ;;
         small_10)
-            rm -rf "$MNTRS_MNT/rmtest_small_10" 2>/dev/null; mkdir -p "$MNTRS_MNT/rmtest_small_10"; rm -rf "$RCLONE_MNT/rmtest_small_10" 2>/dev/null; mkdir -p "$RCLONE_MNT/rmtest_small_10"; for i in $(seq 1 10); do echo "s$i" > "$MNTRS_MNT/rmtest_small_10/f_$i.txt"; echo "s$i" > "$RCLONE_MNT/rmtest_small_10/f_$i.txt"; done ;;
+            rm -rf "$MNTRS_MNT/rmtest_small_10" 2>/dev/null; mkdir -p "$MNTRS_MNT/rmtest_small_10"; rm -rf "$RCLONE_MNT/rmtest_small_10" 2>/dev/null; mkdir -p "$RCLONE_MNT/rmtest_small_10"; for i in $(seq 1 10); do echo "s$i" > "$MNTRS_MNT/rmtest_small_10/f_$i.txt"; echo "s$i" > "$RCLONE_MNT/rmtest_small_10/f_$i.txt"; done
+            rm -rf "$MNTRS_BATCH_MNT/rmtest_small_10" 2>/dev/null; mkdir -p "$MNTRS_BATCH_MNT/rmtest_small_10"; for i in $(seq 1 10); do echo "s$i" > "$MNTRS_BATCH_MNT/rmtest_small_10/f_$i.txt"; done ;;
         shallow_100)
-            rm -rf "$MNTRS_MNT/rmtest_shallow_100" 2>/dev/null; mkdir -p "$MNTRS_MNT/rmtest_shallow_100"; rm -rf "$RCLONE_MNT/rmtest_shallow_100" 2>/dev/null; mkdir -p "$RCLONE_MNT/rmtest_shallow_100"; for i in $(seq 1 100); do echo "sh100_$i" > "$MNTRS_MNT/rmtest_shallow_100/f_$(printf '%04d' "$i").txt"; echo "sh100_$i" > "$RCLONE_MNT/rmtest_shallow_100/f_$(printf '%04d' "$i").txt"; done ;;
+            rm -rf "$MNTRS_MNT/rmtest_shallow_100" 2>/dev/null; mkdir -p "$MNTRS_MNT/rmtest_shallow_100"; rm -rf "$RCLONE_MNT/rmtest_shallow_100" 2>/dev/null; mkdir -p "$RCLONE_MNT/rmtest_shallow_100"; for i in $(seq 1 100); do echo "sh100_$i" > "$MNTRS_MNT/rmtest_shallow_100/f_$(printf '%04d' "$i").txt"; echo "sh100_$i" > "$RCLONE_MNT/rmtest_shallow_100/f_$(printf '%04d' "$i").txt"; done
+            rm -rf "$MNTRS_BATCH_MNT/rmtest_shallow_100" 2>/dev/null; mkdir -p "$MNTRS_BATCH_MNT/rmtest_shallow_100"; for i in $(seq 1 100); do echo "sh100_$i" > "$MNTRS_BATCH_MNT/rmtest_shallow_100/f_$(printf '%04d' "$i").txt"; done ;;
         shallow_500)
-            rm -rf "$MNTRS_MNT/rmtest_shallow_500" 2>/dev/null; mkdir -p "$MNTRS_MNT/rmtest_shallow_500"; rm -rf "$RCLONE_MNT/rmtest_shallow_500" 2>/dev/null; mkdir -p "$RCLONE_MNT/rmtest_shallow_500"; for i in $(seq 1 500); do echo "sh500_$i" > "$MNTRS_MNT/rmtest_shallow_500/f_$(printf '%04d' "$i").txt"; echo "sh500_$i" > "$RCLONE_MNT/rmtest_shallow_500/f_$(printf '%04d' "$i").txt"; done ;;
+            rm -rf "$MNTRS_MNT/rmtest_shallow_500" 2>/dev/null; mkdir -p "$MNTRS_MNT/rmtest_shallow_500"; rm -rf "$RCLONE_MNT/rmtest_shallow_500" 2>/dev/null; mkdir -p "$RCLONE_MNT/rmtest_shallow_500"; for i in $(seq 1 500); do echo "sh500_$i" > "$MNTRS_MNT/rmtest_shallow_500/f_$(printf '%04d' "$i").txt"; echo "sh500_$i" > "$RCLONE_MNT/rmtest_shallow_500/f_$(printf '%04d' "$i").txt"; done
+            rm -rf "$MNTRS_BATCH_MNT/rmtest_shallow_500" 2>/dev/null; mkdir -p "$MNTRS_BATCH_MNT/rmtest_shallow_500"; for i in $(seq 1 500); do echo "sh500_$i" > "$MNTRS_BATCH_MNT/rmtest_shallow_500/f_$(printf '%04d' "$i").txt"; done ;;
         deep)
             rm -rf "$MNTRS_MNT/rmtest_deep_3" 2>/dev/null; rm -rf "$RCLONE_MNT/rmtest_deep_3" 2>/dev/null
             D="$MNTRS_MNT/rmtest_deep_3"; R="$RCLONE_MNT/rmtest_deep_3"
             mkdir -p "$D/a/b/c" "$D/d/e/f" "$R/a/b/c" "$R/d/e/f" 2>/dev/null
             for sub in "$D/a" "$D/a/b" "$D/a/b/c" "$D/d" "$D/d/e" "$D/d/e/f"; do for j in $(seq 1 10); do echo "deep_$j" > "$sub/f_$j.txt"; done; done
-            for sub in "$R/a" "$R/a/b" "$R/a/b/c" "$R/d" "$R/d/e" "$R/d/e/f"; do for j in $(seq 1 10); do echo "deep_$j" > "$sub/f_$j.txt"; done; done ;;
+            for sub in "$R/a" "$R/a/b" "$R/a/b/c" "$R/d" "$R/d/e" "$R/d/e/f"; do for j in $(seq 1 10); do echo "deep_$j" > "$sub/f_$j.txt"; done; done
+            rm -rf "$MNTRS_BATCH_MNT/rmtest_deep_3" 2>/dev/null
+            B="$MNTRS_BATCH_MNT/rmtest_deep_3"
+            mkdir -p "$B/a/b/c" "$B/d/e/f" 2>/dev/null
+            for sub in "$B/a" "$B/a/b" "$B/a/b/c" "$B/d" "$B/d/e" "$B/d/e/f"; do for j in $(seq 1 10); do echo "deep_$j" > "$sub/f_$j.txt"; done; done ;;
         mixed)
             rm -rf "$MNTRS_MNT/rmtest_mixed" 2>/dev/null; rm -rf "$RCLONE_MNT/rmtest_mixed" 2>/dev/null
             mkdir -p "$MNTRS_MNT/rmtest_mixed" "$RCLONE_MNT/rmtest_mixed" 2>/dev/null
             for i in $(seq 1 50); do dd if=/dev/urandom of="$MNTRS_MNT/rmtest_mixed/s_$(printf '%04d' "$i").bin" bs=4K count=1 2>/dev/null; dd if=/dev/urandom of="$RCLONE_MNT/rmtest_mixed/s_$(printf '%04d' "$i").bin" bs=4K count=1 2>/dev/null; done
             dd if=/dev/urandom of="$MNTRS_MNT/rmtest_mixed/large_1.bin" bs=1M count=10 2>/dev/null; dd if=/dev/urandom of="$MNTRS_MNT/rmtest_mixed/large_2.bin" bs=1M count=5 2>/dev/null
-            dd if=/dev/urandom of="$RCLONE_MNT/rmtest_mixed/large_1.bin" bs=1M count=10 2>/dev/null; dd if=/dev/urandom of="$RCLONE_MNT/rmtest_mixed/large_2.bin" bs=1M count=5 2>/dev/null ;;
+            dd if=/dev/urandom of="$RCLONE_MNT/rmtest_mixed/large_1.bin" bs=1M count=10 2>/dev/null; dd if=/dev/urandom of="$RCLONE_MNT/rmtest_mixed/large_2.bin" bs=1M count=5 2>/dev/null
+            rm -rf "$MNTRS_BATCH_MNT/rmtest_mixed" 2>/dev/null
+            mkdir -p "$MNTRS_BATCH_MNT/rmtest_mixed" 2>/dev/null
+            for i in $(seq 1 50); do dd if=/dev/urandom of="$MNTRS_BATCH_MNT/rmtest_mixed/s_$(printf '%04d' "$i").bin" bs=4K count=1 2>/dev/null; done
+            dd if=/dev/urandom of="$MNTRS_BATCH_MNT/rmtest_mixed/large_1.bin" bs=1M count=10 2>/dev/null; dd if=/dev/urandom of="$MNTRS_BATCH_MNT/rmtest_mixed/large_2.bin" bs=1M count=5 2>/dev/null ;;
         nested_empty)
             rm -rf "$MNTRS_MNT/rmtest_nested_empty" 2>/dev/null; rm -rf "$RCLONE_MNT/rmtest_nested_empty" 2>/dev/null
-            mkdir -p "$MNTRS_MNT/rmtest_nested_empty/a/b/c" "$RCLONE_MNT/rmtest_nested_empty/a/b/c" ;;
+            mkdir -p "$MNTRS_MNT/rmtest_nested_empty/a/b/c" "$RCLONE_MNT/rmtest_nested_empty/a/b/c"
+            rm -rf "$MNTRS_BATCH_MNT/rmtest_nested_empty" 2>/dev/null
+            mkdir -p "$MNTRS_BATCH_MNT/rmtest_nested_empty/a/b/c" ;;
     esac; sync; sleep 1
 }
 
 echo ""; echo "=== 21. rm -rf: unlink baseline ==="; CATEGORY="RmRf"
 _recreate_rm_data single
 bench "rm single file" "mntrs" rm -f "$MNTRS_MNT/rmtest_single.txt"
+bench "rm single file" "mntrs-batched" rm -f "$MNTRS_BATCH_MNT/rmtest_single.txt"
 bench "rm single file" "rclone" rm -f "$RCLONE_MNT/rmtest_single.txt"
 
 echo ""; echo "=== 22. rm -rf: empty directory ==="; CATEGORY="RmRf"
 _recreate_rm_data empty_dir
 bench "rmdir empty" "mntrs" rmdir "$MNTRS_MNT/rmtest_empty"
+bench "rmdir empty" "mntrs-batched" rmdir "$MNTRS_BATCH_MNT/rmtest_empty"
 bench "rmdir empty" "rclone" rmdir "$RCLONE_MNT/rmtest_empty"
 _recreate_rm_data nested_empty
 bench "rm -rf nested_empty" "mntrs" rm -rf "$MNTRS_MNT/rmtest_nested_empty"
+bench "rm -rf nested_empty" "mntrs-batched" rm -rf "$MNTRS_BATCH_MNT/rmtest_nested_empty"
 bench "rm -rf nested_empty" "rclone" rm -rf "$RCLONE_MNT/rmtest_nested_empty"
 
 echo ""; echo "=== 23. rm -rf: small batch (10 files) ==="; CATEGORY="RmRf"
 _recreate_rm_data small_10
 bench "rm -rf 10 files" "mntrs" rm -rf "$MNTRS_MNT/rmtest_small_10"
+bench "rm -rf 10 files" "mntrs-batched" rm -rf "$MNTRS_BATCH_MNT/rmtest_small_10"
 bench "rm -rf 10 files" "rclone" rm -rf "$RCLONE_MNT/rmtest_small_10"
 
 echo ""; echo "=== 24. rm -rf: shallow 100 files ==="; CATEGORY="RmRf"
 _recreate_rm_data shallow_100
 bench "rm -rf 100 files" "mntrs" rm -rf "$MNTRS_MNT/rmtest_shallow_100"
+bench "rm -rf 100 files" "mntrs-batched" rm -rf "$MNTRS_BATCH_MNT/rmtest_shallow_100"
 bench "rm -rf 100 files" "rclone" rm -rf "$RCLONE_MNT/rmtest_shallow_100"
 
 echo ""; echo "=== 25. rm -rf: shallow 500 files ==="; CATEGORY="RmRf"
 _recreate_rm_data shallow_500
 bench "rm -rf 500 files" "mntrs" rm -rf "$MNTRS_MNT/rmtest_shallow_500"
+bench "rm -rf 500 files" "mntrs-batched" rm -rf "$MNTRS_BATCH_MNT/rmtest_shallow_500"
 bench "rm -rf 500 files" "rclone" rm -rf "$RCLONE_MNT/rmtest_shallow_500"
 
 echo ""; echo "=== 26. rm -rf: 3-level deep directory tree ==="; CATEGORY="RmRf"
 _recreate_rm_data deep
 bench "rm -rf deep tree (60 files)" "mntrs" rm -rf "$MNTRS_MNT/rmtest_deep_3"
+bench "rm -rf deep tree (60 files)" "mntrs-batched" rm -rf "$MNTRS_BATCH_MNT/rmtest_deep_3"
 bench "rm -rf deep tree (60 files)" "rclone" rm -rf "$RCLONE_MNT/rmtest_deep_3"
 
 echo ""; echo "=== 27. rm -rf: mixed small+large files (52 files, ~15M) ==="; CATEGORY="RmRf"
 _recreate_rm_data mixed
 bench "rm -rf mixed (52 files 15M)" "mntrs" rm -rf "$MNTRS_MNT/rmtest_mixed"
+bench "rm -rf mixed (52 files 15M)" "mntrs-batched" rm -rf "$MNTRS_BATCH_MNT/rmtest_mixed"
 bench "rm -rf mixed (52 files 15M)" "rclone" rm -rf "$RCLONE_MNT/rmtest_mixed"
 
 # ============================================================
@@ -577,3 +631,15 @@ bench "cat 100M warm" "rclone" cat "$RCLONE_MNT/adaptive-100M.bin" >/dev/null
 bench "dd bs=1M 100M cold" "mntrs" dd if="$MNTRS_MNT/adaptive-100M.bin" bs=1M of=/dev/null 2>/dev/null
 bench "dd bs=1M 100M cold" "rclone" dd if="$RCLONE_MNT/adaptive-100M.bin" bs=1M of=/dev/null 2>/dev/null
 rm -f "$MNTRS_MNT/adaptive-100M.bin" "$RCLONE_MNT/adaptive-100M.bin" 2>/dev/null
+
+# ---- Table (final, after all benches incl. rm -rf) ----
+python3 "$SCRIPT_DIR/render_table.py" "$RESULT_TMP"
+if [ -f /tmp/rclone-bench.log ]; then echo "=== rclone log ===" >> "$RESULT_TMP"; cat /tmp/rclone-bench.log >> "$RESULT_TMP"; fi
+if [ -f /tmp/mntrs-daemon-batch.log ]; then echo "=== mntrs-batched daemon log (last 50 lines) ===" >> "$RESULT_TMP"; tail -50 /tmp/mntrs-daemon-batch.log >> "$RESULT_TMP"; fi
+rm -f "$RESULT_TMP"
+
+# ---- Summary ----
+ELAPSED=$(( $(date +%s) - START_TIME ))
+echo "============================================"
+printf " %d tests: %d passed, %d failed (%ds)\n" "$TOTAL" "$PASS" "$FAIL" "$ELAPSED"
+echo "============================================"

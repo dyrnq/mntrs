@@ -17,3 +17,4 @@ docker/csi/mntrs-csi
 # running the bench and consumed by check-regression.sh, not diffed
 # against a static file. See bench/run_all.sh / bench/run_all_mac.sh.
 bench/baseline-*.txt
+bench/__pycache__/
