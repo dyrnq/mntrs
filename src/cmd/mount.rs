@@ -29,6 +29,32 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+// Plan #64 (step 6): build result carries the per-mount
+// `reqwest::Client` plus, for S3, the inputs the batched
+// deleter needs (endpoint/bucket/prefix/region/credentials).
+// Non-S3 schemes get `s3_delete_config = None`. `http` is
+// always populated because cloning `reqwest::Client` is Arc-cheap
+// and keeps the `Mount` entry point free of an `Option`.
+pub(crate) struct BuiltOperator {
+    pub operator: Operator,
+    pub http: reqwest::Client,
+    pub s3_delete_config: Option<S3DeleteMountConfig>,
+}
+
+/// Inputs the S3 batched deleter needs that opendal doesn't
+/// surface through its public API. Built by `build_s3` from
+/// the storage URL + opts; consumed by `MntrsFs` to construct
+/// the `batched_delete::WorkerConfig` (plan #64 step 7).
+#[allow(dead_code)]
+pub(crate) struct S3DeleteMountConfig {
+    pub endpoint: url::Url,
+    pub bucket: String,
+    pub prefix: String,
+    pub region: String,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+}
+
 fn rt_block_on<F, T>(f: F) -> T
 where
     F: std::future::Future<Output = T>,
@@ -695,7 +721,7 @@ fn cache_dir_for_mount(mountpoint: &str) -> String {
 }
 
 pub fn build_operator_sync(storage_url: &str, opts: &HashMap<String, String>) -> Result<Operator> {
-    rt_block_on(build_operator(storage_url, opts))
+    Ok(rt_block_on(build_operator(storage_url, opts))?.operator)
 }
 
 pub fn unmount_internal(mountpoint: &str) -> anyhow::Result<()> {
@@ -1035,7 +1061,14 @@ pub fn mount(
         mountpoint = %mountpoint,
         "mount: entered, about to build_operator"
     );
-    let op = rt_block_on(build_operator(storage_url, opts))?;
+    let built = rt_block_on(build_operator(storage_url, opts))?;
+    let op = built.operator;
+    // Plan #64 step 6/7: `http` and `s3_delete_config` will be
+    // plumbed into MntrsFs in step 7. Capture now so the value
+    // is owned by the mount frame and we don't have to revisit
+    // this site when adding the MntrsFs fields.
+    let _mount_http = built.http;
+    let _mount_s3_delete_config = built.s3_delete_config;
     tracing::debug!(
         elapsed_ms = _t_mount.elapsed().as_millis() as u64,
         "mount: after build_operator"
@@ -2235,9 +2268,9 @@ pub fn mount(
 fn apply_operator_with_tls(
     builder: impl opendal::Builder,
     opts: &std::collections::HashMap<String, String>,
-) -> Result<Operator> {
+) -> Result<(Operator, reqwest::Client)> {
     let client = build_mount_http_client(opts)?;
-    apply_operator_with_client(builder, client)
+    apply_operator_with_client(builder, client.clone()).map(|op| (op, client))
 }
 
 /// Build the mount-scoped `reqwest::Client`. Honours
@@ -2336,7 +2369,10 @@ fn apply_operator_with_client(
     })
 }
 
-async fn build_operator(storage_url: &str, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_operator(
+    storage_url: &str,
+    opts: &HashMap<String, String>,
+) -> Result<BuiltOperator> {
     let url = url::Url::parse(storage_url).map_err(|e| {
         anyhow!(
             "invalid storage URL '{}': {e}",
@@ -2373,7 +2409,7 @@ async fn build_operator(storage_url: &str, opts: &HashMap<String, String>) -> Re
     }
 }
 
-async fn build_s3(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_s3(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let bucket = url.host_str().ok_or_else(|| anyhow!("missing bucket"))?;
     let mut builder = S3::default().bucket(bucket);
     let p = url.path().trim_start_matches('/');
@@ -2418,20 +2454,66 @@ async fn build_s3(url: &url::Url, opts: &HashMap<String, String>) -> Result<Oper
     if let Some(v) = opts.get("storage-class") {
         builder = builder.default_storage_class(v);
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+
+    // Plan #64 step 6: capture the inputs the S3 batched
+    // deleter needs. Endpoint precedence: explicit
+    // `--opt endpoint=` first, then the URL scheme/host.
+    // We use the URL's host:port as the default endpoint
+    // (preserves whatever path-style or virtual-host the
+    // user selected via the URL) — only override when
+    // `--opt endpoint=` is explicitly set.
+    let endpoint = if let Some(v) = opts.get("endpoint") {
+        url::Url::parse(v).map_err(|e| anyhow!("invalid --opt endpoint '{}': {}", v, e))?
+    } else {
+        url.clone()
+    };
+    let region = opts
+        .get("region")
+        .cloned()
+        .unwrap_or_else(|| "us-east-1".to_string());
+    let access_key_id = opts.get("access-key").cloned();
+    let secret_access_key = opts.get("secret-key").cloned();
+    // opendal trims the leading '/' from URL paths and treats
+    // the remainder as the operator root. Mirror that here so
+    // the batcher deletes exactly what opendal would have
+    // (otherwise we'd produce S3 keys off-by-one leading '/').
+    let prefix = if p.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", p)
+    };
+
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: Some(S3DeleteMountConfig {
+            endpoint,
+            bucket: bucket.to_string(),
+            prefix,
+            region,
+            access_key_id,
+            secret_access_key,
+        }),
+    })
 }
 
-async fn build_gcs(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_gcs(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let bucket = url.host_str().ok_or_else(|| anyhow!("missing bucket"))?;
     let mut builder = Gcs::default().bucket(bucket);
     let p = url.path().trim_start_matches('/');
     if !p.is_empty() {
         builder = builder.root(p);
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
-async fn build_azblob(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_azblob(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let container = url.host_str().ok_or_else(|| anyhow!("missing container"))?;
     let mut builder = Azblob::default().container(container);
     let p = url.path().trim_start_matches('/');
@@ -2444,10 +2526,18 @@ async fn build_azblob(url: &url::Url, opts: &HashMap<String, String>) -> Result<
     if let Some(v) = opts.get("account-key") {
         builder = builder.account_key(v);
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
-async fn build_hdfs_native(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_hdfs_native(
+    url: &url::Url,
+    opts: &HashMap<String, String>,
+) -> Result<BuiltOperator> {
     let namenode = url.host_str().ok_or_else(|| anyhow!("missing namenode"))?;
     let port = url.port().unwrap_or(8020);
     // Issue #22: opendal's `name_node` expects the full
@@ -2475,14 +2565,19 @@ async fn build_hdfs_native(url: &url::Url, opts: &HashMap<String, String>) -> Re
     if !opts.is_empty() {
         builder = builder.options(opts.clone());
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
 /// Build HDFS operator using JNI-based libhdfs (requires Java).
 /// Enabled with: cargo build --features hdfs-jni
 /// Supports Kerberos via --opt kerberos-ticket-cache-path and --opt user.
 #[cfg(feature = "hdfs-jni")]
-async fn build_hdfs_jni(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_hdfs_jni(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let namenode = url.host_str().ok_or_else(|| anyhow!("missing namenode"))?;
     let port = url.port().unwrap_or(8020);
     let addr = format!("{}:{}", namenode, port);
@@ -2509,11 +2604,16 @@ async fn build_hdfs_jni(url: &url::Url, opts: &HashMap<String, String>) -> Resul
             _ => tracing::warn!("ignored unsupported hdfs-jni option: {k}={v}"),
         }
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
 /// Build WebHDFS operator (HDFS REST API gateway).
-async fn build_webhdfs(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_webhdfs(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let endpoint = format!(
         "{}://{}{}",
         url.scheme(),
@@ -2532,7 +2632,12 @@ async fn build_webhdfs(url: &url::Url, opts: &HashMap<String, String>) -> Result
             _ => tracing::warn!("ignored unsupported webhdfs option: {k}={v}"),
         }
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
 // Bug 7 / dead-code cleanup: a stale `fn daemonize`
@@ -2554,7 +2659,7 @@ async fn build_webhdfs(url: &url::Url, opts: &HashMap<String, String>) -> Result
 // surface child startup errors back through the
 // status pipe).
 
-async fn build_oss(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_oss(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let bucket = url.host_str().ok_or_else(|| anyhow!("missing bucket"))?;
     let mut builder = Oss::default().bucket(bucket);
     let p = url.path().trim_start_matches('/');
@@ -2570,10 +2675,15 @@ async fn build_oss(url: &url::Url, opts: &HashMap<String, String>) -> Result<Ope
     if let Some(v) = opts.get("secret-key") {
         builder = builder.access_key_secret(v);
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
-async fn build_cos(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_cos(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let bucket = url.host_str().ok_or_else(|| anyhow!("missing bucket"))?;
     let mut builder = Cos::default().bucket(bucket);
     let p = url.path().trim_start_matches('/');
@@ -2589,10 +2699,15 @@ async fn build_cos(url: &url::Url, opts: &HashMap<String, String>) -> Result<Ope
     if let Some(v) = opts.get("secret-key") {
         builder = builder.secret_key(v);
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
-async fn build_obs(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_obs(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let bucket = url.host_str().ok_or_else(|| anyhow!("missing bucket"))?;
     let mut builder = Obs::default().bucket(bucket);
     let p = url.path().trim_start_matches('/');
@@ -2608,10 +2723,15 @@ async fn build_obs(url: &url::Url, opts: &HashMap<String, String>) -> Result<Ope
     if let Some(v) = opts.get("secret-key") {
         builder = builder.secret_access_key(v);
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
-async fn build_b2(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_b2(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let bucket = url.host_str().ok_or_else(|| anyhow!("missing bucket"))?;
     let mut builder = B2::default().bucket(bucket);
     let p = url.path().trim_start_matches('/');
@@ -2624,10 +2744,18 @@ async fn build_b2(url: &url::Url, opts: &HashMap<String, String>) -> Result<Oper
     if let Some(v) = opts.get("application-key") {
         builder = builder.application_key(v);
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
-async fn build_vercel_blob(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_vercel_blob(
+    url: &url::Url,
+    opts: &HashMap<String, String>,
+) -> Result<BuiltOperator> {
     let mut builder = VercelBlob::default();
     let p = url.path().trim_start_matches('/');
     if !p.is_empty() {
@@ -2636,10 +2764,18 @@ async fn build_vercel_blob(url: &url::Url, opts: &HashMap<String, String>) -> Re
     if let Some(v) = opts.get("token") {
         builder = builder.token(v);
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
-async fn build_aliyun_drive(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_aliyun_drive(
+    url: &url::Url,
+    opts: &HashMap<String, String>,
+) -> Result<BuiltOperator> {
     let mut builder = AliyunDrive::default();
     let p = url.path().trim_start_matches('/');
     if !p.is_empty() {
@@ -2660,18 +2796,33 @@ async fn build_aliyun_drive(url: &url::Url, opts: &HashMap<String, String>) -> R
     if let Some(v) = opts.get("drive-type") {
         builder = builder.drive_type(v);
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
-async fn build_fs(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_fs(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let root = url.path().to_string();
     let builder = Fs::default().root(&root);
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
-async fn build_memory(_url: &url::Url, _opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_memory(_url: &url::Url, _opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let builder = Memory::default();
-    apply_operator_with_tls(builder, _opts)
+    let (operator, http) = apply_operator_with_tls(builder, _opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
 /// Async-signal-safe: only sets atomic flags.
@@ -2781,7 +2932,7 @@ unsafe fn install_sigaction(signo: i32, handler: extern "C" fn(i32)) {
     }
 }
 
-async fn build_webdav(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_webdav(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     // Prefer explicit --opt endpoint over URL-derived host.
     // When no endpoint opt is given, derive from the URL host
     // but use http:// scheme (opendal's WebDAV service expects
@@ -2807,7 +2958,12 @@ async fn build_webdav(url: &url::Url, opts: &HashMap<String, String>) -> Result<
     if let Some(v) = opts.get("token") {
         builder = builder.token(v);
     }
-    apply_operator_with_tls(builder, opts)
+    let (operator, http) = apply_operator_with_tls(builder, opts)?;
+    Ok(BuiltOperator {
+        operator,
+        http,
+        s3_delete_config: None,
+    })
 }
 
 /// Build an SFTP operator from the URL and options.
@@ -2821,7 +2977,7 @@ async fn build_webdav(url: &url::Url, opts: &HashMap<String, String>) -> Result<
 ///   key                  — path to SSH private key file
 ///   known_hosts_strategy — "accept" to skip host key verification (default: strict)
 #[cfg(feature = "sftp")]
-async fn build_sftp(url: &url::Url, opts: &HashMap<String, String>) -> Result<Operator> {
+async fn build_sftp(url: &url::Url, opts: &HashMap<String, String>) -> Result<BuiltOperator> {
     let host = url.host_str().unwrap_or("localhost");
     let port = url.port().unwrap_or(22);
     // opendal SFTP expects the endpoint in `ssh://[user@]host[:port]`
