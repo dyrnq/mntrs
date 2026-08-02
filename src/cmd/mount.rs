@@ -1242,6 +1242,9 @@ pub fn mount(
         // Issue #38: empty pending set; populated on
         // first flush/release.
         writeback_pending: std::sync::Arc::new(dashmap::DashSet::new()),
+        // Plan #64 step 10: tombstones for write-behind deletes.
+        // Always populated; remains empty in non-write-behind mode.
+        delete_tombstones: std::sync::Arc::new(dashmap::DashSet::new()),
         // Issue #325: in-memory symlink target table. Empty at
         // mount start; populated by `MntrsFs::symlink` when
         // user-mode code creates a symbolic link (Win32

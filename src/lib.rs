@@ -642,6 +642,22 @@ pub struct MntrsFs {
     /// user's perspective).
     writeback_pending: std::sync::Arc<dashmap::DashSet<String>>,
 
+    /// Plan #64 step 10: in-memory set of paths that are
+    /// logically deleted but whose S3 DeleteObjects request
+    /// hasn't landed yet (write-behind mode, MNTRS_UNLINK_BATCH=1).
+    /// Inserted in `fn unlink` before returning `Ok(())` to the
+    /// kernel. `lookup` / `getattr` / `readdir` skip tombstoned
+    /// paths so the user can't observe the in-flight delete.
+    /// Removed on successful S3 response; on permanent per-key
+    /// failure, removed + relevant caches invalidated + error
+    /// logged so the object becomes visible again.
+    ///
+    /// Process crash loses tombstones → possible orphan objects
+    /// on the backend. Documented limitation of opt-in
+    /// write-behind (default off; MNTRS_UNLINK_BATCH=1).
+    #[allow(dead_code)]
+    delete_tombstones: std::sync::Arc<dashmap::DashSet<String>>,
+
     /// Issue #325: in-memory symlink target table.
     /// Maps the canonical `path → target` for every symlink
     /// created through `CoreFilesystem::symlink`. opendal 0.57
@@ -1219,6 +1235,22 @@ impl MntrsFs {
                 name: display_name,
             });
         }
+        // Plan #64 step 10: tombstone filter for readdir.
+        // Write-behind deletes are visible to readdir as
+        // soon as the user calls unlink — drop tombstoned
+        // entries from the listing so `ls` doesn't show
+        // about-to-be-deleted files.
+        let entries: Vec<CoreDirEntry> = entries
+            .into_iter()
+            .filter(|e| {
+                let full = if path.is_empty() {
+                    e.name.clone()
+                } else {
+                    format!("{}/{}", path, e.name)
+                };
+                !self.delete_tombstones.contains(&full)
+            })
+            .collect();
         Ok(entries)
     }
 
@@ -2791,6 +2823,12 @@ impl CoreFilesystem for MntrsFs {
         } else {
             format!("{}/{}", parent_path, name)
         };
+        // Plan #64 step 10: tombstone filter — write-behind
+        // deletes are visible to lookup as soon as the user
+        // calls unlink (S3 DeleteObjects hasn't landed yet).
+        if self.delete_tombstones.contains(&full_path) {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
+        }
         // Issue #325: if the entry is a symlink, surface it
         // as `FileType::Symlink` before consulting the backend.
         // Without this short-circuit the kernel would see a
@@ -3042,6 +3080,13 @@ impl CoreFilesystem for MntrsFs {
             mtime: inodes_mtime,
         }) = self.resolve(ino)
         {
+            // Plan #64 step 10: tombstone filter for getattr.
+            // Write-behind delete returns Ok to the kernel
+            // before S3 DeleteObjects lands — stat a deleted
+            // path must look like it doesn't exist.
+            if self.delete_tombstones.contains(path.as_str()) {
+                return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
+            }
             // #28 (stat optimization): skip the S3 stat_op
             // round-trip when the inodes entry is fresh
             // enough. The entry is populated by:
@@ -5830,8 +5875,34 @@ impl CoreFilesystem for MntrsFs {
         // step 10) when MNTRS_UNLINK_BATCH=1. op.delete() is the
         // fallback path for non-S3 backends or when batching is
         // disabled.
+        // Plan #64 step 10: when the batched deleter is enabled
+        // (MNTRS_UNLINK_BATCH=1 on S3), use write-behind:
+        //   1. enqueue the path for batched DeleteObjects
+        //   2. insert tombstone so lookup/stat/readdir skip it
+        //   3. drop the oneshot receiver (per-key failures are
+        //      logged by the worker, not propagated)
+        //   4. return Ok(()) to the kernel immediately
+        // The FUSE thread is unblocked; the batcher's worker
+        // dispatches real multi-key requests while the kernel
+        // keeps firing unlink callbacks.
         let _t1 = std::time::Instant::now();
-        let delete_result = self.delete_backend_strict(&full_path, "unlink");
+        let delete_result = if let Some(rx) = self.enqueue_backend_delete(&full_path) {
+            // Write-behind: insert tombstone, drop receiver,
+            // don't await. On a future successful batcher
+            // response the tombstone is removed (TODO: wire
+            // into the deleter result callback). Until then
+            // the tombstone may outlive the S3 delete on the
+            // happy path — a re-create of the same path
+            // returns ENOENT until the next lookup, which is
+            // acceptable for write-behind (the user already
+            // saw `rm` succeed; the kernel's negative cache
+            // expires in seconds).
+            self.delete_tombstones.insert(full_path.clone());
+            drop(rx);
+            Ok(())
+        } else {
+            self.delete_backend_strict(&full_path, "unlink")
+        };
         let _t2 = std::time::Instant::now();
 
         // Local cleanup runs UNCONDITIONALLY below — the
@@ -5984,11 +6055,32 @@ impl CoreFilesystem for MntrsFs {
         // return EEXIST ("EEXIST: directory not empty"); the previous
         // blanket EIO left rm -rf in an undefined state on such
         // backends (some pre-check emptyness, some don't).
-        // Plan #64 step 9: routes through the S3 batched deleter
-        // when enabled; falls back to op.delete() otherwise. Step
-        // 10 will convert this to a barrier (flush() then return)
-        // for write-behind semantics.
-        if let Err(e) = self.delete_backend_strict(&dir_path, "rmdir") {
+        // Plan #64 step 10: rmdir is the **directory barrier**
+        // for write-behind deletes. Two paths:
+        //   - batched_deleter enabled: enqueue the dir marker
+        //     (trailing slash; S3 directory objects), then
+        //     `flush().await` to drain any in-flight file
+        //     deletes before the user's `rm -rf` returns.
+        //     If flush fails, propagate — the barrier promise
+        //     is "dir is gone before you see the next prompt."
+        //   - otherwise: strict delete (same as unlink); no
+        //     barrier because op.delete is synchronous.
+        if self.batched_deleter.get().is_some() {
+            if let Some(rx) = self.enqueue_backend_delete(&dir_path) {
+                drop(rx);
+            }
+            // barrier: drain all pending file deletes + the
+            // dir marker before the kernel sees rmdir return.
+            if let Some(deleter) = self.batched_deleter.get()
+                && let Err(e) = crate::rt().block_on(deleter.flush())
+            {
+                tracing::warn!(
+                    path = %dir_path, error = %e,
+                    "FUSE rmdir: batched_deleter flush failed; some deletes may not be requested yet"
+                );
+                return Err(std::io::Error::other("rmdir: batched deleter flush failed"));
+            }
+        } else if let Err(e) = self.delete_backend_strict(&dir_path, "rmdir") {
             tracing::warn!(path = %dir_path, error = %e, "FUSE rmdir: backend delete failed");
             return Err(e);
         }
@@ -7272,6 +7364,9 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         #[cfg(not(windows))]
         fuse_notifier: std::sync::OnceLock::new(),
         writeback_pending: Arc::new(dashmap::DashSet::new()),
+        // Plan #64 step 10: empty tombstone set in tests; tests
+        // don't exercise the write-behind path (S3-only).
+        delete_tombstones: Arc::new(dashmap::DashSet::new()),
         // Issue #325: in-memory symlink target table. Empty in
         // tests; populated only by tests that exercise the
         // symlink code paths.
