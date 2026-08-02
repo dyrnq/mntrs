@@ -2,6 +2,7 @@
 #![cfg_attr(windows, allow(dead_code, unused_imports, unused_variables))]
 #![recursion_limit = "256"]
 pub mod backpressure;
+pub(crate) mod batched_delete;
 pub mod block_format;
 pub mod cache;
 pub(crate) mod cache_layer;
