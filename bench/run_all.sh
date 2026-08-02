@@ -23,6 +23,7 @@ RESULT_TMP="$(mktemp /tmp/bench-results-XXXXXX)"
 
 PASS=0
 FAIL=0
+SKIP=0
 TOTAL=0
 START_TIME=$(date +%s)
 
@@ -50,6 +51,30 @@ bench() {
     PASS=$((PASS + 1))
 }
 
+# Issue #523: `bench_skip` records a test as SKIP rather than
+# FAIL. Used for environment capabilities the runner doesn't have
+# (e.g. `getfattr` missing on the ubuntu-latest CI image — the
+# `attr` apt package isn't in the FUSE install script) or for
+# comparisons that are meaningless on a particular backend
+# (e.g. rclone mount does not surface symlinks on object storage).
+#
+# Result format mirrors `bench()` exactly (4 `|`-separated
+# columns: status|name|mnt|category) so render_table.py can
+# parse SKIP rows through the same code path as OK/FAIL. The
+# reason goes to the console + a parallel human-readable log,
+# never into $RESULT_TMP.
+SKIP_REASONS="$(mktemp /tmp/bench-skip-reasons-XXXXXX)"
+bench_skip() {
+    local name="$1"; shift
+    local mnt="$1"; shift
+    local reason="${1:-skipped}"
+    TOTAL=$((TOTAL + 1))
+    printf "  %-35s | %15s | SKIP  (%s)\n" "$name" "$mnt" "$reason"
+    echo "SKIP|$name|$mnt|$CATEGORY" >> "$RESULT_TMP"
+    printf "%s %-15s | %-26s | %s\n" "$CATEGORY" "$mnt" "$name" "$reason" >> "$SKIP_REASONS"
+    SKIP=$((SKIP + 1))
+}
+
 echo "============================================"
 echo " mntrs vs rclone benchmark"
 echo " started: $(date -Iseconds)"
@@ -57,6 +82,21 @@ echo " endpoint: $ENDPOINT"
 echo " bucket: $BUCKET"
 echo "============================================"
 echo ""
+
+# Issue #523: probe capability before running so environment
+# gaps are reported as SKIP, not FAIL. `getfattr` lives in the
+# `attr` apt package; the FUSE install script in
+# tests/e2e/common/install-linux-deps.sh doesn't pull it in
+# (it only installs fuse3 / libfuse3-dev / protobuf-compiler),
+# so the bench row has been FAILing on every CI run since the
+# bench was first added. `readlink` is part of coreutils and
+# always present, so the gate there is on the *rclone mount*
+# surfacing symlinks (it doesn't, on object storage) — see
+# the Symlink section below for the SKIP call.
+GETFATTR_BIN="$(command -v getfattr 2>/dev/null || true)"
+if [ -z "$GETFATTR_BIN" ]; then
+    echo "  getfattr: not installed (apt: attr) — Xattr rows will SKIP"
+fi
 
 # ---- Prepare test data ----
 echo "--- Preparing test data ---"
@@ -347,8 +387,18 @@ bench "truncate 1M" "rclone" truncate -s 1M "$RCLONE_MNT/bench-trunc"
 echo ""
 echo "=== 10. Xattr ==="
 CATEGORY="Xattr"
-bench "getfattr" "mntrs" getfattr -d "$MNTRS_MNT/1K.bin" 2>/dev/null || true
-bench "getfattr" "rclone" getfattr -d "$RCLONE_MNT/1K.bin" 2>/dev/null || true
+# Issue #523: skip the row if `getfattr` isn't installed.
+# Pre-fix this row FAILed on every CI run because the bench
+# runner image doesn't ship `attr` (apt package), and the bench
+# `|| { ... FAIL ... }` path swallowed the actual reason. SKIP
+# surfaces the gap as a category-level skip instead.
+if [ -z "$GETFATTR_BIN" ]; then
+    bench_skip "getfattr" "mntrs" "getfattr not installed (apt: attr)"
+    bench_skip "getfattr" "rclone" "getfattr not installed (apt: attr)"
+else
+    bench "getfattr" "mntrs" "$GETFATTR_BIN" -d "$MNTRS_MNT/1K.bin"
+    bench "getfattr" "rclone" "$GETFATTR_BIN" -d "$RCLONE_MNT/1K.bin"
+fi
 
 # memory backend baseline (zero network, single mount)
 echo ""
@@ -405,8 +455,15 @@ echo "=== 16. Symlink ==="
 CATEGORY="Symlink"
 ln -sf "$MNTRS_MNT/1K.bin" "$MNTRS_MNT/bench-link" 2>/dev/null || true
 ln -sf "$RCLONE_MNT/1K.bin" "$RCLONE_MNT/bench-link" 2>/dev/null || true
+# Issue #523: rclone mount on object storage doesn't surface
+# symlinks as kernel-visible entries (`readlink` returns ENOENT
+# because the dentry never resolves to a symlink ino). This is a
+# long-standing rclone mount limitation, not a regression we
+# can fix on the mntrs side. SKIP the comparison row rather
+# than FAILing the bench for an environment-side capability
+# gap.
 bench "readlink" "mntrs" readlink "$MNTRS_MNT/bench-link" 2>/dev/null || true
-bench "readlink" "rclone" readlink "$RCLONE_MNT/bench-link" 2>/dev/null || true
+bench_skip "readlink" "rclone" "rclone mount does not surface symlinks on object storage"
 
 # Dir with 500 files
 echo ""
@@ -673,5 +730,16 @@ rm -f "$RESULT_TMP"
 # ---- Summary ----
 ELAPSED=$(( $(date +%s) - START_TIME ))
 echo "============================================"
-printf " %d tests: %d passed, %d failed (%ds)\n" "$TOTAL" "$PASS" "$FAIL" "$ELAPSED"
+# Issue #523: surface SKIP separately so environment gaps don't
+# look like regressions. The bench job reports `success`
+# regardless of FAIL count, but the SKIP count is what
+# distinguishes "we lost a comparison" from "the runner
+# doesn't have the tool".
+printf " %d tests: %d passed, %d failed, %d skipped (%ds)\n" "$TOTAL" "$PASS" "$FAIL" "$SKIP" "$ELAPSED"
+if [ -s "$SKIP_REASONS" ]; then
+    echo ""
+    echo "  SKIP reasons:"
+    sed 's/^/    /' "$SKIP_REASONS"
+fi
 echo "============================================"
+rm -f "$SKIP_REASONS"
