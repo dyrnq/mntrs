@@ -38,7 +38,7 @@ with open(input_file) as fh:
 
 
 def to_sec(t):
-    if t in ('FAIL', '—'):
+    if t in ('FAIL', 'SKIP', '—'):
         return None
     try:
         parts = t.replace('s', '').split('m')
@@ -46,6 +46,13 @@ def to_sec(t):
     except Exception:
         return None
 
+
+# Issue #523: SKIP is treated identically to FAIL/— in the win
+# accounting. A skipped row is environment-side (e.g. getfattr
+# missing on the runner, rclone mount not surfacing symlinks on
+# object storage) — not a win for either side, and not a
+# regression signal.
+NON_COMPARABLE = ('FAIL', 'SKIP', '—')
 
 table_rows = []
 mntrs_vs_rclone_wins = {'mntrs': 0, 'rclone': 0, 'tie': 0, 'skip': 0}
@@ -59,13 +66,13 @@ for cat, test in rows:
 
     # mntrs vs rclone
     w = '—'
-    if mv == 'FAIL' and rv not in ('FAIL', '—'):
+    if mv == 'FAIL' and rv not in NON_COMPARABLE:
         w = 'rclone'
         mntrs_vs_rclone_wins['rclone'] += 1
-    elif rv == 'FAIL' and mv not in ('FAIL', '—'):
+    elif rv == 'FAIL' and mv not in NON_COMPARABLE:
         w = 'mntrs'
         mntrs_vs_rclone_wins['mntrs'] += 1
-    elif mv not in ('FAIL', '—') and rv not in ('FAIL', '—'):
+    elif mv not in NON_COMPARABLE and rv not in NON_COMPARABLE:
         ms = to_sec(mv)
         rs = to_sec(rv)
         if ms is not None and rs is not None:
@@ -84,8 +91,8 @@ for cat, test in rows:
         mntrs_vs_rclone_wins['skip'] += 1
 
     # mntrs-batched vs mntrs-unbatched delta (only meaningful
-    # when both rows are present and not FAIL).
-    if bv not in ('FAIL', '—') and mv not in ('FAIL', '—'):
+    # when both rows are present and not FAIL/SKIP).
+    if bv not in NON_COMPARABLE and mv not in NON_COMPARABLE:
         ms_b = to_sec(bv)
         ms_u = to_sec(mv)
         if ms_b is not None and ms_u is not None and ms_u > 0:
