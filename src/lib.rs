@@ -1472,6 +1472,84 @@ impl MntrsFs {
         }
     }
 
+    // ===== Plan #64 step 8: backend delete helpers =====
+
+    /// Strict-mode delete. Used by sites that must surface
+    /// per-key errors (rename-fallback, rmdir barrier, symlink
+    /// cleanup). Awaits the S3 DeleteObjects response when the
+    /// batched deleter is enabled; otherwise falls back to
+    /// `op.delete(path).await`. Map `opendal::Error::NotFound` →
+    /// `Ok(())` (delete is idempotent — calling unlink twice on
+    /// the same path is not a failure).
+    #[allow(dead_code)]
+    pub(crate) fn delete_backend_strict(
+        &self,
+        path: &str,
+        op_label: &'static str,
+    ) -> std::io::Result<()> {
+        if let Some(deleter) = self.batched_deleter.get() {
+            // Strict path: enqueue + await. Workers are
+            // single-flight per chunk but the wait is bounded by
+            // batch size and request timeout. The wait has the
+            // same semantic as the old `op.delete().await` —
+            // it's just batched behind the scenes.
+            let rx = match deleter.enqueue(path.to_string()) {
+                Some(rx) => rx,
+                None => {
+                    return Err(std::io::Error::other("batched_deleter: shutting down"));
+                }
+            };
+            // The deleter runs on `crate::rt()`. block_on from
+            // the FUSE thread is unsafe (Bug 15 family), so we
+            // drive the future via the same `rt()` handle that
+            // spawned the worker — same pattern writeback uses
+            // for its oneshots.
+            crate::rt().block_on(async move {
+                match rx.await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "batched_deleter: worker dropped result sender",
+                    )),
+                }
+            })
+        } else {
+            // Fallback: opendal path (non-S3, or batched delete
+            // disabled / failed to spawn).
+            crate::rt().block_on(async {
+                match self.op.delete(path).await {
+                    Ok(()) => Ok(()),
+                    Err(e) if matches!(e.kind(), opendal::ErrorKind::NotFound) => Ok(()),
+                    Err(e) => Err(opendal_to_io_error(&e, op_label)),
+                }
+            })
+        }
+    }
+
+    /// Write-behind delete. Returns the per-key oneshot
+    /// receiver (for tests / strict callers) — the production
+    /// callers drop it, treating the FUSE callback success as
+    /// the user-visible outcome. Per-key S3 failures are logged
+    /// but not propagated.
+    #[allow(dead_code)]
+    pub(crate) fn enqueue_backend_delete(
+        &self,
+        path: &str,
+    ) -> Option<tokio::sync::oneshot::Receiver<std::io::Result<()>>> {
+        if let Some(deleter) = self.batched_deleter.get() {
+            deleter.enqueue(path.to_string())
+        } else {
+            // Non-S3 / disabled: no receiver to give. Caller
+            // will await `op.delete()` directly (e.g. via
+            // delete_backend_strict). Used by sites that always
+            // want strict semantics — they call
+            // delete_backend_strict instead of this.
+            None
+        }
+    }
+
     /// Bug 33: increment the per-ino kernel lookup
     /// reference count. Called from every entry-returning
     /// path (`lookup` / `mkdir` / `create` / `symlink` /
