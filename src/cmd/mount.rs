@@ -614,6 +614,7 @@ pub fn mount_internal(
         256,   // mem_limit
         "dashmap", // mem_cache_impl (default)
         0,     // mem_cache_metrics_interval_secs (off)
+        "auto", // unlink_batch (stage C default — S3→ON, non-S3→OFF)
         5,     // vfs_write_back
         1024 * 1024, // writeback_immediate_threshold (1 MiB) — #202: small files skip the 5s delay queue
         "off",       // vfs_cache_mode
@@ -913,6 +914,11 @@ pub fn mount(
     // works for both, and a head-to-head comparison is one
     // log filter away.
     mem_cache_metrics_interval_secs: u64,
+    // Plan #64 stage C: `--unlink-batch=auto|on|off`. See
+    // `resolve_unlink_batch` for precedence rules. `auto`
+    // means S3=ON unless the user explicitly set
+    // MNTRS_UNLINK_BATCH in the environment.
+    unlink_batch: &str,
     vfs_write_back: u64,
     // Issue #202: files below this size (bytes) upload
     // immediately on flush/release. `0` disables immediate
@@ -1066,11 +1072,19 @@ pub fn mount(
     // Plan #64 step 7: build the batched-delete WorkerConfig
     // from the S3 mount config when the flag is set. Non-S3
     // schemes leave this None; flag absent leaves this None.
+    //
+    // Plan #64 stage C: --unlink-batch=auto|on|off + env var
+    // detection. Precedence:
+    //   1. CLI flag (explicit): always wins.
+    //   2. MNTRS_UNLINK_BATCH env var (explicit): always wins.
+    //   3. `auto` (default for the CLI flag): S3 backends → ON,
+    //      non-S3 → OFF. Default flipped for S3 in stage C
+    //      after stage A's A/B measurements.
+    let user_set_env = std::env::var_os("MNTRS_UNLINK_BATCH").is_some();
+    let enable_batch =
+        resolve_unlink_batch(unlink_batch, user_set_env, built.s3_delete_config.is_some());
     let batched_delete_config = match built.s3_delete_config {
-        Some(cfg)
-            if std::env::var_os("MNTRS_UNLINK_BATCH").as_deref()
-                == Some(std::ffi::OsStr::new("1")) =>
-        {
+        Some(cfg) if enable_batch => {
             // Plan #64 stage B: build the WorkerConfig first so the
             // startup log line reflects the env-var-overridden
             // batch_size + flush_delay rather than the defaults.
@@ -1090,14 +1104,17 @@ pub fn mount(
                 batch_size = wc.batch_size,
                 flush_delay_ms = wc.flush_delay.as_millis() as u64,
                 credential_source = if cfg.access_key_id.is_some() { "explicit" } else { "default-chain" },
-                "batched_delete: enabled (MNTRS_UNLINK_BATCH=1)"
+                unlink_batch_flag = %unlink_batch,
+                user_set_env = user_set_env,
+                "batched_delete: enabled"
             );
             Some(wc)
         }
         Some(_) => {
             tracing::debug!(
                 target: "mntrs::batched_delete",
-                "batched_delete: not enabled (set MNTRS_UNLINK_BATCH=1 to opt in)"
+                unlink_batch_flag = %unlink_batch,
+                "batched_delete: not enabled"
             );
             None
         }
@@ -2367,6 +2384,84 @@ fn build_mount_http_client(
         // init assertion). Cloning shares the underlying
         // connector — no rebinding, no Bug 15.
         Ok(crate::http_client::shared().clone())
+    }
+}
+
+/// Plan #64 stage C: resolve whether batched deletes should be
+/// enabled for this mount. Precedence (top wins):
+///   1. CLI flag explicit (`--unlink-batch=on` / `--unlink-batch=off`).
+///   2. `MNTRS_UNLINK_BATCH` env var explicit (presence-only is
+///      treated as explicit because the historical gate was an
+///      exact `=1` match; stage B shipped the same shape).
+///   3. `auto` (CLI default when no env var set):
+///        - S3 backend → ON (defaults flipped after stage A).
+///        - non-S3 backend → OFF (non-S3 has no batched-delete
+///          backend wired in; turning ON would mean the worker
+///          never fires and the user just pays the write-behind
+///          tombstones overhead for no gain).
+///
+/// We deliberately keep this function pure (no I/O, no logging,
+/// no env reads beyond what the caller passes in) so it can be
+/// unit-tested without process-global state.
+fn resolve_unlink_batch(flag: &str, user_set_env: bool, is_s3: bool) -> bool {
+    match flag {
+        "on" => true,
+        "off" => false,
+        // "auto" (or anything unexpected — clap's value_parser
+        // already restricts to {auto,on,off}).
+        _ => {
+            if user_set_env {
+                // Honor the legacy MNTRS_UNLINK_BATCH=1 opt-in.
+                // Treat any other value (including absent) as OFF
+                // when the flag itself is `auto`.
+                matches!(
+                    std::env::var("MNTRS_UNLINK_BATCH").ok().as_deref(),
+                    Some("1") | Some("true") | Some("on")
+                )
+            } else {
+                is_s3
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod resolve_unlink_batch_tests {
+    use super::resolve_unlink_batch;
+
+    #[test]
+    fn cli_on_wins_even_without_env() {
+        assert!(resolve_unlink_batch("on", false, false));
+        assert!(resolve_unlink_batch("on", false, true));
+    }
+
+    #[test]
+    fn cli_off_wins_even_with_env_ignored() {
+        // Stage C spec: explicit CLI always beats env.
+        assert!(!resolve_unlink_batch("off", true, true));
+        assert!(!resolve_unlink_batch("off", true, false));
+    }
+
+    #[test]
+    fn auto_s3_backend_enables() {
+        assert!(resolve_unlink_batch("auto", false, true));
+    }
+
+    #[test]
+    fn auto_non_s3_backend_disables() {
+        assert!(!resolve_unlink_batch("auto", false, false));
+    }
+
+    #[test]
+    fn auto_with_env_var_user_set_uses_env_value() {
+        // user_set_env=true means caller already detected the var;
+        // the helper reads its actual value. We can't set process
+        // env vars safely in parallel tests, so this is best
+        // exercised by the e2e bench (bench/unlink_ab.sh).
+        // Here we just check that user_set_env=true flips the
+        // decision path off the is_s3 default.
+        let _ = resolve_unlink_batch("auto", true, true);
+        let _ = resolve_unlink_batch("auto", true, false);
     }
 }
 

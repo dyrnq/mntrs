@@ -1513,8 +1513,15 @@ impl MntrsFs {
     /// `op.delete(path).await`. Map `opendal::Error::NotFound` →
     /// `Ok(())` (delete is idempotent — calling unlink twice on
     /// the same path is not a failure).
+    ///
+    /// Async (not a sync fn calling `rt().block_on`) so callers
+    /// already inside a tokio runtime (e.g. the rename fallback
+    /// path that wraps an inner async block in `rt().block_on`)
+    /// can `.await` this without nesting — which would panic
+    /// with `Cannot start a runtime from within a runtime`.
+    /// Sync callers wrap with `crate::rt().block_on(...)`.
     #[allow(dead_code)]
-    pub(crate) fn delete_backend_strict(
+    pub(crate) async fn delete_backend_strict(
         &self,
         path: &str,
         op_label: &'static str,
@@ -1531,32 +1538,23 @@ impl MntrsFs {
                     return Err(std::io::Error::other("batched_deleter: shutting down"));
                 }
             };
-            // The deleter runs on `crate::rt()`. block_on from
-            // the FUSE thread is unsafe (Bug 15 family), so we
-            // drive the future via the same `rt()` handle that
-            // spawned the worker — same pattern writeback uses
-            // for its oneshots.
-            crate::rt().block_on(async move {
-                match rx.await {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Ok(Err(e)) => Err(e),
-                    Err(_) => Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "batched_deleter: worker dropped result sender",
-                    )),
-                }
-            })
+            match rx.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "batched_deleter: worker dropped result sender",
+                )),
+            }
         } else {
             // Fallback: opendal path (non-S3, or batched delete
             // disabled / failed to spawn).
-            crate::rt().block_on(async {
-                match self.op.delete(path).await {
-                    Ok(()) => Ok(()),
-                    Err(e) if matches!(e.kind(), opendal::ErrorKind::NotFound) => Ok(()),
-                    Err(e) => Err(opendal_to_io_error(&e, op_label)),
-                }
-            })
+            match self.op.delete(path).await {
+                Ok(()) => Ok(()),
+                Err(e) if matches!(e.kind(), opendal::ErrorKind::NotFound) => Ok(()),
+                Err(e) => Err(opendal_to_io_error(&e, op_label)),
+            }
         }
     }
 
@@ -5812,7 +5810,8 @@ impl CoreFilesystem for MntrsFs {
             // symlinks. Plan #64 step 9: routes through the S3
             // batched deleter when enabled; otherwise falls back
             // to op.delete().
-            let backend_del = self.delete_backend_strict(stored.as_str(), "symlink_cleanup");
+            let backend_del = crate::rt()
+                .block_on(self.delete_backend_strict(stored.as_str(), "symlink_cleanup"));
             match backend_del {
                 Ok(()) => tracing::info!(
                     path = %stored,
@@ -5901,7 +5900,7 @@ impl CoreFilesystem for MntrsFs {
             drop(rx);
             Ok(())
         } else {
-            self.delete_backend_strict(&full_path, "unlink")
+            crate::rt().block_on(self.delete_backend_strict(&full_path, "unlink"))
         };
         let _t2 = std::time::Instant::now();
 
@@ -6080,7 +6079,8 @@ impl CoreFilesystem for MntrsFs {
                 );
                 return Err(std::io::Error::other("rmdir: batched deleter flush failed"));
             }
-        } else if let Err(e) = self.delete_backend_strict(&dir_path, "rmdir") {
+        } else if let Err(e) = crate::rt().block_on(self.delete_backend_strict(&dir_path, "rmdir"))
+        {
             tracing::warn!(path = %dir_path, error = %e, "FUSE rmdir: backend delete failed");
             return Err(e);
         }
@@ -7097,7 +7097,7 @@ impl MntrsFs {
                         // the warn log; falls back to op.delete()
                         // when batching is disabled or backend is
                         // non-S3).
-                        match self.delete_backend_strict(&src_clone, "rename_fallback") {
+                        match self.delete_backend_strict(&src_clone, "rename_fallback").await {
                             Ok(()) => {
                                 tracing::debug!(src = %src_clone, "rename fallback: delete src ok")
                             }

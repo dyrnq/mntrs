@@ -267,17 +267,35 @@ The macOS variant lives at `bench/run_all_mac.sh`. See
 auto-detect path. No CI workflow runs it — see issue #304
 for the GH runner macFUSE kext limitation.
 
-### Batched S3 deletes (opt-in)
+### Batched S3 deletes (default ON for S3)
 
 For high-fanout `rm -rf` workloads against S3-compatible backends,
-mntrs can coalesce many deletes into a single S3 `DeleteObjects`
-request. **Off by default**, opt in with `MNTRS_UNLINK_BATCH=1`.
+mntrs coalesces many deletes into a single S3 `DeleteObjects`
+request. **Enabled by default on S3 backends** (Stage C); disable
+per-mount with `--unlink-batch=off` or set
+`MNTRS_UNLINK_BATCH=0`. Non-S3 backends always use the unbatched
+path — the batcher has no S3-protocol backend wired in.
 
 ```bash
-MNTRS_UNLINK_BATCH=1 mntrs mount "s3://my-bucket" /mnt/data \
-    --opt endpoint=http://minio:9000 \
-    --opt access-key=AKIA... --opt secret-key=...
+# default (S3): batched deletes on
+mntrs mount "s3://my-bucket" /mnt/data --opt endpoint=http://minio:9000 ...
+
+# explicit OFF — restore strict per-callback S3 DELETE behavior
+mntrs mount "s3://my-bucket" /mnt/data --unlink-batch=off --opt endpoint=...
+
+# explicit ON for an S3 mount where MNTRS_UNLINK_BATCH=0 was set
+# in the environment
+mntrs mount "s3://my-bucket" /mnt/data --unlink-batch=on --opt endpoint=...
 ```
+
+**Precedence** (top wins):
+
+1. `--unlink-batch=on|off` CLI flag — always wins.
+2. `MNTRS_UNLINK_BATCH=1|0` env var — wins over `auto`.
+3. `auto` (CLI default when no env var is set):
+   - S3 backend → ON (defaults flipped after Stage A's
+     1.43× geomean / 1.59× on real workloads).
+   - non-S3 backend → OFF.
 
 Observed speedups vs the unbatched path (local MinIO 2025-09-07,
 mntrs `--release`):
@@ -302,7 +320,7 @@ directory's deletes don't outlive the rmdir callback.
 
 | Env var                        | Default | Range    | Effect |
 |--------------------------------|--------:|---------:|--------|
-| `MNTRS_UNLINK_BATCH`           | 0       | 0/1      | 0=off, 1=on |
+| `MNTRS_UNLINK_BATCH`           | unset   | 0/1      | Legacy env gate (Stage B). Use `--unlink-batch=` instead. |
 | `MNTRS_BATCH_SIZE`             | 100     | 1..1000  | Threshold for immediate flush (S3 hard limit is 1000) |
 | `MNTRS_BATCH_FLUSH_DELAY_MS`   | 50      | 1..10000 | ms to wait after first enqueue before deadline flush |
 
@@ -325,9 +343,10 @@ fewer keys each. Higher values (default 50) maximize batch fill.
 
 Enable with `RUST_LOG=info,mntrs::batched_delete=info`.
 
-**When NOT to enable**: workloads with rare small deletes (single
-`rm` calls), where the 50 ms flush deadline is pure overhead. The
+**When to disable**: workloads dominated by rare single-file
+deletes, where the 50 ms flush deadline is pure overhead. The
 unbatched path's per-callback DELETE is faster for those.
+Set `--unlink-batch=off` or `MNTRS_UNLINK_BATCH=0`.
 
 See `docs/plan64_stage_a_results.md` for the full measurement
 methodology and `bench/unlink_ab.sh` to reproduce locally.
