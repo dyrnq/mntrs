@@ -105,6 +105,59 @@ jobs:
       - name: Platform tests
         run: cargo test --package mntrs --test platform_test
 
+      # WinFSP integration test (issue #516).
+      #
+      # Runs `tests/platform/windows/winfsp_integration_test.rs` —
+      # 29 tests that drive the WinFSP IRP dispatch path through
+      # the in-process `memory://` backend (no mount-process spawn,
+      # no PowerShell filesystem calls, no minio). About 30x faster
+      # than the e2e smoke below and exercises code paths the smoke
+      # can't reach (rename, xattr, symlink, NFC normalization,
+      # cache eviction, etc.).
+      #
+      # Why this wasn't already in CI: prior to this change, the
+      # `windows` job ran only `cargo test --lib`, `core_fs_unit_test`,
+      # and `platform_test` — `platform_windows_winfsp_integration_test`
+      # was un-wired. Issue #489 (drive-letter pool exhausts after 11
+      # mounts) shipped undetected for exactly this reason; a
+      # developer only caught it by running the suite locally.
+      # Subsequent WinFSP regressions should trip this step instead.
+      #
+      # `--test-threads=1` is required: the integration suite uses a
+      # shared global drive-letter free list (post-#489 fix) and
+      # several tests also touch `~/.local/share/mntrs/mounts.txt`
+      # via `record_mount()` for the same mount point. Sequential
+      # execution matches the local run that validated #489 and
+      # reduces the surface area for an unrelated flake.
+      # `timeout-minutes: 10` is a safety net for future regressions
+      # that the skip-list can't catch — the suite currently
+      # completes in ~30s on windows-latest.
+      - name: WinFSP integration test
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $searchRoots = @(
+            'C:\Program Files\WinFSP',
+            'C:\Program Files (x86)\WinFSP',
+            'C:\Windows\System32',
+            'C:\ProgramData\chocolatey\lib\winfsp'
+          )
+          $dll = $null
+          foreach ($root in $searchRoots) {
+            if (Test-Path $root) {
+              $found = Get-ChildItem -Path $root -Recurse -Filter 'winfsp-x64.dll' -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($found) { $dll = $found; break }
+            }
+          }
+          if ($dll) {
+            $env:PATH = "$($dll.DirectoryName);$env:PATH"
+            Write-Host "Found winfsp-x64.dll at: $($dll.FullName)"
+          } else {
+            Write-Host "WARNING: winfsp-x64.dll not found in any known location"
+            Get-ChildItem -Path 'C:\' -Filter 'winfsp*' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 5 | ForEach-Object { Write-Host "  candidate: $($_.FullName)" }
+          }
+          cargo test --package mntrs --test platform_windows_winfsp_integration_test -- --test-threads=1
+
       # WinFSP e2e smoke: spawn `mntrs mount memory:// V:` and exercise
       # the same 7 effective sub-tests that integration.yml runs for the
       # Linux FUSE path (mount-test.sh lines 136-211). PowerShell 7
