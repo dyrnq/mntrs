@@ -5759,20 +5759,21 @@ impl CoreFilesystem for MntrsFs {
             // returns the 0-byte placeholder as a regular
             // file, masking the symlink delete.
             //
-            // Issue the backend delete here, swallowing
-            // NotFound (idempotent: a second unlink sees the
-            // file already gone). Other errors get a warn
-            // but don't fail the unlink — the in-memory
-            // state is the source of truth for symlinks.
-            let op = self.op.clone();
-            let p = stored.clone();
-            let backend_del = rt().block_on(async move { op.delete(&p).await });
+            // Issue the backend delete here. Strict helper: returns Ok
+            // on NotFound (delete is idempotent — a second unlink
+            // sees the placeholder already gone). Other errors
+            // get a warn but don't fail the unlink — the
+            // in-memory state is the source of truth for
+            // symlinks. Plan #64 step 9: routes through the S3
+            // batched deleter when enabled; otherwise falls back
+            // to op.delete().
+            let backend_del = self.delete_backend_strict(stored.as_str(), "symlink_cleanup");
             match backend_del {
                 Ok(()) => tracing::info!(
                     path = %stored,
                     "MntrsFs::unlink: dropped symlink backend placeholder"
                 ),
-                Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     tracing::debug!(
                         path = %stored,
                         "MntrsFs::unlink: backend placeholder already absent (idempotent)"
@@ -5798,8 +5799,6 @@ impl CoreFilesystem for MntrsFs {
             full_path = %full_path,
             "FUSE unlink entry"
         );
-        let op = self.op.clone();
-        let p = full_path.clone();
         let cpath = crate::cache_path(&self.cache_dir, &full_path);
 
         // Backend delete FIRST. For a file that IS in the
@@ -5826,10 +5825,13 @@ impl CoreFilesystem for MntrsFs {
         // + dir_cache.remove). Emits a single info line with the 4
         // sub-durations so we can see whether the 1.06ms backend-DELETE
         // gap is in opendal S3 or in local cache cleanup.
+        // Plan #64 step 9: routes through the S3 batched deleter
+        // (strict mode here; write-behind + tombstones arrive in
+        // step 10) when MNTRS_UNLINK_BATCH=1. op.delete() is the
+        // fallback path for non-S3 backends or when batching is
+        // disabled.
         let _t1 = std::time::Instant::now();
-        let delete_result = rt()
-            .block_on(async move { op.delete(&p).await })
-            .map_err(|e| opendal_to_io_error(&e, "unlink"));
+        let delete_result = self.delete_backend_strict(&full_path, "unlink");
         let _t2 = std::time::Instant::now();
 
         // Local cleanup runs UNCONDITIONALLY below — the
@@ -5977,17 +5979,16 @@ impl CoreFilesystem for MntrsFs {
         // for entries, **warn** for failures.
         tracing::debug!(path = %full_path, "FUSE rmdir entry");
         let dir_path = format!("{}/", full_path.trim_end_matches('/'));
-        let op = self.op.clone();
-        let p = dir_path.clone();
         // Bug D fix: same as unlink — preserve the opendal error
         // kind. POSIX requires rmdir on a non-empty directory to
         // return EEXIST ("EEXIST: directory not empty"); the previous
         // blanket EIO left rm -rf in an undefined state on such
         // backends (some pre-check emptyness, some don't).
-        if let Err(e) = rt()
-            .block_on(async move { op.delete(&p).await })
-            .map_err(|e| opendal_to_io_error(&e, "rmdir"))
-        {
+        // Plan #64 step 9: routes through the S3 batched deleter
+        // when enabled; falls back to op.delete() otherwise. Step
+        // 10 will convert this to a barrier (flush() then return)
+        // for write-behind semantics.
+        if let Err(e) = self.delete_backend_strict(&dir_path, "rmdir") {
             tracing::warn!(path = %dir_path, error = %e, "FUSE rmdir: backend delete failed");
             return Err(e);
         }
@@ -6999,7 +7000,12 @@ impl MntrsFs {
                     // outcome than leaving the rename as a no-op.
                     let copied_ok = matches!(copy_result, Ok(true));
                     if copied_ok {
-                        match op.delete(&src_clone).await {
+                        // Plan #64 step 9: route through the S3
+                        // batched deleter (strict: surface error to
+                        // the warn log; falls back to op.delete()
+                        // when batching is disabled or backend is
+                        // non-S3).
+                        match self.delete_backend_strict(&src_clone, "rename_fallback") {
                             Ok(()) => {
                                 tracing::debug!(src = %src_clone, "rename fallback: delete src ok")
                             }
