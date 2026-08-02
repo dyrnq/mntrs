@@ -253,7 +253,13 @@ pub(crate) fn spawn(
         shared: shared.clone(),
         flush_tx: tx,
     };
-    let handle = tokio::spawn(worker_loop(config, shared, rx));
+    // Plan #64 stage A bug fix: must use crate::rt().spawn,
+    // not bare tokio::spawn. The mount's main thread is not
+    // inside a tokio runtime context — bare tokio::spawn
+    // panics with "there is no reactor running" before the
+    // worker even starts. writeback::spawn uses the same
+    // pattern (writeback.rs:174).
+    let handle = crate::rt().spawn(worker_loop(config, shared, rx));
     Ok((deleter, handle))
 }
 
