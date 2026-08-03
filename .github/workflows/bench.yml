@@ -48,8 +48,17 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install FUSE
-        run: bash tests/e2e/common/install-linux-deps.sh standard "" no no
+      - name: Install FUSE + xattr tooling
+        # Issue #526 — `attr` (the apt package that ships
+        # /usr/bin/getfattr) wasn't installed, so `bench/run_all.sh`'s
+        # Xattr row SKIP'd every CI run. The runner's `command -v
+        # getfattr` probe added by PR #524 still works as defense-in-
+        # depth; this just makes the probe find the binary on a normal
+        # ubuntu-latest image. After install the row will show real
+        # xattr support: both OK means xattr works; both FAIL means the
+        # FUSE layer doesn't expose xattr (real feature gap signal);
+        # asymmetric FAIL means one impl has a real xattr bug.
+        run: bash tests/e2e/common/install-linux-deps.sh standard "attr" no no
 
       - name: Build mntrs (debug, for fuse test)
         run: cargo build
