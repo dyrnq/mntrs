@@ -673,6 +673,25 @@ pub struct MntrsFs {
     // at the cmd/mount.rs boundary so users on old
     // rclone-style scripts see a clear migration signal.
     pub(crate) cache_max_age: Duration,
+    /// Issue #502: macFUSE 64 KiB xattr silent-truncation cap.
+    /// `setxattr` writes whose value exceeds this size trigger a
+    /// `tracing::warn!` (carrying name + bytes) before the write
+    /// is forwarded to the backend. The write still proceeds —
+    /// silent metadata corruption is the failure mode this warn
+    /// exists to surface, not to block. `0` disables the warning
+    /// entirely (e.g. when the user knows their kernel/backend
+    /// combination handles large values correctly).
+    ///
+    /// Stored bytes matter, not chars: macFUSE truncates the raw
+    /// payload length, so this is a `len()` check on the byte
+    /// slice (not `chars().count()`).
+    pub(crate) max_xattr_size: usize,
+    /// Issue #502: process-local atomic counter for `setxattr`
+    /// calls that exceeded `max_xattr_size`. Per-instance so
+    /// concurrent tests don't race on a global atomic.
+    /// Test-only diagnostic — production observability rides
+    /// on the `tracing::warn!` itself.
+    pub(crate) xattr_oversize_warn_count: std::sync::atomic::AtomicU64,
     pub(crate) cache_min_free_space: u64,
     pub(crate) exclude_patterns: Vec<String>,
     pub(crate) include_patterns: Vec<String>,
@@ -6995,6 +7014,35 @@ impl CoreFilesystem for MntrsFs {
                 "xattr metadata disabled (pass --metadata to enable)",
             ));
         }
+        // Issue #502: macFUSE 64 KiB silent-truncation warning.
+        // The check fires *before* the user_xattr_key parse so
+        // even `user.etag` (well-known, rejected below) reports
+        // the size first — silent truncation is the original
+        // failure mode and we want the warning to be loud even
+        // when the write itself is rejected. We do *not* refuse
+        // the write: rclone mount does not reject either, and
+        // users who explicitly disable the warning (`--max-xattr-size 0`)
+        // are opting into trusting the kernel/backend combo.
+        // The `value.len()` byte count is what macFUSE truncates
+        // against; `chars().count()` would understate multi-byte
+        // UTF-8 sequences.
+        if self.max_xattr_size > 0 && value.len() > self.max_xattr_size {
+            // Test-only counter. Lets `xattr_macfuse_cap_test`
+            // assert the warn path without a tracing-subscriber
+            // Layer (the test binary doesn't wire one, see
+            // Cargo.toml dev-dependencies). The counter is a
+            // cheap atomic bump alongside the warn!() — the
+            // submission itself is the primary signal in
+            // production.
+            self.xattr_oversize_warn_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                name = %name,
+                bytes = value.len(),
+                cap = self.max_xattr_size,
+                "xattr value exceeds configured --max-xattr-size; macFUSE/Linux kernel may silently truncate before the backend write completes"
+            );
+        }
         // Only `user.<key>` xattrs are writable. Well-known
         // names (`user.etag`, `user.mime_type`, `user.mtime`,
         // `user.content_length`, plus the legacy S3 spellings)
@@ -8193,6 +8241,15 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         // path opt in explicitly.
         read_stale_on_backend_error: false,
         cache_max_age: std::time::Duration::ZERO, // Issue #507: default off (matches CLI `--vfs-cache-max-age 0` disable). Pre-#507 this was 3600s (matching CLI default), but that fired the age sweep in tests that insert index entries without on-disk files (the sweep then drops the orphan entries, breaking invariants). Tests that exercise age eviction opt in explicitly with `fs.cache_max_age = Duration::from_millis(N)`.
+        // Issue #502: macFUSE 64 KiB xattr cap. Tests default to
+        // `0` (warning disabled) so existing setxattr tests don't
+        // need to populate large values; tests that exercise the
+        // warning opt in explicitly (e.g. `xattr_macfuse_cap_test`).
+        max_xattr_size: 0,
+        // Per-instance atomic for the warn path. Default 0;
+        // tests that exercise the warn path reset/inspect via
+        // the `__xattr_oversize_warn_*_for_test` shims.
+        xattr_oversize_warn_count: std::sync::atomic::AtomicU64::new(0),
         // Issue #243.3: pre-#243 this was 100 MiB. The 100
         // MiB default contradicted the CLI
         // `--vfs-cache-min-free-space` default of `0` (=
@@ -8331,6 +8388,36 @@ impl MntrsFs {
     #[doc(hidden)]
     pub fn __metadata_set_for_test(&mut self, on: bool) {
         self.metadata = on;
+    }
+
+    /// Issue #502: test-only shim to set the macFUSE xattr
+    /// silent-truncation cap (mirrors `--max-xattr-size`).
+    /// `new_test_fs` defaults to 0 (warn disabled) so existing
+    /// setxattr tests don't trip; the boundary + custom-cap
+    /// tests in `tests/xattr_macfuse_cap_test.rs` opt in by
+    /// calling this. `0` disables the warning entirely.
+    #[doc(hidden)]
+    pub fn __max_xattr_size_set_for_test(&mut self, bytes: usize) {
+        self.max_xattr_size = bytes;
+    }
+
+    /// Issue #502: snapshot the per-instance oversize-warn
+    /// counter. Pairs with `__xattr_oversize_warn_reset_for_test`
+    /// so tests can pin a "before exercise" baseline.
+    #[doc(hidden)]
+    pub fn __xattr_oversize_warn_count_for_test(&self) -> u64 {
+        self.xattr_oversize_warn_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Issue #502: reset the per-instance oversize-warn counter
+    /// to zero. Per-instance so concurrent tests don't race on a
+    /// global atomic (the earlier static-counter design failed
+    /// under `--test-threads=2+`).
+    #[doc(hidden)]
+    pub fn __xattr_oversize_warn_reset_for_test(&self) {
+        self.xattr_oversize_warn_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
