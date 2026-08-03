@@ -300,7 +300,7 @@ fn setxattr_user_key_roundtrips_on_fs_backend() {
         std::env::temp_dir().join(format!("mntrs-xattr-set-roundtrip-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
 
-    let op = Operator::new(Fs::default().root(&tmp)).unwrap();
+    let op = Operator::new(Fs::default().root(tmp.to_str().unwrap())).unwrap();
     let mut fs = new_test_fs(op, tmp.clone());
     fs.__metadata_set_for_test(true);
 
@@ -323,7 +323,7 @@ fn setxattr_normalizes_key_on_fs_backend() {
     let tmp = std::env::temp_dir().join(format!("mntrs-xattr-set-norm-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
 
-    let op = Operator::new(Fs::default().root(&tmp)).unwrap();
+    let op = Operator::new(Fs::default().root(tmp.to_str().unwrap())).unwrap();
     let mut fs = new_test_fs(op, tmp.clone());
     fs.__metadata_set_for_test(true);
 
@@ -351,7 +351,7 @@ fn removexattr_user_key_drops_it_on_fs_backend() {
     let tmp = std::env::temp_dir().join(format!("mntrs-xattr-set-rm-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
 
-    let op = Operator::new(Fs::default().root(&tmp)).unwrap();
+    let op = Operator::new(Fs::default().root(tmp.to_str().unwrap())).unwrap();
     let mut fs = new_test_fs(op, tmp.clone());
     fs.__metadata_set_for_test(true);
 
@@ -382,7 +382,7 @@ fn removexattr_truly_absent_key_returns_not_found_on_fs_backend() {
     let tmp = std::env::temp_dir().join(format!("mntrs-xattr-set-rm404-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
 
-    let op = Operator::new(Fs::default().root(&tmp)).unwrap();
+    let op = Operator::new(Fs::default().root(tmp.to_str().unwrap())).unwrap();
     let mut fs = new_test_fs(op, tmp.clone());
     fs.__metadata_set_for_test(true);
 
