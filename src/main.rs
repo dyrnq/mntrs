@@ -341,6 +341,25 @@ enum Commands {
             default_value_t = true
         )]
         _no_slow_statfs: bool,
+        /// macFUSE / kernel-side xattr value size cap, in bytes.
+        /// macFUSE silently truncates single xattr values above
+        /// this threshold (default 64 KiB — historical macFUSE
+        /// documented cap); the FUSE write returns success but the
+        /// backend only sees the truncated bytes, which silently
+        /// corrupts metadata round-trips such as `user.author`
+        /// written by `xattr -w` / Spotlight.
+        ///
+        /// Issue #502: when a `setxattr` value exceeds this cap,
+        /// mntrs emits `tracing::warn!` (with name + bytes) before
+        /// forwarding to the backend. Set `0` to disable the warning
+        /// entirely (e.g. when you've confirmed your kernel/backend
+        /// combination handles large values correctly).
+        ///
+        /// If you configure a value above the kernel hard limit,
+        /// we log a one-shot warning at startup so silent truncation
+        /// becomes loud at the next mount.
+        #[arg(long, default_value_t = 64 * 1024)]
+        max_xattr_size: usize,
         /// macOS: volume name shown in Finder sidebar / `diskutil list`.
         /// Default (when unset): `mntrs-<basename(mountpoint)>`, truncated
         /// to 64 chars (macFUSE hard limit). Ignored on Linux/Windows.
@@ -590,6 +609,7 @@ fn main() -> anyhow::Result<()> {
             daemon_timeout_macos,
             slow_statfs,
             _no_slow_statfs,
+            max_xattr_size,
             volume_name,
             finder_local,
             _no_finder_local,
@@ -787,6 +807,7 @@ fn main() -> anyhow::Result<()> {
                 vfs_disk_space_total_size,
                 vfs_read_stale_on_backend_error,
                 winfsp_dispatcher_threads,
+                max_xattr_size,
             )?;
         }
         Commands::Unmount { target } => {
