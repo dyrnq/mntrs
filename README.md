@@ -444,6 +444,22 @@ would this attribute be?") are honored — `getxattr` returns the
 attribute size without copying the value bytes, and an undersized
 buffer returns `ERANGE` instead of truncating.
 
+**macFUSE 64 KiB truncation warning** (issue #502): macFUSE silently
+truncates single xattr values above the documented 64 KiB cap; the
+FUSE write returns success but the backend only sees the truncated
+bytes, which silently corrupts metadata round-trips such as
+`user.author` written by `xattr -w` / Spotlight. When a `setxattr`
+value exceeds the configured cap (default 64 KiB), mntrs emits a
+`tracing::warn!` with the xattr name and observed byte length
+*before* the write is forwarded to the backend. The write still
+proceeds — silent metadata corruption is the failure mode this
+warning exists to surface, not to block. Use
+`--max-xattr-size=<bytes>` to tune the cap (set `0` to disable the
+warning entirely when you've confirmed your kernel/backend
+combination handles large values correctly). **Strongly consider
+writing large metadata to a backend with an explicit size limit**
+rather than relying on automatic truncation.
+
 ### Daemon Mode
 
 ```bash
