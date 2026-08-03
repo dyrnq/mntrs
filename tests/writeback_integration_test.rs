@@ -181,7 +181,7 @@ fn happy_path_uploads_and_removes_dirty_sidecar() {
     h.inodes.insert(
         100,
         InodeEntry {
-            path: "/remote/a.bin".to_string(),
+            path: std::sync::Arc::from("/remote/a.bin"),
             kind: FileType::RegularFile,
             size: 5,
             mtime: None,
