@@ -2214,7 +2214,6 @@ dependencies = [
  "anyhow",
  "clap",
  "mntrs",
- "opendal",
  "prost",
  "prost-types",
  "rustix",
