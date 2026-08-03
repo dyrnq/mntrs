@@ -1380,6 +1380,9 @@ pub fn mount(
 
         mem_cache: mem_cache.clone(),
         attr_cache: dashmap::DashMap::new(),
+        stat_inflight: dashmap::DashMap::new(),
+        #[cfg(test)]
+        stat_backend_calls: std::sync::Mutex::new(0),
         disk_cache_index: disk_cache_index.clone(),
         multi_cache: {
             crate::multi_level_cache::MultiLevelCache::new(
