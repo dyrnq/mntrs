@@ -155,9 +155,30 @@ echo "  $(date -Iseconds): mntrs mount returned (exit=$?)"
 # rm -rf workload is not corrupted by the unbatched mount's
 # deletes. Same TLS, same client pool, same daemon log
 # surface so the only delta is the batching.
-echo "  $(date -Iseconds): starting mntrs-batched mount (MNTRS_UNLINK_BATCH=1)..."
+#
+# Issue #536: the default `burst_threshold=32` /
+# `batch_threshold=32` / `flush_delay_ms=50` triple gates the
+# batcher out of the typical rm -rf workloads (10/100/500
+# files), so the bench measures only FUSE callback time, not
+# the S3 DeleteObjects wall time. Lowering these env vars on
+# the bench-only batched mount makes the A/B reflect the actual
+# batching fast path.
+#   * MNTRS_BATCH_FLUSH_DELAY_MS=10  — flush window halved
+#   * MNTRS_BATCH_THRESHOLD=4        — deleter-side enqueue gate
+#                                      drops from 32 to 4 so even
+#                                      rm -rf 10 files engages
+#   * MNTRS_BATCH_SIZE=20            — size-driven flush at 20
+#                                      keys (S3 DeleteObjects
+#                                      caps at 1000 anyway, and
+#                                      20 keeps individual batches
+#                                      cheap for mixed loads)
+# The default policy at runtime is unchanged.
+echo "  $(date -Iseconds): starting mntrs-batched mount (MNTRS_UNLINK_BATCH=1, fast-path thresholds)..."
 export MNTRS_BATCH_DAEMON_LOG="${MNTRS_BATCH_DAEMON_LOG:-/tmp/mntrs-daemon-batch.log}"
 MNTRS_UNLINK_BATCH=1 \
+MNTRS_BATCH_FLUSH_DELAY_MS=10 \
+MNTRS_BATCH_THRESHOLD=4 \
+MNTRS_BATCH_SIZE=20 \
 RUST_LOG=info,mntrs::batched_delete=info \
 "$MNTRS_BIN" mount "s3://$BATCH_BUCKET" "$MNTRS_BATCH_MNT" \
     --opt "endpoint=$ENDPOINT" --opt "access-key=$ACCESS_KEY" \
