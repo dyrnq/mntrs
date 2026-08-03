@@ -279,7 +279,47 @@ enum ReadAndPushOutcome {
     /// overlap as terminal silently downgrades every FUSE read to a
     /// direct remote fetch once the overlap fires (issue #413).
     Overlap { back_end: u64 },
+    /// Issue #537: opendal reported a transient range-read error
+    /// (`ErrorKind::Unexpected` with message "reader got too little
+    /// data" or "reader got too much data", emitted by opendal-core's
+    /// `complete` layer when a chunked range read on the S3 backend
+    /// returns fewer/more bytes than requested). The range may not
+    /// have been fetched at all. Caller should release its
+    /// reservation, halve the local window for the next iteration,
+    /// and retry the same offset; do NOT exit the download thread,
+    /// since the issue is downstream chunking on the storage side
+    /// (MinIO in particular is known to short-return range reads
+    /// occasionally), not file content. After
+    /// `MAX_CONSECUTIVE_TRANSIENT_READ_ERRORS` consecutive returns
+    /// of this variant, the caller should escalate to `Cancelled`
+    /// — at that point the storage backend is consistently broken
+    /// for this file and prefetching is making things worse.
+    TransientRangeError,
 }
+
+/// Issue #537: classify an opendal error from `read_with(...).range(...)`
+/// as a transient range-read error we can recover from by halving
+/// the prefetch window. Currently this is the only matching shape:
+/// opendal-core's `complete` layer emits exactly two `Unexpected`
+/// errors ("reader got too little data" / "reader got too much data")
+/// when a chunked range read returns a different byte count than
+/// requested. Both are storage-side chunking issues (MinIO is the
+/// known offender), not file-content errors, so retrying with a
+/// smaller range is the correct response.
+fn is_transient_range_read_error(e: &opendal::Error) -> bool {
+    if e.kind() != opendal::ErrorKind::Unexpected {
+        return false;
+    }
+    let m = e.message();
+    m.contains("reader got too little data") || m.contains("reader got too much data")
+}
+
+/// Issue #537: give up after this many consecutive transient range
+/// errors without a successful read between them. At that point the
+/// storage backend is consistently broken for this file and
+/// continuing to retry with smaller windows wastes S3 RTTs that the
+/// FUSE read path could spend on a direct fallback.
+const MAX_CONSECUTIVE_TRANSIENT_READ_ERRORS: u32 = 5;
 
 /// loop body).
 #[allow(clippy::too_many_arguments)]
@@ -300,6 +340,27 @@ fn read_and_push(
     let buf = match result {
         Ok(b) => b,
         Err(e) => {
+            // Issue #537: transient range-read errors (opendal's
+            // "reader got too little data" / "too much data" on
+            // chunked range reads) are caused by storage-side
+            // chunking, not the file content. Returning
+            // `Cancelled` here would kill the download thread on
+            // the FIRST such error and silently downgrade every
+            // subsequent FUSE read on the same file to a direct
+            // remote fetch — turning a transient 5.4x cold-read
+            // regression into a permanent one. Instead, signal
+            // `TransientRangeError` so the caller halves the
+            // local window and retries.
+            if is_transient_range_read_error(&e) {
+                tracing::debug!(
+                    target: "prefetcher",
+                    offset,
+                    end,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "transient range-read error; will halve window and retry",
+                );
+                return ReadAndPushOutcome::TransientRangeError;
+            }
             let mut qlock = q.lock_or_recover();
             qlock.set_error(format!("prefetch read failed: {e}"));
             return ReadAndPushOutcome::Cancelled;
@@ -424,6 +485,22 @@ impl HandlePrefetcher {
             // mem_pressure currently set, call `set_mem_pressure(false)`
             // so the EMA can recompute the window naturally.
             let mut consecutive_successes: u32 = 0;
+            // Issue #537: count consecutive transient range-read
+            // errors (opendal's "reader got too little/much data"
+            // on chunked range reads). Reset on any successful read.
+            // When this hits `MAX_CONSECUTIVE_TRANSIENT_READ_ERRORS`,
+            // the download thread gives up — at that point the
+            // storage backend is consistently broken for this file
+            // and prefetching is hurting more than helping.
+            let mut consecutive_transient: u32 = 0;
+            // Issue #537: when a transient range error halves the
+            // window for the retry, we want the retry to use the
+            // halved size even if the controller's EMA window has
+            // grown back up. `take()`d on the next iteration so
+            // subsequent iterations resume the normal
+            // `bp.current_window()` path. Only set immediately after
+            // a transient error, never by the controller.
+            let mut local_window_override: Option<u64> = None;
             'download: while offset < file_size {
                 if c.load(Ordering::Relaxed) {
                     break;
@@ -434,11 +511,18 @@ impl HandlePrefetcher {
                 // iteration uses the constructor's `first_chunk`
                 // (== prior fixed value) so the initial chunk is
                 // unchanged from the pre-#132 behavior.
-                let window = if offset == 0 {
-                    first_chunk
-                } else {
-                    bp.current_window()
-                };
+                //
+                // Issue #537: `local_window_override` is set by the
+                // TransientRangeError handler below and is consumed
+                // (take) here. After the retry succeeds the next
+                // iteration falls back to the controller's window.
+                let window = local_window_override.take().unwrap_or_else(|| {
+                    if offset == 0 {
+                        first_chunk
+                    } else {
+                        bp.current_window()
+                    }
+                });
                 let end = (offset + window).min(file_size);
                 let chunk = end - offset;
 
@@ -492,6 +576,7 @@ impl HandlePrefetcher {
                         offset > 0,
                     ) {
                         ReadAndPushOutcome::Ok => {
+                            consecutive_transient = 0;
                             offset = shrunk_end;
                         }
                         ReadAndPushOutcome::Cancelled => {
@@ -513,7 +598,42 @@ impl HandlePrefetcher {
                             // short read).
                             inflight.fetch_sub(shrunk, std::sync::atomic::Ordering::Relaxed);
                             ml.release("prefetch", shrunk);
+                            consecutive_transient = 0;
                             offset = back_end;
+                        }
+                        ReadAndPushOutcome::TransientRangeError => {
+                            // Issue #537: chunked range read on the
+                            // storage backend short-returned. Drop
+                            // the reservation we just made (it's
+                            // owned by this retry), bump the
+                            // counter, and either escalate to
+                            // `Cancelled` (5 in a row) or schedule
+                            // a retry of the SAME offset with a
+                            // halved window. Do NOT advance offset
+                            // — the bytes haven't been read yet.
+                            inflight.fetch_sub(shrunk, std::sync::atomic::Ordering::Relaxed);
+                            ml.release("prefetch", shrunk);
+                            consecutive_transient += 1;
+                            if consecutive_transient > MAX_CONSECUTIVE_TRANSIENT_READ_ERRORS {
+                                let mut qlock = q.lock_or_recover();
+                                qlock.set_error(format!(
+                                    "prefetch gave up after {consecutive_transient} \
+                                     consecutive transient range errors"
+                                ));
+                                break 'download;
+                            }
+                            let new_window = (shrunk / 2).clamp(bp_min_window, shrunk);
+                            tracing::info!(
+                                target: "prefetcher",
+                                offset,
+                                old_window = shrunk,
+                                new_window,
+                                consecutive = consecutive_transient,
+                                "halving prefetch window after transient range error",
+                            );
+                            local_window_override = Some(new_window);
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            continue;
                         }
                     }
                     continue;
@@ -533,6 +653,7 @@ impl HandlePrefetcher {
                 }
                 match read_and_push(&op, &path, offset, end, chunk, &bp, &q, &cv, offset > 0) {
                     ReadAndPushOutcome::Ok => {
+                        consecutive_transient = 0;
                         offset = end;
                     }
                     ReadAndPushOutcome::Cancelled => {
@@ -545,7 +666,40 @@ impl HandlePrefetcher {
                     ReadAndPushOutcome::Overlap { back_end } => {
                         inflight.fetch_sub(chunk, std::sync::atomic::Ordering::Relaxed);
                         ml.release("prefetch", chunk);
+                        consecutive_transient = 0;
                         offset = back_end;
+                    }
+                    ReadAndPushOutcome::TransientRangeError => {
+                        // Issue #537: chunked range read on the
+                        // storage backend short-returned. Drop the
+                        // reservation, bump the counter, and either
+                        // escalate to `Cancelled` (5 in a row) or
+                        // schedule a retry of the SAME offset with
+                        // a halved window. Do NOT advance offset —
+                        // the bytes haven't been read yet.
+                        inflight.fetch_sub(chunk, std::sync::atomic::Ordering::Relaxed);
+                        ml.release("prefetch", chunk);
+                        consecutive_transient += 1;
+                        if consecutive_transient > MAX_CONSECUTIVE_TRANSIENT_READ_ERRORS {
+                            let mut qlock = q.lock_or_recover();
+                            qlock.set_error(format!(
+                                "prefetch gave up after {consecutive_transient} \
+                                 consecutive transient range errors"
+                            ));
+                            break 'download;
+                        }
+                        let new_window = (chunk / 2).clamp(bp_min_window, chunk);
+                        tracing::info!(
+                            target: "prefetcher",
+                            offset,
+                            old_window = chunk,
+                            new_window,
+                            consecutive = consecutive_transient,
+                            "halving prefetch window after transient range error",
+                        );
+                        local_window_override = Some(new_window);
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
                     }
                 }
             }
@@ -741,6 +895,65 @@ mod tests {
         q.set_error("test error".to_string());
         let part = q.pop(0);
         assert!(part.is_none());
+    }
+
+    // ── Issue #537: transient range-read error classification ───
+
+    /// The classifier must return true for the two messages emitted by
+    /// opendal-core's `complete` layer when a chunked range read
+    /// short-returns or over-returns. Both shapes are recoverable
+    /// by halving the prefetch window.
+    #[test]
+    fn transient_range_read_error_classifier_matches_opendal_messages() {
+        let too_little =
+            opendal::Error::new(opendal::ErrorKind::Unexpected, "reader got too little data");
+        let too_much =
+            opendal::Error::new(opendal::ErrorKind::Unexpected, "reader got too much data");
+        assert!(is_transient_range_read_error(&too_little));
+        assert!(is_transient_range_read_error(&too_much));
+    }
+
+    /// Other `ErrorKind::Unexpected` shapes (e.g. "writer has been
+    /// dropped", "retry exhausted", "serialize xml") are NOT
+    /// transient range errors — the classifier must reject them so
+    /// the download thread exits cleanly instead of looping forever
+    /// on a broken pipeline.
+    #[test]
+    fn transient_range_read_error_classifier_rejects_other_unexpected() {
+        for msg in [
+            "writer has been dropped",
+            "retry exhausted",
+            "serialize xml",
+            "reader got unexpected data size",
+            "I'm a crazy monkey!",
+        ] {
+            let e = opendal::Error::new(opendal::ErrorKind::Unexpected, msg);
+            assert!(
+                !is_transient_range_read_error(&e),
+                "must NOT classify '{msg}' as transient (would loop forever)"
+            );
+        }
+    }
+
+    /// Non-`Unexpected` error kinds are terminal and must not be
+    /// classified as transient — the prefetcher should exit and let
+    /// the FUSE read path fall back to a direct read. Catching e.g.
+    /// `NotFound` as transient would loop forever on a missing file.
+    #[test]
+    fn transient_range_read_error_classifier_rejects_other_kinds() {
+        use opendal::ErrorKind;
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::PermissionDenied,
+            ErrorKind::Unsupported,
+            ErrorKind::RateLimited,
+        ] {
+            let e = opendal::Error::new(kind, "reader got too little data");
+            assert!(
+                !is_transient_range_read_error(&e),
+                "must NOT classify ErrorKind::{kind:?} as transient"
+            );
+        }
     }
 
     #[test]
