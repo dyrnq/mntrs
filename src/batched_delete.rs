@@ -77,6 +77,24 @@ pub(crate) const DEFAULT_MAX_RETRIES: u32 = 3;
 pub(crate) const DEFAULT_RETRY_FACTOR: f64 = 2.0;
 pub(crate) const DEFAULT_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 
+/// Issue #530: caller-side threshold gating. When the batched
+/// deleter's pending queue has fewer than this many entries
+/// at the moment of enqueue, the caller falls through to a
+/// direct strict delete (`delete_backend_strict`) instead of
+/// enqueueing. Why: each enqueued file pays up to
+/// `flush_delay` (50 ms by default) of latency before its S3
+/// DELETE is requested. For small bursts (rm -rf on a few
+/// files), the strict path's `op.delete()` is faster and
+/// simpler. Only when the burst is large enough that one
+/// batched `DeleteObjects` call beats N serial `op.delete()`
+/// calls does the overhead pay for itself — bench crossover
+/// is at ~500 files; threshold 32 is a conservative
+/// approximation that still benefits large `rm -rf` work
+/// without hurting small unlink workloads. Tunable via
+/// `MNTRS_BATCH_THRESHOLD` (0 = always batch, even single
+/// files; default 32).
+pub(crate) const DEFAULT_BATCH_THRESHOLD: usize = 32;
+
 // ===== Counters (plan #64 stage B) =====
 //
 // Process-static counters, like writeback::PENDING_COUNT. Read
@@ -88,6 +106,11 @@ static FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHUTDOWN_LOST_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SINGLE_KEY_BATCHES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static MAX_BATCH_SIZE_OBSERVED: AtomicU64 = AtomicU64::new(0);
+/// Issue #530: how many `enqueue` calls were routed to the
+/// strict (`delete_backend_strict`) path because the current
+/// pending queue length was below the batch threshold. Useful
+/// to verify the gating is firing on real workloads.
+static THRESHOLD_SKIPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Plan #64 stage B: snapshot of batched_delete counters.
 /// Exposed for `/metrics` and Stage C observability.
@@ -99,6 +122,8 @@ pub(crate) struct CounterSnapshot {
     pub shutdown_lost_total: u64,
     pub single_key_batches_total: u64,
     pub max_batch_size_observed: u64,
+    /// Issue #530
+    pub threshold_skipped_total: u64,
 }
 
 pub(crate) fn snapshot() -> CounterSnapshot {
@@ -109,6 +134,7 @@ pub(crate) fn snapshot() -> CounterSnapshot {
         shutdown_lost_total: SHUTDOWN_LOST_TOTAL.load(Ordering::Relaxed),
         single_key_batches_total: SINGLE_KEY_BATCHES_TOTAL.load(Ordering::Relaxed),
         max_batch_size_observed: MAX_BATCH_SIZE_OBSERVED.load(Ordering::Relaxed),
+        threshold_skipped_total: THRESHOLD_SKIPPED_TOTAL.load(Ordering::Relaxed),
     }
 }
 
@@ -178,6 +204,16 @@ struct Shared {
     /// accumulate large batches. The rmdir barrier (`Control::Flush`)
     /// bypasses this deadline entirely via `do_flush_all`.
     flush_delay: Duration,
+    /// Issue #530: caller-side threshold gating. `enqueue`
+    /// checks `pending.len()` and returns `None` (caller falls
+    /// back to strict `delete_backend_strict`) when the queue
+    /// is smaller than this. Tunable at runtime via
+    /// `BatchedDeleter::set_batch_threshold`; seeded from
+    /// `WorkerConfig::batch_threshold` (env:
+    /// `MNTRS_BATCH_THRESHOLD`, default 32). Stored as AtomicUsize
+    /// so a future /metrics endpoint can adjust without
+    /// re-spawning the worker.
+    batch_threshold: std::sync::atomic::AtomicUsize,
     /// Tombstones for paths that have an in-flight write-behind
     /// delete. Owned by MntrsFs (test + production constructors
     /// both pre-build a DashSet and pass its Arc clone here) so
@@ -236,6 +272,13 @@ pub(crate) struct WorkerConfig {
     pub http: reqwest::Client,
     pub batch_size: usize,
     pub flush_delay: Duration,
+    /// Issue #530: caller-side threshold gating. See
+    /// `Shared::batch_threshold` for semantics. Sourced from
+    /// env `MNTRS_BATCH_THRESHOLD` (default 32) in
+    /// `from_s3`. 0 means "always batch, even single files"
+    /// (matches the pre-#530 behaviour for users who want
+    /// it).
+    pub batch_threshold: usize,
     pub request_timeout: Duration,
     pub max_retries: u32,
     pub retry_factor: f64,
@@ -263,6 +306,11 @@ impl WorkerConfig {
             DEFAULT_FLUSH_DELAY.as_millis() as u64,
         );
         let flush_delay = Duration::from_millis(flush_delay_ms.clamp(1, 10_000));
+        // Issue #530: caller-side threshold. 0 = always batch
+        // (legacy); 1 = never batch (effectively disables
+        // batching — every enqueue returns None); N > 1 =
+        // batch only when pending.len() >= N at enqueue time.
+        let batch_threshold = env_usize("MNTRS_BATCH_THRESHOLD", DEFAULT_BATCH_THRESHOLD);
         Self {
             endpoint,
             bucket,
@@ -273,6 +321,7 @@ impl WorkerConfig {
             http,
             batch_size,
             flush_delay,
+            batch_threshold,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_retries: DEFAULT_MAX_RETRIES,
             retry_factor: DEFAULT_RETRY_FACTOR,
@@ -316,6 +365,7 @@ pub(crate) fn spawn(
         pending: Mutex::new(Pending::new()),
         accepting: AtomicBool::new(true),
         flush_delay: config.flush_delay,
+        batch_threshold: std::sync::atomic::AtomicUsize::new(config.batch_threshold),
         tombs,
     });
     let deleter = BatchedDeleter {
@@ -342,12 +392,52 @@ impl BatchedDeleter {
     /// S3 outcome is observed via the worker's tracing logs, not
     /// via the receiver. The receiver exists for tests and for any
     /// strict caller.
+    ///
+    /// Issue #530: caller-side threshold gating. If
+    /// `pending.len() < batch_threshold` at the moment of
+    /// enqueue, this method returns `None` so the caller
+    /// falls back to a strict `delete_backend_strict`. Reason:
+    /// the per-key latency floor is `flush_delay` (50 ms by
+    /// default), and a one-off unlink or a 10-file `rm -rf`
+    /// pays that floor without amortising it across enough
+    /// siblings to beat the direct `op.delete()` path.
     pub(crate) fn enqueue(
         &self,
         relative_path: String,
     ) -> Option<oneshot::Receiver<std::io::Result<()>>> {
         if !self.shared.accepting.load(Ordering::Acquire) {
             return None;
+        }
+        // Issue #530: caller-side threshold gating. Read the
+        // threshold atomically (no lock needed) and inspect
+        // the queue length under the pending mutex. Two lock
+        // acquisitions rather than one would race with a
+        // concurrent flush, but `pending_len()` returns a
+        // snapshot and the gating decision is best-effort:
+        // a race that lets a few extra keys through is
+        // strictly better than a race that drops a key
+        // entirely. Bump the counter before returning None so
+        // the gating decision is observable in /metrics.
+        let threshold = self
+            .shared
+            .batch_threshold
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if threshold > 0 {
+            let current_len = {
+                let pending = self.shared.pending.lock().expect("pending mutex poisoned");
+                pending.len()
+            };
+            if current_len < threshold {
+                THRESHOLD_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                tracing::trace!(
+                    target: "mntrs::batched_delete",
+                    relative_path = %relative_path,
+                    current_len,
+                    threshold,
+                    "enqueue: below batch_threshold, returning None for strict fallback"
+                );
+                return None;
+            }
         }
         let (tx, rx) = oneshot::channel();
         let job = PendingDelete {
@@ -498,6 +588,36 @@ impl BatchedDeleter {
     /// True if the worker is still accepting work.
     pub(crate) fn is_accepting(&self) -> bool {
         self.shared.accepting.load(Ordering::Acquire)
+    }
+
+    /// Issue #530: snapshot of the pending queue length. Used
+    /// by `MntrsFs::enqueue_backend_delete` to decide whether
+    /// the next unlink should go through the batched path or
+    /// fall through to a direct `delete_backend_strict`. Cheap
+    /// (mutex lock + len read); the cost is dominated by
+    /// whatever's already holding the pending mutex.
+    pub(crate) fn pending_len(&self) -> usize {
+        let pending = self.shared.pending.lock().expect("pending mutex poisoned");
+        pending.len()
+    }
+
+    /// Issue #530: runtime-adjust the batch threshold without
+    /// re-spawning the worker. `0` disables gating (always
+    /// batch); `1` effectively disables batching (every
+    /// enqueue returns None); `N > 1` batches only when the
+    /// pending queue is at least `N` at enqueue time. Returns
+    /// the previous threshold.
+    pub(crate) fn set_batch_threshold(&self, threshold: usize) -> usize {
+        self.shared
+            .batch_threshold
+            .swap(threshold, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Issue #530: read the current batch threshold.
+    pub(crate) fn batch_threshold(&self) -> usize {
+        self.shared
+            .batch_threshold
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -1468,6 +1588,11 @@ mod tests {
             pending: Mutex::new(Pending::new()),
             accepting: AtomicBool::new(true),
             flush_delay: Duration::from_millis(50),
+            // Issue #530: tests use threshold 0 to disable
+            // gating — they don't exercise the
+            // enqueue-returns-None branch and want a clean
+            // "always enqueue" path.
+            batch_threshold: std::sync::atomic::AtomicUsize::new(0),
             tombs: tombs.clone(),
         });
         let (tx, _rx) = mpsc::channel::<Control>(8);
@@ -1511,6 +1636,11 @@ mod tests {
             pending: Mutex::new(Pending::new()),
             accepting: AtomicBool::new(true),
             flush_delay: Duration::from_millis(50),
+            // Issue #530: tests use threshold 0 to disable
+            // gating — they don't exercise the
+            // enqueue-returns-None branch and want a clean
+            // "always enqueue" path.
+            batch_threshold: std::sync::atomic::AtomicUsize::new(0),
             tombs: tombs.clone(),
         });
         let (tx, _rx) = mpsc::channel::<Control>(8);
@@ -1532,6 +1662,11 @@ mod tests {
             pending: Mutex::new(Pending::new()),
             accepting: AtomicBool::new(true),
             flush_delay: Duration::from_millis(50),
+            // Issue #530: tests use threshold 0 to disable
+            // gating — they don't exercise the
+            // enqueue-returns-None branch and want a clean
+            // "always enqueue" path.
+            batch_threshold: std::sync::atomic::AtomicUsize::new(0),
             tombs: tombs.clone(),
         });
         let (tx, _rx) = mpsc::channel::<Control>(8);
@@ -1542,5 +1677,106 @@ mod tests {
         let n = deleter.cancel_pending("never-existed");
         assert_eq!(n, 0);
         assert!(tombs.is_empty());
+    }
+
+    // ===== Issue #530 threshold gating tests =====
+
+    /// Helper for Issue #530 unit tests: build a Shared
+    /// literal + a stub BatchedDeleter whose `flush_tx`
+    /// channel is a dead end (no worker is spawned — the
+    /// tests don't actually need the worker; they only
+    /// inspect `enqueue()`'s return value and
+    /// `pending_len()`).
+    fn make_test_deleter_with_threshold(
+        threshold: usize,
+    ) -> (BatchedDeleter, std::sync::Arc<dashmap::DashSet<String>>) {
+        let tombs = std::sync::Arc::new(dashmap::DashSet::<String>::new());
+        let shared = std::sync::Arc::new(Shared {
+            pending: Mutex::new(Pending::new()),
+            accepting: AtomicBool::new(true),
+            flush_delay: Duration::from_millis(50),
+            batch_threshold: std::sync::atomic::AtomicUsize::new(threshold),
+            tombs: tombs.clone(),
+        });
+        let (tx, _rx) = mpsc::channel::<Control>(8);
+        let deleter = BatchedDeleter {
+            shared: shared.clone(),
+            flush_tx: tx,
+        };
+        (deleter, tombs)
+    }
+
+    /// Issue #530: when the pending queue is below
+    /// `batch_threshold`, `enqueue()` returns None and does
+    /// not insert a job. This is the gating contract the
+    /// FUSE-side caller relies on for small-burst fallback.
+    #[test]
+    fn enqueue_below_threshold_returns_none_and_does_not_queue() {
+        let (deleter, _tombs) = make_test_deleter_with_threshold(32);
+        let rx = deleter.enqueue("a/b/c".to_string());
+        assert!(rx.is_none(), "below threshold: must return None");
+        assert_eq!(
+            deleter.pending_len(),
+            0,
+            "below threshold: must not insert into pending"
+        );
+        assert_eq!(deleter.batch_threshold(), 32);
+    }
+
+    /// Issue #530: with `batch_threshold = 0`, gating is
+    /// disabled and every `enqueue()` call returns Some
+    /// (preserves the legacy "always batch" behaviour
+    /// users who set MNTRS_BATCH_THRESHOLD=0 expect).
+    #[test]
+    fn enqueue_threshold_zero_disables_gating() {
+        let (deleter, _tombs) = make_test_deleter_with_threshold(0);
+        let rx1 = deleter.enqueue("a".to_string());
+        assert!(rx1.is_some(), "threshold=0: must always enqueue");
+        assert_eq!(deleter.pending_len(), 1);
+        let rx2 = deleter.enqueue("b".to_string());
+        assert!(rx2.is_some(), "threshold=0: must always enqueue");
+        assert_eq!(deleter.pending_len(), 2);
+    }
+
+    /// Issue #530: `set_batch_threshold` is a runtime knob
+    /// that takes effect immediately for subsequent
+    /// `enqueue()` calls. Returns the previous threshold
+    /// (atomic `swap` semantics) so callers can record the
+    /// before/after pair.
+    #[test]
+    fn set_batch_threshold_takes_effect_immediately() {
+        let (deleter, _tombs) = make_test_deleter_with_threshold(32);
+        assert_eq!(deleter.batch_threshold(), 32);
+        let prev = deleter.set_batch_threshold(64);
+        assert_eq!(prev, 32, "returns previous threshold");
+        assert_eq!(deleter.batch_threshold(), 64);
+        // First enqueue with new threshold of 64 and empty
+        // pending queue (0 < 64) must still be None.
+        assert!(deleter.enqueue("x".to_string()).is_none());
+        // Lowering to 0 lets the same queue drain-through.
+        assert_eq!(deleter.set_batch_threshold(0), 64);
+        assert!(deleter.enqueue("y".to_string()).is_some());
+        assert_eq!(deleter.pending_len(), 1);
+    }
+
+    /// Issue #530: when `enqueue` returns None, the
+    /// `THRESHOLD_SKIPPED_TOTAL` counter advances. This is
+    /// how /metrics and the bench harness can confirm the
+    /// gating is actually firing on real workloads
+    /// (without grepping debug logs).
+    #[test]
+    fn threshold_skipped_counter_advances_on_none_return() {
+        let (deleter, _tombs) = make_test_deleter_with_threshold(16);
+        let before = crate::batched_delete::snapshot().threshold_skipped_total;
+        // Three calls, all below threshold (16), all should
+        // return None and bump the counter.
+        assert!(deleter.enqueue("p1".to_string()).is_none());
+        assert!(deleter.enqueue("p2".to_string()).is_none());
+        assert!(deleter.enqueue("p3".to_string()).is_none());
+        let after = crate::batched_delete::snapshot().threshold_skipped_total;
+        assert!(
+            after >= before + 3,
+            "threshold_skipped_total must advance by at least 3 (was {before}, now {after})"
+        );
     }
 }

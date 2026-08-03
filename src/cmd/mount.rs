@@ -1270,6 +1270,13 @@ pub fn mount(
         // Plan #64 step 10: tombstones for write-behind deletes.
         // Always populated; remains empty in non-write-behind mode.
         delete_tombstones: std::sync::Arc::new(dashmap::DashSet::new()),
+        // Issue #530: caller-side burst detection for
+        // enqueue_backend_delete. Default policy (100 ms
+        // window, 32-unlink threshold); can be overridden via
+        // env vars `MNTRS_BURST_WINDOW_MS` and
+        // `MNTRS_BURST_THRESHOLD` (see
+        // UnlinkBurstState::from_env).
+        unlink_burst_state: std::sync::Mutex::new(crate::UnlinkBurstState::from_env()),
         // Issue #325: in-memory symlink target table. Empty at
         // mount start; populated by `MntrsFs::symlink` when
         // user-mode code creates a symbolic link (Win32
