@@ -670,26 +670,27 @@ pub fn mount_internal(
         // saturating memory or concurrent-upload
         // pools. Operators who want serial can pass
         // `--vfs-read-chunk-streams=0` on the CLI.
-        4,        // vfs_read_chunk_streams (parallel)
-        16777216, // vfs_prefetch_threshold (16 MiB)
-        64,       // vfs_prefetch_queue_mb
-        false,    // vfs_fast_fingerprint
-        false,    // async_read
-        false,    // vfs_refresh
-        false,    // vfs_case_insensitive
-        false,    // no_implicit_dir
-        false,    // vfs_block_norm_dupes
-        false,    // vfs_links
-        false,    // vfs_used_is_size
-        None,     // vfs_metadata_extension
-        None,     // storage_class
-        1,        // vfs_write_wait (1s)
-        1,        // vfs_read_wait (1s)
-        60,       // vfs_cache_poll_interval
-        0,        // vfs_handle_caching
-        0,        // vfs_disk_space_total_size (off)
+        4,         // vfs_read_chunk_streams (parallel)
+        16777216,  // vfs_prefetch_threshold (16 MiB)
+        64,        // vfs_prefetch_queue_mb
+        false,     // vfs_fast_fingerprint
+        false,     // async_read
+        false,     // vfs_refresh
+        false,     // vfs_case_insensitive
+        false,     // no_implicit_dir
+        false,     // vfs_block_norm_dupes
+        false,     // vfs_links
+        false,     // vfs_used_is_size
+        None,      // vfs_metadata_extension
+        None,      // storage_class
+        1,         // vfs_write_wait (1s)
+        1,         // vfs_read_wait (1s)
+        60,        // vfs_cache_poll_interval
+        0,         // vfs_handle_caching
+        0,         // vfs_disk_space_total_size (off)
         false, // vfs_read_stale_on_backend_error (CSI: never stale-on-error; data integrity > uptime)
         0, // winfsp_dispatcher_threads (CSI: driver default 8; CSI pods don't need pinned count)
+        64 * 1024, // max_xattr_size (CSI: macFUSE 64 KiB cap; CSI runs on Linux so this is effectively advisory, but the warn hook is still useful for users who mirror the same flag on macOS)
     )
 }
 
@@ -1007,6 +1008,13 @@ pub fn mount(
     // Unix: accepted by clap but ignored here (unix FUSE has its
     // own dispatcher pool — fuser backend).
     winfsp_dispatcher_threads: u32,
+    // Issue #502: macFUSE 64 KiB xattr silent truncation cap.
+    // 0 = warning disabled. Non-zero values also trigger a one-shot
+    // startup warn if the configured cap exceeds the kernel hard
+    // limit. Linux/Windows: cap is accepted but effectively advisory
+    // (no kernel-side truncation — WinFSP EA chunks are
+    // 16 KiB-by-default but configurable per-instance).
+    max_xattr_size: usize,
 ) -> Result<()> {
     // Issue #328: idempotency check at the CLI entry point.
     // When V: is already mounted (by an earlier `mntrs mount`
@@ -1344,6 +1352,17 @@ pub fn mount(
             poll_interval.unwrap_or(vfs_cache_poll_interval).max(1),
         ),
         cache_max_age: cache_max_age_for_mlc,
+        // Issue #502: macFUSE 64 KiB xattr silent-truncation cap.
+        // 0 disables the warning entirely. Non-zero values also
+        // trigger a one-shot startup warn if the configured cap
+        // exceeds the kernel hard limit (see `mount`'s post-
+        // destructure block).
+        max_xattr_size,
+        // Issue #502: per-instance oversize-warn counter. Always
+        // starts at 0 for a fresh mount; the user-facing signal
+        // is the `tracing::warn!` itself, the counter is a test
+        // diagnostic.
+        xattr_oversize_warn_count: std::sync::atomic::AtomicU64::new(0),
         cache_min_free_space: vfs_cache_min_free_space * 1024 * 1024,
         exclude_patterns: exclude,
         include_patterns: include,
