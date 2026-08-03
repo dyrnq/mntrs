@@ -7617,22 +7617,6 @@ fn strip_etag_quotes(s: &str) -> &str {
     }
 }
 
-/// Normalize a custom user-metadata key per rclone's mapping
-/// rules (lowercase + dots→underscores). S3 user metadata keys
-/// are case-insensitive at the HTTP header level (the
-/// `x-amz-meta-*` prefix gets normalized by AWS). Lowercase +
-/// dots→underscores matches the canonical xattr naming: dots
-/// are illegal in xattr names on most platforms.
-///
-/// Thin alias to `crate::xattr_bridge::normalize_user_meta_key`
-/// — single source of truth lives there so the read path
-/// (`xattr_value_for` / `xattr_names_for`) and the write path
-/// (issue #500's `setxattr`) can't drift on the normalization
-/// rule.
-fn normalize_user_meta_key(s: &str) -> String {
-    crate::xattr_bridge::normalize_user_meta_key(s)
-}
-
 impl MntrsFs {
     /// Issue #78: shared rename body — backend op + cache/inode
     /// migration. Inherent method (not on the trait) so both the
