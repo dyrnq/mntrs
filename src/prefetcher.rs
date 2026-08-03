@@ -321,6 +321,74 @@ fn is_transient_range_read_error(e: &opendal::Error) -> bool {
 /// FUSE read path could spend on a direct fallback.
 const MAX_CONSECUTIVE_TRANSIENT_READ_ERRORS: u32 = 5;
 
+/// Issue #545: apply the sticky-floor ratchet to the current
+/// `sticky_max_window`. Pure function so the unit tests below can
+/// exercise the ratchet decision without spinning up a prefetcher
+/// or hitting a real backend.
+///
+/// Returns the new `sticky_max_window` value:
+/// * `None` if the ratchet has never engaged (or the caller has
+///   explicitly cleared it to `None` on a fresh file).
+/// * `min(previously_pinned, new_window)` if the ratchet has
+///   already engaged — the floor is a one-way ratchet, so the
+///   window can only shrink. Subsequent transient errors on the
+///   same file never un-pin or raise the floor; they only ever
+///   shrink it (e.g. the first halve pins to 1 MiB; a later halve
+///   to 512 KiB would then pin to 512 KiB).
+/// * `Some(new_window)` on the first engagement.
+pub(crate) fn apply_sticky_floor(current: Option<u64>, new_window: u64) -> Option<u64> {
+    current.map_or(Some(new_window), |floor| Some(floor.min(new_window)))
+}
+
+#[cfg(test)]
+mod sticky_floor_tests {
+    use super::apply_sticky_floor;
+
+    /// First engagement writes the new window verbatim.
+    #[test]
+    fn sticky_floor_engages_on_first_transient_error() {
+        assert_eq!(apply_sticky_floor(None, 1024 * 1024), Some(1024 * 1024));
+    }
+
+    /// Subsequent engagements only shrink — the ratchet is one-way.
+    /// A later halve that lands at a smaller size must lower the
+    /// floor (not over-write it back up).
+    #[test]
+    fn sticky_floor_shrinks_on_subsequent_transient_errors() {
+        // First error: 1 MiB floor.
+        let after_first = apply_sticky_floor(None, 1024 * 1024);
+        // Second error: 512 KiB halve. Floor tightens.
+        let after_second = apply_sticky_floor(after_first, 512 * 1024);
+        assert_eq!(after_second, Some(512 * 1024));
+    }
+
+    /// A subsequent halve that lands at a size >= the existing
+    /// floor must NOT raise the floor. The ratchet is one-way
+    /// downward only.
+    #[test]
+    fn sticky_floor_does_not_raise_on_subsequent_transient_errors() {
+        // First error: 1 MiB floor.
+        let after_first = apply_sticky_floor(None, 1024 * 1024);
+        // Hypothetical "later" halve that lands at 1 MiB (no
+        // change). Floor stays at 1 MiB, not "raised to a bigger
+        // value" — there's no bigger value here, but the ratchet
+        // still must not raise. Use a value smaller than the
+        // current floor to actually exercise the monotonicity.
+        let after_same = apply_sticky_floor(after_first, 1024 * 1024);
+        assert_eq!(after_same, Some(1024 * 1024));
+        // And a "later" halve with a value larger than the floor
+        // (e.g. transient error on a smaller range somewhere else,
+        // booking a bigger number — the ratchet must clamp to the
+        // floor).
+        let after_bigger = apply_sticky_floor(after_first, 2 * 1024 * 1024);
+        assert_eq!(
+            after_bigger,
+            Some(1024 * 1024),
+            "raised a sticky floor from 1 MiB to 2 MiB — ratchet leaked"
+        );
+    }
+}
+
 /// loop body).
 #[allow(clippy::too_many_arguments)]
 fn read_and_push(
@@ -501,6 +569,22 @@ impl HandlePrefetcher {
             // `bp.current_window()` path. Only set immediately after
             // a transient error, never by the controller.
             let mut local_window_override: Option<u64> = None;
+            // Issue #545: sticky window floor after the FIRST
+            // transient error. Once a transient range error has
+            // forced us to halve to a working size, the EMA path
+            // would otherwise grow the window back to max — and the
+            // next 16MB prefetch would short-return on MinIO again,
+            // re-triggering the halve cycle (3 cycles × 4 halvings =
+            // 12 wasted fetches per cold 100M read). The sticky floor
+            // caps the window at the most-recently-recovered-from size
+            // for the rest of this prefetcher's lifetime. Per-instance
+            // (the variable lives in the `download` thread closure
+            // above), so it cannot leak across files. Within a single
+            // file it is a one-way ratchet: once engaged, the window
+            // can only shrink. AWS S3 valid range reads never trigger
+            // a transient error, so the ratchet should never engage
+            // on AWS.
+            let mut sticky_max_window: Option<u64> = None;
             'download: while offset < file_size {
                 if c.load(Ordering::Relaxed) {
                     break;
@@ -516,12 +600,24 @@ impl HandlePrefetcher {
                 // TransientRangeError handler below and is consumed
                 // (take) here. After the retry succeeds the next
                 // iteration falls back to the controller's window.
+                //
+                // Issue #545: cap the window at `sticky_max_window`
+                // when it has engaged. Without this cap the
+                // controller's normal EMA path would grow the window
+                // back up to max right after the first transient-error
+                // retry, and the next prefetch would short-return on
+                // the same backend again — repeating the halve cycle.
+                // The cap is `min(current_window, sticky_floor)` so
+                // a faster backend (or one with no transient errors)
+                // is unaffected: `sticky_max_window` stays `None`
+                // until the first transient error engages it.
                 let window = local_window_override.take().unwrap_or_else(|| {
-                    if offset == 0 {
+                    let w = if offset == 0 {
                         first_chunk
                     } else {
                         bp.current_window()
-                    }
+                    };
+                    sticky_max_window.map_or(w, |floor| w.min(floor))
                 });
                 let end = (offset + window).min(file_size);
                 let chunk = end - offset;
@@ -631,6 +727,16 @@ impl HandlePrefetcher {
                                 consecutive = consecutive_transient,
                                 "halving prefetch window after transient range error",
                             );
+                            // Issue #545: sticky floor engages on the
+                            // FIRST transient error — the most-recently
+                            // halved size is the only size known to
+                            // succeed on this storage backend for this
+                            // file. Pin subsequent iterations to it
+                            // so the EMA path doesn't grow the window
+                            // back up and re-trigger the halve cycle.
+                            // One-way ratchet: never re-engaged, never
+                            // raised, never crossed lifetime boundary.
+                            sticky_max_window = apply_sticky_floor(sticky_max_window, new_window);
                             local_window_override = Some(new_window);
                             std::thread::sleep(std::time::Duration::from_millis(10));
                             continue;
@@ -697,6 +803,10 @@ impl HandlePrefetcher {
                             consecutive = consecutive_transient,
                             "halving prefetch window after transient range error",
                         );
+                        // Issue #545: sticky floor — see the
+                        // mem_pressure shrunk-retry path comment above
+                        // for the same logic. Same one-way ratchet.
+                        sticky_max_window = apply_sticky_floor(sticky_max_window, new_window);
                         local_window_override = Some(new_window);
                         std::thread::sleep(std::time::Duration::from_millis(10));
                         continue;
