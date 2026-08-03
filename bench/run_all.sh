@@ -170,14 +170,15 @@ echo "  $(date -Iseconds): mntrs mount returned (exit=$?)"
 #   * MNTRS_BURST_THRESHOLD=4     — caller-side burst detector
 #                                   trips after just 4 unlinks
 #   * MNTRS_BATCH_FLUSH_DELAY_MS=10 — flush window halved
-#   * MNTRS_BATCH_THRESHOLD=1     — deleter-side enqueue gate
-#                                   at minimum (the
+#   * MNTRS_BATCH_THRESHOLD=0     — deleter-side enqueue gate
+#                                   bypassed entirely (the
 #                                   `current_len < threshold`
-#                                   check is `>=`-style and a
-#                                   value >1 never admits the
-#                                   first jobs; 1 means "accept
-#                                   once the queue has at least
-#                                   1 prior entry")
+#                                   check is satisfied only
+#                                   once the queue already has
+#                                   `threshold` jobs in it,
+#                                   which can never happen
+#                                   without an initial bypass;
+#                                   0 means "always batch")
 #   * MNTRS_BATCH_SIZE=20         — size-driven flush at 20
 #                                   keys (S3 DeleteObjects
 #                                   caps at 1000 anyway, and
@@ -190,7 +191,7 @@ MNTRS_UNLINK_BATCH=1 \
 MNTRS_BURST_WINDOW_MS=200 \
 MNTRS_BURST_THRESHOLD=4 \
 MNTRS_BATCH_FLUSH_DELAY_MS=10 \
-MNTRS_BATCH_THRESHOLD=1 \
+MNTRS_BATCH_THRESHOLD=0 \
 MNTRS_BATCH_SIZE=20 \
 RUST_LOG=info,mntrs::batched_delete=info \
 "$MNTRS_BIN" mount "s3://$BATCH_BUCKET" "$MNTRS_BATCH_MNT" \
