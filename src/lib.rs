@@ -68,7 +68,12 @@ pub const CACHE_BLOCK_SIZE: u64 = 8 * 1024 * 1024;
 ///     create / mkdir.
 #[derive(Clone, Debug)]
 pub struct InodeEntry {
-    pub path: String,
+    // Issue #520: `Arc<str>` so the per-op `path.clone()` in
+    // [`Self::resolve`] (called by every FUSE op) is a refcount
+    // bump instead of a deep String clone. The same Arc is
+    // shared with `path_to_ino`'s key (also `Arc<str>`), so
+    // inserting / looking up an ino by path doesn't allocate.
+    pub path: std::sync::Arc<str>,
     pub kind: FileType,
     pub size: u64,
     pub mtime: Option<SystemTime>,
@@ -349,14 +354,16 @@ static NEXT_HANDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 #[derive(Debug)]
 enum FileHandleState {
     Read {
-        path: String,
+        // Issue #520: Arc<str> so the per-handle path
+        // copy from `resolve()` is a refcount bump.
+        path: Arc<str>,
         last_offset: u64,
         chunk_size: u64,
         prefetcher: Option<std::sync::Arc<prefetcher::HandlePrefetcher>>,
         expires_at: Option<std::time::Instant>,
     },
     Write {
-        path: String,
+        path: Arc<str>,
         cache_fd: Option<Arc<std::sync::Mutex<std::fs::File>>>,
         dirty: bool,
         dirty_since: Option<std::time::Instant>,
@@ -399,6 +406,9 @@ impl Clone for FileHandleState {
 
 impl FileHandleState {
     fn path(&self) -> &str {
+        // Issue #520: deref `Arc<str>` to `&str` so callers
+        // continue to receive `&str` (zero-alloc — `Arc::deref`
+        // returns the inner `&str` directly).
         match self {
             FileHandleState::Read { path, .. } => path,
             FileHandleState::Write { path, .. } => path,
@@ -440,6 +450,19 @@ pub struct MntrsFs {
     /// from a linear scan if it's missing — so a
     /// forgotten maintenance site self-heals rather than
     /// losing the ino entirely.
+    // Issue #520 (partial): `InodeEntry::path` is `Arc<str>`
+    // (see struct definition above) so `resolve()`-induced clones
+    // are refcount bumps. `path_to_ino` is kept as `String` keys
+    // because `DashMap::remove(&str)` requires `String: Borrow<str>`
+    // which std doesn't implement for `Arc<str>` — switching to
+    // `Arc<str>` keys would force every lookup site to do
+    // `Arc::from(&str)` (1 alloc), eliminating the per-op win
+    // from the high-frequency read path.
+    //
+    // The win therefore comes entirely from `resolve()`'s
+    // `r.value().clone()` on the inodes map (called by every
+    // FUSE op). See the bench comparison in the PR body for the
+    // measured delta.
     path_to_ino: dashmap::DashMap<String, u64>,
     /// Per-ino kernel lookup reference count
     /// (Bug 33). Tracks the FUSE protocol's `nlookup`
@@ -1027,7 +1050,7 @@ impl MntrsFs {
             if block_idx.is_none() {
                 let _ = std::fs::remove_file(cpath.with_extension("meta"));
             }
-            self.disk_cache_index.remove(&(path.clone(), block_idx));
+            self.disk_cache_index.remove(&(path.to_string(), block_idx));
             freed += size;
             remaining = remaining.saturating_sub(size);
         }
@@ -1307,7 +1330,11 @@ impl MntrsFs {
         // matches the parent dir's basename. ls -R then descends into it
         // and gets EIO on stat, plus the root listing can show an empty
         // name (kernel EIO on readdir). Per SESSION_PITFALLS §2.4.
-        let queried_last = std::path::Path::new(&path)
+        // Issue #520: `e.path` is `Arc<str>`, not `String`. `Path::new`
+        // takes `impl AsRef<OsStr>` and `Arc<str>: AsRef<str>`,
+        // not `AsRef<OsStr>`, so deref explicitly with `&*path` to
+        // pass `&str` (which Path::new accepts).
+        let queried_last = std::path::Path::new(&*path)
             .components()
             .next_back()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
@@ -1740,7 +1767,7 @@ impl MntrsFs {
             .entry(ino)
             .and_modify(|v| v.size = size)
             .or_insert(InodeEntry {
-                path: path.to_string(),
+                path: Arc::from(path),
                 kind,
                 size,
                 mtime: None,
@@ -1788,7 +1815,7 @@ impl MntrsFs {
             .entry(ino)
             .and_modify(|v| v.size = size)
             .or_insert(InodeEntry {
-                path: path.to_string(),
+                path: Arc::from(path),
                 kind,
                 size,
                 mtime: Some(mtime),
@@ -1830,7 +1857,7 @@ impl MntrsFs {
         // or since-removed) file.
         if let Some(ino) = self.path_to_ino.get(path).map(|r| *r.value())
             && let Some(entry) = self.inodes.get(&ino)
-            && entry.value().path == path
+            && entry.value().path.as_ref() == path
         {
             return Some(ino);
         }
@@ -1839,7 +1866,7 @@ impl MntrsFs {
         // (e.g. a code path that bypassed `alloc_ino*`).
         // Repair so the next call hits the fast path.
         for entry in self.inodes.iter() {
-            if entry.value().path == path {
+            if entry.value().path.as_ref() == path {
                 let ino = *entry.key();
                 self.path_to_ino.insert(path.to_string(), ino);
                 return Some(ino);
@@ -3382,7 +3409,11 @@ impl CoreFilesystem for MntrsFs {
         if let Some(InodeEntry { path, kind, .. }) = self.resolve(ino)
             && kind == FileType::Symlink
         {
-            let target = self.symlinks.get(&path).ok_or_else(|| {
+            // Issue #520: `path` is `Arc<str>`; `symlinks` is
+            // `DashMap<String, PathBuf>`. Use `path.as_ref()` to
+            // get `&str` — `String: Borrow<str>` makes the lookup
+            // zero-alloc.
+            let target = self.symlinks.get(path.as_ref()).ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!("getattr: ino {ino} has no symlink entry for {path}"),
@@ -3401,7 +3432,11 @@ impl CoreFilesystem for MntrsFs {
             // Write-behind delete returns Ok to the kernel
             // before S3 DeleteObjects lands — stat a deleted
             // path must look like it doesn't exist.
-            if self.delete_tombstones.contains(path.as_str()) {
+            // Issue #520: `path` is `Arc<str>`; `delete_tombstones`
+            // is `DashSet<String>`. `contains` takes `&Q` where
+            // `String: Borrow<Q>`. `String: Borrow<str>` (not
+            // `Borrow<Arc<str>>`), so use `&*path` for `&str`.
+            if self.delete_tombstones.contains(&*path) {
                 return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
             }
             // #28 (stat optimization): skip the S3 stat_op
@@ -4201,7 +4236,7 @@ impl CoreFilesystem for MntrsFs {
                     let _ = std::fs::remove_file(&fcpath);
                     // `None` block_idx = whole-file entry in
                     // `disk_cache_index`.
-                    self.disk_cache_index.remove(&(path.clone(), None));
+                    self.disk_cache_index.remove(&(path.to_string(), None));
                     // Fall through (no return) — the block-cache +
                     // remote-fetch branch below may still satisfy
                     // the read (e.g. when partial whole-file data
@@ -4258,7 +4293,7 @@ impl CoreFilesystem for MntrsFs {
                         // here (see `bump_in_memory_atime`
                         // and the field doc on
                         // `disk_cache_index`).
-                        bump_in_memory_atime(&self.disk_cache_index, &(path.clone(), None));
+                        bump_in_memory_atime(&self.disk_cache_index, &(path.to_string(), None));
                         let start = offset as usize;
                         let end = (start + size as usize).min(b.len());
                         let result = if start < b.len() {
@@ -4654,7 +4689,7 @@ impl CoreFilesystem for MntrsFs {
                 let written_size = (slice.len() + BLOCK_OVERHEAD) as u64;
                 submit_block_cache_write(&cache_dir, &path, block_idx, slice);
                 self.disk_cache_index.insert(
-                    (path.clone(), Some(block_idx)),
+                    (path.to_string(), Some(block_idx)),
                     (written_size, std::time::Instant::now()),
                 );
             }
@@ -4951,7 +4986,7 @@ impl CoreFilesystem for MntrsFs {
             if cpath.exists() {
                 register_dirty_cache_path(&cpath);
                 if let Some(tx) = self.writeback_sender.get()
-                    && self.writeback_pending.insert(path.as_str().to_string())
+                    && self.writeback_pending.insert((*path).to_string())
                 {
                     // Issue #202: small files skip the 5s delay
                     // queue (per_task_writeback_delay returns
@@ -4979,7 +5014,7 @@ impl CoreFilesystem for MntrsFs {
                     // `flush_dirty` skip-if-empty optimization).
                     let task = WritebackTask {
                         ino: _ino,
-                        remote_path: path.clone(),
+                        remote_path: path.to_string(),
                         cache_path: cpath,
                         retry_cycle: 0,
                         per_task_delay: delay,
@@ -4991,7 +5026,7 @@ impl CoreFilesystem for MntrsFs {
                             "write: writeback enqueue failed; \
                              .dirty sidecar will recover on next mount"
                         );
-                        self.writeback_pending.remove(path.as_str());
+                        self.writeback_pending.remove(&*path);
                     }
                 }
             }
@@ -5041,7 +5076,7 @@ impl CoreFilesystem for MntrsFs {
             None => Some(DiskWriteJob {
                 cache_fd: None,
                 cache_path: Some(crate::cache_path(&self.cache_dir, &path)),
-                remote_path: path.clone(),
+                remote_path: path.to_string(),
                 offset: _offset,
                 data: _data.to_vec(),
                 block_cache: None,
@@ -5072,7 +5107,7 @@ impl CoreFilesystem for MntrsFs {
         // value). Audit finding A3.
         let new_end = _offset + _data.len() as u64;
         self.disk_cache_index
-            .entry((path.clone(), None))
+            .entry((path.to_string(), None))
             .and_modify(|v| v.0 = v.0.max(new_end))
             .or_insert((new_end, std::time::Instant::now()));
         // Issue #39: evict BEFORE the pool worker tries to
@@ -5139,7 +5174,7 @@ impl CoreFilesystem for MntrsFs {
                 v.mtime = Some(write_mtime);
             })
             .or_insert_with(|| InodeEntry {
-                path: path.clone(),
+                path: Arc::from(path.as_str()),
                 kind: FileType::RegularFile,
                 size: end,
                 mtime: Some(write_mtime),
@@ -5199,7 +5234,7 @@ impl CoreFilesystem for MntrsFs {
                 }
             })
             .or_insert_with(|| crate::FileHandleState::Write {
-                path: path.clone(),
+                path: Arc::from(path.as_str()),
                 cache_fd: cache_fd.clone(),
                 dirty: true,
                 dirty_since: Some(std::time::Instant::now()),
@@ -5296,7 +5331,7 @@ impl CoreFilesystem for MntrsFs {
                     // upload, so a stale "in flight" entry
                     // is also protected by the next-mount
                     // recovery path.
-                    if self.writeback_pending.insert(path.as_str().to_string()) {
+                    if self.writeback_pending.insert((*path).to_string()) {
                         // Issue #202: per-task delay based on
                         // inodes.size vs writeback_immediate_threshold.
                         // Small files skip the 5s delay queue
@@ -5305,7 +5340,7 @@ impl CoreFilesystem for MntrsFs {
                         let delay = self.per_task_writeback_delay(_ino);
                         if let Err(e) = tx.send(WritebackTask {
                             ino: _ino,
-                            remote_path: path.clone(),
+                            remote_path: (*path).to_string(),
                             cache_path: cpath,
                             retry_cycle: 0,
                             per_task_delay: delay,
@@ -5313,7 +5348,7 @@ impl CoreFilesystem for MntrsFs {
                             // Send failed — back out the
                             // pending insert so the next
                             // flush can retry.
-                            self.writeback_pending.remove(path.as_str());
+                            self.writeback_pending.remove(&*path);
                             tracing::warn!(
                                 path=%path,
                                 error=%e,
@@ -5495,7 +5530,7 @@ impl CoreFilesystem for MntrsFs {
                     // file when there's a write between
                     // them); the pending-set check is
                     // identical to the flush handler.
-                    if self.writeback_pending.insert(path.as_str().to_string()) {
+                    if self.writeback_pending.insert((*path).to_string()) {
                         // Issue #202: per-task delay mirrors the
                         // flush handler above. See the per_task_
                         // writeback_delay doc comment for the
@@ -5504,12 +5539,12 @@ impl CoreFilesystem for MntrsFs {
                         let delay = self.per_task_writeback_delay(_ino);
                         if let Err(e) = tx.send(WritebackTask {
                             ino: _ino,
-                            remote_path: path.clone(),
+                            remote_path: (*path).to_string(),
                             cache_path: cpath,
                             retry_cycle: 0,
                             per_task_delay: delay,
                         }) {
-                            self.writeback_pending.remove(path.as_str());
+                            self.writeback_pending.remove(&**path);
                             tracing::warn!(
                                 path=%path,
                                 error=%e,
@@ -5734,7 +5769,7 @@ impl CoreFilesystem for MntrsFs {
         self.handles.insert(
             fh,
             FileHandleState::Write {
-                path: full_path,
+                path: Arc::from(full_path.as_str()),
                 cache_fd,
                 dirty: false,
                 dirty_since: None,
@@ -5896,7 +5931,7 @@ impl CoreFilesystem for MntrsFs {
         self.handles.insert(
             fh,
             FileHandleState::Write {
-                path: full_path.clone(),
+                path: Arc::from(full_path.as_str()),
                 cache_fd,
                 dirty: false,
                 dirty_since: None,
@@ -6790,7 +6825,7 @@ impl CoreFilesystem for MntrsFs {
                 format!("readlink: ino {ino} not found"),
             )
         })?;
-        let target = self.symlinks.get(&entry.path).ok_or_else(|| {
+        let target = self.symlinks.get(entry.path.as_ref()).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("readlink: ino {ino} is not a symlink ({})", entry.path),
@@ -6864,7 +6899,8 @@ impl CoreFilesystem for MntrsFs {
         // (kind=RegularFile, no reparse tag) which then failed
         // Get-Item (.LinkType=""). Insert via the inodes' path
         // so readlink resolves through the same lookup key.
-        self.symlinks.insert(path.clone(), target.to_path_buf());
+        self.symlinks
+            .insert((*path).to_string(), target.to_path_buf());
         // Issue #485: mirror into the case-insensitive secondary
         // index. The path passed here is the canonical stored
         // key (lowercased per the WinFSP adapter convention at
@@ -6874,7 +6910,7 @@ impl CoreFilesystem for MntrsFs {
         // correctly too. See the field doc for the maintenance
         // contract.
         self.symlinks_lower
-            .insert(path.to_lowercase(), path.clone());
+            .insert(path.to_lowercase(), (*path).to_string());
         // Mutate the inodes entry's kind in place so subsequent
         // getattr / get_file_info / lookup return Symlink, which
         // makes `core_kind_to_file_attributes` set
@@ -6969,12 +7005,12 @@ impl CoreFilesystem for MntrsFs {
             // stale reverse pointer.
             if kind != FileType::Symlink {
                 self.path_to_ino
-                    .remove_if(&path, |_, current_ino| *current_ino == ino);
+                    .remove_if(&*path, |_, current_ino| *current_ino == ino);
             }
-            self.attr_cache.remove(&path);
+            self.attr_cache.remove(path.as_ref());
             // Clean up any open file handles for this inode
             // (actually handles key is fh, not ino; just filter by path)
-            self.handles.retain(|_, v| v.path() != path);
+            self.handles.retain(|_, v| v.path() != &*path);
             // Audit finding A4: drop the writeback_pending entry
             // on inode forget. Without this, the DashSet<String>
             // accumulates a ~100 B entry per file that the user
@@ -6987,7 +7023,7 @@ impl CoreFilesystem for MntrsFs {
             // may be a phantom here (no actual in-flight
             // writeback for this ino) — `remove` is a no-op in
             // that case.
-            self.writeback_pending.remove(&path);
+            self.writeback_pending.remove(&*path);
         }
     }
 }
@@ -7546,7 +7582,7 @@ impl MntrsFs {
         if let Some(src_ino) = src_ino {
             // In-place path update. Size/mtime/ino are unchanged.
             self.inodes.entry(src_ino).and_modify(|v| {
-                v.path = dst.clone();
+                v.path = Arc::from(dst.as_str());
             });
             // Reverse map: drop the old path entry,
             // insert the new one pointing at the same
@@ -9380,5 +9416,130 @@ mod tests {
         for (i, r) in results3.into_iter().enumerate() {
             r.unwrap_or_else(|e| panic!("slot {} returned error: {:?}", i, e));
         }
+    }
+
+    // ---- Issue #520: `InodeEntry::path` is `Arc<str>` ------------------
+    //
+    // The refactor changes `path` from `String` to `std::sync::Arc<str>`.
+    // The win is *refcount-bump clone in the per-op `resolve()` path*
+    // instead of a deep `String` copy. These tests pin the behaviour:
+    // Arc allocation is shared across registrations of the same path,
+    // so a second `alloc_ino` for an already-registered path returns
+    // the same Arc pointer (no new allocation).
+
+    /// alloc_ino returns the same Arc<str> pointer for the same path.
+    ///
+    /// Pre-fix this would be trivially true for `String` (PathBuf::clone
+    /// is a deep copy), so the test is only meaningful with `Arc<str>`:
+    /// `Arc::ptr_eq` proves the second alloc didn't allocate.
+    #[test]
+    fn arc_str_path_same_allocation_reused_on_realloc() {
+        let fs = new_test_fs(
+            opendal::Operator::new(opendal::services::Memory::default()).unwrap(),
+            scratch_dir("arc-str-1"),
+        );
+        // First alloc: allocates a new Arc<str> for the path.
+        let ino1 = fs.alloc_ino("/remote/a.bin", FileType::RegularFile, 5);
+        let arc1 = fs
+            .inodes
+            .get(&ino1)
+            .expect("first alloc_ino must register inodes entry")
+            .value()
+            .path
+            .clone();
+
+        // Second alloc for the same path reuses the existing ino
+        // (issue #325) — and must reuse the Arc<str> as well.
+        let ino2 = fs.alloc_ino("/remote/a.bin", FileType::RegularFile, 5);
+        assert_eq!(ino1, ino2, "issue #325: same path → same ino");
+        let arc2 = fs.inodes.get(&ino2).unwrap().value().path.clone();
+        assert!(
+            std::sync::Arc::ptr_eq(&arc1, &arc2),
+            "issue #520: second alloc_ino must share the Arc<str> allocation \
+             (got distinct allocations: {:?} vs {:?})",
+            std::sync::Arc::as_ptr(&arc1),
+            std::sync::Arc::as_ptr(&arc2),
+        );
+        assert_eq!(
+            arc1.as_ref(),
+            "/remote/a.bin",
+            "Arc<str> content must be the literal path"
+        );
+    }
+
+    /// `path_to_ino` reverse map is a String key, but the forward
+    /// `inodes[*].path` is the `Arc<str>` returned by alloc_ino.
+    ///
+    /// After `find_ino_by_path`, the resolved `InodeEntry::path`
+    /// Arc must still point at the same allocation the initial
+    /// alloc_ino wrote — i.e. resolve must not deep-clone the
+    /// path string into the InodeEntry on each call.
+    #[test]
+    fn arc_str_path_resolve_returns_same_arc_as_initial_alloc() {
+        let fs = new_test_fs(
+            opendal::Operator::new(opendal::services::Memory::default()).unwrap(),
+            scratch_dir("arc-str-2"),
+        );
+        let ino = fs.alloc_ino("/data/file.txt", FileType::RegularFile, 1024);
+        let arc_after_alloc = fs.inodes.get(&ino).unwrap().value().path.clone();
+
+        // resolve(ino) is the per-FUSE-op hot path. Pre-#520 it
+        // cloned a `String` per call; post-#520 it clones an
+        // Arc<str> (refcount bump). The returned InodeEntry must
+        // carry the *same* Arc allocation, not a deep copy.
+        let entry_after_resolve = fs.resolve(ino).expect("resolve(ino) returns entry");
+        assert!(
+            std::sync::Arc::ptr_eq(&arc_after_alloc, &entry_after_resolve.path),
+            "issue #520: resolve(ino) must return the same Arc<str> as \
+             the alloc_ino insertion (no deep clone on the hot path)"
+        );
+
+        // path_to_ino fast path also returns the same ino.
+        let found_ino = fs
+            .find_ino_by_path("/data/file.txt")
+            .expect("path_to_ino.get must hit");
+        assert_eq!(found_ino, ino);
+        let arc_after_find = fs.inodes.get(&found_ino).unwrap().value().path.clone();
+        assert!(
+            std::sync::Arc::ptr_eq(&arc_after_alloc, &arc_after_find),
+            "issue #520: path_to_ino → inodes roundtrip must reuse the Arc"
+        );
+    }
+
+    /// `resolve()` returning `Option<InodeEntry>` clones the Arc
+    /// (refcount bump). Multiple successive resolves must all share
+    /// the same Arc — proving the per-op cost is O(1) refcount
+    /// bump rather than O(n) String allocation.
+    #[test]
+    fn arc_str_path_repeated_resolve_is_refcount_only() {
+        let fs = new_test_fs(
+            opendal::Operator::new(opendal::services::Memory::default()).unwrap(),
+            scratch_dir("arc-str-3"),
+        );
+        let ino = fs.alloc_ino("/hot/lookup", FileType::RegularFile, 0);
+        let baseline = fs.inodes.get(&ino).unwrap().value().path.clone();
+
+        // 1000 resolves — every one returns the *same* Arc pointer.
+        // If pre-#520 String behaviour had leaked into resolve, this
+        // would be 1000 distinct allocations.
+        let resolved: Vec<std::sync::Arc<str>> = (0..1000)
+            .map(|_| fs.resolve(ino).expect("resolve must succeed").path)
+            .collect();
+        for (i, arc) in resolved.iter().enumerate() {
+            assert!(
+                std::sync::Arc::ptr_eq(&baseline, arc),
+                "resolve #{} returned a fresh allocation; \
+                 per-op cost is no longer a refcount bump",
+                i
+            );
+        }
+        // Refcount is at least 1000 + the original baseline + the
+        // resolved Vec's transient references. Strong count >= 1002.
+        let strong = std::sync::Arc::strong_count(&baseline);
+        assert!(
+            strong >= 1002,
+            "expected Arc strong_count >= 1002 after 1000 resolves, got {}",
+            strong
+        );
     }
 }
