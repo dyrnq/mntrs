@@ -29,8 +29,9 @@ use winfsp::FspError;
 
 use widestring::U16CStr;
 use windows::Win32::Foundation::{
-    STATUS_BUFFER_TOO_SMALL, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST,
-    STATUS_INVALID_PARAMETER, STATUS_NOT_IMPLEMENTED, STATUS_UNSUCCESSFUL,
+    STATUS_ACCESS_DENIED, STATUS_BUFFER_TOO_SMALL, STATUS_INSUFFICIENT_RESOURCES,
+    STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER, STATUS_NOT_IMPLEMENTED,
+    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_UNSUCCESSFUL,
 };
 use winfsp::Result;
 use winfsp::constants::FspCleanupFlags;
@@ -609,6 +610,44 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
         .map(|s| (*s).to_string())
         .or_else(|| payload.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "<non-string panic payload>".to_string())
+}
+
+/// Map an `io::Error` from the `CoreFilesystem::setxattr /
+/// removexattr / getxattr / listxattr` trait methods to a
+/// Win32 NTSTATUS for the EA callbacks.
+///
+/// Mapping table (issue #501):
+///   * `Unsupported` → `STATUS_NOT_IMPLEMENTED` (the user
+///     asked for a well-known / non-user / disabled-metadata
+///     xattr; the kernel maps this to ERROR_NOT_SUPPORTED,
+///     which is the right "this isn't a settable xattr"
+///     message in userland).
+///   * `NotFound` → `STATUS_OBJECT_NAME_NOT_FOUND` (POSIX
+///     ENODATA semantics — the EA name doesn't exist; the
+///     kernel surfaces this as ERROR_FILE_NOT_FOUND).
+///   * `InvalidInput` → `STATUS_INVALID_PARAMETER` (POSIX
+///     EINVAL — bad value bytes, empty `user.` key, etc.).
+///   * `PermissionDenied` → `STATUS_ACCESS_DENIED` (POSIX
+///     EACCES — read-only file or backend rejected).
+///   * anything else → `STATUS_UNSUCCESSFUL` (generic Win32
+///     "operation failed"; preserves the source error in a
+///     `tracing::warn!` so future debugging isn't blind).
+fn ea_io_error_to_status(err: std::io::Error) -> FspError {
+    use std::io::ErrorKind;
+    let nt = match err.kind() {
+        ErrorKind::Unsupported => STATUS_NOT_IMPLEMENTED,
+        ErrorKind::NotFound => STATUS_OBJECT_NAME_NOT_FOUND,
+        ErrorKind::InvalidInput => STATUS_INVALID_PARAMETER,
+        ErrorKind::PermissionDenied => STATUS_ACCESS_DENIED,
+        _ => STATUS_UNSUCCESSFUL,
+    };
+    tracing::warn!(
+        kind = ?err.kind(),
+        error = %err,
+        nt = nt.0,
+        "winfsp EA callback: io::Error mapped to NTSTATUS"
+    );
+    FspError::NTSTATUS(nt.0)
 }
 
 /// Convert a Win32 FILETIME (u64, 100-ns intervals since 1601-01-01
@@ -2828,6 +2867,189 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 stream.append_to_buffer(buffer, &mut cursor);
                 StreamInfo::<32>::finalize_buffer(buffer, &mut cursor);
                 Ok(cursor)
+            }),
+        )
+    }
+
+    // Issue #501: WinFSP extended-attributes (EA) callback
+    // plumbing. The kernel calls `set_extended_attributes` when
+    // a Win32 caller issues `SetEaFile` (e.g. via .NET's
+    // `File.SetExtendedAttribute`, `fsutil`, or any Win32
+    // EA-aware tool); `get_extended_attributes` on `GetEaFile`.
+    //
+    // Approach: parse the FILE_FULL_EA_INFORMATION buffer
+    // (xattr_bridge_ea.rs), translate each entry to a call on
+    // `self.inner` (the trait's `setxattr` / `getxattr` /
+    // `removexattr`), and re-encode the result buffer. The
+    // trait methods were added in #500 / PR #533 and already
+    // do the right thing (gate on --metadata, reject
+    // well-known xattrs, etc.). This keeps the WinFSP path
+    // in lock-step with the FUSE path on Linux/macOS.
+    //
+    // Caveat (called out in #501 body): the opendal fs backend
+    // on Windows advertises `write_with_user_metadata = false`
+    // (`#[cfg(unix)]` in opendal-service-fs/src/backend.rs:148).
+    // So while SetEaFile/GetEaFile will *not error*, the data
+    // may not roundtrip through opendal's user_metadata map on
+    // Windows fs backends. Memory backend + future backends
+    // with metadata support will roundtrip correctly. ADS-based
+    // storage (`file:user.foo`) is a separate follow-up.
+    fn get_extended_attributes(
+        &self,
+        context: &Self::FileContext,
+        buffer: &mut [u8],
+    ) -> Result<u32> {
+        // Issue #314: panic safety wrapper.
+        catch_panic(
+            "get_extended_attributes",
+            AssertUnwindSafe(|| {
+                let ino = context.ino;
+                // First: enumerate xattr names via the trait.
+                // The inner's listxattr returns only names that
+                // are actually present in the backend's metadata
+                // (PR #496 contract: "listxattr stats once and
+                // returns only the names the backend populated").
+                let names = self.inner.listxattr(ino).map_err(|e| {
+                    // Issue #501: io::ErrorKind mapping.
+                    // Unsupported → NOT_IMPLEMENTED (ENOSYS).
+                    // Other kinds → STATUS_UNSUCCESSFUL (Win32's
+                    // generic "operation failed" — best mapping
+                    // for "metadata stat failed").
+                    ea_io_error_to_status(e)
+                })?;
+                // Build the FILE_FULL_EA_INFORMATION buffer.
+                // Walk the names in two phases: dry-run to
+                // measure the buffer size, then write. The
+                // kernel calls us with a buffer sized from a
+                // prior probe (per FileSystemFeatures::extended_
+                // attributes); a partial write is signaled by
+                // returning less than the total encoded size.
+                let mut cursor = 0u32;
+                for name_bytes in &names {
+                    let name = match std::str::from_utf8(name_bytes) {
+                        Ok(s) => s,
+                        Err(_) => continue, // skip non-UTF-8 names
+                    };
+                    // Fetch the value via inner.getxattr.
+                    let value = match self.inner.getxattr(ino, name) {
+                        Ok(v) => v,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(e) => return Err(ea_io_error_to_status(e)),
+                    };
+                    if let Err(_e) =
+                        crate::xattr_bridge_ea::write_ea_entry(buffer, &mut cursor, name, &value, 0)
+                    {
+                        // BufferTooSmall mid-write → stop,
+                        // finalize what we have. The kernel
+                        // will call us again with a bigger
+                        // buffer per FileSystemFeatures::extended_
+                        // attributes.
+                        break;
+                    }
+                }
+                // Always terminate — even on an empty list.
+                if let Err(_e) = crate::xattr_bridge_ea::write_ea_terminator(buffer, &mut cursor) {
+                    // If we can't even fit the terminator (4
+                    // bytes), return what we have.
+                    return Ok(cursor);
+                }
+                Ok(cursor)
+            }),
+        )
+    }
+
+    fn set_extended_attributes(
+        &self,
+        context: &Self::FileContext,
+        buffer: &[u8],
+        _file_info: &mut FileInfo,
+    ) -> Result<()> {
+        // Issue #314: panic safety wrapper.
+        catch_panic(
+            "set_extended_attributes",
+            AssertUnwindSafe(|| {
+                let ino = context.ino;
+                // Parse the FILE_FULL_EA_INFORMATION buffer
+                // and translate each entry into a trait call.
+                // Two NTFS semantics worth noting:
+                //
+                //  * An entry with `EaValueLength == 0` is the
+                //    "delete this EA" form per NTFS — we route
+                //    it to `removexattr`.
+                //
+                //  * An entry with non-empty value is "set this
+                //    EA" — we route to `setxattr`.
+                //
+                // Errors from a single entry do not abort the
+                // batch; the trait method's status (e.g.
+                // Unsupported for well-known xattrs) is a
+                // per-entry outcome the kernel caller handles.
+                // We collect any fatal error and propagate it;
+                // per-entry rejections of `Unsupported` are
+                // logged at info level and the entry is
+                // skipped (matches the FUSE behaviour: ENOSYS
+                // is silently skipped for individual xattrs).
+                let mut last_err: Option<std::io::Error> = None;
+                for entry in crate::xattr_bridge_ea::parse_ea_entries(buffer) {
+                    let res = if entry.value.is_empty() {
+                        self.inner.removexattr(ino, entry.name)
+                    } else {
+                        self.inner.setxattr(ino, entry.name, entry.value, 0)
+                    };
+                    match res {
+                        Ok(()) => {}
+                        Err(e) => match e.kind() {
+                            // Per-entry rejections the kernel
+                            // caller already understands. Don't
+                            // fail the whole batch — the user
+                            // gets per-entry feedback through
+                            // the io error code on subsequent
+                            // reads.
+                            std::io::ErrorKind::Unsupported => {
+                                tracing::debug!(
+                                    ino,
+                                    name = entry.name,
+                                    "winfsp set_extended_attributes: \
+                                     inner rejected entry (likely well-known or non-user.*)"
+                                );
+                            }
+                            // NTFS's "delete this EA" form is
+                            // `EaValueLength == 0`. The POSIX
+                            // removexattr semantics return
+                            // NotFound when the key is absent
+                            // (issue #500: "POSIX ENODATA");
+                            // that's a no-op for the NTFS caller
+                            // (the EA is already gone) so we
+                            // swallow it the same way we swallow
+                            // Unsupported. Without this, every
+                            // delete via SetEaFile on a file
+                            // without that EA would surface as
+                            // STATUS_OBJECT_NAME_NOT_FOUND and
+                            // tools like `fsutil` would
+                            // mis-report "file not found" when
+                            // the real intent was "drop this EA
+                            // if it exists".
+                            std::io::ErrorKind::NotFound if entry.value.is_empty() => {
+                                tracing::trace!(
+                                    ino,
+                                    name = entry.name,
+                                    "winfsp set_extended_attributes: \
+                                     delete-of-absent-EA is a no-op"
+                                );
+                            }
+                            // Anything else is fatal — bail and
+                            // return the status to the kernel.
+                            _ => {
+                                last_err = Some(e);
+                                break;
+                            }
+                        },
+                    }
+                }
+                match last_err {
+                    Some(e) => Err(ea_io_error_to_status(e)),
+                    None => Ok(()),
+                }
             }),
         )
     }

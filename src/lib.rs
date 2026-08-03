@@ -20,6 +20,8 @@ pub mod prefetcher;
 pub mod util;
 pub mod writeback;
 pub mod xattr_bridge;
+#[cfg(windows)]
+pub mod xattr_bridge_ea;
 
 // Re-export everything from util so existing `crate::` paths are unaffected.
 pub use util::*;
