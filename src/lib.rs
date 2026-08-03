@@ -449,16 +449,31 @@ struct UnlinkBurstState {
 }
 
 impl UnlinkBurstState {
-    /// Default policy: 100 ms window, 32-unlink threshold.
-    /// Tunable per-mount via env vars (see
-    /// `unlink_burst_state_from_env`).
-    fn new() -> Self {
+    /// Read env vars `MNTRS_BURST_WINDOW_MS` and
+    /// `MNTRS_BURST_THRESHOLD` to allow per-mount tuning.
+    /// Falls back to the hard-coded policy (100 ms / 32
+    /// unlinks) when env vars are unset or fail to parse —
+    /// runtime behaviour is unchanged for callers that do not
+    /// opt in via env. Bench harness overrides these to enable
+    /// the batched_delete fast path on small rm -rf workloads
+    /// (issue #536 follow-up).
+    fn from_env() -> Self {
+        let window_ms = std::env::var("MNTRS_BURST_WINDOW_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(100);
+        let threshold = std::env::var("MNTRS_BURST_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(crate::batched_delete::DEFAULT_BATCH_THRESHOLD as u32);
         Self::with_policy(
-            std::time::Duration::from_millis(100),
-            crate::batched_delete::DEFAULT_BATCH_THRESHOLD as u32,
+            std::time::Duration::from_millis(window_ms.clamp(1, 10_000)),
+            threshold,
         )
     }
 
+    /// Explicit policy for tests that need deterministic gating
+    /// without depending on the host environment.
     fn with_policy(burst_window: std::time::Duration, burst_threshold: u32) -> Self {
         Self {
             // Initialise to "epoch" so the first unlink's gap
@@ -473,25 +488,6 @@ impl UnlinkBurstState {
             burst_window,
             burst_threshold,
         }
-    }
-
-    /// Read env vars `MNTRS_BURST_WINDOW_MS` and
-    /// `MNTRS_BURST_THRESHOLD` to allow per-mount tuning.
-    /// Falls back to the constructor defaults on parse
-    /// failure or unset.
-    fn from_env() -> Self {
-        let window_ms = std::env::var("MNTRS_BURST_WINDOW_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(100);
-        let threshold = std::env::var("MNTRS_BURST_THRESHOLD")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(crate::batched_delete::DEFAULT_BATCH_THRESHOLD as u32);
-        Self::with_policy(
-            std::time::Duration::from_millis(window_ms.clamp(1, 10_000)),
-            threshold,
-        )
     }
 }
 
@@ -8257,7 +8253,11 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         // policy (100 ms window, 32-unlink threshold) so
         // anything short of a sustained `rm -rf` of 32+
         // files in <100 ms goes through the strict path.
-        unlink_burst_state: std::sync::Mutex::new(UnlinkBurstState::new()),
+        //
+        // Bench harness overrides these via MNTRS_BURST_WINDOW_MS
+        // and MNTRS_BURST_THRESHOLD (issue #536 follow-up). The
+        // production default is unchanged.
+        unlink_burst_state: std::sync::Mutex::new(UnlinkBurstState::from_env()),
         // Issue #325: in-memory symlink target table. Empty in
         // tests; populated only by tests that exercise the
         // symlink code paths.
