@@ -892,6 +892,40 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         }
     }
 
+    // Issue #500: write-path routing for the rclone --metadata
+    // xattr surface. Mirrors the getxattr / listxattr pattern
+    // above: delegate to `inner` and map `io::Error` → FUSE
+    // errno via `io_err_to_fuse_errno` (Unsupported → ENOSYS,
+    // NotFound → ENODATA, InvalidInput → EINVAL — see
+    // fuse_error.rs). `flags` is passed through verbatim; the
+    // default `MntrsFs` impl ignores them (opendal
+    // `user_metadata` map semantics already cover create /
+    // replace). `position` is irrelevant for byte-array xattrs.
+    fn setxattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        let name = name.to_string_lossy();
+        match self.inner.setxattr(ino.into(), &name, value, flags) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(io_err_to_fuse_errno(e)),
+        }
+    }
+
+    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let name = name.to_string_lossy();
+        match self.inner.removexattr(ino.into(), &name) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(io_err_to_fuse_errno(e)),
+        }
+    }
+
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
         match self.inner.statfs(_ino.into()) {
             Ok(v) => reply.statfs(

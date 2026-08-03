@@ -19,6 +19,7 @@ pub mod path;
 pub mod prefetcher;
 pub mod util;
 pub mod writeback;
+pub mod xattr_bridge;
 
 // Re-export everything from util so existing `crate::` paths are unaffected.
 pub use util::*;
@@ -6985,6 +6986,193 @@ impl CoreFilesystem for MntrsFs {
         Ok(xattr_names_for(&meta))
     }
 
+    fn setxattr(&self, ino: u64, name: &str, value: &[u8], _flags: i32) -> std::io::Result<()> {
+        // Issue #500: --metadata gate (rclone parity with the
+        // read path at getxattr / listxattr). Short-circuit
+        // before the backend round-trip — the surface is opt-in
+        // to avoid the read+rewrite cost when no caller cares.
+        if !self.metadata {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "xattr metadata disabled (pass --metadata to enable)",
+            ));
+        }
+        // Only `user.<key>` xattrs are writable. Well-known
+        // names (`user.etag`, `user.mime_type`, `user.mtime`,
+        // `user.content_length`, plus the legacy S3 spellings)
+        // are *derived* from backend stat — there is no entry
+        // in the user-metadata map to overwrite, so writing
+        // would be a lie. `parse_user_xattr_key` rejects both
+        // well-known and non-`user.*` namespaces, so we map
+        // either case to Unsupported (matches the
+        // getxattr-Unsupported symmetry).
+        let key = crate::xattr_bridge::parse_user_xattr_key(name).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!(
+                    "setxattr: {name:?} is not a writable user.* xattr \
+                     (well-known names like user.etag/user.mime_type are derived from backend stat)"
+                ),
+            )
+        })?;
+        // opendal's user_metadata is a `HashMap<String, String>`,
+        // so the value bytes must be valid UTF-8. Reject
+        // non-UTF-8 with `InvalidInput` (→ EINVAL via the fuser
+        // adapter) so callers see a clear error rather than a
+        // generic opendal message.
+        let val = std::str::from_utf8(value).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "setxattr: value must be valid UTF-8",
+            )
+        })?;
+        let entry = self.resolve(ino).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("setxattr: ino {ino} not found"),
+            )
+        })?;
+        // rclone parity: --metadata surfaces object metadata
+        // only. Directories don't carry xattrs (they have no
+        // size / etag / mtime to expose).
+        if entry.kind == FileType::Directory {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "setxattr on directory (rclone parity — --metadata applies to objects only)",
+            ));
+        }
+        let op = self.op.clone();
+        let path: Arc<str> = entry.path.clone();
+        // Cheap Arc::clone — the path is shared with
+        // `path_to_ino` (issue #520). One refcount bump per
+        // setxattr is negligible vs the backend read+write.
+        let path_for_cache: Arc<str> = path.clone();
+        // Issue #500: opendal 0.58's `write_with` is a full
+        // object rewrite — there's no metadata-only update
+        // path. We accept this cost for #500 (the issue
+        // explicitly lists it as the short-term plan); future
+        // work can layer a smarter batched metadata protocol.
+        // For the typical small-file workload (≤ a few MB) the
+        // GET + PUT is on the same order of magnitude as the
+        // underlying list+stat the read path was already
+        // paying.
+        rt().block_on(async move {
+            // 1. stat to get current metadata (the existing
+            //    user_metadata map).
+            let meta = op
+                .stat(path.as_ref())
+                .await
+                .map_err(|e| std::io::Error::other(format!("stat failed: {e}")))?;
+            // 2. merge into the existing map. Cloned because
+            //    `Metadata::user_metadata()` returns an
+            //    `Option<&HashMap>` tied to `meta`'s lifetime;
+            //    we need an owned map to mutate.
+            let mut user_meta = meta.user_metadata().cloned().unwrap_or_default();
+            user_meta.insert(key, val.to_string());
+            // 3. read existing content. Bytes are identical
+            //    to what's already on the backend — opendal's
+            //    read returns them via mem_cache when warm.
+            let bytes = op
+                .read(path.as_ref())
+                .await
+                .map_err(|e| std::io::Error::other(format!("read failed: {e}")))?
+                .to_vec();
+            // 4. full rewrite with the merged user_metadata.
+            //    `user_metadata` is the FutureWrite builder
+            //    method (operator_futures.rs:922 in opendal
+            //    0.58.1) — same shape as PR #465's existing
+            //    call sites.
+            op.write_with(path.as_ref(), bytes)
+                .user_metadata(user_meta)
+                .await
+                .map_err(|e| std::io::Error::other(format!("write_with failed: {e}")))?;
+            Ok::<(), std::io::Error>(())
+        })?;
+        // 5. invalidate the path-keyed attr cache so the next
+        //    getattr re-fetches the (now new) etag / mtime /
+        //    size from the backend. Same pattern as
+        //    src/lib.rs:6510 (unlink) and 6617 (rmdir).
+        self.attr_cache.remove(path_for_cache.as_ref());
+        Ok(())
+    }
+
+    fn removexattr(&self, ino: u64, name: &str) -> std::io::Result<()> {
+        if !self.metadata {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "xattr metadata disabled (pass --metadata to enable)",
+            ));
+        }
+        let key = crate::xattr_bridge::parse_user_xattr_key(name).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!(
+                    "removexattr: {name:?} is not a writable user.* xattr \
+                     (well-known names like user.etag/user.mime_type are derived from backend stat)"
+                ),
+            )
+        })?;
+        let entry = self.resolve(ino).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("removexattr: ino {ino} not found"),
+            )
+        })?;
+        if entry.kind == FileType::Directory {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "removexattr on directory (rclone parity — --metadata applies to objects only)",
+            ));
+        }
+        let op = self.op.clone();
+        let path: Arc<str> = entry.path.clone();
+        // Cheap Arc::clone (see setxattr comment for rationale).
+        let path_for_cache: Arc<str> = path.clone();
+        rt().block_on(async move {
+            let meta = op
+                .stat(path.as_ref())
+                .await
+                .map_err(|e| std::io::Error::other(format!("stat failed: {e}")))?;
+            // Mirror the getxattr NotFound semantics: if the
+            // key isn't present, return NotFound so the kernel
+            // surfaces ENODATA rather than silently succeeding.
+            // We also early-return when the backend has no user
+            // metadata at all (the key cannot be present).
+            let Some(existing) = meta.user_metadata() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("removexattr: {name:?} not present"),
+                ));
+            };
+            if !existing.contains_key(&key) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("removexattr: {name:?} not present"),
+                ));
+            }
+            // Reconstruct the map without this key. Order-
+            // preserving isn't required (opendal HashMap on
+            // the read side).
+            let new_map: std::collections::HashMap<String, String> = existing
+                .iter()
+                .filter(|(k, _)| *k != &key)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let bytes = op
+                .read(path.as_ref())
+                .await
+                .map_err(|e| std::io::Error::other(format!("read failed: {e}")))?
+                .to_vec();
+            op.write_with(path.as_ref(), bytes)
+                .user_metadata(new_map)
+                .await
+                .map_err(|e| std::io::Error::other(format!("write_with failed: {e}")))?;
+            Ok::<(), std::io::Error>(())
+        })?;
+        self.attr_cache.remove(path_for_cache.as_ref());
+        Ok(())
+    }
+
     // --- Issue #325: symlink / readlink overrides ---
     //
     // opendal 0.57 has no create_symlink / read_symlink API in
@@ -7528,8 +7716,12 @@ fn xattr_value_for(meta: &opendal::Metadata, name: &str) -> std::io::Result<Vec<
         // user-defined part). Lookup is by the same normalized
         // form (lowercase + dots→underscores) that `listxattr`
         // emitted the name in.
+        //
+        // Normalization lives in `xattr_bridge` (single source
+        // of truth shared with the setxattr write path, issue
+        // #500) so the read and write sides can't drift.
         name if name.starts_with("user.") => {
-            let normalized = normalize_user_meta_key(&name[5..]);
+            let normalized = crate::xattr_bridge::normalize_user_meta_key(&name[5..]);
             match meta.user_metadata() {
                 Some(map) => match map.get(&normalized) {
                     Some(v) => Ok(v.as_bytes().to_vec()),
@@ -7596,16 +7788,6 @@ fn strip_etag_quotes(s: &str) -> &str {
     } else {
         s
     }
-}
-
-/// Normalize a custom user-metadata key per rclone's mapping
-/// rules (lowercase + dots→underscores). S3 user metadata keys
-/// are case-insensitive at the HTTP header level (the
-/// `x-amz-meta-*` prefix gets normalized by AWS). Lowercase +
-/// dots→underscores matches the canonical xattr naming: dots
-/// are illegal in xattr names on most platforms.
-fn normalize_user_meta_key(s: &str) -> String {
-    s.to_lowercase().replace('.', "_")
 }
 
 impl MntrsFs {

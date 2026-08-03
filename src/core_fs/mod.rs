@@ -506,6 +506,41 @@ pub trait CoreFilesystem: Send + Sync {
     /// List extended attribute names.
     fn listxattr(&self, ino: u64) -> std::io::Result<Vec<Vec<u8>>>;
 
+    /// Set extended attribute value.
+    ///
+    /// Issue #500: completes the roundtrip on the rclone `--metadata`
+    /// surface that PR #496 shipped for the read path.
+    ///
+    /// `flags` carries `XATTR_CREATE` / `XATTR_REPLACE` from
+    /// `setxattr(2)`. Implementations that only support a flat
+    /// key→value map can ignore them and accept either (matches
+    /// the existing `op_write_with().user_metadata(...)` semantics:
+    /// key exists → replace, key absent → create).
+    ///
+    /// Default returns `Unsupported` (mapped to `ENOSYS` by the
+    /// fuser adapter) so external test fakes keep compiling when
+    /// the trait gains this method. `MntrsFs` overrides with the
+    /// full-object-rewrite writeback path documented in #500.
+    fn setxattr(&self, ino: u64, name: &str, value: &[u8], flags: i32) -> std::io::Result<()> {
+        let _ = (ino, name, value, flags);
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+
+    /// Remove extended attribute.
+    ///
+    /// Same #500 rationale as `setxattr`. Returns
+    /// `NotFound` when the named xattr doesn't exist on
+    /// `ino`, `Unsupported` when the read path returned
+    /// `Unsupported` (matches the `getxattr` semantic — if
+    /// you can't read it, you can't remove it).
+    ///
+    /// Default returns `Unsupported` so test fakes keep
+    /// compiling.
+    fn removexattr(&self, ino: u64, name: &str) -> std::io::Result<()> {
+        let _ = (ino, name);
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+
     /// Check access permissions.
     fn access(&self, ino: u64, mask: u32) -> std::io::Result<()>;
 
