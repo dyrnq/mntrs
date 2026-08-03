@@ -139,6 +139,15 @@ path = "tests/platform/linux/fuse_integration_test.rs"
 name = "platform_windows_winfsp_integration_test"
 path = "tests/platform/windows/winfsp_integration_test.rs"
 
+# Issue #501 — WinFSP `get_extended_attributes` /
+# `set_extended_attributes` callback tests. Validates the
+# FILE_FULL_EA_INFORMATION encode/decode + EA→xattr routing
+# in `WinFspAdapter`. cfg(windows) only — the EA struct is
+# meaningless on Unix.
+[[test]]
+name = "platform_windows_winfsp_xattr_test"
+path = "tests/platform/windows/winfsp_xattr_test.rs"
+
 # Issue #485 — case-insensitive secondary index for `symlinks`.
 # 6 tests cover the four contract scenarios in the issue body
 # plus self-healing fallback and unlink-mirror completeness.
