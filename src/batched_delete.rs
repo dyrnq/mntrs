@@ -95,6 +95,24 @@ pub(crate) const DEFAULT_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis
 /// files; default 32).
 pub(crate) const DEFAULT_BATCH_THRESHOLD: usize = 32;
 
+/// Issue #553: fast-flush threshold. When the pending
+/// queue has fewer than this many keys, the worker flushes
+/// immediately instead of waiting out the `flush_delay`
+/// deadline. Reasoning: a single unlink or a 10-file
+/// `rm -rf` mid-burst pays the full `flush_delay` (50 ms by
+/// default) for negligible batching benefit (~1 S3 DELETE
+/// either way). 0 disables the fast path (matches pre-fix
+/// behaviour — every non-full batch waits for the deadline).
+///
+/// Empirical sweet spot from issue 541 run 30865329186:
+/// with batch_size=20 the median partial flush carried
+/// 13-16 keys, so any threshold <= 8 keeps the typical
+/// `rm -rf 100 files` (which accumulates 50-100 keys
+/// before the 50 ms deadline) on the WaitForDeadline
+/// path while shunting stragglers and tail fragments
+/// straight to S3.
+pub(crate) const DEFAULT_FAST_FLUSH_THRESHOLD: usize = 8;
+
 // ===== Counters (plan #64 stage B) =====
 //
 // Process-static counters, like writeback::PENDING_COUNT. Read
@@ -105,6 +123,11 @@ static KEYS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHUTDOWN_LOST_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SINGLE_KEY_BATCHES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Issue #553: how many flushes fired via the fast-flush
+/// path (pending.len() < fast_flush_threshold at decision
+/// time). Useful to verify the threshold is firing on small
+/// rm workloads without breaking big-batch timing.
+static FAST_FLUSH_TOTAL: AtomicU64 = AtomicU64::new(0);
 static MAX_BATCH_SIZE_OBSERVED: AtomicU64 = AtomicU64::new(0);
 /// Issue #530: how many `enqueue` calls were routed to the
 /// strict (`delete_backend_strict`) path because the current
@@ -124,6 +147,9 @@ pub(crate) struct CounterSnapshot {
     pub max_batch_size_observed: u64,
     /// Issue #530
     pub threshold_skipped_total: u64,
+    /// Issue #553: how many flushes fired via the fast-flush
+    /// path.
+    pub fast_flush_total: u64,
 }
 
 pub(crate) fn snapshot() -> CounterSnapshot {
@@ -135,6 +161,7 @@ pub(crate) fn snapshot() -> CounterSnapshot {
         single_key_batches_total: SINGLE_KEY_BATCHES_TOTAL.load(Ordering::Relaxed),
         max_batch_size_observed: MAX_BATCH_SIZE_OBSERVED.load(Ordering::Relaxed),
         threshold_skipped_total: THRESHOLD_SKIPPED_TOTAL.load(Ordering::Relaxed),
+        fast_flush_total: FAST_FLUSH_TOTAL.load(Ordering::Relaxed),
     }
 }
 
@@ -279,6 +306,13 @@ pub(crate) struct WorkerConfig {
     /// (matches the pre-#530 behaviour for users who want
     /// it).
     pub batch_threshold: usize,
+    /// Issue #553: fast-flush threshold. When
+    /// `pending.len() < fast_flush_threshold` at decision
+    /// time, the worker flushes immediately instead of
+    /// waiting for the `flush_delay` deadline. 0 disables
+    /// the fast path. Sourced from env
+    /// `MNTRS_BATCH_FAST_FLUSH_THRESHOLD` (default 8).
+    pub fast_flush_threshold: usize,
     pub request_timeout: Duration,
     pub max_retries: u32,
     pub retry_factor: f64,
@@ -311,6 +345,14 @@ impl WorkerConfig {
         // batching — every enqueue returns None); N > 1 =
         // batch only when pending.len() >= N at enqueue time.
         let batch_threshold = env_usize("MNTRS_BATCH_THRESHOLD", DEFAULT_BATCH_THRESHOLD);
+        // Issue #553: fast-flush threshold. 0 disables the
+        // immediate-flush branch in worker_loop and matches
+        // the pre-fix behaviour (every non-full batch waits
+        // for the deadline).
+        let fast_flush_threshold = env_usize(
+            "MNTRS_BATCH_FAST_FLUSH_THRESHOLD",
+            DEFAULT_FAST_FLUSH_THRESHOLD,
+        );
         Self {
             endpoint,
             bucket,
@@ -322,6 +364,7 @@ impl WorkerConfig {
             batch_size,
             flush_delay,
             batch_threshold,
+            fast_flush_threshold,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_retries: DEFAULT_MAX_RETRIES,
             retry_factor: DEFAULT_RETRY_FACTOR,
@@ -652,15 +695,11 @@ async fn worker_loop(config: WorkerConfig, shared: Arc<Shared>, mut rx: mpsc::Re
 
     loop {
         // Snapshot pending state under lock; decide what to do.
+        // The decision is delegated to `decide_next_action` so the
+        // threshold logic stays unit-testable (see tests below).
         let action = {
             let pending = shared.pending.lock().expect("pending mutex poisoned");
-            if pending.len() >= config.batch_size {
-                Some(ScheduledAction::FlushBatch)
-            } else if pending.is_empty() {
-                None
-            } else {
-                Some(ScheduledAction::WaitForDeadline(pending.deadline))
-            }
+            decide_next_action(&config, pending.len(), pending.deadline)
         };
 
         match action {
@@ -704,7 +743,26 @@ async fn worker_loop(config: WorkerConfig, shared: Arc<Shared>, mut rx: mpsc::Re
                     break;
                 }
             },
-            Some(ScheduledAction::FlushBatch) => {
+            Some(ScheduledAction::FlushBatch { fast }) => {
+                // Issue #553: `fast=true` flushes were triggered by
+                // the small-batch fast-flush branch in
+                // `decide_next_action` (pending.len() <
+                // fast_flush_threshold). They're the fix for the
+                // small-batch regression tracked in #541 — the
+                // deadline wait below would otherwise add 10–50ms
+                // of latency to single-file `rm` and the tail
+                // fragments of `rm -rf`. Bump the metric here
+                // (not in the helper) so the helper stays pure
+                // and tests can exercise the decision without
+                // bumping counters.
+                if fast {
+                    FAST_FLUSH_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        target: "mntrs::batched_delete",
+                        reason = "fast",
+                        "batched_delete: flushing via fast-flush branch"
+                    );
+                }
                 flush_one_batch(&config, &signer, &shared, config.batch_size).await;
             }
             Some(ScheduledAction::WaitForDeadline(deadline)) => {
@@ -748,9 +806,51 @@ async fn worker_loop(config: WorkerConfig, shared: Arc<Shared>, mut rx: mpsc::Re
     );
 }
 
+#[derive(Debug)]
 enum ScheduledAction {
-    FlushBatch,
+    /// Flush whatever is in the pending queue right now.
+    /// `fast=true` means the flush was triggered by the
+    /// fast-flush branch (pending.len() < fast_flush_threshold);
+    /// `fast=false` means size-driven (pending.len() >=
+    /// batch_size). The metric increment lives in the match
+    /// arm, not the decision helper, so tests can drive the
+    /// decision without bumping counters.
+    FlushBatch {
+        fast: bool,
+    },
     WaitForDeadline(Option<Instant>),
+}
+
+/// Decide the next worker action from a snapshot of the
+/// pending queue. Pure function — no locks, no async, no
+/// metrics — so unit tests can exercise the threshold edges
+/// without spawning the worker.
+///
+/// Decision tree:
+///   pending.len() >= batch_size        → FlushBatch { fast: false }
+///   pending.len() == 0                 → None (caller blocks on rx.recv)
+///   pending.len() < fast_flush_threshold && threshold > 0
+///                                     → FlushBatch { fast: true }
+///   otherwise                         → WaitForDeadline(deadline)
+///
+/// Issue #553: the small-batch fast flush shaves the
+/// `flush_delay` floor (50 ms by default) for single
+/// unlinks and tail fragments of `rm -rf`, where deadline
+/// wait amortises over too few keys to be worth the latency.
+fn decide_next_action(
+    config: &WorkerConfig,
+    pending_len: usize,
+    deadline: Option<Instant>,
+) -> Option<ScheduledAction> {
+    if pending_len >= config.batch_size {
+        Some(ScheduledAction::FlushBatch { fast: false })
+    } else if pending_len == 0 {
+        None
+    } else if config.fast_flush_threshold > 0 && pending_len < config.fast_flush_threshold {
+        Some(ScheduledAction::FlushBatch { fast: true })
+    } else {
+        Some(ScheduledAction::WaitForDeadline(deadline))
+    }
 }
 
 // ===== Flush helpers =====
@@ -1489,6 +1589,9 @@ mod tests {
         assert_eq!(cfg.flush_delay, DEFAULT_FLUSH_DELAY);
         assert_eq!(cfg.request_timeout, DEFAULT_REQUEST_TIMEOUT);
         assert_eq!(cfg.max_retries, DEFAULT_MAX_RETRIES);
+        // Issue #553: fast_flush_threshold defaults to the
+        // small-batch fix threshold; 0 disables the path.
+        assert_eq!(cfg.fast_flush_threshold, DEFAULT_FAST_FLUSH_THRESHOLD);
     }
 
     #[test]
@@ -1508,6 +1611,8 @@ mod tests {
         assert_eq!(s.shutdown_lost_total, 0);
         assert_eq!(s.single_key_batches_total, 0);
         assert_eq!(s.max_batch_size_observed, 0);
+        // Issue #553: fast_flush_total slot is wired even at rest.
+        assert_eq!(s.fast_flush_total, 0);
     }
 
     #[test]
@@ -1778,5 +1883,140 @@ mod tests {
             after >= before + 3,
             "threshold_skipped_total must advance by at least 3 (was {before}, now {after})"
         );
+    }
+
+    // ===== decide_next_action tests (Issue #553) =====
+    //
+    // `decide_next_action` is the pure helper that picks the
+    // worker's next action. It takes a snapshot of the pending
+    // queue and the WorkerConfig and returns the same ScheduledAction
+    // the worker would pick — without locks, async, or metrics.
+    // That's what makes these tests cheap and deterministic: no
+    // network, no sleep, no shared atomics.
+
+    fn cfg(batch_size: usize, fast_flush_threshold: usize) -> WorkerConfig {
+        WorkerConfig {
+            bucket: "b".into(),
+            prefix: "/".into(),
+            region: "us-east-1".into(),
+            endpoint: url::Url::parse("http://localhost:9000").unwrap(),
+            access_key_id: None,
+            secret_access_key: None,
+            http: reqwest::Client::new(),
+            batch_size,
+            flush_delay: Duration::from_millis(50),
+            request_timeout: Duration::from_secs(30),
+            max_retries: 3,
+            fast_flush_threshold,
+            retry_factor: 2.0,
+            retry_initial_backoff: Duration::from_millis(100),
+            batch_threshold: 0,
+        }
+    }
+
+    #[test]
+    fn decide_empty_queue_returns_none() {
+        // Empty queue → worker should block on rx.recv(), not
+        // spin doing nothing.
+        let cfg = cfg(100, 8);
+        assert!(decide_next_action(&cfg, 0, None).is_none());
+    }
+
+    #[test]
+    fn decide_full_batch_returns_size_driven_flush() {
+        // pending.len() == batch_size → flush, fast=false
+        // (size-driven path; the fast counter must NOT advance).
+        let cfg = cfg(100, 8);
+        let action = decide_next_action(&cfg, 100, None);
+        match action {
+            Some(ScheduledAction::FlushBatch { fast }) => assert!(!fast),
+            other => panic!("expected FlushBatch {{ fast: false }}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_above_batch_size_also_size_driven() {
+        // pending.len() > batch_size → still size-driven flush.
+        // Belt-and-suspenders against off-by-one in the comparison.
+        let cfg = cfg(100, 8);
+        let action = decide_next_action(&cfg, 137, None);
+        match action {
+            Some(ScheduledAction::FlushBatch { fast }) => assert!(!fast),
+            other => panic!("expected FlushBatch {{ fast: false }}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_small_batch_fast_flushes_when_threshold_set() {
+        // pending.len() < fast_flush_threshold (and > 0) → fast
+        // flush. This is the core #541 fix: skip the
+        // flush_delay wait when there's not enough work to
+        // amortise it.
+        let cfg = cfg(100, 8);
+        for &n in &[1usize, 2, 7] {
+            let action = decide_next_action(&cfg, n, None);
+            match action {
+                Some(ScheduledAction::FlushBatch { fast }) => assert!(fast, "n={n}"),
+                other => panic!("n={n}: expected FlushBatch {{ fast: true }}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn decide_middle_band_waits_for_deadline() {
+        // pending.len() in [fast_flush_threshold, batch_size) →
+        // wait for deadline. This is the "true batching" band:
+        // enough keys to amortise the deadline wait, not enough
+        // to trigger size-driven flush.
+        let cfg = cfg(100, 8);
+        let deadline = Some(Instant::now() + Duration::from_millis(20));
+        for &n in &[8usize, 9, 50, 99] {
+            let action = decide_next_action(&cfg, n, deadline);
+            match action {
+                Some(ScheduledAction::WaitForDeadline(d)) => assert_eq!(d, deadline, "n={n}"),
+                other => panic!("n={n}: expected WaitForDeadline, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn decide_threshold_zero_disables_fast_flush() {
+        // fast_flush_threshold == 0 disables the fast branch.
+        // Even a single pending key waits for the deadline —
+        // matches pre-#553 behaviour.
+        let cfg = cfg(100, 0);
+        let action = decide_next_action(&cfg, 1, None);
+        assert!(matches!(action, Some(ScheduledAction::WaitForDeadline(_))));
+    }
+
+    #[test]
+    fn decide_threshold_one_behaves_like_threshold_zero() {
+        // fast_flush_threshold == 1: the predicate is
+        // `pending_len < fast_flush_threshold`, which for
+        // pending_len >= 1 is never true. So 1 == 0 from the
+        // helper's perspective — both fall through to the
+        // deadline wait. Document this in code so a future
+        // reader doesn't think threshold=1 means "fast flush
+        // everything but the first".
+        let cfg = cfg(100, 1);
+        assert!(matches!(
+            decide_next_action(&cfg, 1, None),
+            Some(ScheduledAction::WaitForDeadline(_))
+        ));
+        assert!(matches!(
+            decide_next_action(&cfg, 2, None),
+            Some(ScheduledAction::WaitForDeadline(_))
+        ));
+    }
+
+    #[test]
+    fn decide_threshold_is_strict_less_than() {
+        // pending_len == fast_flush_threshold is NOT a fast
+        // flush — it's the first value in the wait band.
+        // This is the strict `<` semantics that keeps the
+        // middle band non-empty.
+        let cfg = cfg(100, 8);
+        let action = decide_next_action(&cfg, 8, None);
+        assert!(matches!(action, Some(ScheduledAction::WaitForDeadline(_))));
     }
 }
