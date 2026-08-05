@@ -48,7 +48,7 @@ reqsign-file-read-tokio = "3.0"
 http = "1"
 quick-xml = "0.41"
 md-5 = "0.11"
-base64 = "0.22"
+base64 = "0.23"
 # Hardware-accelerated CRC32C (x86 CRC32Q via SSE4.2; ARMv8.2-CRC32).
 # Used for disk cache block integrity checks; falls back to a
 # software implementation on CPUs without the corresponding ISA
