@@ -743,7 +743,59 @@ rm -rf "$MNTRS_MNT/bulkstat" "$RCLONE_MNT/bulkstat" 2>/dev/null
 echo ""; echo "=== 38. Prefetcher adaptive (issue #132): cold vs warm 100M read ==="; CATEGORY="PrefetcherAdaptive"
 dd if=/dev/urandom of="$MNTRS_MNT/adaptive-100M.bin" bs=1M count=100 2>/dev/null
 dd if=/dev/urandom of="$RCLONE_MNT/adaptive-100M.bin" bs=1M count=100 2>/dev/null
-sync; sleep 2
+# Issue #556: poll S3 until the 100 MiB upload completes on BOTH
+# mntrs and rclone mounts before kicking off the cold read. The
+# mounts were launched with `--vfs-cache-mode=writes --vfs-write-back=5`,
+# so a fresh `dd` does NOT upload to S3 for ~5 seconds (the
+# write-back timer) plus the multipart upload time. The prior
+# `sync; sleep 2` finished well before either deadline, so the
+# cold read routinely hit S3 mid-upload: MinIO returned either
+# "reader got too little data" (only 1 MiB chunks flushed) or
+# `416 RangeNotSatisfied` (file still < 1 MiB on S3). Both
+# poisoned the prefetcher into giving up after 5 consecutive
+# transient errors, which then fell back to FUSE-direct range
+# reads (slow). Result: a bimodal "cat 100M cold" distribution
+# in nightly bench runs (5/14 regression cluster at 0.61-0.65 s
+# vs 9/14 healthy at 0.16-0.36 s) that has nothing to do with
+# the prefetcher's ratchet logic. Polling eliminates the race
+# by waiting for `head-object` to confirm `ContentLength ==
+# 104857600` on both backends. Warm-read times (always < 0.06 s
+# regardless of cold timing) confirm the file is fully written
+# within ~1 s of the cold read, so 10 s is plenty of headroom
+# in the steady state; the 30 s ceiling is defensive against
+# CI jitter / MinIO slow startup.
+EXPECTED_SIZE=104857600
+POLL_MAX=30
+for backend in "mntrs:$BUCKET" "rclone:$BUCKET"; do
+    label=${backend%%:*}
+    bkt=${backend##*:}
+    size=0
+    for i in $(seq 1 "$POLL_MAX"); do
+        size=$(AWS_ACCESS_KEY_ID="$ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$SECRET_KEY" \
+            aws --endpoint-url "$ENDPOINT" --no-verify-ssl \
+                s3api head-object --bucket "$bkt" --key adaptive-100M.bin \
+                --query 'ContentLength' --output text 2>/dev/null || echo 0)
+        if [ "$size" = "$EXPECTED_SIZE" ]; then
+            # Verify stability: re-poll once more to make sure
+            # the multipart upload hasn't just hit a milestone
+            # and is still in progress.
+            sleep 1
+            size2=$(AWS_ACCESS_KEY_ID="$ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$SECRET_KEY" \
+                aws --endpoint-url "$ENDPOINT" --no-verify-ssl \
+                    s3api head-object --bucket "$bkt" --key adaptive-100M.bin \
+                    --query 'ContentLength' --output text 2>/dev/null || echo 0)
+            if [ "$size2" = "$EXPECTED_SIZE" ]; then
+                break
+            else
+                size=$size2
+            fi
+        fi
+        sleep 1
+    done
+    if [ "$size" != "$EXPECTED_SIZE" ]; then
+        echo "WARN ($label): adaptive-100M.bin size=$size after ${POLL_MAX}s, expected $EXPECTED_SIZE — cold read will be slow" >&2
+    fi
+done
 # Cold-start read: nothing in cache, first chunk is the minimum window.
 bench "cat 100M cold" "mntrs" cat "$MNTRS_MNT/adaptive-100M.bin" >/dev/null
 bench "cat 100M cold" "rclone" cat "$RCLONE_MNT/adaptive-100M.bin" >/dev/null
