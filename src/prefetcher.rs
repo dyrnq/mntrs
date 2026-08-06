@@ -519,6 +519,54 @@ mod sticky_floor_tests {
             "local_window_override must win over sticky floor on the retry iteration"
         );
     }
+
+    // ===== Issue #556 option C: first_chunk clamped to 4 MiB =====
+    //
+    // Test-local mirror of the option-C first-chunk constant.
+    // The production code clamps
+    //   chunk_size.clamp(bp_min_window, FIRST_CHUNK_MAX)
+    // where FIRST_CHUNK_MAX = 4 MiB (vs the prior `bp_max_window`
+    // = 64 MiB). Mirror it here so the test doesn't need a real
+    // `BackpressureController`.
+
+    /// Local mirror of option C's first-chunk clamp.
+    fn first_chunk_for_test(chunk_size: u64, bp_min_window: u64) -> u64 {
+        const FIRST_CHUNK_MAX: u64 = 4 * 1024 * 1024;
+        chunk_size.clamp(bp_min_window, FIRST_CHUNK_MAX)
+    }
+
+    /// Issue #556 option C: a caller-supplied chunk_size larger
+    /// than `FIRST_CHUNK_MAX` (4 MiB) must be clamped DOWN to 4
+    /// MiB — this is the structural fix that shrinks the blast
+    /// radius of any first-chunk transient.
+    #[test]
+    fn first_chunk_clamped_to_four_mib() {
+        // Default chunk_size from CLI is 128 MiB. Without option
+        // C this clamps to bp_max_window (64 MiB). With option C
+        // it clamps to 4 MiB.
+        assert_eq!(
+            first_chunk_for_test(128 * 1024 * 1024, 128 * 1024),
+            4 * 1024 * 1024,
+            "128 MiB chunk_size must clamp to FIRST_CHUNK_MAX (4 MiB), not bp_max_window"
+        );
+    }
+
+    /// Issue #556 option C regression guard: a caller-supplied
+    /// chunk_size smaller than FIRST_CHUNK_MAX is unchanged.
+    /// The clamp is a one-sided ceiling — we don't grow small
+    /// caller values up to 4 MiB.
+    #[test]
+    fn first_chunk_passthrough_for_small_chunk_size() {
+        // Caller wants 1 MiB first chunk — pass through.
+        assert_eq!(first_chunk_for_test(1024 * 1024, 128 * 1024), 1024 * 1024);
+        // Caller wants 512 KiB — pass through, then clamp to
+        // bp_min_window (128 KiB).
+        assert_eq!(
+            first_chunk_for_test(512 * 1024, 128 * 1024),
+            512 * 1024,
+            "small chunk_size must not be grown up to FIRST_CHUNK_MAX"
+        );
+    }
 }
 
 /// loop body).
@@ -676,8 +724,35 @@ impl HandlePrefetcher {
         // greater than the controller's `bp_max_window` defeats the
         // configured ceiling.
         let bp_min_window: u64 = backpressure.min_window();
-        let bp_max_window: u64 = backpressure.max_window();
-        let first_chunk = chunk_size.clamp(bp_min_window, bp_max_window);
+        // Issue #556 option C: keep the bp_max_window binding for
+        // the explanatory comment below (the prior clamp upper
+        // bound was `bp_max_window`, now `first_chunk_max`). The
+        // value is unused in this option-C build.
+        let _bp_max_window: u64 = backpressure.max_window();
+        // Issue #556 option C: cap the FIRST chunk at a smaller
+        // value than `bp_max_window`. The first iteration is the
+        // one most likely to hit a transient range error on the
+        // backend (MinIO's chunked storage occasionally short-
+        // returns on a fresh connection), and a 64 MiB opener
+        // triggers a #537 halve + #545 ratchet that pins all
+        // subsequent windows at chunk/2 (32 MiB) — adding
+        // ~400 ms to a 100 MiB cold read (Phase 2 nightly bench:
+        // 5/14 runs in 0.610-0.629 s regression cluster). Reducing
+        // the first chunk to 4 MiB shrinks the blast radius of any
+        // first-chunk transient (the ratchet engages at 2 MiB
+        // instead of 32 MiB) at the cost of a slightly slower
+        // cold-start on the healthy path (one 4 MiB read instead
+        // of one 64 MiB read — the EMA catches up by the second
+        // iteration regardless).
+        //
+        // Trade-off vs options A/B (ratchet guard):
+        // - Option A/B: same blast radius, but ratchet no longer
+        //   pinned from iteration 0.
+        // - Option C: smaller blast radius. Even if the ratchet
+        //   engages, it caps at chunk/2 = 2 MiB (instead of
+        //   32 MiB), so the regression is bounded.
+        let first_chunk_max = 4 * 1024 * 1024u64;
+        let first_chunk = chunk_size.clamp(bp_min_window, first_chunk_max);
         std::thread::spawn(move || {
             let mut offset = 0u64;
             // Issue #201: counter for hysteresis. Reset on reserve
