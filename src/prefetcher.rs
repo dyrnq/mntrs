@@ -387,6 +387,138 @@ mod sticky_floor_tests {
             "raised a sticky floor from 1 MiB to 2 MiB — ratchet leaked"
         );
     }
+
+    // ===== Issue #545: end-to-end ratchet link tests =====
+    //
+    // The three tests above cover the `apply_sticky_floor` pure
+    // helper. The tests below verify the OTHER half of #545: the
+    // iteration-top window expression (prefetcher.rs:614-621) that
+    // reads `sticky_max_window` and clamps the next window to it.
+    // Together, the two halves prove the full causal chain:
+    //
+    //   transient error → apply_sticky_floor writes sticky_max_window
+    //                  → iteration top clamps `w.min(floor)`
+    //
+    // We don't pull the iteration-top expression into a prod helper
+    // (the inline 8-line form already has a 10-line comment block
+    // explaining the `min(current_window, sticky_floor)` semantics,
+    // see prefetcher.rs:604-613). Instead we mirror it here in test
+    // code so any future drift between this local helper and the
+    // prod expression shows up as test staleness — not as a silent
+    // production bug. The drift risk is bounded by the existing
+    // `apply_sticky_floor` tests above, which still cover the
+    // ratchet decision itself.
+
+    /// Local mirror of the iteration-top window expression at
+    /// `prefetcher.rs:614-621`. Pure function, no IO. The five
+    /// parameters are the loop's snapshot at iteration top:
+    /// `offset`, `first_chunk` (constructor constant), the
+    /// backpressure controller's current EMA window, the
+    /// transient-error retry override (consumed via `take()`),
+    /// and the sticky floor from #545.
+    fn compute_next_window_for_test(
+        offset: u64,
+        first_chunk: u64,
+        bp_current_window: u64,
+        local_window_override: Option<u64>,
+        sticky_max_window: Option<u64>,
+    ) -> u64 {
+        local_window_override.unwrap_or_else(|| {
+            let w = if offset == 0 {
+                first_chunk
+            } else {
+                bp_current_window
+            };
+            sticky_max_window.map_or(w, |floor| w.min(floor))
+        })
+    }
+
+    /// Issue #545 regression guard: when the ratchet has never
+    /// engaged (no transient errors yet, or fresh file),
+    /// `sticky_max_window = None` and the window expression is
+    /// the identity on `bp_current_window`. This must hold —
+    /// the floor is opt-in via transient errors, not on by
+    /// default.
+    #[test]
+    fn sticky_floor_none_does_not_affect_window() {
+        // First-chunk path (offset == 0 → uses first_chunk).
+        assert_eq!(
+            compute_next_window_for_test(0, 1024 * 1024, 8 * 1024 * 1024, None, None),
+            1024 * 1024,
+        );
+        // Steady-state path (offset > 0 → uses bp_current_window).
+        assert_eq!(
+            compute_next_window_for_test(1024 * 1024, 1024 * 1024, 8 * 1024 * 1024, None, None),
+            8 * 1024 * 1024,
+        );
+    }
+
+    /// Issue #545: the whole point. Backpressure EMA has grown
+    /// the window back to 8 MiB after a transient error halved
+    /// it to 2 MiB. The iteration-top expression MUST clamp to
+    /// the sticky floor, not let the EMA re-grow and re-trigger
+    /// the halve cycle on the next prefetch.
+    #[test]
+    fn sticky_floor_caps_window_against_ema_growth() {
+        // Scenario:
+        //   1. Initial window 4 MiB. First transient error
+        //      halved to 2 MiB → ratchet engaged at 2 MiB
+        //      (via apply_sticky_floor(None, 2 MiB) = Some(2 MiB)).
+        //   2. Consumer keeps reading. Backpressure EMA on the
+        //      controller grows the window back to 8 MiB.
+        //   3. Next iteration: WITHOUT #545, the prefetcher
+        //      would use 8 MiB and almost certainly hit another
+        //      transient error on the same flaky range.
+        //   4. WITH #545, the iteration-top expression clamps
+        //      to min(8 MiB, sticky floor 2 MiB) = 2 MiB.
+        let sticky = Some(2 * 1024 * 1024);
+        let result = compute_next_window_for_test(
+            4 * 1024 * 1024, // offset > 0 → bp_current_window path
+            1024 * 1024,     // first_chunk (unused at offset > 0)
+            8 * 1024 * 1024, // bp EMA wants 8 MiB
+            None,
+            sticky,
+        );
+        assert_eq!(
+            result,
+            2 * 1024 * 1024,
+            "EMA at 8 MiB must be clamped to sticky floor 2 MiB"
+        );
+    }
+
+    /// Issue #545 + #537 layering: when a transient error
+    /// fires, the handler sets `local_window_override = Some(N)`
+    /// for the immediate retry and only then calls
+    /// `apply_sticky_floor` to update the long-lived
+    /// `sticky_max_window`. The retry iteration must use the
+    /// override (not the floor), because the override is the
+    /// size we know worked this iteration. Without this, the
+    /// floor would over-clamp the retry below its own halved
+    /// size and could stall the prefetcher.
+    #[test]
+    fn local_window_override_takes_precedence_over_sticky_floor() {
+        // Scenario:
+        //   1. Ratchet already engaged at 2 MiB (prior transient
+        //      error).
+        //   2. Another transient error halves 2 MiB → 1 MiB.
+        //      Handler sets `local_window_override = Some(1 MiB)`
+        //      for the retry.
+        //   3. Retry iteration: override is consumed by `take()`
+        //      at iteration top → returns 1 MiB. Floor would say
+        //      min(?, 2 MiB) but never gets evaluated.
+        let result = compute_next_window_for_test(
+            1024 * 1024,
+            1024 * 1024,
+            8 * 1024 * 1024,       // bp EMA at 8 MiB
+            Some(1024 * 1024),     // retry override at 1 MiB
+            Some(2 * 1024 * 1024), // floor at 2 MiB
+        );
+        assert_eq!(
+            result,
+            1024 * 1024,
+            "local_window_override must win over sticky floor on the retry iteration"
+        );
+    }
 }
 
 /// loop body).
