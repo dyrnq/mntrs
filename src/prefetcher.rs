@@ -519,6 +519,79 @@ mod sticky_floor_tests {
             "local_window_override must win over sticky floor on the retry iteration"
         );
     }
+
+    // ===== Issue #556 option B: first-chunk transient ratchets to bp_min_window =====
+    //
+    // Local mirror of option B's production wiring: first-chunk
+    // transient → ratchet pin at `bp_min_window` (128 KiB); later
+    // transients → ratchet pin at the halved window (chunk/2).
+    // `bp_min_window` is the smallest legal window the controller
+    // accepts and forces the prefetcher to prove the next size
+    // before growing back up.
+
+    /// Local mirror of option B's ratchet decision. `bp_min_window`
+    /// is passed in explicitly so the test doesn't need a real
+    /// `BackpressureController`.
+    fn ratchet_after_transient_for_test(
+        offset: u64,
+        sticky_max_window: Option<u64>,
+        new_window: u64,
+        bp_min_window: u64,
+    ) -> Option<u64> {
+        let ratchet_target = if offset == 0 {
+            bp_min_window
+        } else {
+            new_window
+        };
+        apply_sticky_floor(sticky_max_window, ratchet_target)
+    }
+
+    /// Issue #556 option B: first-chunk transient (offset == 0)
+    /// engages the ratchet at `bp_min_window` (128 KiB), not at
+    /// chunk/2 (32 MiB). More conservative than the unfixed
+    /// behavior — forces the prefetcher to prove the next size
+    /// before growing back up.
+    #[test]
+    fn first_chunk_transient_engages_at_min_window() {
+        assert_eq!(
+            ratchet_after_transient_for_test(0, None, 32 * 1024 * 1024, 128 * 1024),
+            Some(128 * 1024),
+            "first-chunk transient must engage ratchet at bp_min_window"
+        );
+    }
+
+    /// Issue #556 option B regression guard: later-chunk transient
+    /// (offset > 0) still ratchets at `new_window` (chunk/2), as
+    /// #545 specified. The min_window floor is only for first
+    /// chunks.
+    #[test]
+    fn later_chunk_transient_still_ratchets_at_chunk_half() {
+        assert_eq!(
+            ratchet_after_transient_for_test(64 * 1024 * 1024, None, 4 * 1024 * 1024, 128 * 1024,),
+            Some(4 * 1024 * 1024),
+            "later-chunk transient must ratchet at chunk/2 (not bp_min_window)"
+        );
+    }
+
+    /// Issue #556 option B + #545 layering: when the ratchet is
+    /// already engaged at a value smaller than `bp_min_window` and
+    /// a first-chunk transient then fires, `apply_sticky_floor`
+    /// must preserve the existing floor (don't raise to
+    /// `bp_min_window`). In practice this can't happen since
+    /// `bp_min_window` is the smallest legal window, but the test
+    /// documents the layering invariant.
+    #[test]
+    fn first_chunk_transient_does_not_raise_existing_ratchet() {
+        // bp_min_window = 128 KiB; existing ratchet at 64 KiB
+        // (hypothetical smaller floor). First-chunk transient
+        // wants to pin at bp_min_window (128 KiB).
+        // apply_sticky_floor keeps the smaller value.
+        assert_eq!(
+            ratchet_after_transient_for_test(0, Some(64 * 1024), 32 * 1024 * 1024, 128 * 1024,),
+            Some(64 * 1024),
+            "first-chunk transient must not raise an existing smaller ratchet"
+        );
+    }
 }
 
 /// loop body).
@@ -938,7 +1011,32 @@ impl HandlePrefetcher {
                         // Issue #545: sticky floor — see the
                         // mem_pressure shrunk-retry path comment above
                         // for the same logic. Same one-way ratchet.
-                        sticky_max_window = apply_sticky_floor(sticky_max_window, new_window);
+                        //
+                        // Issue #556 option B: when the transient
+                        // error fires on the FIRST chunk (offset == 0),
+                        // there's no prior "known-good" size to
+                        // anchor the ratchet against. Pinning at
+                        // chunk/2 (32 MiB on a 64 MiB opener) makes
+                        // the ratchet too lenient — it caps windows
+                        // at 32 MiB for the rest of the file when
+                        // the EMA grows back to 64 MiB, costing
+                        // ~400ms on a 100 MiB cold read on MinIO
+                        // (Phase 2 nightly bench: 5/14 runs in
+                        // 0.610-0.629s regression cluster). Pin to
+                        // `bp_min_window` (128 KiB) instead, which
+                        // is the smallest legal window and forces
+                        // the prefetcher to prove the next size
+                        // before raising the floor back up. More
+                        // conservative than option A (skip
+                        // engagement entirely) but still allows the
+                        // ratchet to engage on second-and-later
+                        // chunks.
+                        let ratchet_target = if offset == 0 {
+                            bp_min_window
+                        } else {
+                            new_window
+                        };
+                        sticky_max_window = apply_sticky_floor(sticky_max_window, ratchet_target);
                         local_window_override = Some(new_window);
                         std::thread::sleep(std::time::Duration::from_millis(10));
                         continue;
