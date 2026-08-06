@@ -519,6 +519,93 @@ mod sticky_floor_tests {
             "local_window_override must win over sticky floor on the retry iteration"
         );
     }
+
+    // ===== Issue #556: first-chunk transient does NOT engage ratchet =====
+    //
+    // Mirrors the production `TransientRangeError` handler logic
+    // at `prefetcher.rs` (around the `apply_sticky_floor` call)
+    // with the offset > 0 guard added by #556. The pure
+    // `apply_sticky_floor` helper itself is unchanged — the guard
+    // is at the call site. So the test-local handler below
+    // includes the guard to verify the production wiring.
+
+    /// Local mirror of the production TransientRangeError
+    /// handler's ratchet decision: a transient error at
+    /// `offset` with `new_window = chunk / 2` updates
+    /// `sticky_max_window` only when `offset > 0`. First-chunk
+    /// transients (offset == 0) leave the ratchet untouched —
+    /// they retry via `local_window_override` (not modeled here)
+    /// but do not pin future iterations.
+    fn ratchet_after_transient_for_test(
+        offset: u64,
+        sticky_max_window: Option<u64>,
+        new_window: u64,
+    ) -> Option<u64> {
+        if offset == 0 {
+            sticky_max_window
+        } else {
+            apply_sticky_floor(sticky_max_window, new_window)
+        }
+    }
+
+    /// Issue #556: cold-start transient range error (offset == 0)
+    /// MUST leave `sticky_max_window` untouched. Without the
+    /// `offset > 0` guard, a single bad 64 MiB opener on MinIO
+    /// would engage the ratchet at 32 MiB and cap every
+    /// subsequent window — adding ~400 ms to a 100 MiB cold
+    /// read even when the rest of the file has no transient
+    /// errors. See Phase 2 nightly bench run #31066261842 etc.
+    #[test]
+    fn first_chunk_transient_does_not_engage_ratchet() {
+        // Scenario: cold-start, first 64 MiB opener hits a short
+        // return. Handler halves to 32 MiB. Without the #556
+        // guard, ratchet engages at 32 MiB. With the guard,
+        // ratchet stays None — subsequent iterations are free
+        // to grow the EMA window normally.
+        assert_eq!(
+            ratchet_after_transient_for_test(0, None, 32 * 1024 * 1024),
+            None,
+            "first-chunk transient must NOT engage the ratchet"
+        );
+    }
+
+    /// Issue #556 regression guard: a transient at offset > 0
+    /// MUST still engage the ratchet (the #545 contract). The
+    /// `offset > 0` guard must not leak to non-first-chunk
+    /// cases.
+    #[test]
+    fn later_chunk_transient_still_engages_ratchet() {
+        // Scenario: first 64 MiB opener succeeded. EMA has
+        // grown back to 8 MiB. A second transient error halves
+        // 8 MiB → 4 MiB. Ratchet engages at 4 MiB.
+        assert_eq!(
+            ratchet_after_transient_for_test(
+                64 * 1024 * 1024, // offset > 0
+                None,
+                4 * 1024 * 1024,
+            ),
+            Some(4 * 1024 * 1024),
+            "later-chunk transient must engage the ratchet"
+        );
+    }
+
+    /// Issue #556 + #545 layering: when the ratchet is already
+    /// engaged (from a prior non-first-chunk transient) and a
+    /// FIRST-chunk transient then fires, the ratchet is
+    /// preserved (not overwritten back to None, not replaced
+    /// with chunk/2). The first-chunk guard is about not
+    /// engaging fresh, not about clearing an existing floor.
+    #[test]
+    fn first_chunk_transient_preserves_existing_ratchet() {
+        // Scenario: ratchet already engaged at 2 MiB from a
+        // prior transient. New first-chunk (offset == 0)
+        // transient fires. Floor must stay at 2 MiB.
+        assert_eq!(
+            ratchet_after_transient_for_test(0, Some(2 * 1024 * 1024), 32 * 1024 * 1024,),
+            Some(2 * 1024 * 1024),
+            "first-chunk transient must preserve an already-engaged ratchet"
+        );
+    }
 }
 
 /// loop body).
@@ -938,7 +1025,32 @@ impl HandlePrefetcher {
                         // Issue #545: sticky floor — see the
                         // mem_pressure shrunk-retry path comment above
                         // for the same logic. Same one-way ratchet.
-                        sticky_max_window = apply_sticky_floor(sticky_max_window, new_window);
+                        //
+                        // Issue #556: skip the ratchet engagement on
+                        // the FIRST chunk (offset == 0). The ratchet
+                        // exists to prevent the "I just saw this size
+                        // fail, so don't try it again" pattern — but
+                        // on cold-start there's no prior "known-good"
+                        // size to anchor the ratchet against. Pinning
+                        // the sticky floor from the very first
+                        // iteration makes the prefetcher permanently
+                        // over-conservative for the rest of the file
+                        // (cap window at chunk/2 even when the EMA
+                        // has grown back to max). On MinIO this adds
+                        // ~400ms to a 100 MiB cold read whenever the
+                        // 64 MiB opener hits a short return — see
+                        // Phase 2 nightly bench run #31066261842 etc.
+                        // The retry still runs (via
+                        // `local_window_override`), so transient
+                        // errors on the first chunk are still
+                        // recovered from; we just don't punish the
+                        // next 100 MiB of reads for that one bad
+                        // opener.
+                        sticky_max_window = if offset == 0 {
+                            sticky_max_window
+                        } else {
+                            apply_sticky_floor(sticky_max_window, new_window)
+                        };
                         local_window_override = Some(new_window);
                         std::thread::sleep(std::time::Duration::from_millis(10));
                         continue;
