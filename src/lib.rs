@@ -1645,12 +1645,21 @@ impl MntrsFs {
         // logged and the deleter stays absent (callers fall back
         // to opendal).
         if let Some(cfg) = self.batched_delete_config.as_ref() {
-            // `spawn` is sync (it builds a tokio task and returns
-            // immediately); the worker runs on `crate::rt()`. No
-            // block_on needed here — `spawn` itself just creates
-            // an mpsc pair and an mpsc::Sender, all cheap.
+            // `spawn` is sync (it builds tokio tasks and returns
+            // immediately); the controller + flushers run on
+            // `crate::rt()`. No block_on needed here — `spawn`
+            // itself just creates an mpsc pair and a broadcast
+            // channel, all cheap.
+            //
+            // Issue #562 stage 1: the worker handle bundle is
+            // discarded (fire-and-forget). Shutdown is implicit:
+            // when every `BatchedDeleter` clone drops the
+            // `flush_tx` closes → controller's `rx.recv()` returns
+            // `None` → controller exits → its `wake_tx` drops →
+            // flushers' `wake_rx.recv()` returns `Err(Closed)` →
+            // flushers exit. The handles don't need awaiting.
             match crate::batched_delete::spawn(cfg.clone(), self.delete_tombstones.clone()) {
-                Ok((deleter, _handle)) => {
+                Ok((deleter, _handles)) => {
                     self.batched_deleter.set(deleter).ok();
                 }
                 Err(e) => {
