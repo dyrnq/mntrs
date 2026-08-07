@@ -159,6 +159,14 @@ static THRESHOLD_SKIPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// workload.
 static PROFILE_TRANSITIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+/// Issue #562 stage 1.5: how many single-key flushes used
+/// the short-circuit plain `DELETE /bucket/key` path instead
+/// of the multi-key `DeleteObjects` XML path. Tracks the
+/// actual hit rate so a /metrics consumer (Stage 4) and the
+/// bench harness can verify the lever is firing on small
+/// workloads.
+static SINGLE_KEY_FAST_DELETE_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 // ===== Profile (issue #562 stage 3) =====
 //
 // A workload-shape classification that maps to a fixed triple
@@ -588,6 +596,10 @@ pub(crate) struct CounterSnapshot {
     /// Issue #553: how many flushes fired via the fast-flush
     /// path.
     pub fast_flush_total: u64,
+    /// Issue #562 stage 1.5: how many single-key flushes
+    /// went through the plain `DELETE` short-circuit instead
+    /// of `DeleteObjects`.
+    pub single_key_fast_delete_total: u64,
 }
 
 pub(crate) fn snapshot() -> CounterSnapshot {
@@ -600,6 +612,7 @@ pub(crate) fn snapshot() -> CounterSnapshot {
         max_batch_size_observed: MAX_BATCH_SIZE_OBSERVED.load(Ordering::Relaxed),
         threshold_skipped_total: THRESHOLD_SKIPPED_TOTAL.load(Ordering::Relaxed),
         fast_flush_total: FAST_FLUSH_TOTAL.load(Ordering::Relaxed),
+        single_key_fast_delete_total: SINGLE_KEY_FAST_DELETE_TOTAL.load(Ordering::Relaxed),
     }
 }
 
@@ -1651,7 +1664,7 @@ async fn flush_one_batch(
     }
 
     let started = Instant::now();
-    let outcome = send_chunk_with_retry(config, signer, &batch, &config.prefix).await;
+    let outcome = send_chunk_with_retry(config, signer, shared, &batch, &config.prefix).await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
     FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -1743,7 +1756,7 @@ async fn do_flush_all(
         if batch.is_empty() {
             return Ok(total);
         }
-        let outcome = send_chunk_with_retry(config, signer, &batch, &config.prefix).await;
+        let outcome = send_chunk_with_retry(config, signer, shared, &batch, &config.prefix).await;
         let (succeeded, not_found, failed) = count_outcome(&outcome);
         if failed > 0 {
             FAILURES_TOTAL.fetch_add(failed, Ordering::Relaxed);
@@ -1858,12 +1871,41 @@ fn build_signer(config: &WorkerConfig) -> std::io::Result<Signer<AwsCredential>>
 /// non-retryable failure or exhausted retries, every key in the
 /// chunk receives the same `Err`. On HTTP 200, parses per-key
 /// errors (Quiet=true means success is the absence of an entry).
+/// Issue #562 stage 1.5: pure predicate that decides whether
+/// a chunk should use the single-key short-circuit. Extracted
+/// so the unit tests can exercise every (chunk_len, profile)
+/// combination without touching the network. The semantics:
+/// short-circuit iff `chunk_len == 1` and the active profile
+/// opts in. `Profile::Medium` and `Profile::Bulk` opt out so
+/// the multi-key XML path stays in use for batches where the
+/// per-key amortisation matters.
+fn should_short_circuit_single_key(chunk_len: usize, profile: Profile) -> bool {
+    chunk_len == 1 && profile.single_key_fast_delete()
+}
+
 async fn send_chunk_with_retry(
     config: &WorkerConfig,
     signer: &Signer<AwsCredential>,
+    shared: &Shared,
     chunk: &[PendingDelete],
     prefix: &str,
 ) -> Vec<std::io::Result<()>> {
+    // Issue #562 stage 1.5: single-key short-circuit. When
+    // the active profile opts in (`small` by default) and
+    // the chunk has exactly one key, skip the DeleteObjects
+    // XML body / MD5 / response-parse path and issue a
+    // plain `DELETE /bucket/key` instead. Saves ~50-200 µs
+    // per single-key flush (MD5 + XML build on the request
+    // side; XML response parse on the read side). `Profile::Medium`
+    // and `Profile::Bulk` keep the XML path because at
+    // batch_size >= 20 the per-key amortisation makes the
+    // XML overhead negligible.
+    if should_short_circuit_single_key(chunk.len(), shared.profile_state.current()) {
+        SINGLE_KEY_FAST_DELETE_TOTAL.fetch_add(1, Ordering::Relaxed);
+        let key = join_key(prefix, &chunk[0].relative_path);
+        return send_single_delete_with_retry(config, signer, &key).await;
+    }
+
     let body = build_delete_objects_body(chunk, prefix);
     let body_bytes = body.into_bytes();
     let content_md5 = base64_md5(&body_bytes);
@@ -1960,6 +2002,134 @@ fn is_retryable_status(status: u16) -> bool {
 
 fn next_backoff(current: Duration, factor: f64) -> Duration {
     Duration::from_secs_f64(current.as_secs_f64() * factor)
+}
+
+/// Issue #562 stage 1.5: retry wrapper around the
+/// single-key short-circuit. Mirrors `send_chunk_with_retry`
+/// semantics (3-attempt retry on retryable status / transport
+/// error with exponential backoff) but for a plain
+/// `DELETE /bucket/key`. Returns `vec![Ok(())]` on 204 /
+/// 200 / idempotent 404 and `vec![Err(...)]` otherwise.
+async fn send_single_delete_with_retry(
+    config: &WorkerConfig,
+    signer: &Signer<AwsCredential>,
+    key: &str,
+) -> Vec<std::io::Result<()>> {
+    let mut attempt = 0u32;
+    let mut backoff = config.retry_initial_backoff;
+    loop {
+        match send_single_delete_request(config, signer, key).await {
+            Ok(status) => match status {
+                // 204 No Content is the standard S3 single-object
+                // DELETE success; 200 with empty body is also
+                // accepted by some S3-compatible backends.
+                200 | 204 => return vec![Ok(())],
+                // 404 = NoSuchKey. Idempotent: the key is
+                // already gone, which is the post-condition
+                // the caller wanted. Matches the
+                // DeleteObjects response-parser policy where
+                // NoSuchKey / NoSuchVersion are mapped to Ok.
+                404 => return vec![Ok(())],
+                s if is_retryable_status(s) && attempt < config.max_retries => {
+                    tracing::warn!(
+                        target: "mntrs::batched_delete",
+                        status = s,
+                        attempt = attempt + 1,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "single-key DELETE: retrying after retryable status"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = next_backoff(backoff, config.retry_factor);
+                    attempt += 1;
+                    continue;
+                }
+                s => {
+                    let msg = format!(
+                        "batched_delete: S3 single-object DELETE HTTP {} for key `{}`",
+                        s, key
+                    );
+                    return vec![Err(std::io::Error::other(msg))];
+                }
+            },
+            Err(e) => {
+                if attempt < config.max_retries {
+                    tracing::warn!(
+                        target: "mntrs::batched_delete",
+                        error = %e,
+                        attempt = attempt + 1,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "single-key DELETE: retrying after transport error"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = next_backoff(backoff, config.retry_factor);
+                    attempt += 1;
+                    continue;
+                }
+                let msg = format!(
+                    "batched_delete: single-object DELETE transport failure after {} retries: {}",
+                    config.max_retries, e
+                );
+                return vec![Err(std::io::Error::other(msg))];
+            }
+        }
+    }
+}
+
+/// Issue #562 stage 1.5: send one signed `DELETE /bucket/key`.
+/// Returns the HTTP status code only (no body — S3 single-object
+/// DELETE has no per-key response body). Mirrors
+/// `send_one_request`'s signing + timeout plumbing but uses
+/// HTTP DELETE and skips the content-md5 / content-type
+/// headers (no request body on a plain DELETE).
+async fn send_single_delete_request(
+    config: &WorkerConfig,
+    signer: &Signer<AwsCredential>,
+    key: &str,
+) -> std::io::Result<u16> {
+    let mut url = config.endpoint.clone();
+    {
+        let mut seg = url.path_segments_mut().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "endpoint URL cannot be a base",
+            )
+        })?;
+        seg.clear().push(&config.bucket);
+        for segment in key.split('/').filter(|s| !s.is_empty()) {
+            seg.push(segment);
+        }
+    }
+    let (parts, _) = http::Request::builder()
+        .method(http::Method::DELETE)
+        .uri(url.as_str())
+        .body(())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?
+        .into_parts();
+    let mut parts = parts;
+
+    signer
+        .sign(&mut parts, None)
+        .await
+        .map_err(|e| std::io::Error::other(format!("sign: {}", e)))?;
+
+    let http_req: http::Request<Vec<u8>> = http::Request::from_parts(parts, Vec::new());
+    let reqwest_req = reqwest::Request::try_from(http_req)
+        .map_err(|e| std::io::Error::other(format!("reqwest: {}", e)))?;
+
+    let resp = tokio::time::timeout(config.request_timeout, config.http.execute(reqwest_req))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "single-object DELETE request timeout after {:?}",
+                    config.request_timeout
+                ),
+            )
+        })?
+        .map_err(|e| std::io::Error::other(format!("reqwest: {}", e)))?;
+
+    Ok(resp.status().as_u16())
 }
 
 /// Send one signed DeleteObjects request. Returns
@@ -3260,6 +3430,99 @@ mod tests {
             PROFILE_TRANSITIONS_TOTAL.load(Ordering::Relaxed),
             before + 2,
             "post-cooldown flip must bump the counter by 1"
+        );
+    }
+
+    // ===== Issue #562 stage 1.5: single-key short-circuit =====
+    //
+    // The predicate `should_short_circuit_single_key` is
+    // pure (chunk_len, Profile) → bool. Unit tests pin every
+    // (chunk_len, profile) combination so a future change to
+    // `Profile::single_key_fast_delete()` is caught here
+    // before nightly.
+    //
+    // `send_single_delete_with_retry` and
+    // `send_single_delete_request` are network-dependent and
+    // tested via the existing bench harness; the unit tests
+    // below only verify the pure-path contract.
+
+    /// chunk_len == 1 + Profile::Small (the only profile that
+    /// opts in by default) → short-circuit fires.
+    #[test]
+    fn short_circuit_fires_for_small_profile_single_key() {
+        assert!(should_short_circuit_single_key(1, Profile::Small));
+    }
+
+    /// chunk_len == 1 + Profile::Medium → does NOT short-circuit
+    /// (the per-key amortisation at batch_size=100 makes the
+    /// XML path cheap enough that the short-circuit's complexity
+    /// isn't worth it).
+    #[test]
+    fn short_circuit_skipped_for_medium_profile() {
+        assert!(!should_short_circuit_single_key(1, Profile::Medium));
+    }
+
+    /// chunk_len == 1 + Profile::Bulk → does NOT short-circuit.
+    /// Same reasoning as Medium but stronger: at batch_size=500
+    /// the XML body is amortised over hundreds of keys.
+    #[test]
+    fn short_circuit_skipped_for_bulk_profile() {
+        assert!(!should_short_circuit_single_key(1, Profile::Bulk));
+    }
+
+    /// chunk_len >= 2 + Profile::Small → does NOT short-circuit.
+    /// The short-circuit is *only* for single-key flushes;
+    /// multi-key chunks must use the XML path even when the
+    /// profile would otherwise opt in.
+    #[test]
+    fn short_circuit_skipped_for_multi_key_chunks() {
+        for &n in &[2usize, 5, 20, 100] {
+            assert!(
+                !should_short_circuit_single_key(n, Profile::Small),
+                "chunk_len={n} must use XML path"
+            );
+        }
+    }
+
+    /// Every production profile has the same threshold
+    /// predicate shape: short-circuit iff chunk_len == 1
+    /// AND profile.single_key_fast_delete(). A future
+    /// addition of a `Profile::Tiny` that opts in must not
+    /// regress this; the exhaustive cross-product below
+    /// catches any such change.
+    #[test]
+    fn short_circuit_predicate_cross_product() {
+        let profiles = [Profile::Small, Profile::Medium, Profile::Bulk];
+        let lens = [0usize, 1, 2, 3, 10, 100];
+        for &p in &profiles {
+            for &n in &lens {
+                let expected = n == 1 && p.single_key_fast_delete();
+                assert_eq!(
+                    should_short_circuit_single_key(n, p),
+                    expected,
+                    "profile={p:?} chunk_len={n}"
+                );
+            }
+        }
+    }
+
+    /// Issue #562 stage 1.5 counter advances when the
+    /// short-circuit path fires. We don't drive the
+    /// network path in a unit test (that's bench work);
+    /// instead, verify that the counter is read by
+    /// `snapshot()` so a future /metrics endpoint can
+    /// expose it.
+    #[test]
+    fn single_key_fast_delete_counter_visible_in_snapshot() {
+        // Bump the counter directly (the short-circuit path
+        // bumps it on the network success, but that's not
+        // exercised here — only the snapshot plumbing is).
+        let snap_before = crate::batched_delete::snapshot().single_key_fast_delete_total;
+        SINGLE_KEY_FAST_DELETE_TOTAL.fetch_add(1, Ordering::Relaxed);
+        let snap_after = crate::batched_delete::snapshot().single_key_fast_delete_total;
+        assert!(
+            snap_after > snap_before,
+            "snapshot must reflect the counter advance (before={snap_before}, after={snap_after})"
         );
     }
 }

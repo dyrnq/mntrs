@@ -394,6 +394,13 @@ that always issue the same `rm -rf` shape).
   `MNTRS_BATCH_PROFILE=auto` (issue #562 Stage 3). Under
   steady-state workload this should stay low (< 10/hour);
   high values indicate the burst classifier is oscillating.
+- `single_key_fast_delete_total` — single-key flushes that
+  used the plain `DELETE /bucket/key` short-circuit instead
+  of the multi-key `DeleteObjects` XML path (issue #562
+  Stage 1.5). Active when the running profile is `Small`
+  (the default for sparse workloads); Medium / Bulk keep
+  the XML path because per-key amortisation makes the
+  short-circuit's complexity not worth it.
 
 Enable with `RUST_LOG=info,mntrs::batched_delete=info`.
 
