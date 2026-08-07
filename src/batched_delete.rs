@@ -113,6 +113,23 @@ pub(crate) const DEFAULT_BATCH_THRESHOLD: usize = 32;
 /// straight to S3.
 pub(crate) const DEFAULT_FAST_FLUSH_THRESHOLD: usize = 8;
 
+/// Issue #562 stage 1: default flusher pool size. Matches
+/// rclone --transfers=4 so the mntrs S3 worker can amortise
+/// a DeleteObjects round-trip the same way rclone amortises
+/// its per-file transfer.
+pub(crate) const DEFAULT_BATCH_WORKER_COUNT: usize = 4;
+
+/// Issue #562 stage 1: hard upper bound on the flusher
+/// pool. Each flusher holds its own `Signer<AwsCredential>`
+/// (cheap clone of region+chain) and shares the
+/// `reqwest::Client` connection pool through `Arc` inside
+/// `WorkerConfig::http`, so memory pressure is bounded by
+/// the channel buffers and the connection pool, not by the
+/// signer. Even so, 16 is a generous cap — a misconfigured
+/// `MNTRS_BATCH_WORKER_COUNT=10000` would otherwise spawn
+/// 10000 clones of the credential chain.
+pub(crate) const MAX_BATCH_WORKER_COUNT: usize = 16;
+
 // ===== Counters (plan #64 stage B) =====
 //
 // Process-static counters, like writeback::PENDING_COUNT. Read
@@ -313,6 +330,21 @@ pub(crate) struct WorkerConfig {
     /// the fast path. Sourced from env
     /// `MNTRS_BATCH_FAST_FLUSH_THRESHOLD` (default 8).
     pub fast_flush_threshold: usize,
+    /// Issue #562 stage 1: number of concurrent flusher
+    /// loops that share `Shared::pending` and call
+    /// `send_chunk_with_retry`. One controller task owns
+    /// the `mpsc::Receiver<Control>` and runs
+    /// `decide_next_action`; `worker_count` flusher tasks
+    /// subscribe to a `tokio::sync::broadcast` and drain
+    /// pending keys in parallel. Each flusher takes the
+    /// `Mutex<Pending>` only across the drain slice, so
+    /// S3 round-trips (`send_chunk_with_retry`) overlap
+    /// and the connection pool in `http` (shared via
+    /// `Arc`) is fully utilised. Sourced from env
+    /// `MNTRS_BATCH_WORKER_COUNT` (default 4, clamp
+    /// 1..=16). Value 1 reproduces the pre-#562
+    /// single-consumer behaviour.
+    pub worker_count: usize,
     pub request_timeout: Duration,
     pub max_retries: u32,
     pub retry_factor: f64,
@@ -353,6 +385,13 @@ impl WorkerConfig {
             "MNTRS_BATCH_FAST_FLUSH_THRESHOLD",
             DEFAULT_FAST_FLUSH_THRESHOLD,
         );
+        // Issue #562 stage 1: number of flusher tasks that
+        // run in parallel. Default 4 matches rclone
+        // --transfers=4; clamp 1..=16 keeps a runaway env
+        // value from spawning dozens of S3 clients. Value 1
+        // reproduces pre-#562 behaviour (single consumer).
+        let worker_count = env_usize("MNTRS_BATCH_WORKER_COUNT", DEFAULT_BATCH_WORKER_COUNT)
+            .clamp(1, MAX_BATCH_WORKER_COUNT);
         Self {
             endpoint,
             bucket,
@@ -365,6 +404,7 @@ impl WorkerConfig {
             flush_delay,
             batch_threshold,
             fast_flush_threshold,
+            worker_count,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_retries: DEFAULT_MAX_RETRIES,
             retry_factor: DEFAULT_RETRY_FACTOR,
@@ -399,10 +439,31 @@ enum Control {
 
 // ===== Spawn =====
 
+/// Issue #562 stage 1: handle bundle returned by `spawn`.
+/// The controller task is the one that owns the
+/// `mpsc::Receiver<Control>` and runs `decide_next_action`;
+/// the flushers are the worker-count pool that drains
+/// `Shared::pending` and calls `send_chunk_with_retry`.
+///
+/// Callers can drop this struct to abandon the workers
+/// (they will exit when `flush_tx` and `wake_tx` go out of
+/// scope); or await the controller handle first and then
+/// the flusher handles for a clean shutdown. MntrsFs
+/// currently takes the drop path (fire-and-forget): all
+/// `BatchedDeleter` clones drop → `flush_tx` drops →
+/// controller's `rx.recv()` returns `None` → controller
+/// exits → `wake_tx` drops → flushers' `wake_rx.recv()`
+/// returns `Err(Sender)` → flushers exit.
+#[allow(dead_code)] // the field set is wiring + shutdown paths
+pub(crate) struct WorkerHandles {
+    pub(crate) controller: tokio::task::JoinHandle<()>,
+    pub(crate) flushers: Vec<tokio::task::JoinHandle<()>>,
+}
+
 pub(crate) fn spawn(
     config: WorkerConfig,
     tombs: std::sync::Arc<dashmap::DashSet<String>>,
-) -> std::io::Result<(BatchedDeleter, tokio::task::JoinHandle<()>)> {
+) -> std::io::Result<(BatchedDeleter, WorkerHandles)> {
     let (tx, rx) = mpsc::channel::<Control>(64);
     let shared = Arc::new(Shared {
         pending: Mutex::new(Pending::new()),
@@ -421,8 +482,32 @@ pub(crate) fn spawn(
     // panics with "there is no reactor running" before the
     // worker even starts. writeback::spawn uses the same
     // pattern (writeback.rs:174).
-    let handle = crate::rt().spawn(worker_loop(config, shared, rx));
-    Ok((deleter, handle))
+    //
+    // Issue #562 stage 1: spawn one controller task (owns
+    // `rx`, runs `decide_next_action`, drives shutdown
+    // semantics) plus `worker_count` flusher tasks. The
+    // flushers subscribe to a broadcast channel for
+    // wakeups; the broadcast sender lives inside the
+    // controller task so the channel closes when the
+    // controller exits, which is how flushers know to
+    // break out of `wake_rx.recv()`.
+    let worker_count = config.worker_count.max(1);
+    let (wake_tx, _wake_rx_for_seed) = tokio::sync::broadcast::channel::<()>(1);
+    let mut flusher_handles = Vec::with_capacity(worker_count);
+    for flusher_id in 0..worker_count {
+        let wake_rx = wake_tx.subscribe();
+        let cfg = config.clone();
+        let sh = shared.clone();
+        flusher_handles.push(crate::rt().spawn(flusher_loop(flusher_id, cfg, sh, wake_rx)));
+    }
+    let controller_handle = crate::rt().spawn(controller_loop(config, shared, rx, wake_tx));
+    Ok((
+        deleter,
+        WorkerHandles {
+            controller: controller_handle,
+            flushers: flusher_handles,
+        },
+    ))
 }
 
 // ===== BatchedDeleter API =====
@@ -665,8 +750,33 @@ impl BatchedDeleter {
 }
 
 // ===== Worker loop =====
+//
+// Issue #562 stage 1: split the single consumer loop into
+// one controller + N flushers. The controller owns the
+// `mpsc::Receiver<Control>` (so `Control::Flush` /
+// `Control::Shutdown` ack semantics stay in one place) and
+// runs the pure `decide_next_action` helper. Flushers
+// subscribe to a `tokio::sync::broadcast` for wakeups and
+// drain `Shared::pending` in parallel — their S3
+// round-trips overlap. The `Mutex<Pending>` inside
+// `flush_one_batch` serialises the drain slice, but the
+// S3 call is outside the lock.
 
-async fn worker_loop(config: WorkerConfig, shared: Arc<Shared>, mut rx: mpsc::Receiver<Control>) {
+/// Controller task. Owns the `mpsc::Receiver<Control>`
+/// channel, the `wake_tx` broadcast sender, the S3 signer,
+/// and shutdown accounting. Runs the pure
+/// `decide_next_action` helper to decide whether to flush
+/// immediately or wait for the deadline. On any flush
+/// decision (size-driven, fast-flush, or deadline-expired)
+/// it both runs `flush_one_batch` locally **and** broadcasts
+/// a wake to the flusher pool so they can drain any
+/// remainder in parallel.
+async fn controller_loop(
+    config: WorkerConfig,
+    shared: Arc<Shared>,
+    mut rx: mpsc::Receiver<Control>,
+    wake_tx: tokio::sync::broadcast::Sender<()>,
+) {
     let signer = match build_signer(&config) {
         Ok(s) => s,
         Err(e) => {
@@ -675,7 +785,7 @@ async fn worker_loop(config: WorkerConfig, shared: Arc<Shared>, mut rx: mpsc::Re
                 bucket = %config.bucket,
                 prefix = %config.prefix,
                 error = %e,
-                "batched_delete: failed to build signer, worker exiting"
+                "batched_delete: failed to build signer, controller exiting"
             );
             shared.accepting.store(false, Ordering::Release);
             fail_all_pending(&shared);
@@ -689,8 +799,9 @@ async fn worker_loop(config: WorkerConfig, shared: Arc<Shared>, mut rx: mpsc::Re
         prefix = %config.prefix,
         batch_size = config.batch_size,
         flush_delay_ms = config.flush_delay.as_millis() as u64,
+        worker_count = config.worker_count,
         credential_source = if config.access_key_id.is_some() { "explicit" } else { "default-chain" },
-        "batched_delete: worker started"
+        "batched_delete: controller started"
     );
 
     loop {
@@ -707,12 +818,22 @@ async fn worker_loop(config: WorkerConfig, shared: Arc<Shared>, mut rx: mpsc::Re
                 Some(Control::Wake) => continue,
                 Some(Control::Flush { done }) => {
                     let flushed = do_flush_all(&config, &signer, &shared).await;
+                    // `do_flush_all` already drained everything
+                    // inside HARD_MAX_KEYS_PER_REQUEST chunks;
+                    // there's no remainder for flushers to pick
+                    // up. Still broadcast — costs one channel
+                    // send — so any flusher that happened to
+                    // miss the previous wake gets an empty-loop
+                    // tick and exits its drain loop on the
+                    // `pending.is_empty()` check inside.
+                    let _ = wake_tx.send(());
                     let _ = done.send(flushed);
                     continue;
                 }
                 Some(Control::Shutdown { drain, done }) => {
                     if drain {
                         let _ = do_flush_all(&config, &signer, &shared).await;
+                        let _ = wake_tx.send(());
                     } else {
                         // Lost without drain — record how many.
                         let lost = {
@@ -764,6 +885,12 @@ async fn worker_loop(config: WorkerConfig, shared: Arc<Shared>, mut rx: mpsc::Re
                     );
                 }
                 flush_one_batch(&config, &signer, &shared, config.batch_size).await;
+                // Wake flushers so they race for any keys that
+                // accumulated after the controller took its
+                // batch but before the broadcast lands. Cheap
+                // to ignore (RecvError::Lagged is swallowed by
+                // the broadcast sender's capacity-1 design).
+                let _ = wake_tx.send(());
             }
             Some(ScheduledAction::WaitForDeadline(deadline)) => {
                 let now = Instant::now();
@@ -774,16 +901,19 @@ async fn worker_loop(config: WorkerConfig, shared: Arc<Shared>, mut rx: mpsc::Re
                     biased;
                     _ = tokio::time::sleep(sleep_dur) => {
                         flush_one_batch(&config, &signer, &shared, config.batch_size).await;
+                        let _ = wake_tx.send(());
                     }
                     ctrl = rx.recv() => match ctrl {
                         Some(Control::Wake) => continue,
                         Some(Control::Flush { done }) => {
                             let flushed = do_flush_all(&config, &signer, &shared).await;
+                            let _ = wake_tx.send(());
                             let _ = done.send(flushed);
                         }
                         Some(Control::Shutdown { drain, done }) => {
                             if drain {
                                 let _ = do_flush_all(&config, &signer, &shared).await;
+                                let _ = wake_tx.send(());
                             } else {
                                 fail_all_pending(&shared);
                             }
@@ -800,9 +930,104 @@ async fn worker_loop(config: WorkerConfig, shared: Arc<Shared>, mut rx: mpsc::Re
         }
     }
 
+    // Wake broadcast sender drops here (it's a local
+    // variable, moved into the function). Flushers'
+    // `wake_rx.recv()` will return `Err(Sender)` and they
+    // exit. Note: the flushers do NOT need a separate
+    // shutdown ack — they simply observe that the
+    // controller is gone.
     tracing::info!(
         target: "mntrs::batched_delete",
-        "batched_delete: worker exiting"
+        "batched_delete: controller exiting"
+    );
+}
+
+/// Flusher task. Blocks on `wake_rx.recv()` until the
+/// controller broadcasts a wake, then drains
+/// `Shared::pending` via `flush_one_batch` in a loop until
+/// the queue is empty. Does NOT call `decide_next_action`
+/// — that's the controller's job. Exits when the broadcast
+/// sender drops (controller exited) or on
+/// `RecvError::Closed`.
+///
+/// Why a separate function (not N copies of the same loop):
+/// `Control::Flush` / `Control::Shutdown` carry
+/// `oneshot::Sender` ack channels; the controller owns
+/// those semantics. Flushers have no such obligations —
+/// they're pure drain workers and exit on sender drop.
+async fn flusher_loop(
+    flusher_id: usize,
+    config: WorkerConfig,
+    shared: Arc<Shared>,
+    mut wake_rx: tokio::sync::broadcast::Receiver<()>,
+) {
+    // Each flusher owns its own signer. The signer holds a
+    // reference to the shared `reqwest::Client` connection
+    // pool inside `config.http` (the builder wraps it in an
+    // Arc), so all N flushers share the pool — that's the
+    // whole point of the refactor.
+    let signer = match build_signer(&config) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                target: "mntrs::batched_delete",
+                flusher_id,
+                error = %e,
+                "batched_delete: flusher failed to build signer, exiting"
+            );
+            return;
+        }
+    };
+
+    tracing::info!(
+        target: "mntrs::batched_delete",
+        flusher_id,
+        worker_count = config.worker_count,
+        "batched_delete: flusher started"
+    );
+
+    loop {
+        // Block until the controller broadcasts. There are
+        // three outcomes from `wake_rx.recv()`:
+        //   * Ok(n)  — a wake (possibly lagged); drain.
+        //   * Err(Sender) — controller exited; exit.
+        //   * Err(Lagged(n)) — too many broadcasts since
+        //     last recv; treat as a wake (we want to drain,
+        //     not exit).
+        match wake_rx.recv().await {
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                // Catch-up: drain whatever is in the queue.
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                // Controller exited (its wake_tx dropped).
+                break;
+            }
+        }
+
+        // Drain in a tight loop: each `flush_one_batch`
+        // takes up to `batch_size` keys under the pending
+        // mutex. As long as a batch is non-empty, there may
+        // be more — try again. The loop exits when the
+        // queue is empty (so we don't spin on a stale wake)
+        // or when the controller has signalled exit via
+        // Closed (handled by the recv above).
+        loop {
+            let pending_len = {
+                let pending = shared.pending.lock().expect("pending mutex poisoned");
+                pending.len()
+            };
+            if pending_len == 0 {
+                break;
+            }
+            flush_one_batch(&config, &signer, &shared, config.batch_size).await;
+        }
+    }
+
+    tracing::info!(
+        target: "mntrs::batched_delete",
+        flusher_id,
+        "batched_delete: flusher exiting"
     );
 }
 
@@ -1436,6 +1661,16 @@ pub(crate) fn parse_delete_objects_response(xml: &str) -> Vec<std::io::Result<()
 mod tests {
     use super::*;
 
+    /// Process-global mutex serialising all tests that
+    /// read/write `MNTRS_BATCH_WORKER_COUNT` via
+    /// `unsafe { std::env::set_var / remove_var }`.
+    /// cargo runs tests in parallel by default; without
+    /// this lock a `set_var` from one test can race a
+    /// `remove_var` from another, leaving the worker_count
+    /// field holding the wrong value when
+    /// `WorkerConfig::from_s3` reads it.
+    static WORKER_COUNT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn fake_job(path: &str) -> PendingDelete {
         PendingDelete {
             relative_path: path.to_string(),
@@ -1576,6 +1811,17 @@ mod tests {
 
     #[test]
     fn worker_config_from_s3_uses_defaults() {
+        // Issue #562 stage 1: the worker_count default lives
+        // in env, so unset it before building the config to
+        // hit the documented default. Take the env lock
+        // first so we don't race the `worker_count_*`
+        // sibling tests that set/unset the same env var.
+        let _guard = WORKER_COUNT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("MNTRS_BATCH_WORKER_COUNT");
+        }
         let cfg = WorkerConfig::from_s3(
             url::Url::parse("http://localhost:9000").unwrap(),
             "b".into(),
@@ -1592,6 +1838,8 @@ mod tests {
         // Issue #553: fast_flush_threshold defaults to the
         // small-batch fix threshold; 0 disables the path.
         assert_eq!(cfg.fast_flush_threshold, DEFAULT_FAST_FLUSH_THRESHOLD);
+        // Issue #562 stage 1: flusher pool defaults to 4.
+        assert_eq!(cfg.worker_count, DEFAULT_BATCH_WORKER_COUNT);
     }
 
     #[test]
@@ -1659,7 +1907,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_then_drop_exits_worker() {
-        let (deleter, handle) = spawn(
+        let (deleter, handles) = spawn(
             WorkerConfig::from_s3(
                 url::Url::parse("http://localhost:9000").unwrap(),
                 "b".into(),
@@ -1673,7 +1921,19 @@ mod tests {
         )
         .unwrap();
         drop(deleter);
-        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        // Issue #562 stage 1: the controller owns the
+        // `mpsc::Receiver<Control>` and the `wake_tx`
+        // sender. When the last `BatchedDeleter` clone is
+        // dropped, `flush_tx` closes → controller's
+        // `rx.recv()` returns `None` → controller exits →
+        // its `wake_tx` drops → flushers' `wake_rx.recv()`
+        // returns `Err(Closed)` → flushers exit. Await
+        // controller first so `wake_tx` is guaranteed
+        // dropped by the time we wait on flushers.
+        let _ = tokio::time::timeout(Duration::from_secs(2), handles.controller).await;
+        for fh in handles.flushers {
+            let _ = tokio::time::timeout(Duration::from_secs(2), fh).await;
+        }
     }
 
     // ===== Plan #64 stage C: tombstone lifecycle =====
@@ -1908,6 +2168,13 @@ mod tests {
             request_timeout: Duration::from_secs(30),
             max_retries: 3,
             fast_flush_threshold,
+            // Issue #562 stage 1: tests for the pure
+            // `decide_next_action` helper don't care about
+            // the flusher pool size (only the controller
+            // calls the helper, and the helper doesn't read
+            // worker_count). Pin to 1 so the test never
+            // accidentally spawns a flusher task.
+            worker_count: 1,
             retry_factor: 2.0,
             retry_initial_backoff: Duration::from_millis(100),
             batch_threshold: 0,
@@ -2018,5 +2285,95 @@ mod tests {
         let cfg = cfg(100, 8);
         let action = decide_next_action(&cfg, 8, None);
         assert!(matches!(action, Some(ScheduledAction::WaitForDeadline(_))));
+    }
+
+    // ===== Issue #562 stage 1: worker_count env wiring =====
+    //
+    // These tests share process-global env state via
+    // `unsafe { std::env::set_var/remove_var }`. cargo runs
+    // tests in parallel by default, so they must serialise
+    // on `WORKER_COUNT_ENV_LOCK` (declared at the top of
+    // this module) so a `set_var` from one test doesn't race
+    // a `remove_var` from another. `worker_config_from_s3_uses_defaults`
+    // also acquires the lock for the same reason.
+
+    /// Default worker_count is 4 when MNTRS_BATCH_WORKER_COUNT
+    /// is unset. Matches rclone --transfers=4 so the S3
+    /// worker pool can amortise DeleteObjects round-trips
+    /// the same way rclone amortises per-file transfers.
+    #[test]
+    fn worker_count_default_is_four() {
+        let _guard = WORKER_COUNT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("MNTRS_BATCH_WORKER_COUNT");
+        }
+        let cfg = WorkerConfig::from_s3(
+            url::Url::parse("http://localhost:9000").unwrap(),
+            "b".into(),
+            "/root/".into(),
+            "us-east-1".into(),
+            Some("ak".into()),
+            Some("sk".into()),
+            reqwest::Client::new(),
+        );
+        assert_eq!(cfg.worker_count, DEFAULT_BATCH_WORKER_COUNT);
+        assert_eq!(cfg.worker_count, 4);
+    }
+
+    /// Out-of-range env values clamp to MAX_BATCH_WORKER_COUNT
+    /// (16). Each flusher holds its own signer clone, and a
+    /// misconfigured `MNTRS_BATCH_WORKER_COUNT=999` must not
+    /// spawn 999 S3 clients.
+    #[test]
+    fn worker_count_clamped_to_max_16() {
+        let _guard = WORKER_COUNT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("MNTRS_BATCH_WORKER_COUNT", "999");
+        }
+        let cfg = WorkerConfig::from_s3(
+            url::Url::parse("http://localhost:9000").unwrap(),
+            "b".into(),
+            "/".into(),
+            "us-east-1".into(),
+            Some("ak".into()),
+            Some("sk".into()),
+            reqwest::Client::new(),
+        );
+        assert_eq!(cfg.worker_count, MAX_BATCH_WORKER_COUNT);
+        assert_eq!(cfg.worker_count, 16);
+        unsafe {
+            std::env::remove_var("MNTRS_BATCH_WORKER_COUNT");
+        }
+    }
+
+    /// Env values <= 0 clamp to 1, reproducing the pre-#562
+    /// single-consumer behaviour. The user's intent for
+    /// `MNTRS_BATCH_WORKER_COUNT=0` is "don't multi-task",
+    /// which the existing impl achieves with one flusher.
+    #[test]
+    fn worker_count_clamped_to_min_1() {
+        let _guard = WORKER_COUNT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("MNTRS_BATCH_WORKER_COUNT", "0");
+        }
+        let cfg = WorkerConfig::from_s3(
+            url::Url::parse("http://localhost:9000").unwrap(),
+            "b".into(),
+            "/".into(),
+            "us-east-1".into(),
+            Some("ak".into()),
+            Some("sk".into()),
+            reqwest::Client::new(),
+        );
+        assert_eq!(cfg.worker_count, 1);
+        unsafe {
+            std::env::remove_var("MNTRS_BATCH_WORKER_COUNT");
+        }
     }
 }
