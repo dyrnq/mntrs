@@ -582,6 +582,19 @@ _recreate_rm_data() {
         shallow_500)
             rm -rf "$MNTRS_MNT/rmtest_shallow_500" 2>/dev/null; mkdir -p "$MNTRS_MNT/rmtest_shallow_500"; rm -rf "$RCLONE_MNT/rmtest_shallow_500" 2>/dev/null; mkdir -p "$RCLONE_MNT/rmtest_shallow_500"; for i in $(seq 1 500); do echo "sh500_$i" > "$MNTRS_MNT/rmtest_shallow_500/f_$(printf '%04d' "$i").txt"; echo "sh500_$i" > "$RCLONE_MNT/rmtest_shallow_500/f_$(printf '%04d' "$i").txt"; done
             rm -rf "$MNTRS_BATCH_MNT/rmtest_shallow_500" 2>/dev/null; mkdir -p "$MNTRS_BATCH_MNT/rmtest_shallow_500"; for i in $(seq 1 500); do echo "sh500_$i" > "$MNTRS_BATCH_MNT/rmtest_shallow_500/f_$(printf '%04d' "$i").txt"; done ;;
+        # Issue #562 stage 0: extend the rm -rf curve from 10/100/500
+        # to 200/1000 so the batched_delete shape (size-driven flush
+        # vs deadline-driven flush vs serial vs parallel) is
+        # visible at the workload sizes the design RFC actually
+        # targets. The `shallow_NNN` labels match the `shallow_100`
+        # and `shallow_500` pattern above: flat single directory of
+        # N files, no nesting, same write-on-rm pattern.
+        shallow_200)
+            rm -rf "$MNTRS_MNT/rmtest_shallow_200" 2>/dev/null; mkdir -p "$MNTRS_MNT/rmtest_shallow_200"; rm -rf "$RCLONE_MNT/rmtest_shallow_200" 2>/dev/null; mkdir -p "$RCLONE_MNT/rmtest_shallow_200"; for i in $(seq 1 200); do echo "sh200_$i" > "$MNTRS_MNT/rmtest_shallow_200/f_$(printf '%04d' "$i").txt"; echo "sh200_$i" > "$RCLONE_MNT/rmtest_shallow_200/f_$(printf '%04d' "$i").txt"; done
+            rm -rf "$MNTRS_BATCH_MNT/rmtest_shallow_200" 2>/dev/null; mkdir -p "$MNTRS_BATCH_MNT/rmtest_shallow_200"; for i in $(seq 1 200); do echo "sh200_$i" > "$MNTRS_BATCH_MNT/rmtest_shallow_200/f_$(printf '%04d' "$i").txt"; done ;;
+        shallow_1000)
+            rm -rf "$MNTRS_MNT/rmtest_shallow_1000" 2>/dev/null; mkdir -p "$MNTRS_MNT/rmtest_shallow_1000"; rm -rf "$RCLONE_MNT/rmtest_shallow_1000" 2>/dev/null; mkdir -p "$RCLONE_MNT/rmtest_shallow_1000"; for i in $(seq 1 1000); do echo "sh1000_$i" > "$MNTRS_MNT/rmtest_shallow_1000/f_$(printf '%04d' "$i").txt"; echo "sh1000_$i" > "$RCLONE_MNT/rmtest_shallow_1000/f_$(printf '%04d' "$i").txt"; done
+            rm -rf "$MNTRS_BATCH_MNT/rmtest_shallow_1000" 2>/dev/null; mkdir -p "$MNTRS_BATCH_MNT/rmtest_shallow_1000"; for i in $(seq 1 1000); do echo "sh1000_$i" > "$MNTRS_BATCH_MNT/rmtest_shallow_1000/f_$(printf '%04d' "$i").txt"; done ;;
         deep)
             rm -rf "$MNTRS_MNT/rmtest_deep_3" 2>/dev/null; rm -rf "$RCLONE_MNT/rmtest_deep_3" 2>/dev/null
             D="$MNTRS_MNT/rmtest_deep_3"; R="$RCLONE_MNT/rmtest_deep_3"
@@ -643,6 +656,25 @@ _recreate_rm_data shallow_500
 bench "rm -rf 500 files" "mntrs" rm -rf "$MNTRS_MNT/rmtest_shallow_500"
 bench "rm -rf 500 files" "mntrs-batched" rm -rf "$MNTRS_BATCH_MNT/rmtest_shallow_500"
 bench "rm -rf 500 files" "rclone" rm -rf "$RCLONE_MNT/rmtest_shallow_500"
+
+# Issue #562 stage 0: extend the curve with 200 and 1000 to
+# characterise the size-driven flush / serialisation shape
+# before designing Stage 1 (N-consumer worker). 200 sits in
+# the gap where fast-flush (issue #553) does not help and the
+# serial batcher overhead dominates; 1000 stress-tests the
+# S3 DeleteObjects key limit (1000/request) at exactly one
+# request per mount.
+echo ""; echo "=== 25.5 rm -rf: shallow 200 files (issue #562 stage 0) ==="; CATEGORY="RmRf"
+_recreate_rm_data shallow_200
+bench "rm -rf 200 files" "mntrs" rm -rf "$MNTRS_MNT/rmtest_shallow_200"
+bench "rm -rf 200 files" "mntrs-batched" rm -rf "$MNTRS_BATCH_MNT/rmtest_shallow_200"
+bench "rm -rf 200 files" "rclone" rm -rf "$RCLONE_MNT/rmtest_shallow_200"
+
+echo ""; echo "=== 25.7 rm -rf: shallow 1000 files (issue #562 stage 0) ==="; CATEGORY="RmRf"
+_recreate_rm_data shallow_1000
+bench "rm -rf 1000 files" "mntrs" rm -rf "$MNTRS_MNT/rmtest_shallow_1000"
+bench "rm -rf 1000 files" "mntrs-batched" rm -rf "$MNTRS_BATCH_MNT/rmtest_shallow_1000"
+bench "rm -rf 1000 files" "rclone" rm -rf "$RCLONE_MNT/rmtest_shallow_1000"
 
 echo ""; echo "=== 26. rm -rf: 3-level deep directory tree ==="; CATEGORY="RmRf"
 _recreate_rm_data deep
