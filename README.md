@@ -334,10 +334,43 @@ worker acked the original delete.
 | `MNTRS_UNLINK_BATCH`           | unset   | 0/1      | Legacy env gate (Stage B). Use `--unlink-batch=` instead. |
 | `MNTRS_BATCH_SIZE`             | 100     | 1..1000  | Threshold for immediate flush (S3 hard limit is 1000) |
 | `MNTRS_BATCH_FLUSH_DELAY_MS`   | 50      | 1..10000 | ms to wait after first enqueue before deadline flush |
+| `MNTRS_BATCH_WORKER_COUNT`     | 4       | 1..16    | Concurrent flushers (matches `rclone --transfers=4`) |
+| `MNTRS_BATCH_PROFILE`          | auto    | auto / small / medium / bulk | Runtime profile selection (issue #562 Stage 3) |
 
 Lower `MNTRS_BATCH_FLUSH_DELAY_MS` (e.g. 10) for latency-sensitive
 workloads; the trade-off is more `DeleteObjects` requests with
 fewer keys each. Higher values (default 50) maximize batch fill.
+
+**Stage 3: workload-adaptive profiles** (issue #562):
+
+The `MNTRS_BATCH_PROFILE` env var picks how the batcher
+classifies the current workload. Three profiles map to three
+(batch_size, flush_delay, fast_flush_threshold) triples:
+
+| Profile | batch_size | flush_delay | fast_flush_threshold | Use case |
+|---------|-----------:|------------:|---------------------:|----------|
+| `small` | 20         | 10 ms       | 4                    | Sparse: IDE saves, single-file unlinks |
+| `medium`| 100        | 50 ms       | 8                    | Mixed: `rm` of small dirs interleaved with other ops |
+| `bulk`  | 500        | 200 ms      | 32                   | Large `rm -rf`, cleanup scripts |
+
+`auto` (default) lets the batcher choose the profile at runtime
+based on a sliding-window `p95` of `pending.len()`. Hysteresis
+(p95 must exceed 50 to flip toward `bulk` or fall below 5 to
+flip toward `small`) and a 5-second cooldown between transitions
+keep a single `rm -rf` from bouncing the system. Profile flips
+are logged via `tracing::info!` on the `mntrs::batched_delete`
+target:
+
+```
+batched_delete: profile transition from=Medium to=Bulk hint_p95=87 cooldown_ms=5000
+```
+
+Pinning a specific profile (`MNTRS_BATCH_PROFILE=medium`) makes
+that profile's `(batch_size, flush_delay, fast_flush_threshold)`
+the only values used at runtime — equivalent to the pre-Stage-3
+behaviour for that profile's triple. Use this when the auto
+classifier's hint doesn't match your workload (e.g. CI benches
+that always issue the same `rm -rf` shape).
 
 **Counters** (process-static, log-scrapable via
 `mntrs::batched_delete` target):
@@ -351,6 +384,16 @@ fewer keys each. Higher values (default 50) maximize batch fill.
   non-idempotent `NoSuchKey`, etc.). Expect 0 in steady state.
 - `shutdown_lost_total` — keys dropped on unclean shutdown
   (drain=false or channel close without explicit shutdown).
+- `threshold_skipped_total` — enqueue calls routed to the strict
+  `delete_backend_strict` path because the pending queue was
+  below `MNTRS_BATCH_THRESHOLD` (issue #530).
+- `fast_flush_total` — flushes fired via the fast-flush branch
+  (pending.len() < fast_flush_threshold at decision time,
+  issue #553).
+- `profile_transitions_total` — profile flips under
+  `MNTRS_BATCH_PROFILE=auto` (issue #562 Stage 3). Under
+  steady-state workload this should stay low (< 10/hour);
+  high values indicate the burst classifier is oscillating.
 
 Enable with `RUST_LOG=info,mntrs::batched_delete=info`.
 
