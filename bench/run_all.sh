@@ -609,6 +609,21 @@ _recreate_rm_data() {
         shallow_1000)
             rm -rf "$MNTRS_MNT/rmtest_shallow_1000" 2>/dev/null; mkdir -p "$MNTRS_MNT/rmtest_shallow_1000"; rm -rf "$RCLONE_MNT/rmtest_shallow_1000" 2>/dev/null; mkdir -p "$RCLONE_MNT/rmtest_shallow_1000"; for i in $(seq 1 1000); do echo "sh1000_$i" > "$MNTRS_MNT/rmtest_shallow_1000/f_$(printf '%04d' "$i").txt"; echo "sh1000_$i" > "$RCLONE_MNT/rmtest_shallow_1000/f_$(printf '%04d' "$i").txt"; done
             rm -rf "$MNTRS_BATCH_MNT/rmtest_shallow_1000" 2>/dev/null; mkdir -p "$MNTRS_BATCH_MNT/rmtest_shallow_1000"; for i in $(seq 1 1000); do echo "sh1000_$i" > "$MNTRS_BATCH_MNT/rmtest_shallow_1000/f_$(printf '%04d' "$i").txt"; done ;;
+        # Probe: extend the rm -rf curve to 5000/10000 to
+        # characterise the bulk regime where Profile::Bulk
+        # (batch_size=500) should shine. The hypothesis is
+        # mntrs-batched's DeleteObjects batching wins
+        # decisively over rclone's per-file DELETE at this
+        # size; if it doesn't, there's a structural issue
+        # beyond the S3 round-trip floor. Used by the
+        # Stage 5 Calibrator nightly investigation; not
+        # part of the official acceptance criteria.
+        shallow_5000)
+            rm -rf "$MNTRS_MNT/rmtest_shallow_5000" 2>/dev/null; mkdir -p "$MNTRS_MNT/rmtest_shallow_5000"; rm -rf "$RCLONE_MNT/rmtest_shallow_5000" 2>/dev/null; mkdir -p "$RCLONE_MNT/rmtest_shallow_5000"; for i in $(seq 1 5000); do echo "sh5000_$i" > "$MNTRS_MNT/rmtest_shallow_5000/f_$(printf '%05d' "$i").txt"; echo "sh5000_$i" > "$RCLONE_MNT/rmtest_shallow_5000/f_$(printf '%05d' "$i").txt"; done
+            rm -rf "$MNTRS_BATCH_MNT/rmtest_shallow_5000" 2>/dev/null; mkdir -p "$MNTRS_BATCH_MNT/rmtest_shallow_5000"; for i in $(seq 1 5000); do echo "sh5000_$i" > "$MNTRS_BATCH_MNT/rmtest_shallow_5000/f_$(printf '%05d' "$i").txt"; done ;;
+        shallow_10000)
+            rm -rf "$MNTRS_MNT/rmtest_shallow_10000" 2>/dev/null; mkdir -p "$MNTRS_MNT/rmtest_shallow_10000"; rm -rf "$RCLONE_MNT/rmtest_shallow_10000" 2>/dev/null; mkdir -p "$RCLONE_MNT/rmtest_shallow_10000"; for i in $(seq 1 10000); do echo "sh10000_$i" > "$MNTRS_MNT/rmtest_shallow_10000/f_$(printf '%05d' "$i").txt"; echo "sh10000_$i" > "$RCLONE_MNT/rmtest_shallow_10000/f_$(printf '%05d' "$i").txt"; done
+            rm -rf "$MNTRS_BATCH_MNT/rmtest_shallow_10000" 2>/dev/null; mkdir -p "$MNTRS_BATCH_MNT/rmtest_shallow_10000"; for i in $(seq 1 10000); do echo "sh10000_$i" > "$MNTRS_BATCH_MNT/rmtest_shallow_10000/f_$(printf '%05d' "$i").txt"; done ;;
         deep)
             rm -rf "$MNTRS_MNT/rmtest_deep_3" 2>/dev/null; rm -rf "$RCLONE_MNT/rmtest_deep_3" 2>/dev/null
             D="$MNTRS_MNT/rmtest_deep_3"; R="$RCLONE_MNT/rmtest_deep_3"
@@ -689,6 +704,18 @@ _recreate_rm_data shallow_1000
 bench "rm -rf 1000 files" "mntrs" rm -rf "$MNTRS_MNT/rmtest_shallow_1000"
 bench "rm -rf 1000 files" "mntrs-batched" rm -rf "$MNTRS_BATCH_MNT/rmtest_shallow_1000"
 bench "rm -rf 1000 files" "rclone" rm -rf "$RCLONE_MNT/rmtest_shallow_1000"
+
+echo ""; echo "=== 25.8 rm -rf: shallow 5000 files (bulk probe) ==="; CATEGORY="RmRf"
+_recreate_rm_data shallow_5000
+bench "rm -rf 5000 files" "mntrs" rm -rf "$MNTRS_MNT/rmtest_shallow_5000"
+bench "rm -rf 5000 files" "mntrs-batched" rm -rf "$MNTRS_BATCH_MNT/rmtest_shallow_5000"
+bench "rm -rf 5000 files" "rclone" rm -rf "$RCLONE_MNT/rmtest_shallow_5000"
+
+echo ""; echo "=== 25.9 rm -rf: shallow 10000 files (bulk probe) ==="; CATEGORY="RmRf"
+_recreate_rm_data shallow_10000
+bench "rm -rf 10000 files" "mntrs" rm -rf "$MNTRS_MNT/rmtest_shallow_10000"
+bench "rm -rf 10000 files" "mntrs-batched" rm -rf "$MNTRS_BATCH_MNT/rmtest_shallow_10000"
+bench "rm -rf 10000 files" "rclone" rm -rf "$RCLONE_MNT/rmtest_shallow_10000"
 
 echo ""; echo "=== 26. rm -rf: 3-level deep directory tree ==="; CATEGORY="RmRf"
 _recreate_rm_data deep
