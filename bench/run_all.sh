@@ -193,6 +193,14 @@ export MNTRS_BATCH_DAEMON_LOG="${MNTRS_BATCH_DAEMON_LOG:-/tmp/mntrs-daemon-batch
 # flip to `medium` for the deep / mixed cases, and flip to
 # `bulk` for the 500/1000 cases — verify by grepping the
 # daemon log for `batched_delete: profile transition`.
+# Issue #562 stage 5: the Calibrator runs alongside the
+# controller and emits `batched_delete: calibrator
+# recommendation` lines when the running workload crosses
+# a trigger. The bench fixture is well-fit by the current
+# Profile defaults so under normal runs this count is 0;
+# verify by grepping `calibrator_recommendations_total` in
+# the snapshot or `calibrator recommendation` in the daemon
+# log.
 MNTRS_UNLINK_BATCH=1 \
 MNTRS_BURST_WINDOW_MS=200 \
 MNTRS_BURST_THRESHOLD=4 \
