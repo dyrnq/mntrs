@@ -372,6 +372,52 @@ behaviour for that profile's triple. Use this when the auto
 classifier's hint doesn't match your workload (e.g. CI benches
 that always issue the same `rm -rf` shape).
 
+**Stage 5: ThresholdCalibrator** (issue #562):
+
+A memory-only background task reads `CounterSnapshot` +
+`BurstObserver::p95()` every 60 s and emits
+`tracing::info!` recommendations when the running workload
+suggests the active profile is mis-configured. **The
+calibrator never auto-applies** — it logs the proposed
+adjustment and bumps `calibrator_recommendations_total`;
+the operator decides whether to set `MNTRS_BATCH_SIZE` /
+`MNTRS_BATCH_FAST_FLUSH_THRESHOLD` on the next mount.
+
+Recommendation triggers:
+
+| Signal | Trigger | Recommendation |
+|---|---|---|
+| `retry_total / flushes_total >= 5%` | retry rate is high; per-key overhead dominates | `RaiseBatchSize` (current × 1.25, clamped 1..=1000) |
+| `avg_chunk_size < 2 && burst_p95 < 5` | sustained small-burst workload | `LowerFastFlushThreshold` (→ 1) |
+| `batch_size > 100 && retry_rate < 1% && avg_chunk_size < batch_size/8` | batch_size is too large for the workload | `LowerBatchSize` (current / 2, clamped 1..=1000) |
+
+Safety guards:
+
+- **Cold-start silence**: no recommendations until
+  `flushes_total >= 100` (avoids mis-firing during the
+  first few minutes of a fresh mount).
+- **Hysteresis**: at most one recommendation per
+  10-minute window regardless of input noise.
+- **Never auto-applies**: the calibrator is
+  observation-only. To act on a recommendation, set
+  `MNTRS_BATCH_SIZE` / `MNTRS_BATCH_FAST_FLUSH_THRESHOLD`
+  on the next mount and observe whether the new nightly
+  ratios improve.
+
+Example log line:
+
+```
+batched_delete: calibrator recommendation (memory-only, NOT auto-applied; set MNTRS_BATCH_SIZE / MNTRS_BATCH_FAST_FLUSH_THRESHOLD on next mount to act)
+  recommendation=lower_fast_flush_threshold current=8 proposed=1
+  avg_chunk_size=1 retry_rate_bps=12 burst_p95=3 current_profile=Medium
+  flushes_total=1247
+```
+
+`calibrator_recommendations_total` is exposed on the
+snapshot so future `/metrics` consumers (Stage 4) can
+chart it. A zero value over a 24h run means the active
+profile is well-fit and no adjustment is suggested.
+
 **Counters** (process-static, log-scrapable via
 `mntrs::batched_delete` target):
 
@@ -401,6 +447,19 @@ that always issue the same `rm -rf` shape).
   (the default for sparse workloads); Medium / Bulk keep
   the XML path because per-key amortisation makes the
   short-circuit's complexity not worth it.
+- `retry_total` — retry decisions across both the multi-key
+  XML path and the single-key DELETE path (issue #562
+  Stage 5 input). `retry_rate_bps = retry_total * 10000 /
+  flushes_total`; the Calibrator triggers `RaiseBatchSize`
+  when this exceeds 500 (5 %).
+- `chunk_size_sum` — cumulative sum of `batch.len()` across
+  every flush (issue #562 Stage 5 input). `avg_chunk_size
+  = chunk_size_sum / flushes_total`; the Calibrator uses
+  it to detect over-batched workloads.
+- `calibrator_recommendations_total` — number of
+  `tracing::info!` recommendation lines emitted by the
+  Calibrator (issue #562 Stage 5). Zero over a 24h run
+  means the active profile is well-fit.
 
 Enable with `RUST_LOG=info,mntrs::batched_delete=info`.
 

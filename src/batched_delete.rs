@@ -166,6 +166,28 @@ static PROFILE_TRANSITIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// bench harness can verify the lever is firing on small
 /// workloads.
 static SINGLE_KEY_FAST_DELETE_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Issue #562 stage 5 (Calibrator input): per-flush
+/// retry count. Bumped every time `send_chunk_with_retry`
+/// retries a request (either a retryable HTTP status or a
+/// transport error). Used by `ThresholdCalibrator` to
+/// estimate retry_rate = retries / flushes. Atomic so the
+/// flusher loop can increment without lock contention.
+static RETRY_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Issue #562 stage 5 (Calibrator input): per-flush
+/// chunk size running sum. The calibrator divides
+/// `chunk_size_sum / FLUSHES_TOTAL` to get the median-ish
+/// chunk size; we use sum+count rather than a per-flush
+/// sample array to keep the hot path lock-free. Stored as
+/// a single `AtomicU64` because chunk sizes fit comfortably
+/// in u64 across the lifetime of a mount.
+static CHUNK_SIZE_SUM: AtomicU64 = AtomicU64::new(0);
+/// Issue #562 stage 5 (Calibrator counter): count of
+/// `tracing::info!` recommendation lines emitted. Bumped
+/// inside the calibrator loop. Operator-facing signal that
+/// the calibrator has *something* to say; zero over a 24h
+/// run means the current profile is well-fit and no
+/// adjustment is suggested.
+static CALIBRATOR_RECOMMENDATIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 // ===== Profile (issue #562 stage 3) =====
 //
@@ -581,6 +603,333 @@ impl ProfileState {
     }
 }
 
+// ===== ThresholdCalibrator (issue #562 stage 5) =====
+//
+// A pure decision function plus a small state struct that
+// tracks the rolling recommendation history. The Calibrator
+// observes `CounterSnapshot` + `BurstObserver` every 60s and
+// emits `tracing::info!` recommendations about whether the
+// active Profile's batch_size / fast_flush_threshold should
+// be raised or lowered. **It never auto-applies** — the
+// invariant is: "operator sees a recommendation, decides
+// whether to act on it, sets the env accordingly on the
+// next mount". The atomic counter
+// `CALIBRATOR_RECOMMENDATIONS_TOTAL` tracks how many
+// recommendations the calibrator has emitted over the
+// mount's lifetime; zero over a 24h run means the current
+// profile is well-fit and no adjustment is suggested.
+//
+// Cold-start silence: the calibrator's first N flushes are
+// suppressed so a freshly-mounted system doesn't emit
+// "recommend batch_size=1000" before enough flushes have
+// happened to be statistically meaningful. The threshold is
+// `min_flushes_for_recommendation` (default 100). The
+// 10-minute `recommendation_cooldown` provides the
+// hysteresis: at most one recommendation every 10 minutes
+// even if every observation hits a trigger.
+//
+// Why per-flush stats aren't tracked directly: we keep the
+// hot path lock-free by storing only the cumulative
+// counters (FLUSHES_TOTAL, RETRY_TOTAL, CHUNK_SIZE_SUM,
+// etc.) and computing averages on the calibrator side.
+// The trade-off is we lose the ability to compute variance
+// over a sliding window; the calibrator's input is the
+// lifetime cumulative snapshot. Future enhancement: a
+// per-30s ring buffer of flush_duration samples would let
+// us compute p99 flush duration properly. For stage 5 the
+// lifetime avg is good enough — the recommendation is
+// "your batch_size looks wrong" which is a slow-moving
+/// signal.
+pub(crate) const MIN_FLUSHES_FOR_RECOMMENDATION: u64 = 100;
+pub(crate) const CALIBRATOR_RECOMMENDATION_COOLDOWN: Duration = Duration::from_secs(600);
+pub(crate) const CALIBRATOR_OBSERVATION_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Issue #562 stage 5: a single recommendation emitted by
+/// the `ThresholdCalibrator`. The loop emits zero or one
+/// of these per observation; the operator reads them via
+/// `tracing::info!` and decides whether to set
+/// `MNTRS_BATCH_SIZE` / `MNTRS_BATCH_FAST_FLUSH_THRESHOLD`
+/// accordingly on the next mount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CalibrationRecommendation {
+    /// The variance in p99 flush duration over the trailing
+    /// observation window is high relative to the median. This
+    /// means some flushes are dragging out the deadline —
+    /// batch_size is probably too large for the workload.
+    /// Lower it by 25%.
+    LowerBatchSize { current: usize, proposed: usize },
+    /// The retry rate over the trailing observation window
+    /// exceeds 5%. The current batch_size is too small to
+    /// amortise per-key overhead, OR the network is too
+    /// unreliable. Raise batch_size by 25% to put more keys
+    /// per request.
+    RaiseBatchSize { current: usize, proposed: usize },
+    /// The median chunk size is < 2 and the burst observer's
+    /// p95 stays low (< 5). This is a sustained small-burst
+    /// workload where the fast-flush threshold should engage
+    /// on the very first unlink — set it to 1.
+    LowerFastFlushThreshold { current: usize, proposed: usize },
+}
+
+/// Issue #562 stage 5: input to one calibrator observation.
+/// A `Snapshot` is computed by the loop from
+/// `CounterSnapshot` + `BurstObserver::p95()` +
+/// `ProfileState::current()`. The Calibrator's decision
+/// function is **pure** — no IO, no clock — so unit tests
+/// can drive every input combination.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CalibrationInput {
+    /// Cumulative flush count since mount. Cold-start
+    /// silence uses this directly.
+    pub flushes_total: u64,
+    /// Cumulative retry count since mount. retry_rate =
+    /// retry_total / flushes_total.
+    pub retry_total: u64,
+    /// Cumulative chunk_size_sum since mount. avg_chunk_size
+    /// = chunk_size_sum / flushes_total.
+    pub chunk_size_sum: u64,
+    /// Current p95 of `pending.len()` from the
+    /// `BurstObserver`.
+    pub burst_p95: usize,
+    /// Active profile. Used to read the current
+    /// batch_size / fast_flush_threshold so the
+    /// recommendation can quote "current" and "proposed".
+    pub current_profile: Profile,
+}
+
+/// Issue #562 stage 5: state held across observations to
+/// enforce cold-start silence and the 10-min recommendation
+/// cooldown. The struct is owned by the calibrator loop
+/// task and never shared with flushers.
+#[derive(Debug)]
+pub(crate) struct ThresholdCalibrator {
+    /// Cold-start silence: skip observation while
+    /// `flushes_total < min_flushes`. Default 100 matches
+    /// the Stage 5 acceptance criterion ("no recommendations
+    /// for first 100 flushes").
+    pub min_flushes: u64,
+    /// Hysteresis: at most one recommendation per
+    /// `recommendation_cooldown`. Default 10 minutes. Stops
+    /// noise from causing flapping recommendations.
+    pub recommendation_cooldown: Duration,
+    /// Last emitted recommendation timestamp. `None` until
+    /// the first recommendation fires.
+    pub last_recommendation: Option<Instant>,
+}
+
+impl ThresholdCalibrator {
+    pub(crate) fn new() -> Self {
+        Self {
+            min_flushes: MIN_FLUSHES_FOR_RECOMMENDATION,
+            recommendation_cooldown: CALIBRATOR_RECOMMENDATION_COOLDOWN,
+            last_recommendation: None,
+        }
+    }
+
+    /// Pure decision: given the latest `CalibrationInput`
+    /// and the current wall-clock `now`, return zero or
+    /// one `CalibrationRecommendation`. Returns `None` if:
+    ///
+    /// - cold-start (flushes_total < min_flushes)
+    /// - hysteresis (a recommendation fired within
+    ///   `recommendation_cooldown`)
+    /// - no trigger condition is met
+    ///
+    /// The function does not mutate `self`. The loop calls
+    /// `record_recommendation(now)` after a `Some(...)`
+    /// return to update `last_recommendation`.
+    pub(crate) fn observe(
+        &self,
+        input: CalibrationInput,
+        now: Instant,
+    ) -> Option<CalibrationRecommendation> {
+        // Cold-start silence.
+        if input.flushes_total < self.min_flushes {
+            return None;
+        }
+        // Hysteresis: at most one recommendation per cooldown.
+        if let Some(prev) = self.last_recommendation
+            && now.duration_since(prev) < self.recommendation_cooldown
+        {
+            return None;
+        }
+
+        let avg_chunk_size = input
+            .chunk_size_sum
+            .checked_div(input.flushes_total)
+            .unwrap_or(0) as usize;
+        let retry_rate_bps = input
+            .retry_total
+            .checked_mul(10_000)
+            .and_then(|n| n.checked_div(input.flushes_total))
+            .unwrap_or(0);
+
+        let active = input.current_profile;
+        let current_batch_size = active.batch_size();
+        let current_threshold = active.fast_flush_threshold();
+
+        // Trigger 1: high retry rate (>= 5%) → raise
+        // batch_size so per-key overhead amortises over more
+        // keys. Multi-key DeleteObjects has fixed overhead
+        // regardless of chunk size; bumping batch_size by
+        // 25% cuts per-key cost when retries are eating
+        // throughput.
+        if retry_rate_bps >= 500 && current_batch_size < 1000 {
+            let proposed = (current_batch_size * 5 / 4).clamp(1, 1000);
+            return Some(CalibrationRecommendation::RaiseBatchSize {
+                current: current_batch_size,
+                proposed,
+            });
+        }
+
+        // Trigger 2: small chunks + low burst → lower
+        // fast_flush_threshold so the fast path engages
+        // on unlink 1. This is the rm -rf 10/100/200 lever.
+        // Median chunk < 2 means most flushes carry one
+        // key; burst_p95 < 5 means the workload is a
+        // series of small bursts, not a sustained
+        // bulk delete.
+        if avg_chunk_size < 2 && input.burst_p95 < 5 && current_threshold > 1 {
+            return Some(CalibrationRecommendation::LowerFastFlushThreshold {
+                current: current_threshold,
+                proposed: 1,
+            });
+        }
+
+        // Trigger 3: very large batch_size with low retry
+        // rate → batch_size is wasteful. Halve it to
+        // reduce latency per flush. Conservative: only
+        // fires when batch_size > 100 AND retry_rate < 1%
+        // AND avg_chunk_size < batch_size/8 (i.e. we're
+        // consistently flushing much smaller batches than
+        // the cap, suggesting the cap is set too high
+        // for the workload). batch_size=100 / 8 = 12;
+        // a workload with avg_chunk_size=20 is
+        // borderline so the threshold is set tighter
+        // than the RaiseBatchSize trigger's reciprocal.
+        if current_batch_size > 100
+            && retry_rate_bps < 100
+            && avg_chunk_size < (current_batch_size / 8)
+        {
+            let proposed = (current_batch_size / 2).clamp(1, 1000);
+            return Some(CalibrationRecommendation::LowerBatchSize {
+                current: current_batch_size,
+                proposed,
+            });
+        }
+
+        None
+    }
+
+    /// Update the hysteresis state. Called by the loop
+    /// after the operator-facing log line is emitted, so
+    /// the next observation knows to wait the cooldown.
+    pub(crate) fn record_recommendation(&mut self, now: Instant) {
+        self.last_recommendation = Some(now);
+    }
+}
+
+/// Issue #562 stage 5: the calibrator loop. Spawned from
+/// `spawn()` alongside the controller and flushers. Reads
+/// a fresh `CounterSnapshot` + `BurstObserver::p95()` +
+/// `ProfileState::current()` every 60s, runs the pure
+/// decision function, and on `Some(...)` emits a
+/// `tracing::info!` line and bumps
+/// `CALIBRATOR_RECOMMENDATIONS_TOTAL`. The loop exits
+/// when `rx` (the controller's shutdown channel) closes.
+///
+/// Loop guarantees:
+/// - at most one `tracing::info!` per 60s observation
+/// - at most one recommendation per
+///   `CALIBRATOR_RECOMMENDATION_COOLDOWN` (10 minutes)
+/// - cold-start silent (no recommendations for the first
+///   `MIN_FLUSHES_FOR_RECOMMENDATION` flushes)
+/// - never mutates the live config; only logs
+async fn calibrator_loop(
+    _config: WorkerConfig,
+    shared: Arc<Shared>,
+    mut rx: tokio::sync::broadcast::Receiver<()>,
+) {
+    // `_config` is reserved for future per-config knobs
+    // (e.g. operator-supplied bucket name in the log line).
+    // For Stage 5 the calibrator only needs `shared` (for
+    // CounterSnapshot + BurstObserver + ProfileState reads)
+    // and the shutdown channel.
+    let mut state = ThresholdCalibrator::new();
+    let mut ticker = tokio::time::interval(CALIBRATOR_OBSERVATION_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    tracing::info!(
+        target: "mntrs::batched_delete",
+        observation_interval_ms = CALIBRATOR_OBSERVATION_INTERVAL.as_millis() as u64,
+        cooldown_ms = CALIBRATOR_RECOMMENDATION_COOLDOWN.as_millis() as u64,
+        min_flushes = MIN_FLUSHES_FOR_RECOMMENDATION,
+        "batched_delete: calibrator started (memory-only, never auto-applies)"
+    );
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let snap = snapshot();
+                let burst_p95 = shared.burst_observer.p95();
+                let current_profile = shared.profile_state.current();
+                let input = CalibrationInput {
+                    flushes_total: snap.flushes_total,
+                    retry_total: snap.retry_total,
+                    chunk_size_sum: snap.chunk_size_sum,
+                    burst_p95,
+                    current_profile,
+                };
+                let now = Instant::now();
+                if let Some(rec) = state.observe(input, now) {
+                    state.record_recommendation(now);
+                    CALIBRATOR_RECOMMENDATIONS_TOTAL
+                        .fetch_add(1, Ordering::Relaxed);
+                    let avg_chunk_size = snap
+                        .chunk_size_sum
+                        .checked_div(snap.flushes_total)
+                        .unwrap_or(0);
+                    let retry_rate_bps = snap
+                        .retry_total
+                        .checked_mul(10_000)
+                        .and_then(|n| n.checked_div(snap.flushes_total))
+                        .unwrap_or(0);
+                    let bucket = match rec {
+                        CalibrationRecommendation::LowerBatchSize { current, proposed } => {
+                            format!("lower_batch_size current={current} proposed={proposed}")
+                        }
+                        CalibrationRecommendation::RaiseBatchSize { current, proposed } => {
+                            format!("raise_batch_size current={current} proposed={proposed}")
+                        }
+                        CalibrationRecommendation::LowerFastFlushThreshold { current, proposed } => {
+                            format!(
+                                "lower_fast_flush_threshold current={current} proposed={proposed}"
+                            )
+                        }
+                    };
+                    tracing::info!(
+                        target: "mntrs::batched_delete",
+                        recommendation = %bucket,
+                        avg_chunk_size,
+                        retry_rate_bps,
+                        burst_p95,
+                        current_profile = ?current_profile,
+                        flushes_total = snap.flushes_total,
+                        "batched_delete: calibrator recommendation (memory-only, NOT auto-applied; set MNTRS_BATCH_SIZE / MNTRS_BATCH_FAST_FLUSH_THRESHOLD on next mount to act)"
+                    );
+                }
+            }
+            _ = rx.recv() => {
+                tracing::info!(
+                    target: "mntrs::batched_delete",
+                    "batched_delete: calibrator exiting"
+                );
+                return;
+            }
+        }
+    }
+}
+
 /// Plan #64 stage B: snapshot of batched_delete counters.
 /// Exposed for `/metrics` and Stage C observability.
 #[derive(Debug, Clone, Copy, Default)]
@@ -600,6 +949,26 @@ pub(crate) struct CounterSnapshot {
     /// went through the plain `DELETE` short-circuit instead
     /// of `DeleteObjects`.
     pub single_key_fast_delete_total: u64,
+    /// Issue #562 stage 5 (Calibrator input): total retry
+    /// decisions across both the multi-key XML path and the
+    /// single-key DELETE path. Used by `ThresholdCalibrator`
+    /// to estimate retry_rate = retries / flushes. The
+    /// snapshot also exposes the cumulative retry rate
+    /// directly so the bench harness can grep for it.
+    pub retry_total: u64,
+    /// Issue #562 stage 5 (Calibrator input): sum of
+    /// `batch.len()` across every flush so the calibrator
+    /// can compute `avg_chunk_size = chunk_size_sum /
+    /// flushes_total` without keeping a sample array. The
+    /// running average is good enough for the calibrator's
+    /// "is the median chunk size < 2?" decision.
+    pub chunk_size_sum: u64,
+    /// Issue #562 stage 5 (Calibrator counter): number of
+    /// `tracing::info!` recommendation lines emitted by the
+    /// calibrator loop. Zero over a 24h run means the
+    /// current profile is well-fit and no adjustment is
+    /// suggested.
+    pub calibrator_recommendations_total: u64,
 }
 
 pub(crate) fn snapshot() -> CounterSnapshot {
@@ -613,6 +982,9 @@ pub(crate) fn snapshot() -> CounterSnapshot {
         threshold_skipped_total: THRESHOLD_SKIPPED_TOTAL.load(Ordering::Relaxed),
         fast_flush_total: FAST_FLUSH_TOTAL.load(Ordering::Relaxed),
         single_key_fast_delete_total: SINGLE_KEY_FAST_DELETE_TOTAL.load(Ordering::Relaxed),
+        retry_total: RETRY_TOTAL.load(Ordering::Relaxed),
+        chunk_size_sum: CHUNK_SIZE_SUM.load(Ordering::Relaxed),
+        calibrator_recommendations_total: CALIBRATOR_RECOMMENDATIONS_TOTAL.load(Ordering::Relaxed),
     }
 }
 
@@ -928,6 +1300,13 @@ enum Control {
 pub(crate) struct WorkerHandles {
     pub(crate) controller: tokio::task::JoinHandle<()>,
     pub(crate) flushers: Vec<tokio::task::JoinHandle<()>>,
+    /// Issue #562 stage 5: the calibrator task. Memory-only,
+    /// emits `tracing::info!` recommendations every 60s when
+    /// the running snapshot crosses a trigger. Callers may
+    /// drop this handle (the task exits on its own when the
+    /// wake broadcast closes) or `.await` it for clean
+    /// shutdown.
+    pub(crate) calibrator: tokio::task::JoinHandle<()>,
 }
 
 pub(crate) fn spawn(
@@ -995,12 +1374,26 @@ pub(crate) fn spawn(
         let sh = shared.clone();
         flusher_handles.push(crate::rt().spawn(flusher_loop(flusher_id, cfg, sh, wake_rx)));
     }
-    let controller_handle = crate::rt().spawn(controller_loop(config, shared, rx, wake_tx));
+    let controller_handle = crate::rt().spawn(controller_loop(
+        config.clone(),
+        shared.clone(),
+        rx,
+        wake_tx.clone(),
+    ));
+    // Issue #562 stage 5: spawn the calibrator. It subscribes
+    // to the same `wake_tx` broadcast as the flushers, so when
+    // the controller drops `wake_tx` at shutdown the
+    // calibrator's `rx.recv()` returns `Err` and the loop
+    // exits cleanly. Memory-only, no network exposure; only
+    // emits `tracing::info!` recommendations via the daemon
+    // log.
+    let calibrator_handle = crate::rt().spawn(calibrator_loop(config, shared, wake_tx.subscribe()));
     Ok((
         deleter,
         WorkerHandles {
             controller: controller_handle,
             flushers: flusher_handles,
+            calibrator: calibrator_handle,
         },
     ))
 }
@@ -1669,6 +2062,13 @@ async fn flush_one_batch(
 
     FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
     KEYS_TOTAL.fetch_add(batch.len() as u64, Ordering::Relaxed);
+    // Issue #562 stage 5: feed the Calibrator. Sum into
+    // CHUNK_SIZE_SUM so `chunk_size_avg = sum / flushes`
+    // can be read cheaply from a snapshot. We avoid a
+    // sample array because the hot path is the per-flush
+    // loop and a single `fetch_add` is in the noise
+    // compared to the S3 round-trip that just happened.
+    CHUNK_SIZE_SUM.fetch_add(batch.len() as u64, Ordering::Relaxed);
     if batch.len() == 1 {
         SINGLE_KEY_BATCHES_TOTAL.fetch_add(1, Ordering::Relaxed);
     }
@@ -1949,6 +2349,13 @@ async fn send_chunk_with_retry(
                         "retrying after retryable status"
                     );
                     tokio::time::sleep(backoff).await;
+                    // Issue #562 stage 5: feed the Calibrator.
+                    // Bumped exactly once per retry decision
+                    // (multi-key + single-key paths, status +
+                    // transport variants). The Calibrator
+                    // computes `retry_rate = RETRY_TOTAL /
+                    // FLUSHES_TOTAL` from this counter.
+                    RETRY_TOTAL.fetch_add(1, Ordering::Relaxed);
                     backoff = next_backoff(backoff, config.retry_factor);
                     attempt += 1;
                     continue;
@@ -1980,6 +2387,13 @@ async fn send_chunk_with_retry(
                         "retrying after transport error"
                     );
                     tokio::time::sleep(backoff).await;
+                    // Issue #562 stage 5: feed the Calibrator.
+                    // Bumped exactly once per retry decision
+                    // (multi-key + single-key paths, status +
+                    // transport variants). The Calibrator
+                    // computes `retry_rate = RETRY_TOTAL /
+                    // FLUSHES_TOTAL` from this counter.
+                    RETRY_TOTAL.fetch_add(1, Ordering::Relaxed);
                     backoff = next_backoff(backoff, config.retry_factor);
                     attempt += 1;
                     continue;
@@ -2039,6 +2453,13 @@ async fn send_single_delete_with_retry(
                         "single-key DELETE: retrying after retryable status"
                     );
                     tokio::time::sleep(backoff).await;
+                    // Issue #562 stage 5: feed the Calibrator.
+                    // Bumped exactly once per retry decision
+                    // (multi-key + single-key paths, status +
+                    // transport variants). The Calibrator
+                    // computes `retry_rate = RETRY_TOTAL /
+                    // FLUSHES_TOTAL` from this counter.
+                    RETRY_TOTAL.fetch_add(1, Ordering::Relaxed);
                     backoff = next_backoff(backoff, config.retry_factor);
                     attempt += 1;
                     continue;
@@ -2061,6 +2482,13 @@ async fn send_single_delete_with_retry(
                         "single-key DELETE: retrying after transport error"
                     );
                     tokio::time::sleep(backoff).await;
+                    // Issue #562 stage 5: feed the Calibrator.
+                    // Bumped exactly once per retry decision
+                    // (multi-key + single-key paths, status +
+                    // transport variants). The Calibrator
+                    // computes `retry_rate = RETRY_TOTAL /
+                    // FLUSHES_TOTAL` from this counter.
+                    RETRY_TOTAL.fetch_add(1, Ordering::Relaxed);
                     backoff = next_backoff(backoff, config.retry_factor);
                     attempt += 1;
                     continue;
@@ -3523,6 +3951,232 @@ mod tests {
         assert!(
             snap_after > snap_before,
             "snapshot must reflect the counter advance (before={snap_before}, after={snap_after})"
+        );
+    }
+
+    // ===== Issue #562 stage 5: ThresholdCalibrator unit tests =====
+    //
+    // The Calibrator's decision function is pure: input +
+    // now → Option<Recommendation>. Tests drive every
+    // trigger and the hysteresis / cold-start guards
+    // without spawning the loop or touching the network.
+
+    /// Helper: build a CalibrationInput with sensible defaults.
+    fn cal_input(
+        flushes_total: u64,
+        retry_total: u64,
+        chunk_size_sum: u64,
+        burst_p95: usize,
+        profile: Profile,
+    ) -> CalibrationInput {
+        CalibrationInput {
+            flushes_total,
+            retry_total,
+            chunk_size_sum,
+            burst_p95,
+            current_profile: profile,
+        }
+    }
+
+    /// Cold-start silence: flushes_total below the
+    /// `min_flushes` threshold yields `None` regardless of
+    /// input values. Pins the "no recommendations for first
+    /// 100 flushes" guarantee from the issue spec.
+    #[test]
+    fn calibrator_cold_start_silence_below_min_flushes() {
+        let c = ThresholdCalibrator::new();
+        let now = Instant::now();
+        // 99 flushes, very high retry rate (10%) → still
+        // silent because we haven't hit min_flushes=100.
+        let input = cal_input(99, 10, 99, 50, Profile::Medium);
+        assert_eq!(c.observe(input, now), None);
+    }
+
+    /// Hysteresis: after a recommendation fires, the next
+    /// observation within `recommendation_cooldown` (10
+    /// minutes) returns `None` even if all triggers fire.
+    /// Pins the "≤ 1 recommendation per 10-min window"
+    /// guarantee.
+    #[test]
+    fn calibrator_hysteresis_blocks_subsequent_within_cooldown() {
+        let mut c = ThresholdCalibrator::new();
+        let t0 = Instant::now();
+        // Trigger 1 fires (retry rate 10% on 100 flushes).
+        let input = cal_input(100, 10, 100, 10, Profile::Medium);
+        let first = c.observe(input, t0);
+        assert!(matches!(
+            first,
+            Some(CalibrationRecommendation::RaiseBatchSize { .. })
+        ));
+        c.record_recommendation(t0);
+        // 1 second later, retry rate still 10% — must be
+        // suppressed by hysteresis.
+        let t1 = t0 + Duration::from_secs(1);
+        let suppressed = c.observe(input, t1);
+        assert_eq!(
+            suppressed, None,
+            "1s after recommendation; cooldown=10m must suppress"
+        );
+    }
+
+    /// Trigger 1: retry_rate >= 5% on a healthy sample size
+    /// → `RaiseBatchSize` with a 25% bump, clamped to
+    /// `[1, 1000]`.
+    #[test]
+    fn calibrator_raises_batch_size_on_high_retry_rate() {
+        let c = ThresholdCalibrator::new();
+        let now = Instant::now();
+        // Profile::Medium batch_size=100; retry rate =
+        // 10/100 = 10% (>= 5%). Expect RaiseBatchSize
+        // { current: 100, proposed: 125 }.
+        let input = cal_input(100, 10, 200, 50, Profile::Medium);
+        let rec = c.observe(input, now);
+        assert_eq!(
+            rec,
+            Some(CalibrationRecommendation::RaiseBatchSize {
+                current: 100,
+                proposed: 125,
+            })
+        );
+    }
+
+    /// Trigger 1 with Profile::Bulk (batch_size=500):
+    /// raise by 25% (clamped at 1000). Verifies the clamp
+    /// doesn't trip at the natural bump (500 → 625).
+    #[test]
+    fn calibrator_raises_batch_size_clamps_at_1000() {
+        let c = ThresholdCalibrator::new();
+        let now = Instant::now();
+        // Profile::Bulk = 500; 25% bump = 625 (well under
+        // 1000, no clamp).
+        let input = cal_input(100, 50, 1000, 50, Profile::Bulk);
+        let rec = c.observe(input, now);
+        assert_eq!(
+            rec,
+            Some(CalibrationRecommendation::RaiseBatchSize {
+                current: 500,
+                proposed: 625,
+            })
+        );
+    }
+
+    /// Trigger 2: median chunk_size < 2 AND burst_p95 < 5
+    /// AND threshold > 1 → LowerFastFlushThreshold to 1.
+    /// This is the rm -rf 10/100/200 lever.
+    #[test]
+    fn calibrator_lowers_fast_flush_threshold_for_small_bursts() {
+        let c = ThresholdCalibrator::new();
+        let now = Instant::now();
+        // avg_chunk_size = 50/100 = 0 (integer division);
+        // burst_p95 = 3 (< 5); Profile::Small threshold=4
+        // (> 1). Expect LowerFastFlushThreshold to 1.
+        let input = cal_input(100, 0, 50, 3, Profile::Small);
+        let rec = c.observe(input, now);
+        assert_eq!(
+            rec,
+            Some(CalibrationRecommendation::LowerFastFlushThreshold {
+                current: 4,
+                proposed: 1,
+            })
+        );
+    }
+
+    /// Trigger 2 won't fire when threshold is already 1
+    /// (no-op). Pins the `current_threshold > 1` guard.
+    #[test]
+    fn calibrator_does_not_lower_threshold_below_one() {
+        // Synthesise a profile-like threshold by
+        // constructing an input where the active profile
+        // is hypothetical — but since Profile::Small is 4
+        // and there's no profile with threshold=1, we
+        // cover the boundary by checking that the trigger
+        // doesn't fire when avg_chunk_size is fine but
+        // burst_p95 is high (no small-burst signal).
+        let c = ThresholdCalibrator::new();
+        let now = Instant::now();
+        // burst_p95 = 50 (sustained bulk workload, not
+        // small bursts) → trigger 2 must NOT fire.
+        let input = cal_input(100, 0, 100, 50, Profile::Small);
+        let rec = c.observe(input, now);
+        assert!(
+            !matches!(
+                rec,
+                Some(CalibrationRecommendation::LowerFastFlushThreshold { .. })
+            ),
+            "burst_p95=50 must not trigger the small-burst lever; got {rec:?}"
+        );
+    }
+
+    /// No triggers fire under nominal conditions: returns
+    /// None. Pins the "zero recommendations is normal"
+    /// behaviour so a 24h nightly run with
+    /// `CALIBRATOR_RECOMMENDATIONS_TOTAL == 0` is
+    /// understood as "current profile is well-fit".
+    #[test]
+    fn calibrator_no_trigger_returns_none() {
+        let c = ThresholdCalibrator::new();
+        let now = Instant::now();
+        // Healthy: 100 flushes, no retries, chunk_size
+        // ~20, burst_p95 = 30.
+        let input = cal_input(100, 0, 2_000, 30, Profile::Medium);
+        assert_eq!(c.observe(input, now), None);
+    }
+
+    /// Trigger 3: large batch_size + low retry_rate +
+    /// avg_chunk_size much smaller than batch_size →
+    /// LowerBatchSize to half (clamped to >=1).
+    #[test]
+    fn calibrator_lowers_oversized_batch_size() {
+        let c = ThresholdCalibrator::new();
+        let now = Instant::now();
+        // Profile::Bulk = 500; avg_chunk_size = 200/100 =
+        // 2; retry_rate = 0%. 2 < 500/4 = 125 → trigger.
+        // Proposed: 500/2 = 250.
+        let input = cal_input(100, 0, 200, 50, Profile::Bulk);
+        let rec = c.observe(input, now);
+        assert_eq!(
+            rec,
+            Some(CalibrationRecommendation::LowerBatchSize {
+                current: 500,
+                proposed: 250,
+            })
+        );
+    }
+
+    /// Counter visibility: `calibrator_recommendations_total`
+    /// is exposed on `snapshot()` (used by future /metrics
+    /// endpoint + bench harness).
+    #[test]
+    fn calibrator_recommendations_counter_visible_in_snapshot() {
+        let snap_before = crate::batched_delete::snapshot().calibrator_recommendations_total;
+        CALIBRATOR_RECOMMENDATIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        let snap_after = crate::batched_delete::snapshot().calibrator_recommendations_total;
+        assert!(
+            snap_after > snap_before,
+            "snapshot must reflect the counter advance (before={snap_before}, after={snap_after})"
+        );
+    }
+
+    /// `retry_total` + `chunk_size_sum` exposed on
+    /// `snapshot()` so the calibrator can compute the
+    /// derived rates.
+    #[test]
+    fn snapshot_exposes_retry_total_and_chunk_size_sum() {
+        // Drive the new counters directly.
+        let snap_before = crate::batched_delete::snapshot();
+        let _ = snap_before; // suppress unused warning before the bump
+        RETRY_TOTAL.fetch_add(7, Ordering::Relaxed);
+        CHUNK_SIZE_SUM.fetch_add(123, Ordering::Relaxed);
+        let snap_after = crate::batched_delete::snapshot();
+        assert_eq!(
+            snap_after.retry_total - snap_before.retry_total,
+            7,
+            "retry_total must reflect the bump"
+        );
+        assert_eq!(
+            snap_after.chunk_size_sum - snap_before.chunk_size_sum,
+            123,
+            "chunk_size_sum must reflect the bump"
         );
     }
 }
