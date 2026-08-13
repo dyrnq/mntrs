@@ -44,7 +44,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -62,14 +62,18 @@ use tokio::sync::{mpsc, oneshot};
 // ===== Constants =====
 
 /// S3 hard limit: at most 1000 object identifiers per DeleteObjects
-/// request. We chunk below this regardless of the configured
-/// `batch_size` so a misconfiguration cannot produce an invalid
-/// request.
+/// request. The opt-in `MNTRS_DELETE_BATCH=1` path chunks below
+/// this so a misconfiguration cannot produce an invalid request.
 pub(crate) const HARD_MAX_KEYS_PER_REQUEST: usize = 1000;
 
-// Plan #64 stage B: per-mount tuning knobs surfaced via
-// environment variables. Defaults preserve the values that the
-// original plan #64 baseline used.
+// Plan #64 stage B: retry knobs (kept). Per-mount tuning knobs
+// (`MNTRS_BATCH_SIZE`, `MNTRS_BATCH_FLUSH_DELAY_MS`,
+// `MNTRS_BATCH_THRESHOLD`, `MNTRS_BATCH_FAST_FLUSH_THRESHOLD`,
+// `MNTRS_BATCH_PROFILE`) were dropped along with the Profile /
+// Calibrator / BurstObserver subsystem in issue #568 stage 6. The
+// batch XML path is still reachable as opt-in via
+// `MNTRS_DELETE_BATCH=1`; the constants below parameterise that
+// opt-in path.
 pub(crate) const DEFAULT_BATCH_SIZE: usize = 100;
 pub(crate) const DEFAULT_FLUSH_DELAY: Duration = Duration::from_millis(50);
 pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -77,58 +81,29 @@ pub(crate) const DEFAULT_MAX_RETRIES: u32 = 3;
 pub(crate) const DEFAULT_RETRY_FACTOR: f64 = 2.0;
 pub(crate) const DEFAULT_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 
-/// Issue #530: caller-side threshold gating. When the batched
-/// deleter's pending queue has fewer than this many entries
-/// at the moment of enqueue, the caller falls through to a
-/// direct strict delete (`delete_backend_strict`) instead of
-/// enqueueing. Why: each enqueued file pays up to
-/// `flush_delay` (50 ms by default) of latency before its S3
-/// DELETE is requested. For small bursts (rm -rf on a few
-/// files), the strict path's `op.delete()` is faster and
-/// simpler. Only when the burst is large enough that one
-/// batched `DeleteObjects` call beats N serial `op.delete()`
-/// calls does the overhead pay for itself — bench crossover
-/// is at ~500 files; threshold 32 is a conservative
-/// approximation that still benefits large `rm -rf` work
-/// without hurting small unlink workloads. Tunable via
-/// `MNTRS_BATCH_THRESHOLD` (0 = always batch, even single
-/// files; default 32).
+/// Issue #530: caller-side threshold gating (kept as a stub for
+/// `UnlinkBurstState::from_env` callers — see `src/lib.rs:492`).
+/// The batched-deleter threshold gate was removed in issue #568
+/// stage 6, but this constant remains so external readers don't
+/// see a breaking constant drop. New code should ignore it.
 pub(crate) const DEFAULT_BATCH_THRESHOLD: usize = 32;
 
-/// Issue #553: fast-flush threshold. When the pending
-/// queue has fewer than this many keys, the worker flushes
-/// immediately instead of waiting out the `flush_delay`
-/// deadline. Reasoning: a single unlink or a 10-file
-/// `rm -rf` mid-burst pays the full `flush_delay` (50 ms by
-/// default) for negligible batching benefit (~1 S3 DELETE
-/// either way). 0 disables the fast path (matches pre-fix
-/// behaviour — every non-full batch waits for the deadline).
-///
-/// Empirical sweet spot from issue 541 run 30865329186:
-/// with batch_size=20 the median partial flush carried
-/// 13-16 keys, so any threshold <= 8 keeps the typical
-/// `rm -rf 100 files` (which accumulates 50-100 keys
-/// before the 50 ms deadline) on the WaitForDeadline
-/// path while shunting stragglers and tail fragments
-/// straight to S3.
-pub(crate) const DEFAULT_FAST_FLUSH_THRESHOLD: usize = 8;
+/// Issue #562 stage 1 (kept): default deleter pool size. Aligned
+/// with rclone `--checkers=8` in issue #568 stage 6 — the N
+/// concurrent single-DELETE workers replace the previous flusher
+/// pool that drove `DeleteObjects` round-trips. Default 8 wins on
+/// every workload size measured in PR #567 nightly.
+pub(crate) const DEFAULT_DELETE_WORKER_COUNT: usize = 8;
 
-/// Issue #562 stage 1: default flusher pool size. Matches
-/// rclone --transfers=4 so the mntrs S3 worker can amortise
-/// a DeleteObjects round-trip the same way rclone amortises
-/// its per-file transfer.
-pub(crate) const DEFAULT_BATCH_WORKER_COUNT: usize = 4;
-
-/// Issue #562 stage 1: hard upper bound on the flusher
-/// pool. Each flusher holds its own `Signer<AwsCredential>`
-/// (cheap clone of region+chain) and shares the
-/// `reqwest::Client` connection pool through `Arc` inside
-/// `WorkerConfig::http`, so memory pressure is bounded by
-/// the channel buffers and the connection pool, not by the
-/// signer. Even so, 16 is a generous cap — a misconfigured
-/// `MNTRS_BATCH_WORKER_COUNT=10000` would otherwise spawn
-/// 10000 clones of the credential chain.
-pub(crate) const MAX_BATCH_WORKER_COUNT: usize = 16;
+/// Issue #562 stage 1 (kept): hard upper bound on the worker
+/// pool. Each worker holds its own `Signer<AwsCredential>` (cheap
+/// clone of region+chain) and shares the `reqwest::Client`
+/// connection pool through `Arc` inside `WorkerConfig::http`, so
+/// memory pressure is bounded by the channel buffers and the
+/// connection pool, not by the signer. Even so, 16 is a generous
+/// cap — a misconfigured `MNTRS_DELETE_WORKER_COUNT=10000` would
+/// otherwise spawn 10000 clones of the credential chain.
+pub(crate) const MAX_DELETE_WORKER_COUNT: usize = 16;
 
 // ===== Counters (plan #64 stage B) =====
 //
@@ -218,15 +193,13 @@ pub(crate) struct PendingDelete {
 }
 
 struct Pending {
-    jobs: Vec<PendingDelete>,
-    deadline: Option<Instant>,
+    jobs: std::collections::VecDeque<PendingDelete>,
 }
 
 impl Pending {
     fn new() -> Self {
         Self {
-            jobs: Vec::with_capacity(DEFAULT_BATCH_SIZE),
-            deadline: None,
+            jobs: std::collections::VecDeque::with_capacity(16),
         }
     }
     fn is_empty(&self) -> bool {
@@ -235,11 +208,27 @@ impl Pending {
     fn len(&self) -> usize {
         self.jobs.len()
     }
-    fn reset_deadline(&mut self, delay: Duration) {
-        self.deadline = Some(Instant::now() + delay);
+    /// Pop one job from the front of the queue (FIFO). Used by the
+    /// deleter loop. **Stage 6 (issue #568):** O(1) via VecDeque
+    /// — the old `flush_one_batch` did `Vec::remove(0)` which was
+    /// O(n) per drain slice; with N concurrent deleters each
+    /// popping one job at a time, the per-call cost is now
+    /// visible on hot paths.
+    fn pop_one(&mut self) -> Option<PendingDelete> {
+        self.jobs.pop_front()
     }
-    fn clear_deadline(&mut self) {
-        self.deadline = None;
+    fn push(&mut self, job: PendingDelete) {
+        self.jobs.push_back(job);
+    }
+    /// Drain the entire queue. Used by the drain worker for the
+    /// `Flush` / `Shutdown { drain: true }` commands (Policy B
+    /// rmdir barrier).
+    fn drain_all(&mut self) -> Vec<PendingDelete> {
+        let drained: Vec<PendingDelete> = self.jobs.drain(..).collect();
+        drained
+    }
+    fn clear(&mut self) {
+        self.jobs.clear();
     }
 }
 
@@ -248,6 +237,18 @@ impl Pending {
 struct Shared {
     pending: Mutex<Pending>,
     accepting: AtomicBool,
+    /// **Stage 6 (issue #568):** edge-triggered wake signal for the
+    /// N deleter loops. `enqueue()` calls `notify_one()` after
+    /// pushing the job; each `deleter_loop()` calls
+    /// `notify.notified().await` to wait for work. Lost
+    /// notifications are safe — the woken deleter drains
+    /// everything in `pending` before sleeping again, so any job
+    /// pushed while no deleter was waiting gets picked up the next
+    /// time a deleter wakes (including a notification stored for
+    /// the next `notified()` call). `flush_tx`-side `Control::Wake`
+    /// commands call `notify_waiters()` to fan out to all
+    /// currently-sleeping deleters at once.
+    notify: tokio::sync::Notify,
     /// Tombstones for paths that have an in-flight write-behind
     /// delete. Owned by MntrsFs (test + production constructors
     /// both pre-build a DashSet and pass its Arc clone here) so
@@ -304,39 +305,15 @@ pub(crate) struct WorkerConfig {
     /// Shared reqwest client — same TLS settings + connection pool
     /// as opendal uses (see `cmd/mount.rs::build_mount_http_client`).
     pub http: reqwest::Client,
-    /// **Stage 6 (issue #568):** kept on `WorkerConfig` for now
-    /// because `flush_one_batch` still takes it as a ceiling on
-    /// the drain slice. Step 2 will drop the field once the
-    /// deleter loop rewrites to `pop_one()`. Sourced from env
-    /// `MNTRS_BATCH_SIZE` (default 100, clamp 1..=1000).
-    pub batch_size: usize,
-    /// **Stage 6 (issue #568):** kept on `WorkerConfig` for now
-    /// so existing `flush_one_batch` / `controller_loop` code
-    /// compiles. The field is unused after the Profile subsystem
-    /// was removed — Step 2 will delete it. Sourced from env
-    /// `MNTRS_BATCH_FLUSH_DELAY_MS` (default 50 ms).
-    pub flush_delay: Duration,
-    /// **Stage 6 (issue #568):** kept on `WorkerConfig` because
-    /// `decide_next_action` still takes it as the fast-flush
-    /// threshold (replacing the old `Profile::fast_flush_threshold()`).
-    /// Step 2 will drop the field once the deleter loop is
-    /// rewritten. Sourced from env
-    /// `MNTRS_BATCH_FAST_FLUSH_THRESHOLD` (default 8).
-    pub fast_flush_threshold: usize,
-    /// Issue #562 stage 1: number of concurrent flusher
-    /// loops that share `Shared::pending` and call
-    /// `send_chunk_with_retry`. One controller task owns
-    /// the `mpsc::Receiver<Control>` and runs
-    /// `decide_next_action`; `worker_count` flusher tasks
-    /// subscribe to a `tokio::sync::broadcast` and drain
-    /// pending keys in parallel. Each flusher takes the
-    /// `Mutex<Pending>` only across the drain slice, so
-    /// S3 round-trips (`send_chunk_with_retry`) overlap
-    /// and the connection pool in `http` (shared via
-    /// `Arc`) is fully utilised. Sourced from env
-    /// `MNTRS_BATCH_WORKER_COUNT` (default 4, clamp
-    /// 1..=16). Value 1 reproduces the pre-#562
-    /// single-consumer behaviour.
+    /// Issue #562 stage 1 (renamed in issue #568 stage 6):
+    /// number of concurrent deleter loops that share
+    /// `Shared::pending`. Each deleter pops one job at a time
+    /// and fires `send_single_delete_with_retry` — rclone-style
+    /// N concurrent single-DELETE Checkers. Default 8 matches
+    /// rclone `--checkers=8`. Sourced from env
+    /// `MNTRS_DELETE_WORKER_COUNT` (default 8, clamp 1..=16).
+    /// Value 1 reproduces the pre-#562 single-consumer
+    /// behaviour.
     pub worker_count: usize,
     pub request_timeout: Duration,
     pub max_retries: u32,
@@ -356,35 +333,19 @@ impl WorkerConfig {
         secret_access_key: Option<String>,
         http: reqwest::Client,
     ) -> Self {
-        // Plan #64 stage B: honor MNTRS_BATCH_SIZE and
-        // MNTRS_BATCH_FLUSH_DELAY_MS env vars for per-mount
-        // tuning. Defaults preserve plan #64 baseline.
-        // **Stage 6 (issue #568):** the env knobs are still
-        // honoured here so the existing bench scripts don't
-        // break, but Step 2 will drop the entire batch_size /
-        // flush_delay / fast_flush_threshold / batch_threshold
-        // surface in favour of `MNTRS_DELETE_WORKER_COUNT` only.
-        let batch_size = env_usize("MNTRS_BATCH_SIZE", DEFAULT_BATCH_SIZE).clamp(1, 1000);
-        let flush_delay_ms = env_u64(
-            "MNTRS_BATCH_FLUSH_DELAY_MS",
-            DEFAULT_FLUSH_DELAY.as_millis() as u64,
-        );
-        let flush_delay = Duration::from_millis(flush_delay_ms.clamp(1, 10_000));
-        // Issue #553: fast-flush threshold. 0 disables the
-        // immediate-flush branch in worker_loop and matches
-        // the pre-fix behaviour (every non-full batch waits
-        // for the deadline).
-        let fast_flush_threshold = env_usize(
-            "MNTRS_BATCH_FAST_FLUSH_THRESHOLD",
-            DEFAULT_FAST_FLUSH_THRESHOLD,
-        );
-        // Issue #562 stage 1: number of flusher tasks that
-        // run in parallel. Default 4 matches rclone
-        // --transfers=4; clamp 1..=16 keeps a runaway env
-        // value from spawning dozens of S3 clients. Value 1
-        // reproduces pre-#562 behaviour (single consumer).
-        let worker_count = env_usize("MNTRS_BATCH_WORKER_COUNT", DEFAULT_BATCH_WORKER_COUNT)
-            .clamp(1, MAX_BATCH_WORKER_COUNT);
+        // Issue #568 stage 6: only `MNTRS_DELETE_WORKER_COUNT`
+        // remains as a tuning knob. The previous batch tuners
+        // (`MNTRS_BATCH_SIZE`, `MNTRS_BATCH_FLUSH_DELAY_MS`,
+        // `MNTRS_BATCH_THRESHOLD`,
+        // `MNTRS_BATCH_FAST_FLUSH_THRESHOLD`, `MNTRS_BATCH_PROFILE`)
+        // were dropped along with the Profile / Calibrator /
+        // BurstObserver subsystem — see the subsystem deletion
+        // commit. The opt-in batch XML path (triggered by
+        // `MNTRS_DELETE_BATCH=1`) re-reads `DEFAULT_BATCH_SIZE` /
+        // `DEFAULT_FLUSH_DELAY` directly and ignores
+        // `MNTRS_BATCH_*` env vars.
+        let worker_count = env_usize("MNTRS_DELETE_WORKER_COUNT", DEFAULT_DELETE_WORKER_COUNT)
+            .clamp(1, MAX_DELETE_WORKER_COUNT);
         Self {
             endpoint,
             bucket,
@@ -393,9 +354,6 @@ impl WorkerConfig {
             access_key_id,
             secret_access_key,
             http,
-            batch_size,
-            flush_delay,
-            fast_flush_threshold,
             worker_count,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_retries: DEFAULT_MAX_RETRIES,
@@ -448,8 +406,25 @@ enum Control {
 /// returns `Err(Sender)` → flushers exit.
 #[allow(dead_code)] // the field set is wiring + shutdown paths
 pub(crate) struct WorkerHandles {
-    pub(crate) controller: tokio::task::JoinHandle<()>,
-    pub(crate) flushers: Vec<tokio::task::JoinHandle<()>>,
+    /// Drain worker — owns the `mpsc::Receiver<Control>`,
+    /// executes `Control::Wake` / `Control::Flush` /
+    /// `Control::Shutdown` commands. Drives the rmdir barrier
+    /// (`Control::Flush`) and the shutdown drain semantics.
+    /// **Stage 6 (issue #568):** the old `controller` field
+    /// was renamed to `drain` because the controller's only
+    /// remaining job is the `Control::Receiver<Control>`-side
+    /// command dispatch; the batching / accumulator / profile
+    /// logic moved out (now per-deleter responsibility, no
+    /// global accumulator).
+    pub(crate) drain: tokio::task::JoinHandle<()>,
+    /// N concurrent single-DELETE workers (default 8). Each
+    /// pops one key at a time from `Shared::pending`, fires
+    /// `send_single_delete_with_retry`, and acks the per-key
+    /// oneshot. **Stage 6 (issue #568):** the old `flushers`
+    /// field was renamed to `deleters` because the worker no
+    /// longer drains a flush batch — every iteration is one
+    /// single DELETE.
+    pub(crate) deleters: Vec<tokio::task::JoinHandle<()>>,
 }
 
 pub(crate) fn spawn(
@@ -457,14 +432,15 @@ pub(crate) fn spawn(
     tombs: std::sync::Arc<dashmap::DashSet<String>>,
 ) -> std::io::Result<(BatchedDeleter, WorkerHandles)> {
     let (tx, rx) = mpsc::channel::<Control>(64);
-    // **Stage 6 (issue #568):** the profile_state +
-    // PROFILE_TRANSITIONS_TOTAL + burst_observer trio was
-    // removed wholesale. spawn now constructs `Shared` without
-    // any of the prior dynamic-tuning state. The Calibrator
-    // loop is also gone (no separate task spawned).
+    // **Stage 6 (issue #568):** Shared now also carries the
+    // `tokio::sync::Notify` used to wake N concurrent deleter
+    // loops. Each `enqueue()` calls `notify_one()`; each
+    // `deleter_loop()` calls `notified().await`. See the
+    // `Shared` doc-comment for the edge-trigger semantics.
     let shared = Arc::new(Shared {
         pending: Mutex::new(Pending::new()),
         accepting: AtomicBool::new(true),
+        notify: tokio::sync::Notify::new(),
         tombs,
     });
     let deleter = BatchedDeleter {
@@ -478,34 +454,29 @@ pub(crate) fn spawn(
     // worker even starts. writeback::spawn uses the same
     // pattern (writeback.rs:174).
     //
-    // Issue #562 stage 1: spawn one controller task (owns
-    // `rx`, runs `decide_next_action`, drives shutdown
-    // semantics) plus `worker_count` flusher tasks. The
-    // flushers subscribe to a broadcast channel for
-    // wakeups; the broadcast sender lives inside the
-    // controller task so the channel closes when the
-    // controller exits, which is how flushers know to
-    // break out of `wake_rx.recv()`.
+    // **Stage 6 (issue #568):** spawn `worker_count` deleter
+    // loops (default 8, rclone-style N concurrent single-DELETE)
+    // plus 1 drain worker that owns the `mpsc::Receiver<Control>`
+    // and dispatches `Control::Wake` (notify all waiters),
+    // `Control::Flush` (sync drain, ack oneshot — rmdir barrier),
+    // and `Control::Shutdown { drain, done }` (drain or fail).
+    // The controller_loop + flusher_loop pair from issue #562
+    // stage 1 was retired: there is no global accumulator
+    // anymore — every push goes straight to a deleter via the
+    // `notify` primitive.
     let worker_count = config.worker_count.max(1);
-    let (wake_tx, _wake_rx_for_seed) = tokio::sync::broadcast::channel::<()>(1);
-    let mut flusher_handles = Vec::with_capacity(worker_count);
-    for flusher_id in 0..worker_count {
-        let wake_rx = wake_tx.subscribe();
+    let mut deleter_handles = Vec::with_capacity(worker_count);
+    for deleter_id in 0..worker_count {
         let cfg = config.clone();
         let sh = shared.clone();
-        flusher_handles.push(crate::rt().spawn(flusher_loop(flusher_id, cfg, sh, wake_rx)));
+        deleter_handles.push(crate::rt().spawn(deleter_loop(deleter_id, cfg, sh)));
     }
-    let controller_handle = crate::rt().spawn(controller_loop(
-        config.clone(),
-        shared.clone(),
-        rx,
-        wake_tx.clone(),
-    ));
+    let drain_handle = crate::rt().spawn(drain_worker_loop(config, shared.clone(), rx));
     Ok((
         deleter,
         WorkerHandles {
-            controller: controller_handle,
-            flushers: flusher_handles,
+            drain: drain_handle,
+            deleters: deleter_handles,
         },
     ))
 }
@@ -543,15 +514,15 @@ impl BatchedDeleter {
         };
         let mut pending = self.shared.pending.lock().expect("pending mutex poisoned");
         let was_empty = pending.is_empty();
-        pending.jobs.push(job);
+        pending.push(job);
         drop(pending);
         if was_empty {
-            // Wake the worker so it doesn't wait out its current
-            // `rx.recv().await` before noticing the new key.
-            // try_send because the channel is bounded and a slow
-            // worker isn't a reason to block the FUSE thread; if
-            // the worker is mid-flush, the next iteration will see
-            // the new pending entries on its own.
+            // **Stage 6 (issue #568):** notify one sleeping
+            // deleter directly. We still send the legacy
+            // `Control::Wake` to the drain worker (cheap; it
+            // just calls `notify_waiters()`) for callers that
+            // race the first-push fast path.
+            self.shared.notify.notify_one();
             let _ = self.flush_tx.try_send(Control::Wake);
         }
         Some(rx)
@@ -585,7 +556,8 @@ impl BatchedDeleter {
         let mut cancelled = 0usize;
         {
             let mut pending = self.shared.pending.lock().expect("pending mutex poisoned");
-            let mut kept = Vec::with_capacity(pending.jobs.len());
+            let mut kept: std::collections::VecDeque<PendingDelete> =
+                std::collections::VecDeque::with_capacity(pending.jobs.len());
             for job in pending.jobs.drain(..) {
                 if job.relative_path == relative_path {
                     let _ = job.result_tx.send(Err(std::io::Error::new(
@@ -594,21 +566,18 @@ impl BatchedDeleter {
                     )));
                     cancelled += 1;
                 } else {
-                    kept.push(job);
+                    kept.push_back(job);
                 }
             }
             pending.jobs = kept;
-            if pending.is_empty() {
-                pending.clear_deadline();
-            }
+            // **Stage 6 (issue #568):** no deadline tracking in
+            // the post-Profile design — the per-key deleter loop
+            // has no flush-coalescing window.
         }
         // Tombstone clear is unconditional: even if no job was
         // pending, the FUSE-side lookup will hit it if the user
-        // did `rm file; sleep 50ms; touch file` (50ms < flush
-        // deadline of 5ms would race, but if user pre-set
-        // MNTRS_BATCH_FLUSH_DELAY_MS=10 or higher, the tombstone
-        // outlives the queue). Clearing on every create() call
-        // is the safest invariant.
+        // did `rm file; sleep; touch file`. Clearing on every
+        // `create()` call is the safest invariant.
         self.shared.tombs.remove(relative_path);
         cancelled
     }
@@ -704,21 +673,47 @@ impl BatchedDeleter {
 // round-trips overlap. The `Mutex<Pending>` inside
 // `flush_one_batch` serialises the drain slice, but the
 // S3 call is outside the lock.
+// **Stage 6 (issue #568):** the previous comment described
+// the issue #562 stage 1 controller + flusher design. Both
+// tasks have been retired; see `drain_worker_loop` and
+// `deleter_loop` below for the rclone-style N-worker
+// concurrent single-DELETE design.
 
-/// Controller task. Owns the `mpsc::Receiver<Control>`
-/// channel, the `wake_tx` broadcast sender, the S3 signer,
-/// and shutdown accounting. Runs the pure
-/// `decide_next_action` helper to decide whether to flush
-/// immediately or wait for the deadline. On any flush
-/// decision (size-driven, fast-flush, or deadline-expired)
-/// it both runs `flush_one_batch` locally **and** broadcasts
-/// a wake to the flusher pool so they can drain any
-/// remainder in parallel.
-async fn controller_loop(
+/// Drain worker task. Owns the `mpsc::Receiver<Control>`,
+/// the S3 signer, and shutdown accounting. Dispatch loop:
+///
+/// * `Control::Wake` — fan-out wake to all currently
+///   sleeping deleters (`Shared::notify.notify_waiters()`).
+///   Used by the caller-side `BatchedDeleter::enqueue` first-
+///   push path to break any deleter out of
+///   `notify.notified().await`. (After the rewrite, deleters
+///   also call `notify_one()` themselves on every push, so the
+///   `Wake` path is mostly a defensive no-op for callers that
+///   race the threshold gate — kept for API compatibility.)
+/// * `Control::Flush { done }` — sync drain of all pending
+///   keys, ack the oneshot with the number flushed. Used by
+///   `BatchedDeleter::flush()` (Policy B rmdir barrier):
+///   the caller blocks until the drain completes so a
+///   subsequent `op.readdir` sees the directory as empty.
+/// * `Control::Shutdown { drain, done }` — graceful shutdown.
+///   `drain=true` flushes pending before exit (typical);
+///   `drain=false` fails all pending oneshots with
+///   `BrokenPipe` and counts them under `SHUTDOWN_LOST_TOTAL`.
+///   The `done` oneshot fires once the drain / fail is
+///   complete.
+///
+/// **Stage 6 (issue #568):** the previous `controller_loop`
+/// also drove the `decide_next_action` accumulator and the
+/// `Mutex<Pending>` deadline tracking. Both responsibilities
+/// moved into per-deleter territory (each deleter pops one
+/// job at a time and runs it through the S3 DELETE pipeline
+/// inline) so the drain worker is purely a command dispatcher
+/// now. The S3 signer is held only for the lifetime of an
+/// in-flight `Control::Flush` (not for the steady state).
+async fn drain_worker_loop(
     config: WorkerConfig,
     shared: Arc<Shared>,
     mut rx: mpsc::Receiver<Control>,
-    wake_tx: tokio::sync::broadcast::Sender<()>,
 ) {
     let signer = match build_signer(&config) {
         Ok(s) => s,
@@ -728,7 +723,7 @@ async fn controller_loop(
                 bucket = %config.bucket,
                 prefix = %config.prefix,
                 error = %e,
-                "batched_delete: failed to build signer, controller exiting"
+                "batched_delete: drain worker failed to build signer, exiting"
             );
             shared.accepting.store(false, Ordering::Release);
             fail_all_pending(&shared);
@@ -740,196 +735,124 @@ async fn controller_loop(
         target: "mntrs::batched_delete",
         bucket = %config.bucket,
         prefix = %config.prefix,
-        batch_size = config.batch_size,
-        flush_delay_ms = config.flush_delay.as_millis() as u64,
         worker_count = config.worker_count,
         credential_source = if config.access_key_id.is_some() { "explicit" } else { "default-chain" },
-        "batched_delete: controller started"
+        "batched_delete: drain worker started"
     );
 
-    loop {
-        // Snapshot pending state under lock; decide what to do.
-        // The decision is delegated to `decide_next_action` so the
-        // threshold logic stays unit-testable (see tests below).
-        //
-        // **Stage 6 (issue #568):** the burst observer + profile
-        // state observer calls are gone. `decide_next_action` now
-        // takes the static `batch_size` / `fast_flush_threshold`
-        // from `WorkerConfig` directly (no per-burst profile
-        // adaptation). Step 3 will rewrite this whole loop into
-        // the rclone-style N-worker concurrent single-DELETE.
-        let action = {
-            let pending = shared.pending.lock().expect("pending mutex poisoned");
-            decide_next_action(
-                config.batch_size,
-                config.fast_flush_threshold,
-                pending.len(),
-                pending.deadline,
-            )
-        };
-
-        match action {
-            None => match rx.recv().await {
-                Some(Control::Wake) => continue,
-                Some(Control::Flush { done }) => {
-                    let flushed = do_flush_all(&config, &signer, &shared).await;
-                    // `do_flush_all` already drained everything
-                    // inside HARD_MAX_KEYS_PER_REQUEST chunks;
-                    // there's no remainder for flushers to pick
-                    // up. Still broadcast — costs one channel
-                    // send — so any flusher that happened to
-                    // miss the previous wake gets an empty-loop
-                    // tick and exits its drain loop on the
-                    // `pending.is_empty()` check inside.
-                    let _ = wake_tx.send(());
-                    let _ = done.send(flushed);
-                    continue;
-                }
-                Some(Control::Shutdown { drain, done }) => {
-                    if drain {
-                        let _ = do_flush_all(&config, &signer, &shared).await;
-                        let _ = wake_tx.send(());
-                    } else {
-                        // Lost without drain — record how many.
-                        let lost = {
-                            let mut p = shared.pending.lock().expect("pending mutex poisoned");
-                            let n = p.jobs.len() as u64;
-                            p.jobs.clear();
-                            n
-                        };
-                        if lost > 0 {
-                            SHUTDOWN_LOST_TOTAL.fetch_add(lost, Ordering::Relaxed);
-                        }
-                        fail_all_pending(&shared);
-                    }
-                    let _ = done.send(());
-                    break;
-                }
-                None => {
-                    // Channel closed without explicit shutdown — same
-                    // accounting as drain=false: lost keys count.
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            Control::Wake => {
+                // Fan out to all currently sleeping deleters.
+                // After the issue #568 rewrite, deleters also
+                // `notify_one()` themselves on every push, so
+                // this is mostly a no-op — but the caller-side
+                // FUSE unlink path still sends `Wake` on the
+                // first push of an empty queue (see
+                // `BatchedDeleter::enqueue`) for the
+                // "break the worker out of `rx.recv().await`"
+                // legacy semantics. `notify_waiters()` is
+                // cheap (one atomic op, no allocation).
+                shared.notify.notify_waiters();
+            }
+            Control::Flush { done } => {
+                let flushed = do_flush_all(&config, &signer, &shared).await;
+                let _ = done.send(flushed);
+            }
+            Control::Shutdown { drain, done } => {
+                if drain {
+                    let _ = do_flush_all(&config, &signer, &shared).await;
+                } else {
                     let lost = {
-                        let p = shared.pending.lock().expect("pending mutex poisoned");
-                        p.jobs.len() as u64
+                        let mut p = shared.pending.lock().expect("pending mutex poisoned");
+                        let n = p.jobs.len() as u64;
+                        p.clear();
+                        n
                     };
                     if lost > 0 {
                         SHUTDOWN_LOST_TOTAL.fetch_add(lost, Ordering::Relaxed);
                     }
                     fail_all_pending(&shared);
-                    break;
                 }
-            },
-            Some(ScheduledAction::FlushBatch { fast }) => {
-                // Issue #553: `fast=true` flushes were triggered by
-                // the small-batch fast-flush branch in
-                // `decide_next_action` (pending.len() <
-                // fast_flush_threshold). They're the fix for the
-                // small-batch regression tracked in #541 — the
-                // deadline wait below would otherwise add 10–50ms
-                // of latency to single-file `rm` and the tail
-                // fragments of `rm -rf`. **Stage 6 (issue #568):**
-                // the `FAST_FLUSH_TOTAL` counter has been dropped
-                // along with the rest of the batch-specific
-                // counters; the `tracing::debug!` line stays as a
-                // breadcrumb for `RUST_LOG=mntrs::batched_delete=debug`
-                // investigations.
-                if fast {
-                    tracing::debug!(
-                        target: "mntrs::batched_delete",
-                        reason = "fast",
-                        "batched_delete: flushing via fast-flush branch"
-                    );
-                }
-                flush_one_batch(&config, &signer, &shared, config.batch_size).await;
-                // Wake flushers so they race for any keys that
-                // accumulated after the controller took its
-                // batch but before the broadcast lands. Cheap
-                // to ignore (RecvError::Lagged is swallowed by
-                // the broadcast sender's capacity-1 design).
-                let _ = wake_tx.send(());
-            }
-            Some(ScheduledAction::WaitForDeadline(deadline)) => {
-                let now = Instant::now();
-                let sleep_dur = deadline
-                    .map(|d| d.saturating_duration_since(now))
-                    .unwrap_or(config.flush_delay);
-                tokio::select! {
-                    biased;
-                    _ = tokio::time::sleep(sleep_dur) => {
-                        flush_one_batch(&config, &signer, &shared, config.batch_size).await;
-                        let _ = wake_tx.send(());
-                    }
-                    ctrl = rx.recv() => match ctrl {
-                        Some(Control::Wake) => continue,
-                        Some(Control::Flush { done }) => {
-                            let flushed = do_flush_all(&config, &signer, &shared).await;
-                            let _ = wake_tx.send(());
-                            let _ = done.send(flushed);
-                        }
-                        Some(Control::Shutdown { drain, done }) => {
-                            if drain {
-                                let _ = do_flush_all(&config, &signer, &shared).await;
-                                let _ = wake_tx.send(());
-                            } else {
-                                fail_all_pending(&shared);
-                            }
-                            let _ = done.send(());
-                            break;
-                        }
-                        None => {
-                            fail_all_pending(&shared);
-                            break;
-                        }
-                    }
-                }
+                let _ = done.send(());
+                break;
             }
         }
     }
 
-    // Wake broadcast sender drops here (it's a local
-    // variable, moved into the function). Flushers'
-    // `wake_rx.recv()` will return `Err(Sender)` and they
-    // exit. Note: the flushers do NOT need a separate
-    // shutdown ack — they simply observe that the
-    // controller is gone.
+    // Channel closed without explicit shutdown — same
+    // accounting as `drain=false`: lost keys count.
+    let lost = {
+        let mut p = shared.pending.lock().expect("pending mutex poisoned");
+        let n = p.jobs.len() as u64;
+        p.clear();
+        n
+    };
+    if lost > 0 {
+        SHUTDOWN_LOST_TOTAL.fetch_add(lost, Ordering::Relaxed);
+    }
+    fail_all_pending(&shared);
     tracing::info!(
         target: "mntrs::batched_delete",
-        "batched_delete: controller exiting"
+        "batched_delete: drain worker exiting"
     );
 }
 
-/// Flusher task. Blocks on `wake_rx.recv()` until the
-/// controller broadcasts a wake, then drains
-/// `Shared::pending` via `flush_one_batch` in a loop until
-/// the queue is empty. Does NOT call `decide_next_action`
-/// — that's the controller's job. Exits when the broadcast
-/// sender drops (controller exited) or on
-/// `RecvError::Closed`.
+/// Deleter worker task. Each instance is a single-DELETE
+/// loop:
+///   1. wait on `Shared::notify.notified()`,
+///   2. pop one job from `Shared::pending` (FIFO),
+///   3. fire `send_single_delete_with_retry` on the key,
+///   4. ack the per-key oneshot + clear the tombstone,
+///   5. loop back to step 1 if more work remains.
 ///
-/// Why a separate function (not N copies of the same loop):
-/// `Control::Flush` / `Control::Shutdown` carry
-/// `oneshot::Sender` ack channels; the controller owns
-/// those semantics. Flushers have no such obligations —
-/// they're pure drain workers and exit on sender drop.
-async fn flusher_loop(
-    flusher_id: usize,
-    config: WorkerConfig,
-    shared: Arc<Shared>,
-    mut wake_rx: tokio::sync::broadcast::Receiver<()>,
-) {
-    // Each flusher owns its own signer. The signer holds a
+/// **Why rclone-style N concurrent single-DELETE?** The
+/// 5000/10000-file probe in PR #567 nightly showed 99.3%
+/// of flushes were batch_size=1 fast flushes — the old
+/// `BatchSize=100 + FlushDelay=50ms` accumulator never
+/// accumulated beyond 1 key in practice on FUSE workloads,
+/// so the per-flush DeleteObjects XML round-trip is pure
+/// overhead. rclone's design (`backend/s3/s3.go:5170` +
+/// `fs/operations/operations.go:599`) is N Checkers each
+/// issuing a single HTTP DELETE in parallel. We mirror that
+/// here: N deleters each pull one key at a time. The
+/// `Mutex<Pending>` is held only across the `pop_front()`
+/// (microseconds); the S3 round-trip is unlocked so all N
+/// deleters run concurrently against the shared
+/// `reqwest::Client` connection pool inside
+/// `WorkerConfig::http`.
+///
+/// **Stage 6 (issue #568):** this replaces the previous
+/// `flusher_loop` (which drained a whole batch via
+/// `flush_one_batch` on a broadcast wake) and the previous
+/// `controller_loop` (which ran `decide_next_action` and
+/// drove the accumulator). Both are gone.
+///
+/// The deleter loop runs forever — there is no graceful
+/// shutdown path for an individual deleter. The drain
+/// worker marks `Shared::accepting = false` on shutdown,
+/// which causes `BatchedDeleter::enqueue` to return `None`;
+/// in-flight jobs continue processing until the queue is
+/// empty. When the drain worker exits it drops the
+/// `Shared::notify` along with everything else, so the
+/// deleter loops lose their wake signal and idle. They
+/// never exit on their own — the destructor of the
+/// `crate::rt()` runtime cleans them up when the mount
+/// process exits.
+async fn deleter_loop(deleter_id: usize, config: WorkerConfig, shared: Arc<Shared>) {
+    // Each deleter owns its own signer. The signer holds a
     // reference to the shared `reqwest::Client` connection
     // pool inside `config.http` (the builder wraps it in an
-    // Arc), so all N flushers share the pool — that's the
-    // whole point of the refactor.
+    // Arc), so all N deleters share the pool — that's the
+    // whole point of the rclone-style N concurrent design.
     let signer = match build_signer(&config) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(
                 target: "mntrs::batched_delete",
-                flusher_id,
+                deleter_id,
                 error = %e,
-                "batched_delete: flusher failed to build signer, exiting"
+                "batched_delete: deleter failed to build signer, exiting"
             );
             return;
         }
@@ -937,224 +860,83 @@ async fn flusher_loop(
 
     tracing::info!(
         target: "mntrs::batched_delete",
-        flusher_id,
+        deleter_id,
         worker_count = config.worker_count,
-        "batched_delete: flusher started"
+        "batched_delete: deleter started"
     );
 
     loop {
-        // Block until the controller broadcasts. There are
-        // three outcomes from `wake_rx.recv()`:
-        //   * Ok(n)  — a wake (possibly lagged); drain.
-        //   * Err(Sender) — controller exited; exit.
-        //   * Err(Lagged(n)) — too many broadcasts since
-        //     last recv; treat as a wake (we want to drain,
-        //     not exit).
-        match wake_rx.recv().await {
-            Ok(_) => {}
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                // Catch-up: drain whatever is in the queue.
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                // Controller exited (its wake_tx dropped).
-                break;
-            }
-        }
+        // Wait for the next enqueue. `notified()` is
+        // edge-triggered: if a `notify_one()` already fired
+        // while we were processing, the next call here returns
+        // immediately. If no work is pending, we sleep here
+        // until the next `notify_one()` / `notify_waiters()`
+        // call.
+        shared.notify.notified().await;
 
-        // Drain in a tight loop: each `flush_one_batch`
-        // takes up to `batch_size` keys under the pending
-        // mutex. As long as a batch is non-empty, there may
-        // be more — try again. The loop exits when the
-        // queue is empty (so we don't spin on a stale wake)
-        // or when the controller has signalled exit via
-        // Closed (handled by the recv above).
+        // Drain everything currently in the queue. The
+        // inner `loop` exits when `pop_one()` returns `None`
+        // — at that point either we're caught up or another
+        // push came in during the drain and we need to
+        // re-arm via the outer `notified().await` (the
+        // pending `notify_one()` from `enqueue()` is already
+        // buffered).
         loop {
-            let pending_len = {
-                let pending = shared.pending.lock().expect("pending mutex poisoned");
-                pending.len()
+            let job = {
+                let mut pending = shared.pending.lock().expect("pending mutex poisoned");
+                pending.pop_one()
             };
-            if pending_len == 0 {
+            let Some(job) = job else {
                 break;
+            };
+
+            // Send the per-key DELETE. This is the bulk of
+            // the deleter's time — the mutex is released
+            // before the await, so N deleters can be
+            // mid-flight on S3 round-trips concurrently.
+            let key = join_key(&config.prefix, &job.relative_path);
+            // `send_single_delete_with_retry` returns a `Vec`
+            // because it was originally designed to take a
+            // chunk; the deleter loop always passes a
+            // single key, so the Vec has length 1.
+            let results = send_single_delete_with_retry(&config, &signer, &key).await;
+            // Unwrap the single-result Vec. Errors here would
+            // be programmer bugs (caller passed an empty
+            // chunk); treat as a transport error.
+            let outcome = results.into_iter().next().unwrap_or_else(|| {
+                Err(std::io::Error::other(
+                    "batched_delete: send_single_delete_with_retry returned empty result",
+                ))
+            });
+
+            // Tally outcome. Per-key counters keep the
+            // legacy semantics: FLUSHES_TOTAL counts flush
+            // attempts (= per-key DELETE requests), KEYS_TOTAL
+            // counts successful keys, FAILURES_TOTAL counts
+            // permanent failures.
+            match &outcome {
+                Ok(()) => {
+                    FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    KEYS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            flush_one_batch(&config, &signer, &shared, config.batch_size).await;
+
+            // Clear the tombstone. Plan #64 stage C: every
+            // terminal outcome clears the tombstone so the
+            // object becomes visible again (write-behind
+            // rm-then-create race fix).
+            shared.tombs.remove(&job.relative_path);
+
+            // Ack the per-key oneshot. The receiver lives in
+            // the FUSE callback (MntrsFs write-behind path);
+            // most callers drop the receiver without observing
+            // it (Policy B write-behind), but tests and strict
+            // callers use it.
+            let _ = job.result_tx.send(outcome);
         }
-    }
-
-    tracing::info!(
-        target: "mntrs::batched_delete",
-        flusher_id,
-        "batched_delete: flusher exiting"
-    );
-}
-
-#[derive(Debug)]
-enum ScheduledAction {
-    /// Flush whatever is in the pending queue right now.
-    /// `fast=true` means the flush was triggered by the
-    /// fast-flush branch (pending.len() < fast_flush_threshold);
-    /// `fast=false` means size-driven (pending.len() >=
-    /// batch_size). The metric increment lives in the match
-    /// arm, not the decision helper, so tests can drive the
-    /// decision without bumping counters.
-    FlushBatch {
-        fast: bool,
-    },
-    WaitForDeadline(Option<Instant>),
-}
-
-/// Decide the next worker action from a snapshot of the
-/// pending queue. Pure function — no locks, no async, no
-/// metrics — so unit tests can exercise the threshold edges
-/// without spawning the worker.
-///
-/// Decision tree:
-///   pending.len() >= profile.batch_size()
-///                                     → FlushBatch { fast: false }
-///   pending.len() == 0                 → None (caller blocks on rx.recv)
-///   pending.len() < profile.fast_flush_threshold() && threshold > 0
-///                                     → FlushBatch { fast: true }
-///   otherwise                         → WaitForDeadline(deadline)
-///
-/// Issue #553: the small-batch fast flush shaves the
-/// `flush_delay` floor (50 ms by default) for single
-/// unlinks and tail fragments of `rm -rf`, where deadline
-/// wait amortises over too few keys to be worth the latency.
-///
-/// Issue #562 stage 3: the thresholds now come from the
-/// active `Profile` (chosen by `ProfileState` based on the
-/// burst observer) rather than the static `WorkerConfig`.
-/// The helper stays a pure function so the 6 existing unit
-/// tests can drive it with a `Profile` literal and observe
-/// the expected decision without touching the state
-/// machine.
-fn decide_next_action(
-    batch_size: usize,
-    fast_flush_threshold: usize,
-    pending_len: usize,
-    deadline: Option<Instant>,
-) -> Option<ScheduledAction> {
-    // **Stage 6 (issue #568):** the Profile enum is gone, so
-    // the helper takes the two thresholds directly from
-    // `WorkerConfig`. Decision tree is identical to the
-    // pre-Stage-3 / pre-Stage-6 version, just inlined.
-    if pending_len >= batch_size {
-        Some(ScheduledAction::FlushBatch { fast: false })
-    } else if pending_len == 0 {
-        None
-    } else if fast_flush_threshold > 0 && pending_len < fast_flush_threshold {
-        Some(ScheduledAction::FlushBatch { fast: true })
-    } else {
-        Some(ScheduledAction::WaitForDeadline(deadline))
-    }
-}
-
-// ===== Flush helpers =====
-
-/// Flush one batch of up to `limit` keys. Updates the deadline for
-/// any remaining keys.
-///
-/// Issue #562 stage 3: the per-flush knobs (`batch_size` and
-/// `flush_delay`) are now read from the active `Profile`
-/// (via `shared.profile_state.current()`) rather than from
-/// the `WorkerConfig` argument. `limit` is treated as a
-/// ceiling — the profile's batch size is the actual target.
-/// We snapshot the profile **once per flush** so a
-/// mid-flush profile flip (the controller's next iteration
-/// may observe a new p95 and flip the profile) doesn't tear
-/// the batch in two different ways mid-flight.
-///
-/// **Stage 6 (issue #568):** the Profile / BurstObserver /
-/// ThresholdCalibrator subsystem was removed wholesale. The
-/// batch_size now comes from `limit` (the caller's cap,
-/// currently `config.batch_size`); the Profile-derived
-/// `profile_batch_size` / `profile_flush_delay` snapshots
-/// are gone. The drain-then-deadline-reset pattern is
-/// unchanged because the same shape works for the
-/// static-threshold path.
-async fn flush_one_batch(
-    config: &WorkerConfig,
-    signer: &Signer<AwsCredential>,
-    shared: &Shared,
-    limit: usize,
-) {
-    let batch = {
-        let mut pending = shared.pending.lock().expect("pending mutex poisoned");
-        if pending.is_empty() {
-            return;
-        }
-        // `limit` (the caller's cap, currently
-        // `config.batch_size`) is the actual target now that
-        // the per-flush profile knob is gone.
-        let take = pending.jobs.len().min(limit);
-        let drained: Vec<PendingDelete> = pending.jobs.drain(..take).collect();
-        if !pending.is_empty() {
-            // **Stage 6:** deadline reset still uses
-            // `config.flush_delay` because the deadline field
-            // is preserved on `Pending` for the opt-in
-            // `MNTRS_DELETE_BATCH=1` path (Step 6). The
-            // default path (`MNTRS_DELETE_BATCH=0`) always
-            // drains immediately, so this reset is a
-            // no-op for that case.
-            pending.reset_deadline(config.flush_delay);
-        } else {
-            pending.clear_deadline();
-        }
-        drained
-    };
-
-    if batch.is_empty() {
-        return;
-    }
-
-    let started = Instant::now();
-    let outcome = send_chunk_with_retry(config, signer, &batch, &config.prefix).await;
-    let elapsed_ms = started.elapsed().as_millis() as u64;
-
-    FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
-    KEYS_TOTAL.fetch_add(batch.len() as u64, Ordering::Relaxed);
-    let (succeeded, not_found, failed) = count_outcome(&outcome);
-    if failed > 0 {
-        FAILURES_TOTAL.fetch_add(failed, Ordering::Relaxed);
-    }
-
-    tracing::info!(
-        target: "mntrs::batched_delete",
-        batch_size = batch.len(),
-        elapsed_ms,
-        succeeded,
-        not_found,
-        failed,
-        reason = "scheduled",
-        "batched_delete: flush"
-    );
-
-    for (job, result) in batch.into_iter().zip(outcome) {
-        // Same tombstone-cleanup-on-ack policy as do_flush_all.
-        // Centralised here so the two flush paths stay in lockstep;
-        // if we ever add a third path, both helpers must converge
-        // on it. `result` is `io::Result<()>`; success clears the
-        // tombstone silently, NotFound/AlreadyExists clear it
-        // silently (idempotent outcome), and any other error logs
-        // an `error!` line then clears the tombstone so the user
-        // can see the object again.
-        match &result {
-            Ok(()) => {
-                shared.tombs.remove(&job.relative_path);
-            }
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound) => {
-                shared.tombs.remove(&job.relative_path);
-            }
-            Err(e) => {
-                tracing::error!(
-                    target: "mntrs::batched_delete",
-                    path = %job.relative_path,
-                    error = %e,
-                    "batched_delete: per-key delete failed; clearing tombstone so object becomes visible again"
-                );
-                shared.tombs.remove(&job.relative_path);
-            }
-        }
-        let _ = job.result_tx.send(result);
     }
 }
 
@@ -1227,7 +1009,9 @@ async fn do_flush_all(
 fn fail_all_pending(shared: &Shared) {
     let jobs = {
         let mut pending = shared.pending.lock().expect("pending mutex poisoned");
-        pending.clear_deadline();
+        // **Stage 6 (issue #568):** no deadline to clear in
+        // the post-Profile design — the per-key deleter loop
+        // has no flush-coalescing window.
         std::mem::take(&mut pending.jobs)
     };
     let count = jobs.len() as u64;
@@ -1992,15 +1776,14 @@ mod tests {
             Some("sk".into()),
             reqwest::Client::new(),
         );
-        assert_eq!(cfg.batch_size, DEFAULT_BATCH_SIZE);
-        assert_eq!(cfg.flush_delay, DEFAULT_FLUSH_DELAY);
         assert_eq!(cfg.request_timeout, DEFAULT_REQUEST_TIMEOUT);
         assert_eq!(cfg.max_retries, DEFAULT_MAX_RETRIES);
-        // Issue #553: fast_flush_threshold defaults to the
-        // small-batch fix threshold; 0 disables the path.
-        assert_eq!(cfg.fast_flush_threshold, DEFAULT_FAST_FLUSH_THRESHOLD);
-        // Issue #562 stage 1: flusher pool defaults to 4.
-        assert_eq!(cfg.worker_count, DEFAULT_BATCH_WORKER_COUNT);
+        // Issue #562 stage 1 + Issue #568 stage 6: worker pool
+        // defaults to 8 (rclone `--checkers=8`). The previous
+        // batch tuners (`batch_size`, `flush_delay`,
+        // `fast_flush_threshold`) were removed along with the
+        // Profile / Calibrator / BurstObserver subsystem.
+        assert_eq!(cfg.worker_count, DEFAULT_DELETE_WORKER_COUNT);
     }
 
     #[test]
@@ -2087,19 +1870,16 @@ mod tests {
         )
         .unwrap();
         drop(deleter);
-        // Issue #562 stage 1: the controller owns the
-        // `mpsc::Receiver<Control>` and the `wake_tx`
-        // sender. When the last `BatchedDeleter` clone is
-        // dropped, `flush_tx` closes → controller's
-        // `rx.recv()` returns `None` → controller exits →
-        // its `wake_tx` drops → flushers' `wake_rx.recv()`
-        // returns `Err(Closed)` → flushers exit. Await
-        // controller first so `wake_tx` is guaranteed
-        // dropped by the time we wait on flushers.
-        let _ = tokio::time::timeout(Duration::from_secs(2), handles.controller).await;
-        for fh in handles.flushers {
-            let _ = tokio::time::timeout(Duration::from_secs(2), fh).await;
-        }
+        // Issue #562 stage 1 + Issue #568 stage 6: the drain
+        // worker owns the `mpsc::Receiver<Control>`. When the
+        // last `BatchedDeleter` clone is dropped, `flush_tx`
+        // closes → drain's `rx.recv()` returns `None` → drain
+        // exits. The deleter loops do not exit on their own
+        // (they idle on `notify.notified().await`); they are
+        // cleaned up when the `crate::rt()` runtime drops.
+        // Awaiting the drain handle is the only thing this
+        // test can verify cleanly.
+        let _ = tokio::time::timeout(Duration::from_secs(2), handles.drain).await;
     }
 
     // ===== Plan #64 stage C: tombstone lifecycle =====
@@ -2118,15 +1898,8 @@ mod tests {
         let shared = std::sync::Arc::new(Shared {
             pending: Mutex::new(Pending::new()),
             accepting: AtomicBool::new(true),
-            // Issue #530: tests use threshold 0 to disable
-            // gating — they don't exercise the
-            // enqueue-returns-None branch and want a clean
-            // "always enqueue" path.
+            notify: tokio::sync::Notify::new(),
             tombs: tombs.clone(),
-            // Issue #562 stage 3: tests don't exercise the
-            // observer / profile state paths. Use the default
-            // initial profile (Medium) so any incidental
-            // reads in the future don't trip on a default.
         });
         let (tx, _rx) = mpsc::channel::<Control>(8);
         let deleter = BatchedDeleter {
@@ -2139,7 +1912,7 @@ mod tests {
         {
             let mut pending = shared.pending.lock().unwrap();
             let (otx, _orx) = oneshot::channel();
-            pending.jobs.push(PendingDelete {
+            pending.push(PendingDelete {
                 relative_path: "p".into(),
                 result_tx: otx,
             });
@@ -2168,14 +1941,8 @@ mod tests {
         let shared = std::sync::Arc::new(Shared {
             pending: Mutex::new(Pending::new()),
             accepting: AtomicBool::new(true),
-            // Issue #530: tests use threshold 0 to disable
-            // gating — they don't exercise the
-            // enqueue-returns-None branch and want a clean
-            // "always enqueue" path.
+            notify: tokio::sync::Notify::new(),
             tombs: tombs.clone(),
-            // Issue #562 stage 3: see the cancel_pending test
-            // above for rationale. Stub values; the cancel
-            // paths don't read the observer or profile.
         });
         let (tx, _rx) = mpsc::channel::<Control>(8);
         let deleter = BatchedDeleter {
@@ -2195,13 +1962,8 @@ mod tests {
         let shared = std::sync::Arc::new(Shared {
             pending: Mutex::new(Pending::new()),
             accepting: AtomicBool::new(true),
-            // Issue #530: tests use threshold 0 to disable
-            // gating — they don't exercise the
-            // enqueue-returns-None branch and want a clean
-            // "always enqueue" path.
+            notify: tokio::sync::Notify::new(),
             tombs: tombs.clone(),
-            // Issue #562 stage 3: see the cancel_pending test
-            // above for rationale.
         });
         let (tx, _rx) = mpsc::channel::<Control>(8);
         let deleter = BatchedDeleter {
@@ -2237,6 +1999,7 @@ mod tests {
         let shared = std::sync::Arc::new(Shared {
             pending: Mutex::new(Pending::new()),
             accepting: AtomicBool::new(true),
+            notify: tokio::sync::Notify::new(),
             tombs: tombs.clone(),
         });
         let (tx, _rx) = mpsc::channel::<Control>(8);
@@ -2249,148 +2012,23 @@ mod tests {
 
     // ===== decide_next_action tests (Issue #553) =====
     //
-    // `decide_next_action` is the pure helper that picks the
-    // worker's next action. It takes a snapshot of the pending
-    // queue and the WorkerConfig and returns the same ScheduledAction
-    // the worker would pick — without locks, async, or metrics.
-    // That's what makes these tests cheap and deterministic: no
-    // network, no sleep, no shared atomics.
+    // **Stage 6 (issue #568):** the `decide_next_action` helper,
+    // the `ScheduledAction` enum, and the entire fast-flush /
+    // wait-for-deadline accumulator were removed along with the
+    // Profile / Calibrator / BurstObserver subsystem. The new
+    // design (rclone-style N concurrent single-DELETE) has no
+    // decision logic to test — each deleter pops one key, fires
+    // `send_single_delete_with_retry`, and loops. The tests
+    // below that previously exercised `decide_next_action`
+    // (`decide_empty_queue_returns_none`,
+    // `decide_full_batch_returns_size_driven_flush`,
+    // `decide_above_batch_size_also_size_driven`,
+    // `decide_small_batch_fast_flushes_when_threshold_set`,
+    // `decide_middle_band_waits_for_deadline`,
+    // `decide_threshold_is_strict_less_than`,
+    // `decide_threshold_zero_disables_fast_branch`) are gone.
 
-    fn cfg(batch_size: usize, fast_flush_threshold: usize) -> WorkerConfig {
-        WorkerConfig {
-            bucket: "b".into(),
-            prefix: "/".into(),
-            region: "us-east-1".into(),
-            endpoint: url::Url::parse("http://localhost:9000").unwrap(),
-            access_key_id: None,
-            secret_access_key: None,
-            http: reqwest::Client::new(),
-            batch_size,
-            // **Stage 6 (issue #568):** the field is kept on
-            // `WorkerConfig` because `flush_one_batch` still
-            // reads it for the deadline reset. Default to 50 ms
-            // so the existing tests don't change behaviour.
-            flush_delay: Duration::from_millis(50),
-            request_timeout: Duration::from_secs(30),
-            max_retries: 3,
-            fast_flush_threshold,
-            // Issue #562 stage 1: tests for the pure
-            // `decide_next_action` helper don't care about
-            // the flusher pool size (only the controller
-            // calls the helper, and the helper doesn't read
-            // worker_count). Pin to 1 so the test never
-            // accidentally spawns a flusher task.
-            worker_count: 1,
-            retry_factor: 2.0,
-            retry_initial_backoff: Duration::from_millis(100),
-        }
-    }
-
-    /// Test helper: build a synthetic decision context.
-    /// **Stage 6 (issue #568):** the `Profile` parameter was
-    /// replaced by `(batch_size, fast_flush_threshold)` since
-    /// the Profile enum is gone. The thresholds (100/8) match
-    /// the pre-Stage-3 defaults, so the production code path is
-    /// exercised.
-    fn decide_for(pending_len: usize, deadline: Option<Instant>) -> Option<ScheduledAction> {
-        decide_next_action(
-            DEFAULT_BATCH_SIZE,
-            DEFAULT_FAST_FLUSH_THRESHOLD,
-            pending_len,
-            deadline,
-        )
-    }
-
-    #[test]
-    fn decide_empty_queue_returns_none() {
-        // Empty queue → worker should block on rx.recv(), not
-        // spin doing nothing.
-        assert!(decide_for(0, None).is_none());
-    }
-
-    #[test]
-    fn decide_full_batch_returns_size_driven_flush() {
-        // pending.len() == batch_size → flush, fast=false
-        // (size-driven path).
-        let action = decide_for(100, None);
-        match action {
-            Some(ScheduledAction::FlushBatch { fast }) => assert!(!fast),
-            other => panic!("expected FlushBatch {{ fast: false }}, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn decide_above_batch_size_also_size_driven() {
-        // pending.len() > batch_size → still size-driven flush.
-        // Belt-and-suspenders against off-by-one in the comparison.
-        let action = decide_for(137, None);
-        match action {
-            Some(ScheduledAction::FlushBatch { fast }) => assert!(!fast),
-            other => panic!("expected FlushBatch {{ fast: false }}, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn decide_small_batch_fast_flushes_when_threshold_set() {
-        // pending.len() < fast_flush_threshold (8) → fast
-        // flush. This is the core #541 fix: skip the
-        // flush_delay wait when there's not enough work to
-        // amortise it.
-        for &n in &[1usize, 2, 7] {
-            let action = decide_for(n, None);
-            match action {
-                Some(ScheduledAction::FlushBatch { fast }) => assert!(fast, "n={n}"),
-                other => panic!("n={n}: expected FlushBatch {{ fast: true }}, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn decide_middle_band_waits_for_deadline() {
-        // pending.len() in [fast_flush_threshold, batch_size) →
-        // wait for deadline. This is the "true batching" band:
-        // enough keys to amortise the deadline wait, not enough
-        // to trigger size-driven flush.
-        let deadline = Some(Instant::now() + Duration::from_millis(20));
-        for &n in &[8usize, 9, 50, 99] {
-            let action = decide_for(n, deadline);
-            match action {
-                Some(ScheduledAction::WaitForDeadline(d)) => assert_eq!(d, deadline, "n={n}"),
-                other => panic!("n={n}: expected WaitForDeadline, got {other:?}"),
-            }
-        }
-    }
-
-    /// Regression guard for the strict-`<` semantics at the
-    /// fast_flush_threshold boundary. **Stage 6 (issue #568):**
-    /// `pending_len == fast_flush_threshold` falls into the
-    /// wait band, not the fast branch.
-    #[test]
-    fn decide_threshold_is_strict_less_than() {
-        // pending_len == fast_flush_threshold is NOT a fast
-        // flush — it's the first value in the wait band.
-        // This is the strict `<` semantics that keeps the
-        // middle band non-empty.
-        let action = decide_for(8, None);
-        assert!(matches!(action, Some(ScheduledAction::WaitForDeadline(_))));
-    }
-
-    /// **Stage 6 (issue #568):** `fast_flush_threshold = 0`
-    /// disables the fast branch entirely (matches pre-#541
-    /// behaviour where every non-full batch waited for the
-    /// deadline).
-    #[test]
-    fn decide_threshold_zero_disables_fast_branch() {
-        let action = decide_next_action(100, 0, 1, None);
-        // n=1 < batch_size (100) and threshold=0 → fall
-        // through to the wait branch.
-        assert!(
-            matches!(action, Some(ScheduledAction::WaitForDeadline(_))),
-            "threshold=0 must disable fast branch; got {action:?}"
-        );
-    }
-
-    // ===== Issue #562 stage 1: worker_count env wiring =====
+    // ===== Issue #562 stage 1 + Issue #568 stage 6: worker_count env wiring =====
     //
     // These tests share process-global env state via
     // `unsafe { std::env::set_var/remove_var }`. cargo runs
@@ -2399,18 +2037,26 @@ mod tests {
     // this module) so a `set_var` from one test doesn't race
     // a `remove_var` from another. `worker_config_from_s3_uses_defaults`
     // also acquires the lock for the same reason.
+    //
+    // **Stage 6 (issue #568):** the env var was renamed from
+    // `MNTRS_BATCH_WORKER_COUNT` to `MNTRS_DELETE_WORKER_COUNT`
+    // (the old name still worked with the old flusher pool; the
+    // new N-deleter pool is conceptually different — single-DELETE
+    // per worker, no batching). The default also moved from 4
+    // (rclone `--transfers=4` analogy) to 8 (rclone
+    // `--checkers=8` analogy).
 
-    /// Default worker_count is 4 when MNTRS_BATCH_WORKER_COUNT
-    /// is unset. Matches rclone --transfers=4 so the S3
-    /// worker pool can amortise DeleteObjects round-trips
-    /// the same way rclone amortises per-file transfers.
+    /// Default worker_count is 8 when MNTRS_DELETE_WORKER_COUNT
+    /// is unset. Matches rclone `--checkers=8` so the S3
+    /// worker pool can issue N concurrent single-DELETE
+    /// round-trips the same way rclone Checkers do.
     #[test]
-    fn worker_count_default_is_four() {
+    fn worker_count_default_is_eight() {
         let _guard = WORKER_COUNT_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         unsafe {
-            std::env::remove_var("MNTRS_BATCH_WORKER_COUNT");
+            std::env::remove_var("MNTRS_DELETE_WORKER_COUNT");
         }
         let cfg = WorkerConfig::from_s3(
             url::Url::parse("http://localhost:9000").unwrap(),
@@ -2421,13 +2067,13 @@ mod tests {
             Some("sk".into()),
             reqwest::Client::new(),
         );
-        assert_eq!(cfg.worker_count, DEFAULT_BATCH_WORKER_COUNT);
-        assert_eq!(cfg.worker_count, 4);
+        assert_eq!(cfg.worker_count, DEFAULT_DELETE_WORKER_COUNT);
+        assert_eq!(cfg.worker_count, 8);
     }
 
-    /// Out-of-range env values clamp to MAX_BATCH_WORKER_COUNT
-    /// (16). Each flusher holds its own signer clone, and a
-    /// misconfigured `MNTRS_BATCH_WORKER_COUNT=999` must not
+    /// Out-of-range env values clamp to MAX_DELETE_WORKER_COUNT
+    /// (16). Each deleter holds its own signer clone, and a
+    /// misconfigured `MNTRS_DELETE_WORKER_COUNT=999` must not
     /// spawn 999 S3 clients.
     #[test]
     fn worker_count_clamped_to_max_16() {
@@ -2435,7 +2081,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         unsafe {
-            std::env::set_var("MNTRS_BATCH_WORKER_COUNT", "999");
+            std::env::set_var("MNTRS_DELETE_WORKER_COUNT", "999");
         }
         let cfg = WorkerConfig::from_s3(
             url::Url::parse("http://localhost:9000").unwrap(),
@@ -2446,24 +2092,24 @@ mod tests {
             Some("sk".into()),
             reqwest::Client::new(),
         );
-        assert_eq!(cfg.worker_count, MAX_BATCH_WORKER_COUNT);
+        assert_eq!(cfg.worker_count, MAX_DELETE_WORKER_COUNT);
         assert_eq!(cfg.worker_count, 16);
         unsafe {
-            std::env::remove_var("MNTRS_BATCH_WORKER_COUNT");
+            std::env::remove_var("MNTRS_DELETE_WORKER_COUNT");
         }
     }
 
     /// Env values <= 0 clamp to 1, reproducing the pre-#562
     /// single-consumer behaviour. The user's intent for
-    /// `MNTRS_BATCH_WORKER_COUNT=0` is "don't multi-task",
-    /// which the existing impl achieves with one flusher.
+    /// `MNTRS_DELETE_WORKER_COUNT=0` is "don't multi-task",
+    /// which the existing impl achieves with one deleter.
     #[test]
     fn worker_count_clamped_to_min_1() {
         let _guard = WORKER_COUNT_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         unsafe {
-            std::env::set_var("MNTRS_BATCH_WORKER_COUNT", "0");
+            std::env::set_var("MNTRS_DELETE_WORKER_COUNT", "0");
         }
         let cfg = WorkerConfig::from_s3(
             url::Url::parse("http://localhost:9000").unwrap(),
@@ -2476,7 +2122,7 @@ mod tests {
         );
         assert_eq!(cfg.worker_count, 1);
         unsafe {
-            std::env::remove_var("MNTRS_BATCH_WORKER_COUNT");
+            std::env::remove_var("MNTRS_DELETE_WORKER_COUNT");
         }
     }
 }
