@@ -187,6 +187,12 @@ echo "  $(date -Iseconds): mntrs mount returned (exit=$?)"
 # The default policy at runtime is unchanged.
 echo "  $(date -Iseconds): starting mntrs-batched mount (MNTRS_UNLINK_BATCH=1, fast-path thresholds)..."
 export MNTRS_BATCH_DAEMON_LOG="${MNTRS_BATCH_DAEMON_LOG:-/tmp/mntrs-daemon-batch.log}"
+# Issue #562 stage 3: leave MNTRS_BATCH_PROFILE unset so the
+# auto profile is exercised end-to-end. The burst classifier
+# should keep the system in `small` for `rm -rf 10/100`,
+# flip to `medium` for the deep / mixed cases, and flip to
+# `bulk` for the 500/1000 cases — verify by grepping the
+# daemon log for `batched_delete: profile transition`.
 MNTRS_UNLINK_BATCH=1 \
 MNTRS_BURST_WINDOW_MS=200 \
 MNTRS_BURST_THRESHOLD=4 \

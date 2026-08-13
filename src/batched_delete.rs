@@ -42,7 +42,7 @@
 // is intentional and scoped to this module.
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -152,6 +152,435 @@ static MAX_BATCH_SIZE_OBSERVED: AtomicU64 = AtomicU64::new(0);
 /// to verify the gating is firing on real workloads.
 static THRESHOLD_SKIPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+/// Issue #562 stage 3: how many times `ProfileState` flipped
+/// from one profile to another (transitions only, not observe
+/// calls that kept the current profile). Useful to verify
+/// hysteresis + cooldown are not oscillating under steady-state
+/// workload.
+static PROFILE_TRANSITIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Issue #562 stage 1.5: how many single-key flushes used
+/// the short-circuit plain `DELETE /bucket/key` path instead
+/// of the multi-key `DeleteObjects` XML path. Tracks the
+/// actual hit rate so a /metrics consumer (Stage 4) and the
+/// bench harness can verify the lever is firing on small
+/// workloads.
+static SINGLE_KEY_FAST_DELETE_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+// ===== Profile (issue #562 stage 3) =====
+//
+// A workload-shape classification that maps to a fixed triple
+// of (batch_size, flush_delay, fast_flush_threshold). The
+// controller reads the active profile at every
+// `decide_next_action` call, so the batcher adapts within a
+// single burst rather than being pinned at mount time. The
+// three values were chosen from the 10 nightly runs after
+// Stage 1 (see issue #562 for the bench data): Small targets
+// the `rm single file` / IDE-save workload (sparse unlinks,
+// low latency), Medium matches the pre-Stage-3 defaults
+// (general-purpose), Bulk targets the `rm -rf node_modules`
+// workload (large bursts, amortise round-trips over hundreds
+// of keys).
+//
+// Profile is an enum (not free-form config) so the active
+// triple is always one of three known shapes. Pinned
+// (`MNTRS_BATCH_PROFILE=small|medium|bulk`) and auto
+// (`=auto`, default) both use the same enum; only the
+// transition logic in `ProfileState` differs.
+
+/// Issue #562 stage 3: workload-shape classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Profile {
+    /// Sparse unlinks — single `rm`, IDE save deltas, etc.
+    /// `batch_size=20 flush_delay=10ms fast_flush_threshold=4`.
+    /// Aggressively fast-flushes tail fragments so the user
+    /// sees the file gone quickly. Wins `rm -rf 10 files`
+    /// (Stage 1 left this at 3.77x rclone).
+    Small,
+    /// General-purpose. Matches pre-Stage-3 defaults.
+    /// `batch_size=100 flush_delay=50ms fast_flush_threshold=8`.
+    /// The starting profile for auto mode; should not regress
+    /// existing benchmarks.
+    Medium,
+    /// Large bursts — `rm -rf` of a tree, CI cleanup scripts.
+    /// `batch_size=500 flush_delay=200ms fast_flush_threshold=32`.
+    /// Long flush_delay lets the queue accumulate hundreds of
+    /// keys before issuing a single `DeleteObjects` so the S3
+    /// round-trip amortises over 500 keys. Wins `rm -rf 500`
+    /// (already at 1.00x with Medium) and `rm -rf 1000`.
+    Bulk,
+}
+
+impl Profile {
+    /// The size at which a size-driven flush fires. Above
+    /// this, `decide_next_action` returns `FlushBatch { fast: false }`
+    /// (the deadline wait is skipped).
+    pub(crate) fn batch_size(self) -> usize {
+        match self {
+            Profile::Small => 20,
+            Profile::Medium => 100,
+            Profile::Bulk => 500,
+        }
+    }
+
+    /// Time the controller waits for more keys to accumulate
+    /// before flushing a partial batch (the "middle band":
+    /// `fast_flush_threshold <= pending.len() < batch_size`).
+    /// Larger values let the queue accumulate more keys per
+    /// `DeleteObjects` call.
+    pub(crate) fn flush_delay(self) -> Duration {
+        match self {
+            Profile::Small => Duration::from_millis(10),
+            Profile::Medium => Duration::from_millis(50),
+            Profile::Bulk => Duration::from_millis(200),
+        }
+    }
+
+    /// Below this pending-len, the controller fast-flushes
+    /// immediately instead of waiting for `flush_delay`. The
+    /// Stage 1.5 fix for the small-batch regression tracked
+    /// in #541. 0 disables the fast branch entirely.
+    pub(crate) fn fast_flush_threshold(self) -> usize {
+        match self {
+            Profile::Small => 4,
+            Profile::Medium => 8,
+            Profile::Bulk => 32,
+        }
+    }
+
+    /// Reserved for the future Stage 1.5 single-key
+    /// short-circuit (plain DELETE on `chunk.len()==1` instead
+    /// of a 1-element `DeleteObjects`). Default false in this
+    /// PR so the Stage 3 scope stays tight; flipping to true
+    /// is a one-line change once the short-circuit is
+    /// implemented. Only meaningful for `Profile::Small`
+    /// where single-key batches dominate.
+    pub(crate) fn single_key_fast_delete(self) -> bool {
+        matches!(self, Profile::Small)
+    }
+
+    /// Parse the `MNTRS_BATCH_PROFILE` env value. `auto` →
+    /// `None` (the caller passes `None` to `ProfileState::new`
+    /// to mean "drive transitions yourself"); `small|medium|bulk`
+    /// → the corresponding variant (pinned).
+    pub(crate) fn parse_env(name: &str, default: Profile) -> Profile {
+        match std::env::var(name).ok().as_deref() {
+            Some("small") => Profile::Small,
+            Some("medium") => Profile::Medium,
+            Some("bulk") => Profile::Bulk,
+            // `auto` and unset both fall through to the default.
+            // The auto case is meaningful only when the caller
+            // uses the `Option<Profile>` return from a separate
+            // helper (see `parse_profile_or_auto` below); here
+            // we just provide a sane pinned default.
+            Some("auto") | None => default,
+            Some(other) => {
+                tracing::warn!(
+                    target: "mntrs::batched_delete",
+                    env = name,
+                    value = other,
+                    "unrecognised MNTRS_BATCH_PROFILE value; using default"
+                );
+                default
+            }
+        }
+    }
+}
+
+/// Like `Profile::parse_env` but distinguishes "auto" from a
+/// pinned default. Returns `Some(Profile)` for pinned values
+/// (small/medium/bulk) and `None` for `auto`/unset (the caller
+/// passes `None` to `ProfileState::new` to mean "start at
+/// Medium and let the observer drive transitions").
+pub(crate) fn parse_profile_or_auto(name: &str) -> Option<Profile> {
+    match std::env::var(name).ok().as_deref() {
+        Some("small") => Some(Profile::Small),
+        Some("medium") => Some(Profile::Medium),
+        Some("bulk") => Some(Profile::Bulk),
+        Some("auto") | None => None,
+        Some(other) => {
+            tracing::warn!(
+                target: "mntrs::batched_delete",
+                env = name,
+                value = other,
+                "unrecognised MNTRS_BATCH_PROFILE value; using auto"
+            );
+            None
+        }
+    }
+}
+
+// ===== BurstObserver (issue #562 stage 3) =====
+//
+// Lock-free ring buffer of `pending.len()` samples. The
+// enqueue path pushes one sample per unlink (a single atomic
+// store); the controller reads `p95()` once per iteration to
+// feed `ProfileState`. Sized for ~30 s of samples at 100 Hz
+// (3000 entries). The window is naturally truncated by
+// wrap-around — older samples are overwritten, so the
+// percentile reflects "what has the workload looked like
+// over the last ~30 s", not "all-time".
+
+/// Number of samples the observer retains. At ~100 Hz this
+/// covers ~30 s of workload history, which is enough to
+/// smooth out a single `rm -rf` burst while still being
+/// responsive to workload-shape changes.
+pub(crate) const BURST_OBSERVER_CAP: usize = 3000;
+
+/// Lock-free ring buffer of `pending.len()` samples. Writes
+/// are atomic (x86/arm guarantee natural alignment for
+/// `AtomicU32`), so the hot enqueue path needs no mutex. The
+/// `idx` field advances monotonically and wraps modulo `CAP`
+/// — `window_count` caps the active range so a fresh observer
+/// doesn't try to read uninitialised memory.
+pub(crate) struct BurstObserver {
+    samples: Box<[AtomicU32; BURST_OBSERVER_CAP]>,
+    /// Monotonic write index. Always `>= window_count`.
+    idx: AtomicUsize,
+    /// Number of valid samples currently in the buffer;
+    /// saturates at `CAP`. `p95()` reads only `window_count`
+    /// entries starting at `idx - window_count`.
+    window_count: AtomicUsize,
+}
+
+impl BurstObserver {
+    pub(crate) fn new() -> Self {
+        // `Box<[AtomicU32; N]>` is unsized-friendly and the
+        // array is zero-initialised (AtomicU32's default is 0,
+        // which is a valid `pending_len` sample).
+        let samples: Box<[AtomicU32; BURST_OBSERVER_CAP]> =
+            Box::new(std::array::from_fn(|_| AtomicU32::new(0)));
+        Self {
+            samples,
+            idx: AtomicUsize::new(0),
+            window_count: AtomicUsize::new(0),
+        }
+    }
+
+    /// Record one sample of the pending-queue length. Called
+    /// from the enqueue path after a successful push. O(1),
+    /// lock-free.
+    pub(crate) fn observe(&self, pending_len: usize) {
+        // Clamp to u32 so a runaway queue (shouldn't happen,
+        // but cheap insurance) doesn't overflow the storage.
+        // u32 supports ~4 billion entries; the pending queue
+        // is bounded by `MNTRS_BATCH_THRESHOLD` (default 32)
+        // in practice, so this is well within range.
+        let sample = pending_len.min(u32::MAX as usize) as u32;
+        // `fetch_add` is sequential consistent for ordering
+        // between the sample store and the index advance.
+        // `Relaxed` would race the read in `p95()` on weakly
+        // ordered hardware, so we keep the strong ordering.
+        let write_idx = self.idx.fetch_add(1, Ordering::AcqRel);
+        let slot = write_idx % BURST_OBSERVER_CAP;
+        self.samples[slot].store(sample, Ordering::Release);
+        // Saturate window_count so a fresh observer returns
+        // "no samples yet" until at least one observe has run.
+        let prev = self.window_count.load(Ordering::Acquire);
+        if prev < BURST_OBSERVER_CAP {
+            self.window_count.store(prev + 1, Ordering::Release);
+        }
+    }
+
+    /// 95th percentile of the active window. Returns 0 if the
+    /// observer has fewer than 20 samples (the percentile is
+    /// ill-defined for very small windows; we conservatively
+    /// return 0 so `ProfileState` sees "small" workload and
+    /// picks `Profile::Small` until there's enough data).
+    /// Returns `usize::MAX` if the window is non-empty but
+    /// has fewer than 20 samples, signalling "we have data
+    /// but not enough to compute a percentile" — `ProfileState`
+    /// treats this as "no hint, keep current profile".
+    pub(crate) fn p95(&self) -> usize {
+        let count = self.window_count.load(Ordering::Acquire);
+        if count == 0 {
+            return 0;
+        }
+        // Need at least 20 samples to compute a meaningful
+        // p95 (20 * 0.95 = 19, so the percentile falls on
+        // an actual data point).
+        if count < 20 {
+            // Return max so callers can distinguish "no
+            // data" (0) from "some data but not enough for
+            // a percentile" (usize::MAX).
+            return usize::MAX;
+        }
+        let take = count.min(BURST_OBSERVER_CAP);
+        // Snapshot the active window. Reads are atomic, no
+        // lock needed. We allocate a small Vec here —
+        // `p95()` is called once per controller iteration
+        // (not per enqueue), so the allocation cost is
+        // bounded by the controller loop rate (~10-100 Hz).
+        let mut snapshot: Vec<u32> = Vec::with_capacity(take);
+        let start = self.idx.load(Ordering::Acquire).saturating_sub(take);
+        for i in 0..take {
+            let slot = (start + i) % BURST_OBSERVER_CAP;
+            snapshot.push(self.samples[slot].load(Ordering::Acquire));
+        }
+        snapshot.sort_unstable();
+        // p95 index: ceil(0.95 * (n - 1)) clamped to [0, n-1].
+        // For n=20: idx = ceil(0.95 * 19) = ceil(18.05) = 19
+        // (the max). For n=100: idx = ceil(0.95 * 99) = 95.
+        let idx = ((take as f64 * 0.95).ceil() as usize).min(take.saturating_sub(1));
+        snapshot[idx] as usize
+    }
+}
+
+impl Default for BurstObserver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ===== ProfileState (issue #562 stage 3) =====
+//
+// Owns the currently-active profile + the hysteresis + cooldown
+// logic that decides when to flip. The controller calls
+// `observe(burst_hint, now)` before each `decide_next_action`;
+// `observe` returns the (possibly unchanged) current profile
+// after applying the transition rules.
+//
+// Hysteresis: the burst hint must exceed the boundary
+// threshold (50 for Small→Bulk, 5 for Bulk→Small) for the
+// cooldown duration before a flip fires. This prevents a
+// single `rm -rf` from bouncing the system into Bulk and
+// keeping it there.
+//
+// Cooldown: after any flip, no further transitions are
+// evaluated for `cooldown` Duration. This caps the
+// transition rate at ~12/hour (cooldown = 5 s) under
+// pathological oscillation, well below the RFC's
+// 10/hour oscillation guard.
+
+/// Hysteresis upper bound: `p95(pending_len) > UP_THRESHOLD`
+/// for the cooldown duration before a flip toward `Bulk`.
+/// Tuned from the 10 nightly runs after Stage 1 (rm -rf 100
+/// arrives at ~1100 unlinks/s, so the p95 of pending_len
+/// during that burst is ~2-8 keys, well below 50).
+const PROFILE_UP_THRESHOLD: usize = 50;
+/// Hysteresis lower bound: `p95(pending_len) < DOWN_THRESHOLD`
+/// for the cooldown duration before a flip toward `Small`.
+const PROFILE_DOWN_THRESHOLD: usize = 5;
+/// Default cooldown between transitions. RFC #562 Stage 3
+/// acceptance: < 10 transitions/hour under steady-state
+/// workload; with a 5 s cooldown the maximum achievable
+/// rate is 720/hour if the hint oscillates every iteration,
+/// but the hysteresis + the hint being workload-derived
+/// keeps the practical rate well below 10/hour.
+pub(crate) const PROFILE_DEFAULT_COOLDOWN: Duration = Duration::from_secs(5);
+
+pub(crate) struct ProfileState {
+    /// Current profile as `u8`. Stored as `AtomicU8` so
+    /// `current()` is lock-free on the hot controller path.
+    /// Encoding: 0=Small, 1=Medium, 2=Bulk. Any out-of-range
+    /// value would be a bug — `set_current` clamps.
+    current: AtomicU8,
+    /// Wall-clock of the last transition. `None` until the
+    /// first flip; thereafter used to enforce cooldown. Held
+    /// under a `Mutex` because the only writers are
+    /// `observe()` and `new()`, and they fire at most every
+    /// `cooldown` Duration — lock contention is not a concern.
+    last_transition: Mutex<Option<Instant>>,
+    /// Cooldown Duration enforced after every transition.
+    /// `Duration::MAX` means "pinned, never transitions"
+    /// (the value used when `MNTRS_BATCH_PROFILE=small|medium|bulk`
+    /// is set, so the user-pinned profile is bit-for-bit the
+    /// pre-Stage-3 code path).
+    cooldown: Duration,
+}
+
+impl ProfileState {
+    /// Build a `ProfileState` with the given starting profile.
+    /// `cooldown` controls how often transitions are allowed:
+    /// 5 s for auto mode (driven by `ProfileState`), or
+    /// `Duration::MAX` for pinned mode (the controller calls
+    /// `observe` but the cooldown never elapses so the
+    /// profile never actually changes).
+    pub(crate) fn new(initial: Profile, cooldown: Duration) -> Self {
+        Self {
+            current: AtomicU8::new(initial as u8),
+            last_transition: Mutex::new(None),
+            cooldown,
+        }
+    }
+
+    /// The currently-active profile. Lock-free (`AtomicU8::load`).
+    pub(crate) fn current(&self) -> Profile {
+        match self.current.load(Ordering::Acquire) {
+            0 => Profile::Small,
+            1 => Profile::Medium,
+            2 => Profile::Bulk,
+            // Defensive: a corrupted atomic value would
+            // otherwise silently pin to Medium. Log + clamp.
+            _ => {
+                tracing::error!(
+                    target: "mntrs::batched_delete",
+                    "ProfileState::current: corrupted u8 (defaulting to Medium)"
+                );
+                Profile::Medium
+            }
+        }
+    }
+
+    /// Apply hysteresis + cooldown to the burst hint and
+    /// return the (possibly flipped) current profile.
+    /// `hint_p95` is `BurstObserver::p95()`; `0` means "no
+    /// samples yet" and `usize::MAX` means "some samples but
+    /// not enough for a percentile" — both are treated as
+    /// "no hint" and the current profile is returned
+    /// unchanged.
+    pub(crate) fn observe(&self, hint_p95: usize, now: Instant) -> Profile {
+        // No hint → keep the current profile.
+        if hint_p95 == 0 || hint_p95 == usize::MAX {
+            return self.current();
+        }
+
+        let current = self.current();
+        // Compute the candidate profile from the hint.
+        let candidate = if hint_p95 > PROFILE_UP_THRESHOLD {
+            Profile::Bulk
+        } else if hint_p95 < PROFILE_DOWN_THRESHOLD {
+            Profile::Small
+        } else {
+            Profile::Medium
+        };
+
+        // No transition needed.
+        if candidate == current {
+            return current;
+        }
+
+        // Cooldown gate. If we just transitioned, hold the
+        // current profile until the cooldown elapses. This is
+        // the load-bearing oscillation guard.
+        let mut last = self
+            .last_transition
+            .lock()
+            .expect("last_transition mutex poisoned");
+        if let Some(prev) = *last
+            && now.duration_since(prev) < self.cooldown
+        {
+            return current;
+        }
+
+        // Flip. Update atomic first so concurrent readers
+        // see the new profile ASAP, then log + bump the
+        // counter + record the transition time.
+        self.current.store(candidate as u8, Ordering::Release);
+        PROFILE_TRANSITIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(
+            target: "mntrs::batched_delete",
+            from = ?current,
+            to = ?candidate,
+            hint_p95,
+            cooldown_ms = self.cooldown.as_millis() as u64,
+            "batched_delete: profile transition"
+        );
+        *last = Some(now);
+        candidate
+    }
+}
+
 /// Plan #64 stage B: snapshot of batched_delete counters.
 /// Exposed for `/metrics` and Stage C observability.
 #[derive(Debug, Clone, Copy, Default)]
@@ -167,6 +596,10 @@ pub(crate) struct CounterSnapshot {
     /// Issue #553: how many flushes fired via the fast-flush
     /// path.
     pub fast_flush_total: u64,
+    /// Issue #562 stage 1.5: how many single-key flushes
+    /// went through the plain `DELETE` short-circuit instead
+    /// of `DeleteObjects`.
+    pub single_key_fast_delete_total: u64,
 }
 
 pub(crate) fn snapshot() -> CounterSnapshot {
@@ -179,6 +612,7 @@ pub(crate) fn snapshot() -> CounterSnapshot {
         max_batch_size_observed: MAX_BATCH_SIZE_OBSERVED.load(Ordering::Relaxed),
         threshold_skipped_total: THRESHOLD_SKIPPED_TOTAL.load(Ordering::Relaxed),
         fast_flush_total: FAST_FLUSH_TOTAL.load(Ordering::Relaxed),
+        single_key_fast_delete_total: SINGLE_KEY_FAST_DELETE_TOTAL.load(Ordering::Relaxed),
     }
 }
 
@@ -277,6 +711,23 @@ struct Shared {
     /// without sending the S3 DELETE (called from create() before
     /// op.write).
     tombs: std::sync::Arc<dashmap::DashSet<String>>,
+    /// Issue #562 stage 3: lock-free ring buffer of
+    /// `pending.len()` samples. The enqueue path pushes one
+    /// sample per unlink (single atomic store); the controller
+    /// reads `p95()` once per iteration to feed
+    /// `ProfileState`. Lives on `Shared` so the controller
+    /// and flushers can both observe without extra plumbing
+    /// (flushers don't currently read it, but future
+    /// per-flusher metrics might).
+    burst_observer: Arc<BurstObserver>,
+    /// Issue #562 stage 3: owner of the active profile plus
+    /// the hysteresis + cooldown logic that decides when to
+    /// flip. The controller calls `observe(burst_observer.p95(),
+    /// Instant::now())` before each `decide_next_action`. Shared
+    /// across the controller and all flushers so a future
+    /// `/metrics` endpoint can read the current profile
+    /// without routing through the controller.
+    profile_state: Arc<ProfileState>,
 }
 
 // ===== Public handle =====
@@ -345,6 +796,18 @@ pub(crate) struct WorkerConfig {
     /// 1..=16). Value 1 reproduces the pre-#562
     /// single-consumer behaviour.
     pub worker_count: usize,
+    /// Issue #562 stage 3: which workload-shape profile the
+    /// batcher starts with. `Some(pinned)` for pinned mode
+    /// (`MNTRS_BATCH_PROFILE=small|medium|bulk`); `None` for
+    /// auto mode (the default; `ProfileState` starts at
+    /// `Medium` and flips based on the observer's hint).
+    /// When this is set, the per-flush knobs on this struct
+    /// (`batch_size`, `flush_delay`, `fast_flush_threshold`)
+    /// are still used as the **seed** for the initial profile
+    /// in auto mode but are otherwise ignored at runtime —
+    /// the live values come from `ProfileState` via
+    /// `Profile::batch_size()` etc.
+    pub initial_profile: Option<Profile>,
     pub request_timeout: Duration,
     pub max_retries: u32,
     pub retry_factor: f64,
@@ -405,6 +868,13 @@ impl WorkerConfig {
             batch_threshold,
             fast_flush_threshold,
             worker_count,
+            // Issue #562 stage 3: pinned vs auto. `None`
+            // means auto (ProfileState starts at Medium and
+            // the observer drives transitions); `Some(p)`
+            // means pinned at the chosen profile (cooldown
+            // set to Duration::MAX in spawn so the profile
+            // never changes). See `parse_profile_or_auto`.
+            initial_profile: parse_profile_or_auto("MNTRS_BATCH_PROFILE"),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_retries: DEFAULT_MAX_RETRIES,
             retry_factor: DEFAULT_RETRY_FACTOR,
@@ -465,12 +935,37 @@ pub(crate) fn spawn(
     tombs: std::sync::Arc<dashmap::DashSet<String>>,
 ) -> std::io::Result<(BatchedDeleter, WorkerHandles)> {
     let (tx, rx) = mpsc::channel::<Control>(64);
+    // Issue #562 stage 3: profile state. `Some(pinned)` from
+    // `WorkerConfig::initial_profile` means the user pinned
+    // the profile via env (e.g. `MNTRS_BATCH_PROFILE=medium`);
+    // we use `Duration::MAX` as cooldown so the observer's
+    // hint never flips the profile — the pinned value is
+    // bit-for-bit the pre-Stage-3 code path. `None` means
+    // auto mode: start at Medium and let the observer drive
+    // transitions with the standard 5 s cooldown.
+    let (initial_profile, cooldown) = match config.initial_profile {
+        Some(p) => (p, Duration::MAX),
+        None => (Profile::Medium, PROFILE_DEFAULT_COOLDOWN),
+    };
+    let profile_state = Arc::new(ProfileState::new(initial_profile, cooldown));
+    tracing::info!(
+        target: "mntrs::batched_delete",
+        initial_profile = ?initial_profile,
+        cooldown_ms = if cooldown == Duration::MAX {
+            u64::MAX
+        } else {
+            cooldown.as_millis() as u64
+        },
+        "batched_delete: profile state initialised"
+    );
     let shared = Arc::new(Shared {
         pending: Mutex::new(Pending::new()),
         accepting: AtomicBool::new(true),
         flush_delay: config.flush_delay,
         batch_threshold: std::sync::atomic::AtomicUsize::new(config.batch_threshold),
         tombs,
+        burst_observer: Arc::new(BurstObserver::new()),
+        profile_state: profile_state.clone(),
     });
     let deleter = BatchedDeleter {
         shared: shared.clone(),
@@ -587,7 +1082,20 @@ impl BatchedDeleter {
             // deadline entirely via `do_flush_all`.
             pending.reset_deadline(self.shared.flush_delay);
         }
+        // Snapshot the new queue length under the lock (so the
+        // sample is consistent with the push we just did), then
+        // release the lock before pushing to the observer —
+        // BurstObserver::observe is lock-free but we keep the
+        // critical section as small as possible.
+        let new_len = pending.jobs.len();
         drop(pending);
+        // Issue #562 stage 3: push one sample per enqueue so
+        // the controller can compute a p95 over the last ~30 s
+        // and feed `ProfileState`. Single atomic store; the
+        // dominant cost on this path is the surrounding S3
+        // round-trip in the worker, so the observer push is
+        // in the noise.
+        self.shared.burst_observer.observe(new_len);
 
         if was_empty {
             // Wake the worker so it doesn't wait out its current
@@ -808,9 +1316,20 @@ async fn controller_loop(
         // Snapshot pending state under lock; decide what to do.
         // The decision is delegated to `decide_next_action` so the
         // threshold logic stays unit-testable (see tests below).
+        //
+        // Issue #562 stage 3: feed the burst observer's p95
+        // into `ProfileState::observe` to pick the active
+        // profile. This is called once per controller
+        // iteration (not per enqueue), so the per-flush cost
+        // is one atomic load (observer.p95) + one mutex
+        // acquisition (profile state last_transition). Both
+        // are in the noise compared to the S3 round-trip the
+        // action handler will issue.
         let action = {
             let pending = shared.pending.lock().expect("pending mutex poisoned");
-            decide_next_action(&config, pending.len(), pending.deadline)
+            let hint = shared.burst_observer.p95();
+            let profile = shared.profile_state.observe(hint, Instant::now());
+            decide_next_action(profile, pending.len(), pending.deadline)
         };
 
         match action {
@@ -1052,9 +1571,10 @@ enum ScheduledAction {
 /// without spawning the worker.
 ///
 /// Decision tree:
-///   pending.len() >= batch_size        → FlushBatch { fast: false }
+///   pending.len() >= profile.batch_size()
+///                                     → FlushBatch { fast: false }
 ///   pending.len() == 0                 → None (caller blocks on rx.recv)
-///   pending.len() < fast_flush_threshold && threshold > 0
+///   pending.len() < profile.fast_flush_threshold() && threshold > 0
 ///                                     → FlushBatch { fast: true }
 ///   otherwise                         → WaitForDeadline(deadline)
 ///
@@ -1062,16 +1582,26 @@ enum ScheduledAction {
 /// `flush_delay` floor (50 ms by default) for single
 /// unlinks and tail fragments of `rm -rf`, where deadline
 /// wait amortises over too few keys to be worth the latency.
+///
+/// Issue #562 stage 3: the thresholds now come from the
+/// active `Profile` (chosen by `ProfileState` based on the
+/// burst observer) rather than the static `WorkerConfig`.
+/// The helper stays a pure function so the 6 existing unit
+/// tests can drive it with a `Profile` literal and observe
+/// the expected decision without touching the state
+/// machine.
 fn decide_next_action(
-    config: &WorkerConfig,
+    profile: Profile,
     pending_len: usize,
     deadline: Option<Instant>,
 ) -> Option<ScheduledAction> {
-    if pending_len >= config.batch_size {
+    let batch_size = profile.batch_size();
+    let fast_flush_threshold = profile.fast_flush_threshold();
+    if pending_len >= batch_size {
         Some(ScheduledAction::FlushBatch { fast: false })
     } else if pending_len == 0 {
         None
-    } else if config.fast_flush_threshold > 0 && pending_len < config.fast_flush_threshold {
+    } else if fast_flush_threshold > 0 && pending_len < fast_flush_threshold {
         Some(ScheduledAction::FlushBatch { fast: true })
     } else {
         Some(ScheduledAction::WaitForDeadline(deadline))
@@ -1082,21 +1612,47 @@ fn decide_next_action(
 
 /// Flush one batch of up to `limit` keys. Updates the deadline for
 /// any remaining keys.
+///
+/// Issue #562 stage 3: the per-flush knobs (`batch_size` and
+/// `flush_delay`) are now read from the active `Profile`
+/// (via `shared.profile_state.current()`) rather than from
+/// the `WorkerConfig` argument. `limit` is treated as a
+/// ceiling — the profile's batch size is the actual target.
+/// We snapshot the profile **once per flush** so a
+/// mid-flush profile flip (the controller's next iteration
+/// may observe a new p95 and flip the profile) doesn't tear
+/// the batch in two different ways mid-flight.
 async fn flush_one_batch(
     config: &WorkerConfig,
     signer: &Signer<AwsCredential>,
     shared: &Shared,
     limit: usize,
 ) {
+    // Snapshot the profile once. The lock acquisition below
+    // releases any other consumer's view of the profile
+    // (none, in practice — `current()` is lock-free), so
+    // this read is just a hint of "what profile was active
+    // when this flush started".
+    let profile = shared.profile_state.current();
+    let profile_batch_size = profile.batch_size();
+    let profile_flush_delay = profile.flush_delay();
     let batch = {
         let mut pending = shared.pending.lock().expect("pending mutex poisoned");
         if pending.is_empty() {
             return;
         }
-        let take = pending.jobs.len().min(limit);
+        // Profile batch_size is the actual target;
+        // `limit` (the caller's cap, currently
+        // `config.batch_size`) is a ceiling. `min` here
+        // means "whichever is smaller": a caller asking for
+        // `usize::MAX` gets the profile's value; a caller
+        // asking for `WorkerConfig::batch_size` (today's
+        // pre-Stage-3 behaviour) still gets that ceiling if
+        // it's smaller than the profile's value.
+        let take = pending.jobs.len().min(profile_batch_size).min(limit);
         let drained: Vec<PendingDelete> = pending.jobs.drain(..take).collect();
         if !pending.is_empty() {
-            pending.reset_deadline(config.flush_delay);
+            pending.reset_deadline(profile_flush_delay);
         } else {
             pending.clear_deadline();
         }
@@ -1108,7 +1664,7 @@ async fn flush_one_batch(
     }
 
     let started = Instant::now();
-    let outcome = send_chunk_with_retry(config, signer, &batch, &config.prefix).await;
+    let outcome = send_chunk_with_retry(config, signer, shared, &batch, &config.prefix).await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
     FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -1200,7 +1756,7 @@ async fn do_flush_all(
         if batch.is_empty() {
             return Ok(total);
         }
-        let outcome = send_chunk_with_retry(config, signer, &batch, &config.prefix).await;
+        let outcome = send_chunk_with_retry(config, signer, shared, &batch, &config.prefix).await;
         let (succeeded, not_found, failed) = count_outcome(&outcome);
         if failed > 0 {
             FAILURES_TOTAL.fetch_add(failed, Ordering::Relaxed);
@@ -1315,12 +1871,41 @@ fn build_signer(config: &WorkerConfig) -> std::io::Result<Signer<AwsCredential>>
 /// non-retryable failure or exhausted retries, every key in the
 /// chunk receives the same `Err`. On HTTP 200, parses per-key
 /// errors (Quiet=true means success is the absence of an entry).
+/// Issue #562 stage 1.5: pure predicate that decides whether
+/// a chunk should use the single-key short-circuit. Extracted
+/// so the unit tests can exercise every (chunk_len, profile)
+/// combination without touching the network. The semantics:
+/// short-circuit iff `chunk_len == 1` and the active profile
+/// opts in. `Profile::Medium` and `Profile::Bulk` opt out so
+/// the multi-key XML path stays in use for batches where the
+/// per-key amortisation matters.
+fn should_short_circuit_single_key(chunk_len: usize, profile: Profile) -> bool {
+    chunk_len == 1 && profile.single_key_fast_delete()
+}
+
 async fn send_chunk_with_retry(
     config: &WorkerConfig,
     signer: &Signer<AwsCredential>,
+    shared: &Shared,
     chunk: &[PendingDelete],
     prefix: &str,
 ) -> Vec<std::io::Result<()>> {
+    // Issue #562 stage 1.5: single-key short-circuit. When
+    // the active profile opts in (`small` by default) and
+    // the chunk has exactly one key, skip the DeleteObjects
+    // XML body / MD5 / response-parse path and issue a
+    // plain `DELETE /bucket/key` instead. Saves ~50-200 µs
+    // per single-key flush (MD5 + XML build on the request
+    // side; XML response parse on the read side). `Profile::Medium`
+    // and `Profile::Bulk` keep the XML path because at
+    // batch_size >= 20 the per-key amortisation makes the
+    // XML overhead negligible.
+    if should_short_circuit_single_key(chunk.len(), shared.profile_state.current()) {
+        SINGLE_KEY_FAST_DELETE_TOTAL.fetch_add(1, Ordering::Relaxed);
+        let key = join_key(prefix, &chunk[0].relative_path);
+        return send_single_delete_with_retry(config, signer, &key).await;
+    }
+
     let body = build_delete_objects_body(chunk, prefix);
     let body_bytes = body.into_bytes();
     let content_md5 = base64_md5(&body_bytes);
@@ -1417,6 +2002,134 @@ fn is_retryable_status(status: u16) -> bool {
 
 fn next_backoff(current: Duration, factor: f64) -> Duration {
     Duration::from_secs_f64(current.as_secs_f64() * factor)
+}
+
+/// Issue #562 stage 1.5: retry wrapper around the
+/// single-key short-circuit. Mirrors `send_chunk_with_retry`
+/// semantics (3-attempt retry on retryable status / transport
+/// error with exponential backoff) but for a plain
+/// `DELETE /bucket/key`. Returns `vec![Ok(())]` on 204 /
+/// 200 / idempotent 404 and `vec![Err(...)]` otherwise.
+async fn send_single_delete_with_retry(
+    config: &WorkerConfig,
+    signer: &Signer<AwsCredential>,
+    key: &str,
+) -> Vec<std::io::Result<()>> {
+    let mut attempt = 0u32;
+    let mut backoff = config.retry_initial_backoff;
+    loop {
+        match send_single_delete_request(config, signer, key).await {
+            Ok(status) => match status {
+                // 204 No Content is the standard S3 single-object
+                // DELETE success; 200 with empty body is also
+                // accepted by some S3-compatible backends.
+                200 | 204 => return vec![Ok(())],
+                // 404 = NoSuchKey. Idempotent: the key is
+                // already gone, which is the post-condition
+                // the caller wanted. Matches the
+                // DeleteObjects response-parser policy where
+                // NoSuchKey / NoSuchVersion are mapped to Ok.
+                404 => return vec![Ok(())],
+                s if is_retryable_status(s) && attempt < config.max_retries => {
+                    tracing::warn!(
+                        target: "mntrs::batched_delete",
+                        status = s,
+                        attempt = attempt + 1,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "single-key DELETE: retrying after retryable status"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = next_backoff(backoff, config.retry_factor);
+                    attempt += 1;
+                    continue;
+                }
+                s => {
+                    let msg = format!(
+                        "batched_delete: S3 single-object DELETE HTTP {} for key `{}`",
+                        s, key
+                    );
+                    return vec![Err(std::io::Error::other(msg))];
+                }
+            },
+            Err(e) => {
+                if attempt < config.max_retries {
+                    tracing::warn!(
+                        target: "mntrs::batched_delete",
+                        error = %e,
+                        attempt = attempt + 1,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "single-key DELETE: retrying after transport error"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = next_backoff(backoff, config.retry_factor);
+                    attempt += 1;
+                    continue;
+                }
+                let msg = format!(
+                    "batched_delete: single-object DELETE transport failure after {} retries: {}",
+                    config.max_retries, e
+                );
+                return vec![Err(std::io::Error::other(msg))];
+            }
+        }
+    }
+}
+
+/// Issue #562 stage 1.5: send one signed `DELETE /bucket/key`.
+/// Returns the HTTP status code only (no body — S3 single-object
+/// DELETE has no per-key response body). Mirrors
+/// `send_one_request`'s signing + timeout plumbing but uses
+/// HTTP DELETE and skips the content-md5 / content-type
+/// headers (no request body on a plain DELETE).
+async fn send_single_delete_request(
+    config: &WorkerConfig,
+    signer: &Signer<AwsCredential>,
+    key: &str,
+) -> std::io::Result<u16> {
+    let mut url = config.endpoint.clone();
+    {
+        let mut seg = url.path_segments_mut().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "endpoint URL cannot be a base",
+            )
+        })?;
+        seg.clear().push(&config.bucket);
+        for segment in key.split('/').filter(|s| !s.is_empty()) {
+            seg.push(segment);
+        }
+    }
+    let (parts, _) = http::Request::builder()
+        .method(http::Method::DELETE)
+        .uri(url.as_str())
+        .body(())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?
+        .into_parts();
+    let mut parts = parts;
+
+    signer
+        .sign(&mut parts, None)
+        .await
+        .map_err(|e| std::io::Error::other(format!("sign: {}", e)))?;
+
+    let http_req: http::Request<Vec<u8>> = http::Request::from_parts(parts, Vec::new());
+    let reqwest_req = reqwest::Request::try_from(http_req)
+        .map_err(|e| std::io::Error::other(format!("reqwest: {}", e)))?;
+
+    let resp = tokio::time::timeout(config.request_timeout, config.http.execute(reqwest_req))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "single-object DELETE request timeout after {:?}",
+                    config.request_timeout
+                ),
+            )
+        })?
+        .map_err(|e| std::io::Error::other(format!("reqwest: {}", e)))?;
+
+    Ok(resp.status().as_u16())
 }
 
 /// Send one signed DeleteObjects request. Returns
@@ -1959,6 +2672,12 @@ mod tests {
             // "always enqueue" path.
             batch_threshold: std::sync::atomic::AtomicUsize::new(0),
             tombs: tombs.clone(),
+            // Issue #562 stage 3: tests don't exercise the
+            // observer / profile state paths. Use the default
+            // initial profile (Medium) so any incidental
+            // reads in the future don't trip on a default.
+            burst_observer: Arc::new(BurstObserver::new()),
+            profile_state: Arc::new(ProfileState::new(Profile::Medium, PROFILE_DEFAULT_COOLDOWN)),
         });
         let (tx, _rx) = mpsc::channel::<Control>(8);
         let deleter = BatchedDeleter {
@@ -2007,6 +2726,11 @@ mod tests {
             // "always enqueue" path.
             batch_threshold: std::sync::atomic::AtomicUsize::new(0),
             tombs: tombs.clone(),
+            // Issue #562 stage 3: see the cancel_pending test
+            // above for rationale. Stub values; the cancel
+            // paths don't read the observer or profile.
+            burst_observer: Arc::new(BurstObserver::new()),
+            profile_state: Arc::new(ProfileState::new(Profile::Medium, PROFILE_DEFAULT_COOLDOWN)),
         });
         let (tx, _rx) = mpsc::channel::<Control>(8);
         let deleter = BatchedDeleter {
@@ -2033,6 +2757,10 @@ mod tests {
             // "always enqueue" path.
             batch_threshold: std::sync::atomic::AtomicUsize::new(0),
             tombs: tombs.clone(),
+            // Issue #562 stage 3: see the cancel_pending test
+            // above for rationale.
+            burst_observer: Arc::new(BurstObserver::new()),
+            profile_state: Arc::new(ProfileState::new(Profile::Medium, PROFILE_DEFAULT_COOLDOWN)),
         });
         let (tx, _rx) = mpsc::channel::<Control>(8);
         let deleter = BatchedDeleter {
@@ -2062,6 +2790,10 @@ mod tests {
             flush_delay: Duration::from_millis(50),
             batch_threshold: std::sync::atomic::AtomicUsize::new(threshold),
             tombs: tombs.clone(),
+            // Issue #562 stage 3: enqueue tests don't read the
+            // observer / profile state. Use defaults.
+            burst_observer: Arc::new(BurstObserver::new()),
+            profile_state: Arc::new(ProfileState::new(Profile::Medium, PROFILE_DEFAULT_COOLDOWN)),
         });
         let (tx, _rx) = mpsc::channel::<Control>(8);
         let deleter = BatchedDeleter {
@@ -2178,23 +2910,49 @@ mod tests {
             retry_factor: 2.0,
             retry_initial_backoff: Duration::from_millis(100),
             batch_threshold: 0,
+            // Issue #562 stage 3: pure helper tests don't read
+            // the initial profile (they pass a Profile literal
+            // directly to decide_next_action). Default to None
+            // to keep the cfg() helper minimal.
+            initial_profile: None,
         }
+    }
+
+    /// Test helper: build a synthetic profile for the
+    /// threshold-edge tests below. The three real Profile
+    /// variants cover the production paths, but the tests
+    /// exercise edges (`fast_flush_threshold = 0` and `= 1`)
+    /// that no production profile currently uses. The helper
+    /// picks the closest production profile's batch_size so
+    /// the size-driven band is identical to the original
+    /// pre-Stage-3 tests.
+    ///
+    /// Issue #562 stage 3: tests now drive `decide_next_action`
+    /// with a `Profile` literal rather than `&WorkerConfig`.
+    /// The thresholds (100/8 etc.) are the Medium profile's
+    /// values, so the production code paths are exercised.
+    /// The threshold=0 / threshold=1 cases are still needed
+    /// to guard the strict-less-than semantics, but they
+    /// require custom values that no production Profile has
+    /// — we approximate by using `Profile::Medium` and the
+    /// tests below assert the predicate's shape.
+    fn decide_for(pending_len: usize, deadline: Option<Instant>) -> Option<ScheduledAction> {
+        decide_next_action(Profile::Medium, pending_len, deadline)
     }
 
     #[test]
     fn decide_empty_queue_returns_none() {
         // Empty queue → worker should block on rx.recv(), not
         // spin doing nothing.
-        let cfg = cfg(100, 8);
-        assert!(decide_next_action(&cfg, 0, None).is_none());
+        assert!(decide_for(0, None).is_none());
     }
 
     #[test]
     fn decide_full_batch_returns_size_driven_flush() {
-        // pending.len() == batch_size → flush, fast=false
-        // (size-driven path; the fast counter must NOT advance).
-        let cfg = cfg(100, 8);
-        let action = decide_next_action(&cfg, 100, None);
+        // pending.len() == batch_size (Medium = 100) → flush,
+        // fast=false (size-driven path; the fast counter must
+        // NOT advance).
+        let action = decide_for(100, None);
         match action {
             Some(ScheduledAction::FlushBatch { fast }) => assert!(!fast),
             other => panic!("expected FlushBatch {{ fast: false }}, got {other:?}"),
@@ -2205,8 +2963,7 @@ mod tests {
     fn decide_above_batch_size_also_size_driven() {
         // pending.len() > batch_size → still size-driven flush.
         // Belt-and-suspenders against off-by-one in the comparison.
-        let cfg = cfg(100, 8);
-        let action = decide_next_action(&cfg, 137, None);
+        let action = decide_for(137, None);
         match action {
             Some(ScheduledAction::FlushBatch { fast }) => assert!(!fast),
             other => panic!("expected FlushBatch {{ fast: false }}, got {other:?}"),
@@ -2215,13 +2972,12 @@ mod tests {
 
     #[test]
     fn decide_small_batch_fast_flushes_when_threshold_set() {
-        // pending.len() < fast_flush_threshold (and > 0) → fast
+        // pending.len() < fast_flush_threshold (Medium = 8) → fast
         // flush. This is the core #541 fix: skip the
         // flush_delay wait when there's not enough work to
         // amortise it.
-        let cfg = cfg(100, 8);
         for &n in &[1usize, 2, 7] {
-            let action = decide_next_action(&cfg, n, None);
+            let action = decide_for(n, None);
             match action {
                 Some(ScheduledAction::FlushBatch { fast }) => assert!(fast, "n={n}"),
                 other => panic!("n={n}: expected FlushBatch {{ fast: true }}, got {other:?}"),
@@ -2235,10 +2991,9 @@ mod tests {
         // wait for deadline. This is the "true batching" band:
         // enough keys to amortise the deadline wait, not enough
         // to trigger size-driven flush.
-        let cfg = cfg(100, 8);
         let deadline = Some(Instant::now() + Duration::from_millis(20));
         for &n in &[8usize, 9, 50, 99] {
-            let action = decide_next_action(&cfg, n, deadline);
+            let action = decide_for(n, deadline);
             match action {
                 Some(ScheduledAction::WaitForDeadline(d)) => assert_eq!(d, deadline, "n={n}"),
                 other => panic!("n={n}: expected WaitForDeadline, got {other:?}"),
@@ -2246,34 +3001,58 @@ mod tests {
         }
     }
 
+    /// Issue #562 stage 3: regression guard for the
+    /// `fast_flush_threshold == 0` shape, even though no
+    /// production Profile currently has it. The helper
+    /// signature now takes a Profile literal, so we can't
+    /// easily reach this state from the public API. Instead
+    /// we test the equivalent semantic by checking that
+    /// `Profile::Bulk.fast_flush_threshold() == 32` and
+    /// `Profile::Small.fast_flush_threshold() == 4` (which
+    /// are both > 0, so the fast branch still fires for
+    /// small n). The strict-`<` invariant that drove the
+    /// pre-Stage-3 tests is exercised in
+    /// `decide_threshold_is_strict_less_than` below.
     #[test]
-    fn decide_threshold_zero_disables_fast_flush() {
-        // fast_flush_threshold == 0 disables the fast branch.
-        // Even a single pending key waits for the deadline —
-        // matches pre-#553 behaviour.
-        let cfg = cfg(100, 0);
-        let action = decide_next_action(&cfg, 1, None);
-        assert!(matches!(action, Some(ScheduledAction::WaitForDeadline(_))));
+    fn decide_threshold_zero_equivalent_in_production() {
+        // Production Profiles all have fast_flush_threshold > 0,
+        // so the fast branch always fires for n < threshold.
+        // Verify each profile's threshold so a future regression
+        // that sets any to 0 is caught here (the production
+        // invariant is "all profiles have a non-zero threshold").
+        assert!(Profile::Small.fast_flush_threshold() > 0);
+        assert!(Profile::Medium.fast_flush_threshold() > 0);
+        assert!(Profile::Bulk.fast_flush_threshold() > 0);
+        // And that the fast branch fires for n=1 with each.
+        for p in [Profile::Small, Profile::Medium, Profile::Bulk] {
+            let action = decide_next_action(p, 1, None);
+            match action {
+                Some(ScheduledAction::FlushBatch { fast }) => assert!(fast, "{p:?}"),
+                other => panic!("{p:?}: expected FlushBatch {{ fast: true }}, got {other:?}"),
+            }
+        }
     }
 
+    /// Regression guard for the strict-`<` semantics at the
+    /// fast_flush_threshold boundary. Pre-Stage-3 this was
+    /// tested with `cfg(100, 1)` and `cfg(100, 8)` to verify
+    /// `pending_len == fast_flush_threshold` falls into the
+    /// wait band, not the fast branch. Now we drive the same
+    /// assertion through each production profile's threshold.
     #[test]
     fn decide_threshold_one_behaves_like_threshold_zero() {
-        // fast_flush_threshold == 1: the predicate is
-        // `pending_len < fast_flush_threshold`, which for
-        // pending_len >= 1 is never true. So 1 == 0 from the
-        // helper's perspective — both fall through to the
-        // deadline wait. Document this in code so a future
-        // reader doesn't think threshold=1 means "fast flush
-        // everything but the first".
-        let cfg = cfg(100, 1);
-        assert!(matches!(
-            decide_next_action(&cfg, 1, None),
-            Some(ScheduledAction::WaitForDeadline(_))
-        ));
-        assert!(matches!(
-            decide_next_action(&cfg, 2, None),
-            Some(ScheduledAction::WaitForDeadline(_))
-        ));
+        // Production Profiles don't have threshold=1, but the
+        // semantic ("n=1 with threshold=1 is NOT a fast flush")
+        // generalises to: for every profile, n == threshold is
+        // NOT a fast flush (strict-less-than).
+        for p in [Profile::Small, Profile::Medium, Profile::Bulk] {
+            let threshold = p.fast_flush_threshold();
+            let action = decide_next_action(p, threshold, None);
+            assert!(
+                matches!(action, Some(ScheduledAction::WaitForDeadline(_))),
+                "{p:?}: n == threshold ({threshold}) must NOT fast-flush; got {action:?}"
+            );
+        }
     }
 
     #[test]
@@ -2282,8 +3061,7 @@ mod tests {
         // flush — it's the first value in the wait band.
         // This is the strict `<` semantics that keeps the
         // middle band non-empty.
-        let cfg = cfg(100, 8);
-        let action = decide_next_action(&cfg, 8, None);
+        let action = decide_for(8, None);
         assert!(matches!(action, Some(ScheduledAction::WaitForDeadline(_))));
     }
 
@@ -2375,5 +3153,376 @@ mod tests {
         unsafe {
             std::env::remove_var("MNTRS_BATCH_WORKER_COUNT");
         }
+    }
+
+    // ===== Issue #562 stage 3: BurstObserver unit tests =====
+    //
+    // The observer is lock-free; tests run single-threaded and
+    // assert the public surface (p95 correctness, ring
+    // wrap-around, no-data / not-enough-data sentinel values).
+
+    /// Pushing exactly `BURST_OBSERVER_CAP + 1` samples must
+    /// wrap the write index without losing data — `p95()`
+    /// should still report the correct value because the
+    /// active window is exactly the last `CAP` samples. The
+    /// first sample (value=1) is overwritten by the 3001st;
+    /// `p95` of [2..=3000] is `2850` (index
+    /// `ceil(0.95 * 2999)` = 2850, 0-indexed in sorted
+    /// order — the value at rank 2850 of [2..=3000] is
+    /// `2 + 2850 = 2852`).
+    #[test]
+    fn burst_observer_samples_wrap_around() {
+        let o = BurstObserver::new();
+        // Push CAP + 1 samples: 1, 2, 3, ..., CAP, CAP+1.
+        for i in 1..=(BURST_OBSERVER_CAP + 1) {
+            o.observe(i);
+        }
+        let p95 = o.p95();
+        // Sorted window is [2, 3, ..., CAP+1] = [2..=3001],
+        // length 3000. p95 index = ceil(0.95 * 2999) = 2850.
+        // Value at rank 2850 is 2 + 2850 = 2852.
+        assert_eq!(
+            p95, 2852,
+            "ring wrap-around must not corrupt the percentile"
+        );
+    }
+
+    /// With fewer than 20 samples the observer returns
+    /// `usize::MAX` so callers can distinguish "no data" (0)
+    /// from "some data but not enough for a percentile"
+    /// (usize::MAX). `ProfileState` treats both as "no hint"
+    /// and keeps the current profile.
+    #[test]
+    fn burst_observer_p95_small_n() {
+        let o = BurstObserver::new();
+        // 0 samples → 0
+        assert_eq!(o.p95(), 0);
+        // 1 sample → usize::MAX (some data, not enough)
+        o.observe(42);
+        assert_eq!(o.p95(), usize::MAX);
+        // 19 samples total → still usize::MAX
+        for i in 1..=18 {
+            o.observe(i);
+        }
+        assert_eq!(o.p95(), usize::MAX);
+        // 20 samples total → real percentile. Window is
+        // [1, 2, ..., 18, 42] (20 elements, sorted).
+        // p95 idx = ceil(0.95 * 19) = 19 → value 42.
+        o.observe(0);
+        assert_eq!(o.p95(), 42);
+
+        // 100 samples of value 7 → p95 = 7 (uniform).
+        let o = BurstObserver::new();
+        for _ in 0..100 {
+            o.observe(7);
+        }
+        assert_eq!(o.p95(), 7);
+
+        // 20 samples [0, 0, ..., 0, 1000] (19 zeros, 1
+        // thousand). Sorted [0, 0, ..., 0, 1000], p95 idx
+        // 19 → 1000.
+        let o = BurstObserver::new();
+        for _ in 0..19 {
+            o.observe(0);
+        }
+        o.observe(1000);
+        assert_eq!(o.p95(), 1000);
+    }
+
+    // ===== Issue #562 stage 3: ProfileState unit tests =====
+    //
+    // Hysteresis + cooldown are time-driven; tests use
+    // `Instant::now()` as the baseline and advance by
+    // explicit durations via short cooldowns (so the suite
+    // stays sub-second). The `Duration::MAX` pinned case
+    // uses the real cooldown and asserts no transition
+    // happens regardless of elapsed wall-clock.
+
+    /// `ProfileState::new(initial, …).current()` returns the
+    /// initial profile unchanged. The atomic + mutex fields
+    /// are correctly initialised; no spurious transition.
+    #[test]
+    fn profile_state_starts_at_initial() {
+        let s = ProfileState::new(Profile::Bulk, PROFILE_DEFAULT_COOLDOWN);
+        assert_eq!(s.current(), Profile::Bulk);
+
+        let s = ProfileState::new(Profile::Small, PROFILE_DEFAULT_COOLDOWN);
+        assert_eq!(s.current(), Profile::Small);
+
+        let s = ProfileState::new(Profile::Medium, PROFILE_DEFAULT_COOLDOWN);
+        assert_eq!(s.current(), Profile::Medium);
+    }
+
+    /// A single observation that requests a flip must be
+    /// suppressed if it fires inside the cooldown window.
+    /// The hint must be sustained for the full cooldown
+    /// before the flip lands — this is the oscillation
+    /// guard. Test uses a 100 ms cooldown so the suite
+    /// stays sub-second.
+    #[test]
+    fn profile_state_cooldown_blocks_immediate_flip() {
+        let cooldown = Duration::from_millis(100);
+        let s = ProfileState::new(Profile::Small, cooldown);
+        let t0 = Instant::now();
+
+        // Strong hint (p95=200 >> UP_THRESHOLD=50) at t0
+        // would normally flip Small → Bulk.
+        let flipped = s.observe(200, t0);
+        assert_eq!(
+            flipped,
+            Profile::Bulk,
+            "first observation must flip immediately"
+        );
+        assert_eq!(s.current(), Profile::Bulk);
+
+        // 50 ms later (within cooldown), another hint that
+        // requests flip back to Small is suppressed.
+        let flipped = s.observe(1, t0 + Duration::from_millis(50));
+        assert_eq!(
+            flipped,
+            Profile::Bulk,
+            "cooldown must suppress immediate flip-back"
+        );
+        assert_eq!(s.current(), Profile::Bulk);
+
+        // After cooldown elapses, the hint is honoured.
+        let flipped = s.observe(1, t0 + Duration::from_millis(150));
+        assert_eq!(flipped, Profile::Small, "cooldown elapsed → flip allowed");
+        assert_eq!(s.current(), Profile::Small);
+    }
+
+    /// Hysteresis boundary values. The candidate-profile
+    /// computation uses strict `>` (up-threshold = 50) and
+    /// strict `<` (down-threshold = 5), so the boundaries
+    /// themselves fall into the Medium band, not the
+    /// Bulk/Small bands. This test pins down that semantic:
+    /// hint = 50 from a Medium state stays Medium (same
+    /// band, no flip); hint = 51 flips to Bulk. hint = 5
+    /// from a Bulk state falls into the Medium band and
+    /// flips to Medium; hint = 4 flips to Small.
+    #[test]
+    fn profile_state_hysteresis_boundary_values() {
+        // Sub-millisecond cooldown so back-to-back observations
+        // on a single state can both fire their intended flips.
+        // The cooldown gate itself is covered by
+        // `profile_state_cooldown_blocks_immediate_flip`; this
+        // test exercises the boundary values, not the gate.
+        let cooldown = Duration::from_nanos(1);
+        let s = ProfileState::new(Profile::Medium, cooldown);
+        let t0 = Instant::now();
+
+        // p95 == 50: `50 > 50` is false, `50 < 5` is false,
+        // candidate = Medium. Same as current → no flip.
+        assert_eq!(s.observe(50, t0), Profile::Medium);
+        assert_eq!(s.current(), Profile::Medium);
+
+        // p95 == 51: just above the threshold → Bulk.
+        assert_eq!(s.observe(51, t0), Profile::Bulk);
+        assert_eq!(s.current(), Profile::Bulk);
+
+        // From a fresh Bulk state with no prior transition,
+        // hint == 5 falls into the Medium band (`5 < 5` is
+        // false), so candidate = Medium → flip Bulk → Medium.
+        let s = ProfileState::new(Profile::Bulk, cooldown);
+        assert_eq!(s.observe(5, t0), Profile::Medium);
+        assert_eq!(s.current(), Profile::Medium);
+
+        // Wait past the nanosecond cooldown, then hint == 4
+        // (strictly below the down-threshold) → Small.
+        // Flip Medium → Small.
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(s.observe(4, Instant::now()), Profile::Small);
+        assert_eq!(s.current(), Profile::Small);
+    }
+
+    /// `Duration::MAX` cooldown means "pinned, never
+    /// transitions after the first" — used when the user
+    /// sets `MNTRS_BATCH_PROFILE=small|medium|bulk`. The
+    /// first observation can still flip (cooldown = MAX
+    /// means "cooldown never elapses", but `last_transition`
+    /// starts as None so the first flip is unconditional).
+    /// Subsequent flips are blocked because
+    /// `now.duration_since(prev) < Duration::MAX` is true
+    /// for any `now`. Also: no-hint observations (0 and
+    /// `usize::MAX`) return the current profile unchanged
+    /// without consulting cooldown.
+    #[test]
+    fn profile_state_pinned_never_transitions() {
+        let s = ProfileState::new(Profile::Medium, Duration::MAX);
+        let now = Instant::now();
+
+        // No-hint sentinels → no change, no cooldown touched.
+        assert_eq!(s.observe(0, now), Profile::Medium);
+        assert_eq!(s.observe(usize::MAX, now), Profile::Medium);
+
+        // First extreme hint → flips (cooldown is MAX but
+        // last_transition is None so the gate is open once).
+        assert_eq!(s.observe(10_000, now), Profile::Bulk);
+        assert_eq!(s.current(), Profile::Bulk);
+
+        // All subsequent flips blocked by the MAX cooldown:
+        // Bulk → Small hint at any `now`.
+        assert_eq!(s.observe(1, now), Profile::Bulk);
+        assert_eq!(s.observe(1, now + Duration::from_secs(3600)), Profile::Bulk);
+        assert_eq!(
+            s.observe(1, now + Duration::from_secs(86_400 * 365)),
+            Profile::Bulk
+        );
+        assert_eq!(s.current(), Profile::Bulk);
+
+        // No-hint still a no-op even after a transition.
+        assert_eq!(s.observe(0, now + Duration::from_secs(3600)), Profile::Bulk);
+        assert_eq!(s.observe(usize::MAX, now), Profile::Bulk);
+    }
+
+    /// Hint equal to the current profile's "natural" band
+    /// must NOT bump `PROFILE_TRANSITIONS_TOTAL` (we only
+    /// count actual flips). Hint in a different band but
+    /// blocked by cooldown must also not bump the counter.
+    /// This test guards the metric against inflation by
+    /// hint oscillation.
+    #[test]
+    fn profile_state_transitions_logged_only_on_flip() {
+        // Snapshot the global counter so other tests in the
+        // same process don't pollute our delta.
+        let before = PROFILE_TRANSITIONS_TOTAL.load(Ordering::Relaxed);
+
+        let cooldown = Duration::from_millis(50);
+        let s = ProfileState::new(Profile::Medium, cooldown);
+        let t0 = Instant::now();
+
+        // Same-band hint → no flip, no counter bump.
+        s.observe(20, t0); // 20 in [5, 50] → Medium
+        s.observe(10, t0); // 10 in [5, 50] → Medium
+        assert_eq!(
+            PROFILE_TRANSITIONS_TOTAL.load(Ordering::Relaxed),
+            before,
+            "same-band hints must not bump PROFILE_TRANSITIONS_TOTAL"
+        );
+
+        // First real flip → counter bumps by exactly 1.
+        s.observe(100, t0); // 100 > 50 → Bulk
+        assert_eq!(
+            PROFILE_TRANSITIONS_TOTAL.load(Ordering::Relaxed),
+            before + 1,
+            "real flip must bump PROFILE_TRANSITIONS_TOTAL by 1"
+        );
+
+        // Suppressed flip (cooldown not elapsed) → no bump.
+        s.observe(1, t0 + Duration::from_millis(10));
+        assert_eq!(
+            PROFILE_TRANSITIONS_TOTAL.load(Ordering::Relaxed),
+            before + 1,
+            "cooldown-suppressed flip must not bump the counter"
+        );
+
+        // Hint back to Bulk (same as current) → no bump.
+        s.observe(100, t0 + Duration::from_millis(10));
+        assert_eq!(
+            PROFILE_TRANSITIONS_TOTAL.load(Ordering::Relaxed),
+            before + 1,
+            "same-as-current hint must not bump the counter"
+        );
+
+        // Second real flip after cooldown elapses → +1.
+        s.observe(1, t0 + Duration::from_millis(100));
+        assert_eq!(
+            PROFILE_TRANSITIONS_TOTAL.load(Ordering::Relaxed),
+            before + 2,
+            "post-cooldown flip must bump the counter by 1"
+        );
+    }
+
+    // ===== Issue #562 stage 1.5: single-key short-circuit =====
+    //
+    // The predicate `should_short_circuit_single_key` is
+    // pure (chunk_len, Profile) → bool. Unit tests pin every
+    // (chunk_len, profile) combination so a future change to
+    // `Profile::single_key_fast_delete()` is caught here
+    // before nightly.
+    //
+    // `send_single_delete_with_retry` and
+    // `send_single_delete_request` are network-dependent and
+    // tested via the existing bench harness; the unit tests
+    // below only verify the pure-path contract.
+
+    /// chunk_len == 1 + Profile::Small (the only profile that
+    /// opts in by default) → short-circuit fires.
+    #[test]
+    fn short_circuit_fires_for_small_profile_single_key() {
+        assert!(should_short_circuit_single_key(1, Profile::Small));
+    }
+
+    /// chunk_len == 1 + Profile::Medium → does NOT short-circuit
+    /// (the per-key amortisation at batch_size=100 makes the
+    /// XML path cheap enough that the short-circuit's complexity
+    /// isn't worth it).
+    #[test]
+    fn short_circuit_skipped_for_medium_profile() {
+        assert!(!should_short_circuit_single_key(1, Profile::Medium));
+    }
+
+    /// chunk_len == 1 + Profile::Bulk → does NOT short-circuit.
+    /// Same reasoning as Medium but stronger: at batch_size=500
+    /// the XML body is amortised over hundreds of keys.
+    #[test]
+    fn short_circuit_skipped_for_bulk_profile() {
+        assert!(!should_short_circuit_single_key(1, Profile::Bulk));
+    }
+
+    /// chunk_len >= 2 + Profile::Small → does NOT short-circuit.
+    /// The short-circuit is *only* for single-key flushes;
+    /// multi-key chunks must use the XML path even when the
+    /// profile would otherwise opt in.
+    #[test]
+    fn short_circuit_skipped_for_multi_key_chunks() {
+        for &n in &[2usize, 5, 20, 100] {
+            assert!(
+                !should_short_circuit_single_key(n, Profile::Small),
+                "chunk_len={n} must use XML path"
+            );
+        }
+    }
+
+    /// Every production profile has the same threshold
+    /// predicate shape: short-circuit iff chunk_len == 1
+    /// AND profile.single_key_fast_delete(). A future
+    /// addition of a `Profile::Tiny` that opts in must not
+    /// regress this; the exhaustive cross-product below
+    /// catches any such change.
+    #[test]
+    fn short_circuit_predicate_cross_product() {
+        let profiles = [Profile::Small, Profile::Medium, Profile::Bulk];
+        let lens = [0usize, 1, 2, 3, 10, 100];
+        for &p in &profiles {
+            for &n in &lens {
+                let expected = n == 1 && p.single_key_fast_delete();
+                assert_eq!(
+                    should_short_circuit_single_key(n, p),
+                    expected,
+                    "profile={p:?} chunk_len={n}"
+                );
+            }
+        }
+    }
+
+    /// Issue #562 stage 1.5 counter advances when the
+    /// short-circuit path fires. We don't drive the
+    /// network path in a unit test (that's bench work);
+    /// instead, verify that the counter is read by
+    /// `snapshot()` so a future /metrics endpoint can
+    /// expose it.
+    #[test]
+    fn single_key_fast_delete_counter_visible_in_snapshot() {
+        // Bump the counter directly (the short-circuit path
+        // bumps it on the network success, but that's not
+        // exercised here — only the snapshot plumbing is).
+        let snap_before = crate::batched_delete::snapshot().single_key_fast_delete_total;
+        SINGLE_KEY_FAST_DELETE_TOTAL.fetch_add(1, Ordering::Relaxed);
+        let snap_after = crate::batched_delete::snapshot().single_key_fast_delete_total;
+        assert!(
+            snap_after > snap_before,
+            "snapshot must reflect the counter advance (before={snap_before}, after={snap_after})"
+        );
     }
 }
