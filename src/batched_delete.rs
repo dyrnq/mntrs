@@ -46,11 +46,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as B64;
-use md5::{Digest, Md5};
-use quick_xml::Writer;
-use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use reqsign_aws_v4::{
     Credential as AwsCredential, DefaultCredentialProvider, EnvCredentialProvider,
     ProfileCredentialProvider, RequestSigner, StaticCredentialProvider,
@@ -61,21 +56,17 @@ use tokio::sync::{mpsc, oneshot};
 
 // ===== Constants =====
 
-/// S3 hard limit: at most 1000 object identifiers per DeleteObjects
-/// request. The opt-in `MNTRS_DELETE_BATCH=1` path chunks below
-/// this so a misconfiguration cannot produce an invalid request.
-pub(crate) const HARD_MAX_KEYS_PER_REQUEST: usize = 1000;
-
 // Plan #64 stage B: retry knobs (kept). Per-mount tuning knobs
 // (`MNTRS_BATCH_SIZE`, `MNTRS_BATCH_FLUSH_DELAY_MS`,
 // `MNTRS_BATCH_THRESHOLD`, `MNTRS_BATCH_FAST_FLUSH_THRESHOLD`,
 // `MNTRS_BATCH_PROFILE`) were dropped along with the Profile /
-// Calibrator / BurstObserver subsystem in issue #568 stage 6. The
-// batch XML path is still reachable as opt-in via
-// `MNTRS_DELETE_BATCH=1`; the constants below parameterise that
-// opt-in path.
-pub(crate) const DEFAULT_BATCH_SIZE: usize = 100;
-pub(crate) const DEFAULT_FLUSH_DELAY: Duration = Duration::from_millis(50);
+// Calibrator / BurstObserver subsystem in issue #568 stage 6.
+// Issue #570 follow-up: the DeleteObjects XML batch path
+// (and its `DEFAULT_BATCH_SIZE` / `DEFAULT_FLUSH_DELAY` /
+// `HARD_MAX_KEYS_PER_REQUEST` constants) was also removed —
+// single path = N concurrent single-DELETE. There is no
+// opt-in knob; if a workload ever needs batch XML again,
+// resurrect the helpers from git history (commit 6eaac39).
 pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const DEFAULT_MAX_RETRIES: u32 = 3;
 pub(crate) const DEFAULT_RETRY_FACTOR: f64 = 2.0;
@@ -333,17 +324,17 @@ impl WorkerConfig {
         secret_access_key: Option<String>,
         http: reqwest::Client,
     ) -> Self {
-        // Issue #568 stage 6: only `MNTRS_DELETE_WORKER_COUNT`
-        // remains as a tuning knob. The previous batch tuners
-        // (`MNTRS_BATCH_SIZE`, `MNTRS_BATCH_FLUSH_DELAY_MS`,
-        // `MNTRS_BATCH_THRESHOLD`,
+        // Issue #570: the entire batch XML path was dropped.
+        // `MNTRS_DELETE_WORKER_COUNT` is the only remaining
+        // tuning knob. The previous batch tuners (`MNTRS_BATCH_SIZE`,
+        // `MNTRS_BATCH_FLUSH_DELAY_MS`, `MNTRS_BATCH_THRESHOLD`,
         // `MNTRS_BATCH_FAST_FLUSH_THRESHOLD`, `MNTRS_BATCH_PROFILE`)
-        // were dropped along with the Profile / Calibrator /
-        // BurstObserver subsystem — see the subsystem deletion
-        // commit. The opt-in batch XML path (triggered by
-        // `MNTRS_DELETE_BATCH=1`) re-reads `DEFAULT_BATCH_SIZE` /
-        // `DEFAULT_FLUSH_DELAY` directly and ignores
-        // `MNTRS_BATCH_*` env vars.
+        // and the Profile / Calibrator / BurstObserver subsystem
+        // were all removed along with `send_chunk_with_retry` and
+        // the `DeleteObjects` XML body/parser — single path is N
+        // concurrent single-DELETE. There is no opt-in knob; if a
+        // workload ever needs batch XML again, resurrect the helpers
+        // from git history.
         let worker_count = env_usize("MNTRS_DELETE_WORKER_COUNT", DEFAULT_DELETE_WORKER_COUNT)
             .clamp(1, MAX_DELETE_WORKER_COUNT);
         Self {
@@ -389,16 +380,16 @@ enum Control {
 
 // ===== Spawn =====
 
-/// Issue #562 stage 1: handle bundle returned by `spawn`.
-/// The controller task is the one that owns the
-/// `mpsc::Receiver<Control>` and runs `decide_next_action`;
-/// the flushers are the worker-count pool that drains
-/// `Shared::pending` and calls `send_chunk_with_retry`.
+/// Handle bundle returned by `spawn`. The drain worker owns
+/// the `mpsc::Receiver<Control>` and dispatches
+/// `Control::Wake` / `Control::Flush` / `Control::Shutdown`;
+/// the deleters are the worker-count pool that drains
+/// `Shared::pending` and calls `send_single_delete_with_retry`.
 ///
 /// Callers can drop this struct to abandon the workers
 /// (they will exit when `flush_tx` and `wake_tx` go out of
-/// scope); or await the controller handle first and then
-/// the flusher handles for a clean shutdown. MntrsFs
+/// scope); or await the drain handle first and then
+/// the deleter handles for a clean shutdown. MntrsFs
 /// currently takes the drop path (fire-and-forget): all
 /// `BatchedDeleter` clones drop → `flush_tx` drops →
 /// controller's `rx.recv()` returns `None` → controller
@@ -940,70 +931,57 @@ async fn deleter_loop(deleter_id: usize, config: WorkerConfig, shared: Arc<Share
     }
 }
 
-/// Flush all pending keys in chunks of HARD_MAX_KEYS_PER_REQUEST.
-/// Returns total number of keys flushed across chunks.
+/// Flush all pending keys by serial single-DELETE.
+///
+/// Issue #570: the old batch XML path is gone, so `do_flush_all`
+/// no longer drives a `DeleteObjects` round-trip. The drain worker
+/// uses this to satisfy `Control::Flush { done }` (Policy B rmdir
+/// barrier) — it drains the queue in serial order on its own
+/// signer so the caller can block on `done` and observe a
+/// consistent post-state. The N concurrent deleter loops continue
+/// to issue single-DELETEs in parallel; we hold no shared mutex
+/// here other than the brief `drain_all` snapshot.
+///
+/// Returns the number of keys whose per-key DELETE completed
+/// (Ok + idempotent-NotFound + permanent failure all count — the
+/// rmdir barrier only needs the S3 round-trip to have landed).
 async fn do_flush_all(
     config: &WorkerConfig,
     signer: &Signer<AwsCredential>,
     shared: &Arc<Shared>,
 ) -> std::io::Result<usize> {
-    let mut total = 0usize;
-    loop {
-        let batch_size = {
-            let pending = shared.pending.lock().expect("pending mutex poisoned");
-            pending.len()
-        };
-        if batch_size == 0 {
-            return Ok(total);
-        }
-        let limit = batch_size.min(HARD_MAX_KEYS_PER_REQUEST);
-        let batch: Vec<PendingDelete> = {
-            let mut pending = shared.pending.lock().expect("pending mutex poisoned");
-            pending.jobs.drain(..limit).collect()
-        };
-        if batch.is_empty() {
-            return Ok(total);
-        }
-        let outcome = send_chunk_with_retry(config, signer, &batch, &config.prefix).await;
-        let (succeeded, not_found, failed) = count_outcome(&outcome);
-        if failed > 0 {
-            FAILURES_TOTAL.fetch_add(failed, Ordering::Relaxed);
-        }
-        FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
-        KEYS_TOTAL.fetch_add(batch.len() as u64, Ordering::Relaxed);
-        for (job, result) in batch.into_iter().zip(outcome) {
-            // Plan #64 stage C: tombstone cleanup is part of the
-            // per-key ack path. Every terminal outcome clears
-            // its tombstone — success, NotFound (idempotent),
-            // and permanent failures alike. Without this the
-            // FUSE side's lookup/getattr/readdir filters would
-            // keep masking the path even after the worker
-            // confirmed the delete landed on S3, and a
-            // recreate would return ENOENT until the user
-            // worked around it. See flush_one_batch for the
-            // canonical implementation — mirrored here to keep
-            // the lock-and-send pattern local to each flush site.
-            match &result {
-                Ok(()) => {
-                    shared.tombs.remove(&job.relative_path);
-                }
-                Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound) => {
-                    shared.tombs.remove(&job.relative_path);
-                }
-                Err(e) => {
-                    tracing::error!(
-                        target: "mntrs::batched_delete",
-                        path = %job.relative_path,
-                        error = %e,
-                        "batched_delete: per-key delete failed; clearing tombstone so object becomes visible again"
-                    );
-                    shared.tombs.remove(&job.relative_path);
-                }
-            }
-            let _ = job.result_tx.send(result);
-        }
-        total += succeeded as usize + not_found as usize + failed as usize;
+    let batch: Vec<PendingDelete> = {
+        let mut pending = shared.pending.lock().expect("pending mutex poisoned");
+        pending.drain_all()
+    };
+    if batch.is_empty() {
+        return Ok(0);
     }
+    let mut total = 0usize;
+    for job in batch {
+        let key = join_key(&config.prefix, &job.relative_path);
+        let results = send_single_delete_with_retry(config, signer, &key).await;
+        let outcome = results.into_iter().next().unwrap_or_else(|| {
+            Err(std::io::Error::other(
+                "batched_delete: send_single_delete_with_retry returned empty result",
+            ))
+        });
+        // Same accounting as the deleter loop: per-key counters,
+        // per-key tombstone cleanup, per-key oneshot ack.
+        match &outcome {
+            Ok(()) => {
+                FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
+                KEYS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        shared.tombs.remove(&job.relative_path);
+        let _ = job.result_tx.send(outcome);
+        total += 1;
+    }
+    Ok(total)
 }
 
 fn fail_all_pending(shared: &Shared) {
@@ -1039,20 +1017,6 @@ fn fail_all_pending(shared: &Shared) {
     }
 }
 
-fn count_outcome(results: &[std::io::Result<()>]) -> (u64, u64, u64) {
-    let mut s = 0u64;
-    let mut n = 0u64;
-    let mut f = 0u64;
-    for r in results {
-        match r {
-            Ok(()) => s += 1,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => n += 1,
-            Err(_) => f += 1,
-        }
-    }
-    (s, n, f)
-}
-
 // ===== Signer build =====
 
 /// Build a `reqsign::Signer` for SigV4. If explicit credentials are
@@ -1075,144 +1039,6 @@ fn build_signer(config: &WorkerConfig) -> std::io::Result<Signer<AwsCredential>>
 }
 
 // ===== S3 protocol =====
-
-/// Send one chunk (≤HARD_MAX_KEYS_PER_REQUEST keys) with retry.
-/// Retries transport failures + retryable HTTP statuses. On
-/// non-retryable failure or exhausted retries, every key in the
-/// chunk receives the same `Err`. On HTTP 200, parses per-key
-/// errors (Quiet=true means success is the absence of an entry).
-///
-/// **Stage 6 (issue #568):** `should_short_circuit_single_key`
-/// was deleted along with the Profile enum. The inline
-/// short-circuit below always fires for `chunk.len() == 1`,
-/// which matches the historical `Profile::Small` opt-in
-/// behaviour (rclone's design wins on small workloads too).
-/// The accompanying `SINGLE_KEY_FAST_DELETE_TOTAL` counter has
-/// also been dropped — the per-key DELETE path is now the
-/// default, so counting it adds no information.
-async fn send_chunk_with_retry(
-    config: &WorkerConfig,
-    signer: &Signer<AwsCredential>,
-    chunk: &[PendingDelete],
-    prefix: &str,
-) -> Vec<std::io::Result<()>> {
-    // Issue #562 stage 1.5 + Stage 6 (issue #568):
-    // single-key short-circuit. When the chunk has exactly
-    // one key, skip the DeleteObjects XML body / MD5 /
-    // response-parse path and issue a plain
-    // `DELETE /bucket/key` instead. Saves ~50-200 µs per
-    // single-key flush. Pre-Stage-6 this only fired under
-    // `Profile::Small`; now it always fires because
-    // single-key is the dominant case (99.3% of flushes
-    // per the 5000/10000-file probe in PR #567).
-    if chunk.len() == 1 {
-        let key = join_key(prefix, &chunk[0].relative_path);
-        return send_single_delete_with_retry(config, signer, &key).await;
-    }
-
-    let body = build_delete_objects_body(chunk, prefix);
-    let body_bytes = body.into_bytes();
-    let content_md5 = base64_md5(&body_bytes);
-
-    let mut attempt = 0u32;
-    let mut backoff = config.retry_initial_backoff;
-    loop {
-        match send_one_request(config, signer, &body_bytes, &content_md5).await {
-            Ok((200, resp_xml)) => {
-                // Parse per-key. Per the plan: per-key NoSuchKey /
-                // NoSuchVersion → success; everything else → Err.
-                // Quiet=true means keys absent from response = Ok.
-                let per_key = parse_delete_objects_response(&resp_xml);
-
-                // We have to map per-key entries back to chunk
-                // indices. S3 returns one <Error> per failing key,
-                // in the same order as requested. Quiet=true means
-                // no <Error> for successful keys, so we pad with
-                // Ok(()) to chunk.len() entries.
-                let mut results: Vec<std::io::Result<()>> = Vec::with_capacity(chunk.len());
-                let mut per_key_iter = per_key.into_iter();
-                for _ in 0..chunk.len() {
-                    match per_key_iter.next() {
-                        Some(r) => results.push(r),
-                        None => results.push(Ok(())),
-                    }
-                }
-                return results;
-            }
-            Ok((status, _body)) => {
-                let err_msg = format!(
-                    "batched_delete: S3 DeleteObjects HTTP {} (request-level, failing all keys in chunk)",
-                    status
-                );
-                if is_retryable_status(status) && attempt < config.max_retries {
-                    tracing::warn!(
-                        target: "mntrs::batched_delete",
-                        status,
-                        attempt = attempt + 1,
-                        backoff_ms = backoff.as_millis() as u64,
-                        "retrying after retryable status"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    // Issue #562 stage 5: feed the Calibrator.
-                    // Bumped exactly once per retry decision
-                    // (multi-key + single-key paths, status +
-                    // transport variants). The Calibrator
-                    // computes `retry_rate = RETRY_TOTAL /
-                    // FLUSHES_TOTAL` from this counter.
-                    RETRY_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    backoff = next_backoff(backoff, config.retry_factor);
-                    attempt += 1;
-                    continue;
-                }
-                let kind = if status == 404 {
-                    std::io::ErrorKind::NotFound
-                } else {
-                    std::io::ErrorKind::Other
-                };
-                let msg = if status == 404 {
-                    format!(
-                        "{} (request-level 404 is NoSuchBucket, not idempotent missing key)",
-                        err_msg
-                    )
-                } else {
-                    err_msg
-                };
-                return (0..chunk.len())
-                    .map(|_| Err(std::io::Error::new(kind, msg.clone())))
-                    .collect();
-            }
-            Err(e) => {
-                if attempt < config.max_retries {
-                    tracing::warn!(
-                        target: "mntrs::batched_delete",
-                        error = %e,
-                        attempt = attempt + 1,
-                        backoff_ms = backoff.as_millis() as u64,
-                        "retrying after transport error"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    // Issue #562 stage 5: feed the Calibrator.
-                    // Bumped exactly once per retry decision
-                    // (multi-key + single-key paths, status +
-                    // transport variants). The Calibrator
-                    // computes `retry_rate = RETRY_TOTAL /
-                    // FLUSHES_TOTAL` from this counter.
-                    RETRY_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    backoff = next_backoff(backoff, config.retry_factor);
-                    attempt += 1;
-                    continue;
-                }
-                let msg = format!(
-                    "batched_delete: transport failure after {} retries: {}",
-                    config.max_retries, e
-                );
-                return (0..chunk.len())
-                    .map(|_| Err(std::io::Error::other(msg.clone())))
-                    .collect();
-            }
-        }
-    }
-}
 
 fn is_retryable_status(status: u16) -> bool {
     matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
@@ -1364,114 +1190,11 @@ async fn send_single_delete_request(
     Ok(resp.status().as_u16())
 }
 
-/// Send one signed DeleteObjects request. Returns
-/// `(status_code, response_body_xml)`.
-async fn send_one_request(
-    config: &WorkerConfig,
-    signer: &Signer<AwsCredential>,
-    body_bytes: &[u8],
-    content_md5_b64: &str,
-) -> std::io::Result<(u16, String)> {
-    let url = build_delete_objects_url(&config.endpoint, &config.bucket)?;
-    let (parts, _) = http::Request::builder()
-        .method(http::Method::POST)
-        .uri(url.as_str())
-        .body(())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?
-        .into_parts();
-    let mut parts = parts;
+// ===== Key joiner =====
 
-    parts.headers.insert(
-        "content-type",
-        http::HeaderValue::from_static("application/xml"),
-    );
-    parts.headers.insert(
-        "content-length",
-        http::HeaderValue::from_str(&body_bytes.len().to_string())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?,
-    );
-    parts.headers.insert(
-        "content-md5",
-        http::HeaderValue::from_str(content_md5_b64)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?,
-    );
-
-    signer
-        .sign(&mut parts, None)
-        .await
-        .map_err(|e| std::io::Error::other(format!("sign: {}", e)))?;
-
-    let http_req: http::Request<Vec<u8>> = http::Request::from_parts(parts, body_bytes.to_vec());
-    let reqwest_req = reqwest::Request::try_from(http_req)
-        .map_err(|e| std::io::Error::other(format!("reqwest: {}", e)))?;
-
-    let resp = tokio::time::timeout(config.request_timeout, config.http.execute(reqwest_req))
-        .await
-        .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!(
-                    "DeleteObjects request timeout after {:?}",
-                    config.request_timeout
-                ),
-            )
-        })?
-        .map_err(|e| std::io::Error::other(format!("reqwest: {}", e)))?;
-
-    let status = resp.status().as_u16();
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| std::io::Error::other(format!("read body: {}", e)))?;
-    Ok((status, body))
-}
-
-// ===== XML body builder =====
-
-/// Build the `<Delete>...</Delete>` body for one chunk.
-/// `prefix` is the operator root (e.g. `/some/dir/`) prepended to
-/// every relative path.
-pub(crate) fn build_delete_objects_body(chunk: &[PendingDelete], prefix: &str) -> String {
-    let mut writer = Writer::new(Vec::<u8>::new());
-    writer
-        .write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))
-        .expect("xml decl write");
-    writer
-        .write_event(Event::Start(BytesStart::new("Delete")))
-        .expect("Delete start");
-    for job in chunk {
-        writer
-            .write_event(Event::Start(BytesStart::new("Object")))
-            .expect("Object start");
-        let key_full = join_key(prefix, &job.relative_path);
-        writer
-            .write_event(Event::Start(BytesStart::new("Key")))
-            .expect("Key start");
-        writer
-            .write_event(Event::Text(BytesText::new(&key_full)))
-            .expect("Key text");
-        writer
-            .write_event(Event::End(BytesEnd::new("Key")))
-            .expect("Key end");
-        writer
-            .write_event(Event::End(BytesStart::new("Object").to_end()))
-            .expect("Object end");
-    }
-    writer
-        .write_event(Event::Start(BytesStart::new("Quiet")))
-        .expect("Quiet start");
-    writer
-        .write_event(Event::Text(BytesText::new("true")))
-        .expect("Quiet text");
-    writer
-        .write_event(Event::End(BytesEnd::new("Quiet")))
-        .expect("Quiet end");
-    writer
-        .write_event(Event::End(BytesStart::new("Delete").to_end()))
-        .expect("Delete end");
-    String::from_utf8(writer.into_inner()).expect("xml utf8")
-}
-
+/// Join an operator-root prefix with a relative path to form the
+/// full S3 object key. Used by the deleter loop (single-DELETE
+/// path) and the rmdir-barrier drain (`do_flush_all`).
 fn join_key(prefix: &str, rel: &str) -> String {
     let p = prefix.trim_end_matches('/');
     if p.is_empty() {
@@ -1483,123 +1206,6 @@ fn join_key(prefix: &str, rel: &str) -> String {
     }
 }
 
-fn base64_md5(body: &[u8]) -> String {
-    let mut hasher = Md5::new();
-    hasher.update(body);
-    B64.encode(hasher.finalize())
-}
-
-// ===== URL builder =====
-
-/// Build the path-style DeleteObjects URL:
-/// `{endpoint}/{bucket}/?delete`. Path style for S3-compatible
-/// endpoints (MinIO defaults to path-style).
-pub(crate) fn build_delete_objects_url(
-    endpoint: &url::Url,
-    bucket: &str,
-) -> std::io::Result<url::Url> {
-    let mut url = endpoint.clone();
-    {
-        let mut seg = url.path_segments_mut().map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "endpoint URL cannot be a base",
-            )
-        })?;
-        seg.clear().push(bucket);
-    }
-    url.query_pairs_mut().append_pair("delete", "");
-    Ok(url)
-}
-
-// ===== Response parser =====
-
-/// Parse the DeleteObjects response XML into a per-failing-key
-/// `Result<(), io::Error>`. `Quiet=true` means successful keys are
-/// absent from the response (they map to `Ok(())`).
-///
-/// Per-key error mapping:
-/// - `NoSuchKey` / `NoSuchVersion` / `NoSuchUpload` → Ok(())
-/// - Anything else → Err(io::Error)
-pub(crate) fn parse_delete_objects_response(xml: &str) -> Vec<std::io::Result<()>> {
-    use quick_xml::events::Event as QEvent;
-    use quick_xml::reader::Reader;
-
-    let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
-
-    let mut out: Vec<std::io::Result<()>> = Vec::new();
-    let mut in_error = false;
-    let mut cur_key: Option<String> = None;
-    let mut cur_code: Option<String> = None;
-    let mut cur_message: Option<String> = None;
-    let mut last_tag: Option<String> = None;
-
-    let mut buf = Vec::new();
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(QEvent::Start(e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
-                match name.as_str() {
-                    "Error" => {
-                        in_error = true;
-                        cur_key = None;
-                        cur_code = None;
-                        cur_message = None;
-                    }
-                    "Key" => cur_key = None,
-                    "Code" => cur_code = None,
-                    "Message" => cur_message = None,
-                    _ => {}
-                }
-                last_tag = Some(name);
-            }
-            Ok(QEvent::Text(t)) => {
-                let raw = t.into_inner();
-                let txt = String::from_utf8_lossy(&raw).into_owned();
-                if in_error {
-                    match last_tag.as_deref() {
-                        Some("Key") => cur_key = Some(txt),
-                        Some("Code") => cur_code = Some(txt),
-                        Some("Message") => cur_message = Some(txt),
-                        _ => {}
-                    }
-                }
-            }
-            Ok(QEvent::End(e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
-                if name == "Error" && in_error {
-                    let code = cur_code.take().unwrap_or_default();
-                    let message = cur_message.take().unwrap_or_default();
-                    let _key = cur_key.take();
-                    let is_not_found = matches!(
-                        code.as_str(),
-                        "NoSuchKey" | "NoSuchVersion" | "NoSuchUpload"
-                    );
-                    let entry = if is_not_found {
-                        Ok(())
-                    } else {
-                        Err(std::io::Error::other(format!(
-                            "S3 DeleteObjects per-key error: {} ({})",
-                            code, message
-                        )))
-                    };
-                    out.push(entry);
-                    in_error = false;
-                }
-                last_tag = None;
-            }
-            Ok(QEvent::Eof) => break,
-            Err(_) => break,
-            _ => {
-                last_tag = None;
-            }
-        }
-        buf.clear();
-    }
-    out
-}
-
 // ===== Unit tests =====
 
 #[cfg(test)]
@@ -1607,7 +1213,7 @@ mod tests {
     use super::*;
 
     /// Process-global mutex serialising all tests that
-    /// read/write `MNTRS_BATCH_WORKER_COUNT` via
+    /// read/write `MNTRS_DELETE_WORKER_COUNT` via
     /// `unsafe { std::env::set_var / remove_var }`.
     /// cargo runs tests in parallel by default; without
     /// this lock a `set_var` from one test can race a
@@ -1615,124 +1221,6 @@ mod tests {
     /// field holding the wrong value when
     /// `WorkerConfig::from_s3` reads it.
     static WORKER_COUNT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn fake_job(path: &str) -> PendingDelete {
-        PendingDelete {
-            relative_path: path.to_string(),
-            result_tx: oneshot::channel().0,
-        }
-    }
-
-    #[test]
-    fn build_body_emits_delete_quiet_object_keys() {
-        let jobs = vec![fake_job("a/b.txt"), fake_job("c.txt")];
-        let body = build_delete_objects_body(&jobs, "/root/");
-        assert!(body.contains("<Delete>"));
-        assert!(body.contains("<Quiet>true</Quiet>"));
-        assert!(body.contains("<Key>/root/a/b.txt</Key>"));
-        assert!(body.contains("<Key>/root/c.txt</Key>"));
-        assert!(body.contains("</Delete>"));
-    }
-
-    #[test]
-    fn build_body_prefix_root_without_slash() {
-        let jobs = vec![fake_job("a.txt")];
-        let body = build_delete_objects_body(&jobs, "root");
-        assert!(body.contains("<Key>root/a.txt</Key>"));
-    }
-
-    #[test]
-    fn build_body_relative_path_with_leading_slash() {
-        let jobs = vec![fake_job("/a.txt")];
-        let body = build_delete_objects_body(&jobs, "/root/");
-        assert!(body.contains("<Key>/root/a.txt</Key>"));
-    }
-
-    #[test]
-    fn build_body_empty_prefix() {
-        let jobs = vec![fake_job("a.txt")];
-        let body = build_delete_objects_body(&jobs, "");
-        assert!(body.contains("<Key>a.txt</Key>"));
-    }
-
-    #[test]
-    fn base64_md5_is_deterministic() {
-        let body = b"<Delete></Delete>";
-        let a = base64_md5(body);
-        let b = base64_md5(body);
-        assert_eq!(a, b);
-        let mut hasher = Md5::new();
-        hasher.update(body);
-        let expected = B64.encode(hasher.finalize());
-        assert_eq!(a, expected);
-    }
-
-    #[test]
-    fn build_delete_objects_url_path_style() {
-        let endpoint = url::Url::parse("http://localhost:9000").unwrap();
-        let url = build_delete_objects_url(&endpoint, "mybucket").unwrap();
-        assert_eq!(url.path(), "/mybucket");
-        assert_eq!(url.query(), Some("delete="));
-    }
-
-    #[test]
-    fn build_delete_objects_url_with_existing_path() {
-        let endpoint = url::Url::parse("http://localhost:9000/some/prefix").unwrap();
-        let url = build_delete_objects_url(&endpoint, "mybucket").unwrap();
-        assert_eq!(url.path(), "/mybucket");
-    }
-
-    #[test]
-    fn parse_response_all_success_quiet() {
-        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>"#;
-        let res = parse_delete_objects_response(xml);
-        assert!(res.is_empty(), "Quiet=true + no errors = no entries");
-    }
-
-    #[test]
-    fn parse_response_with_not_found_key() {
-        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<DeleteResult>
-  <Error><Key>a.txt</Key><Code>NoSuchKey</Code><Message>missing</Message></Error>
-  <Error><Key>b.txt</Key><Code>AccessDenied</Code><Message>forbidden</Message></Error>
-</DeleteResult>"#;
-        let res = parse_delete_objects_response(xml);
-        assert_eq!(res.len(), 2);
-        assert!(res[0].is_ok(), "NoSuchKey is idempotent success");
-        assert!(res[1].is_err(), "AccessDenied surfaces");
-    }
-
-    #[test]
-    fn parse_response_nosuchversion_is_success() {
-        let xml = r#"<DeleteResult>
-  <Error><Key>v.txt</Key><Code>NoSuchVersion</Code><Message>x</Message></Error>
-</DeleteResult>"#;
-        let res = parse_delete_objects_response(xml);
-        assert_eq!(res.len(), 1);
-        assert!(res[0].is_ok());
-    }
-
-    #[test]
-    fn parse_response_malformed_returns_empty() {
-        let xml = "<<<not xml>>>";
-        let res = parse_delete_objects_response(xml);
-        assert!(res.is_empty());
-    }
-
-    #[test]
-    fn count_outcome_separates_success_notfound_failure() {
-        let results = vec![
-            Ok(()),
-            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "x")),
-            Err(std::io::Error::other("x")),
-            Ok(()),
-        ];
-        let (s, n, f) = count_outcome(&results);
-        assert_eq!(s, 2);
-        assert_eq!(n, 1);
-        assert_eq!(f, 1);
-    }
 
     #[test]
     fn retryable_status_set() {
@@ -1765,7 +1253,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         unsafe {
-            std::env::remove_var("MNTRS_BATCH_WORKER_COUNT");
+            std::env::remove_var("MNTRS_DELETE_WORKER_COUNT");
         }
         let cfg = WorkerConfig::from_s3(
             url::Url::parse("http://localhost:9000").unwrap(),
@@ -1784,12 +1272,6 @@ mod tests {
         // `fast_flush_threshold`) were removed along with the
         // Profile / Calibrator / BurstObserver subsystem.
         assert_eq!(cfg.worker_count, DEFAULT_DELETE_WORKER_COUNT);
-    }
-
-    #[test]
-    fn parse_response_empty_input() {
-        let res = parse_delete_objects_response("");
-        assert!(res.is_empty());
     }
 
     #[test]
