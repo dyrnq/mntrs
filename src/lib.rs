@@ -3699,6 +3699,63 @@ impl MntrsFs {
         // first call after a `BATCHFORGET`, so it has to be
         // self-consistent with the cache-file state.
         //
+        // Issue #580: serve warm dir_cache entries in-process
+        // before falling through to stat_op_async. Without this,
+        // `ls -la <bigdir>` issues one S3 HEAD per entry via
+        // stat_op_async — 500 entries × ~0.8 ms ≈ 0.4 s, vs
+        // `ls many` 0.014 s on the same dataset. The dir_cache
+        // snapshot (TTL 300 s, warmed by the prior readdir)
+        // already carries mode + size + mtime + ino — every
+        // field `make_attr` (`src/lib.rs:1312`) needs to
+        // synthesize a full FileAttr. Return early with the
+        // synthetic attr, skipping the S3 HEAD.
+        //
+        // Symlinks cannot reach this branch: the
+        // `lookup_symlink_entry_case_insensitive` short-circuit
+        // above (line 3661) returns early for any path registered
+        // in `self.symlinks`, and `cache_add_entry` only stores
+        // FILE / DIR modes — UNKNOWN is a defensive fallback
+        // mirroring the NotFound branch's mode match below.
+        let parent_cache_key = canonicalize_list_path(&parent_path);
+        let cache_hit = self.dir_cache.get(&parent_cache_key).and_then(|entry| {
+            let (_t, entries) = entry.value();
+            entries.get(name).map(|r| *r.value())
+        });
+        if let Some(DirEntryCacheValue {
+            mode,
+            size: cached_size,
+            mtime: cached_mtime,
+            ..
+        }) = cache_hit
+        {
+            let kind = match mode {
+                EntryMode::DIR => FileType::Directory,
+                _ => FileType::RegularFile, // FILE + UNKNOWN both → file
+            };
+            // bug 128 precedence: a not-yet-uploaded write leaves
+            // the local cache file larger than the backend's
+            // reported size. Until writeback lands, the cache
+            // file is the source of truth — same rule the
+            // stat_op_async branch applies at line 3713.
+            let size = if kind == FileType::Directory {
+                0
+            } else {
+                let cpath = crate::cache_path(&self.cache_dir, &full_path);
+                let cache_file_size = std::fs::metadata(&cpath).map(|m| m.len()).unwrap_or(0);
+                cached_size.max(cache_file_size)
+            };
+            // Issue #28 path: write mtime into the inodes entry
+            // so the subsequent `getattr` for this ino is also
+            // free (matches the `alloc_ino_with_mtime` call the
+            // cold path makes below at line 3848).
+            let ino = self
+                .find_ino_by_path(&full_path)
+                .unwrap_or_else(|| self.alloc_ino_with_mtime(&full_path, kind, size, cached_mtime));
+            // Bug 33: mirror the kernel's dentry-cache ref count.
+            self.bump_lookup_count(ino);
+            return Ok(to_core_attr(&self.make_attr(ino, size, kind, cached_mtime)));
+        }
+
         // Issue #519: stat_op → stat_op_async. The async
         // variant is what enables the join_all in
         // batch_lookup_from_dir_cache: parallel misses now
@@ -10163,6 +10220,128 @@ mod tests {
                 attr.ino
             );
         }
+    }
+
+    // ---- Issue #580: lookup_async warm dir_cache fast path ----
+    //
+    // `MntrsFs::lookup_async` now consults the parent's dir_cache
+    // before falling through to `stat_op_async` (S3 HEAD). On a warm
+    // dir_cache hit (the common case after a `ls` / `find` /
+    // `readdir` on the same parent within `dir_cache_ttl`), the
+    // returned attr is synthesized from `DirEntryCacheValue { mode,
+    // size, mtime, ino }` — no backend round-trip.
+    //
+    // These tests pin the contract:
+    //   1. warm file hit → returns synthetic attr, no backend stat
+    //   2. warm dir hit → returns synthetic attr, size forced to 0
+    //   3. cold path (no dir_cache entry) → still consults backend
+    //
+    // Test 1 is the load-bearing one: on the pre-fix code, the
+    // `cache_add_entry` below puts a synthetic entry into dir_cache
+    // for a path that does NOT exist on the backend. `lookup_async`
+    // would call `stat_op_async`, which returns `None`, and the
+    // function would return `Err(NotFound)` — failing the test.
+    // Post-fix, the warm branch fires and returns `Ok` with the
+    // cached size / mtime.
+
+    #[test]
+    fn lookup_warm_dir_cache_hit_skips_backend() {
+        let dir = scratch_dir("580-warm-file");
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        // No `op.write` call — the file does NOT exist on the backend.
+        // Pre-fix: lookup_async would call stat_op_async → None →
+        // NotFound fallback → no dir_cache hit there either →
+        // `Err(NotFound)`.
+        // Post-fix: warm branch returns Ok with the synthetic attr.
+        let fs = new_test_fs(op, dir);
+
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        fs.cache_add_entry("", "ghost.txt", EntryMode::FILE, 9_999, mtime, 42);
+
+        let attr = rt()
+            .block_on(fs.lookup_async(1, "ghost.txt"))
+            .expect("warm dir_cache hit must succeed without backend stat");
+        assert_eq!(
+            attr.size, 9_999,
+            "size from DirEntryCacheValue, not backend"
+        );
+        assert_eq!(
+            attr.mtime, mtime,
+            "mtime from DirEntryCacheValue, not UNIX_EPOCH"
+        );
+        assert_eq!(
+            attr.kind,
+            crate::core_fs::CoreFileType::RegularFile,
+            "EntryMode::FILE → RegularFile"
+        );
+        // Note: `cache_add_entry` stores the ino into dir_cache,
+        // but `lookup_async` resolves the ino through
+        // `find_ino_by_path` → `alloc_ino_with_mtime` (the same
+        // path the cold branch takes at line 3847-3854). Without
+        // a prior `path_to_ino.insert` from create/mkdir,
+        // `find_ino_by_path` returns None and a fresh ino is
+        // allocated. The dir_cache's `ino: Some(42)` is consumed
+        // by the readdir fast path (issue #538), not here.
+        assert!(
+            attr.ino > 1,
+            "warm-path lookup must allocate a fresh ino > root, got {}",
+            attr.ino
+        );
+    }
+
+    #[test]
+    fn lookup_warm_dir_cache_dir_hit_returns_synth_attr() {
+        let dir = scratch_dir("580-warm-dir");
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        let fs = new_test_fs(op, dir);
+
+        // Mirror the `cache_add_entry` call mkdir makes at
+        // `src/lib.rs:6555`. We pass `size = 4096` (the value mkdir
+        // stores) — the warm branch must force it to 0 for dirs,
+        // matching the NotFound branch's rule at line 3808.
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        fs.cache_add_entry("", "subdir", EntryMode::DIR, 4_096, mtime, 7);
+
+        let attr = rt()
+            .block_on(fs.lookup_async(1, "subdir"))
+            .expect("warm dir_cache hit for directory");
+        assert_eq!(
+            attr.size, 0,
+            "directory size forced to 0 (bug 128 rule for dirs)"
+        );
+        assert_eq!(attr.kind, crate::core_fs::CoreFileType::Directory);
+        assert!(
+            attr.ino > 1,
+            "warm-path dir lookup must allocate a fresh ino > root, got {}",
+            attr.ino
+        );
+    }
+
+    #[test]
+    fn lookup_cold_dir_cache_still_consults_backend() {
+        // Regression guard: the warm-path fast return must be
+        // gated on dir_cache membership. A name with no entry in
+        // the parent's dir_cache must still reach stat_op_async.
+        let dir = scratch_dir("580-cold-fallback");
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        // Pre-create the file so stat_op_async's success path
+        // (Some(FileStat)) fires — same shape as the existing
+        // batch_lookup_miss_returns_attr_via_lookup_async test.
+        rt().block_on(async {
+            op.write("real.txt", b"hello-cold" as &[u8]).await.unwrap();
+        });
+        let fs = new_test_fs(op, dir);
+        assert!(
+            fs.dir_cache.is_empty(),
+            "no list_op has run — dir_cache must be cold for this name"
+        );
+
+        let attr = rt()
+            .block_on(fs.lookup_async(1, "real.txt"))
+            .expect("cold dir_cache must still succeed via stat_op_async");
+        // Memory backend reports size == bytes written.
+        assert_eq!(attr.size, b"hello-cold".len() as u64);
+        assert_eq!(attr.kind, crate::core_fs::CoreFileType::RegularFile);
     }
 
     /// Issue #519: `.` and `..` are handled in the cheap pass
