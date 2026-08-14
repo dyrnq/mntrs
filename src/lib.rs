@@ -1474,11 +1474,29 @@ impl MntrsFs {
         // list_op arg AND the queried_last derivation
         // base — duplicating the trailing-slash policy
         // that list_op now owns.
-        let listed = self.list_op(&path).map_err(|e| {
-            tracing::warn!(path = %path, error = %e,
-                    "CoreFilesystem::readdir: list_op failed");
-            std::io::Error::other(e)
-        })?;
+        //
+        // hdfs-native quirk: the first entry of op.lister(p) is a phantom
+        // whose name is the LAST path component of p (with any trailing
+        // slash already trimmed by list_op). Confirmed by direct probe:
+        //   lister("/")         → [0].name = ""        (root, no component)
+        //   lister("/test/")    → [0].name = "test"
+        //   lister("/test/sub/")→ [0].name = "sub"
+        // Without filtering, the FUSE reply contains a phantom that
+        // matches the parent dir's basename. ls -R then descends into it
+        // and gets EIO on stat, plus the root listing can show an empty
+        // name (kernel EIO on readdir). Per SESSION_PITFALLS §2.4.
+        //
+        // Issue #520: `e.path` is `Arc<str>`, not `String`. `Path::new`
+        // takes `impl AsRef<OsStr>` and `Arc<str>: AsRef<str>`,
+        // not `AsRef<OsStr>`, so deref explicitly with `&*path` to
+        // pass `&str` (which Path::new accepts).
+        let queried_last = std::path::Path::new(&*path)
+            .components()
+            .next_back()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let cache_key = canonicalize_list_path(&path);
+        let cache_key = cache_key.as_str();
         let mut entries = vec![
             CoreDirEntry {
                 ino,
@@ -1491,80 +1509,94 @@ impl MntrsFs {
                 name: "..".to_string(),
             },
         ];
-        // hdfs-native quirk: the first entry of op.lister(p) is the queried
-        // path itself. After trim_end_matches('/') inside list_op:
-        //   lister("/")      → entries[0].name = ""       ← was caught
-        //   lister("/test/") → entries[0].name = "/test"
-        //   lister("/test")  → entries[0].name = "test"
-        // Without filtering all three, the FUSE reply contains a phantom
-        // entry that matches the parent dir name. ls -R then descends into
-        // it and gets EIO on stat, plus the root listing can show an empty
-        // name (kernel EIO on readdir).
-        // hdfs-native quirk: the first entry of op.lister(p) is a phantom
-        // whose name is the LAST path component of p (with any trailing
-        // slash already trimmed by list_op). Confirmed by direct probe:
-        //   lister("/")         → [0].name = ""        (root, no component)
-        //   lister("/test/")    → [0].name = "test"
-        //   lister("/test/sub/")→ [0].name = "sub"
-        // Without filtering, the FUSE reply contains a phantom that
-        // matches the parent dir's basename. ls -R then descends into it
-        // and gets EIO on stat, plus the root listing can show an empty
-        // name (kernel EIO on readdir). Per SESSION_PITFALLS §2.4.
-        // Issue #520: `e.path` is `Arc<str>`, not `String`. `Path::new`
-        // takes `impl AsRef<OsStr>` and `Arc<str>: AsRef<str>`,
-        // not `AsRef<OsStr>`, so deref explicitly with `&*path` to
-        // pass `&str` (which Path::new accepts).
-        let queried_last = std::path::Path::new(&*path)
-            .components()
-            .next_back()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .unwrap_or_default();
-        for (name, mode, size, _mtime, cached_ino) in listed {
-            if name.is_empty() || name == "/" || (name == queried_last && !queried_last.is_empty())
-            {
-                continue;
+        // Issue #578: warm-cache fast path. Try the
+        // `dir_cache` inner `Arc<DashMap<...>>` first;
+        // on HIT, build entries directly from it instead
+        // of going through `list_op`'s
+        // `Vec<ListOpRow>` intermediate. On MISS (or
+        // expired), fall through to the existing
+        // `list_op` path which refills the cache as a
+        // side effect. The inner Arc is cloned once
+        // under the outer DashMap shard lock; the
+        // per-entry `iter` below runs against the
+        // snapshot, never holding any shard lock for
+        // the duration of the materialisation (which
+        // involves `alloc_ino` calls and `String`
+        // allocations).
+        let mut went_cold = true;
+        if let Some(entry) = self.dir_cache.get(cache_key) {
+            let (cached_at, inner_arc) = entry.value();
+            if cached_at.elapsed() < self.dir_cache_ttl {
+                let snapshot = std::sync::Arc::clone(inner_arc);
+                drop(entry);
+                self.readdir_emit_entries_from_cache(&queried_last, snapshot, &mut entries);
+                went_cold = false;
+            } else {
+                // Cache expired — drop the entry and
+                // fall through to the cold path which
+                // will refill on its next `list_op`.
+                drop(entry);
+                self.dir_cache.remove(cache_key);
             }
-            let kind = match mode {
-                EntryMode::DIR => CoreFileType::Directory,
-                _ => CoreFileType::RegularFile,
-            };
-            // name from list_op already includes path prefix (e.g., "many/file_0001.txt")
-            // Extract just the filename for display, use full path for inode allocation
-            let display_name = name
-                .rsplit_once('/')
-                .map(|(_, n)| n.to_string())
-                .unwrap_or_else(|| name.clone());
-            // Issue #538: cache HIT now carries a pre-allocated
-            // ino from `list_op`'s cache-miss path (or from a
-            // prior `cache_add_entry`). Reuse it instead of
-            // re-running `alloc_ino` here — for a 500-entry
-            // directory that's ~15 ms of DashMap churn removed
-            // from the readdir hot path. On the rare path where
-            // the cache value has `ino: None` (entries seeded
-            // before #538 or via legacy test helpers), fall
-            // back to `alloc_ino` so behaviour stays correct.
-            let ino = match cached_ino {
-                Some(c) => c,
-                None => self.alloc_ino(
-                    &name,
-                    match kind {
-                        CoreFileType::Directory => FileType::Directory,
-                        _ => FileType::RegularFile,
-                    },
-                    size,
-                ),
-            };
-            entries.push(CoreDirEntry {
-                ino,
-                kind,
-                name: display_name,
-            });
+        }
+        if went_cold {
+            let listed = self.list_op(&path).map_err(|e| {
+                tracing::warn!(path = %path, error = %e,
+                        "CoreFilesystem::readdir: list_op failed");
+                std::io::Error::other(e)
+            })?;
+            for (name, mode, size, _mtime, cached_ino) in listed {
+                if name.is_empty()
+                    || name == "/"
+                    || (name == queried_last && !queried_last.is_empty())
+                {
+                    continue;
+                }
+                let kind = match mode {
+                    EntryMode::DIR => CoreFileType::Directory,
+                    _ => CoreFileType::RegularFile,
+                };
+                // name from list_op already includes path prefix (e.g., "many/file_0001.txt")
+                // Extract just the filename for display, use full path for inode allocation
+                let display_name = name
+                    .rsplit_once('/')
+                    .map(|(_, n)| n.to_string())
+                    .unwrap_or_else(|| name.clone());
+                // Issue #538: cache HIT now carries a pre-allocated
+                // ino from `list_op`'s cache-miss path (or from a
+                // prior `cache_add_entry`). Reuse it instead of
+                // re-running `alloc_ino` here — for a 500-entry
+                // directory that's ~15 ms of DashMap churn removed
+                // from the readdir hot path. On the rare path where
+                // the cache value has `ino: None` (entries seeded
+                // before #538 or via legacy test helpers), fall
+                // back to `alloc_ino` so behaviour stays correct.
+                let ino = match cached_ino {
+                    Some(c) => c,
+                    None => self.alloc_ino(
+                        &name,
+                        match kind {
+                            CoreFileType::Directory => FileType::Directory,
+                            _ => FileType::RegularFile,
+                        },
+                        size,
+                    ),
+                };
+                entries.push(CoreDirEntry {
+                    ino,
+                    kind,
+                    name: display_name,
+                });
+            }
         }
         // Plan #64 step 10: tombstone filter for readdir.
         // Write-behind deletes are visible to readdir as
         // soon as the user calls unlink — drop tombstoned
         // entries from the listing so `ls` doesn't show
-        // about-to-be-deleted files.
+        // about-to-be-deleted files. Applied uniformly to
+        // warm and cold materialisation paths — entries
+        // can be tombstoned by `unlink` after the cache
+        // was filled.
         let entries: Vec<CoreDirEntry> = entries
             .into_iter()
             .filter(|e| {
@@ -1577,6 +1609,67 @@ impl MntrsFs {
             })
             .collect();
         Ok(entries)
+    }
+
+    /// Issue #578: warm-cache helper for
+    /// `readdir_materialise`. Iterates the snapshot
+    /// `Arc<DashMap<String, DirEntryCacheValue>>` cloned
+    /// under the outer `dir_cache` shard lock, and pushes
+    /// `CoreDirEntry`s into `out`. Skips phantoms (empty
+    /// name, `/`, or the queried dir's own basename) and
+    /// falls back to `alloc_ino` for legacy entries that
+    /// don't carry a cached ino (issue #538). Mirror of
+    /// the cold-path loop in `readdir_materialise` —
+    /// kept separate to keep each loop's local state
+    /// small.
+    fn readdir_emit_entries_from_cache(
+        &self,
+        queried_last: &str,
+        cached: std::sync::Arc<dashmap::DashMap<String, DirEntryCacheValue>>,
+        out: &mut Vec<CoreDirEntry>,
+    ) {
+        for pair in cached.iter() {
+            let (
+                name,
+                DirEntryCacheValue {
+                    mode,
+                    size,
+                    mtime: _,
+                    ino: cached_ino,
+                },
+            ) = pair.pair();
+            if name.is_empty() || name == "/" || (name == queried_last && !queried_last.is_empty())
+            {
+                continue;
+            }
+            let kind = match mode {
+                EntryMode::DIR => CoreFileType::Directory,
+                _ => CoreFileType::RegularFile,
+            };
+            // `name` is the full key into the dir_cache
+            // (e.g. `"many/file_0001.txt"`); `display_name`
+            // is the basename the FUSE reply carries.
+            let display_name = name
+                .rsplit_once('/')
+                .map(|(_, n)| n.to_string())
+                .unwrap_or_else(|| name.clone());
+            let entry_ino = match cached_ino {
+                Some(c) => *c,
+                None => self.alloc_ino(
+                    name,
+                    match kind {
+                        CoreFileType::Directory => FileType::Directory,
+                        _ => FileType::RegularFile,
+                    },
+                    *size,
+                ),
+            };
+            out.push(CoreDirEntry {
+                ino: entry_ino,
+                kind,
+                name: display_name,
+            });
+        }
     }
 
     /// Background thread that periodically clears stale directory cache entries.
