@@ -76,10 +76,10 @@ mount_mntrs() {
     # MNTRS_DAEMON_LOG: capture the daemon CHILD's stdout/stderr
     # (mount.rs:1489 redirects fds 1/2 inside the forked daemon).
     # Without this, only the parent's startup lines are captured.
-    # RUST_LOG=info so batched_delete flush lines land in the log.
+    # RUST_LOG=info so concurrent_delete flush lines land in the log.
     rm -f "$log"
     MNTRS_DAEMON_LOG="$log" \
-    RUST_LOG=info,mntrs::batched_delete=info \
+    RUST_LOG=info,mntrs::concurrent_delete=info \
     "$MNTRS_BIN" mount "s3://$bucket" "$mp" \
         --opt "endpoint=$ENDPOINT" --opt "access-key=$AK" \
         --opt "secret-key=$SK" --opt "region=$REGION" \
@@ -131,13 +131,15 @@ echo "=========================================="
 echo "--- mounting three impls ---"
 mount_mntrs "$MNTRS_MNT" "$BUCKET_UNB" "$DAEMON_UNB" || { echo "FAIL: unbatched mount"; exit 1; }
 echo "  mntrs-unbatched: OK"
-# Batched mount must inherit MNTRS_UNLINK_BATCH=1 in its env.
-# Stage B: MNTRS_BATCH_FLUSH_DELAY_MS=10 lowers the deadline-driven
-# flush window from 50ms to 10ms — eliminates the small-workload
-# overhead discovered in stage A (single-file was 0.50x).
-MNTRS_UNLINK_BATCH=1 MNTRS_BATCH_FLUSH_DELAY_MS=10 \
+# Concurrent-delete mount must inherit MNTRS_UNLINK_BATCH=1 in its env.
+# Stage B (historical): MNTRS_BATCH_FLUSH_DELAY_MS=10 lowered the
+# deadline-driven flush window from 50ms to 10ms — eliminated the
+# small-workload overhead discovered in stage A. That knob is gone
+# in issue #568 stage 6 / #570 (no flush_coalescing window anymore),
+# so only MNTRS_UNLINK_BATCH=1 remains as the gate.
+MNTRS_UNLINK_BATCH=1 \
     mount_mntrs "$MNTRS_BAT_MNT" "$BUCKET_BAT" "$DAEMON_BAT" || { echo "FAIL: batched mount"; exit 1; }
-echo "  mntrs-batched:   OK (MNTRS_UNLINK_BATCH=1, MNTRS_BATCH_FLUSH_DELAY_MS=10)"
+echo "  mntrs-batched:   OK (MNTRS_UNLINK_BATCH=1)"
 mount_rclone "$RCLONE_MNT" "$BUCKET_RCL" || { echo "FAIL: rclone mount"; exit 1; }
 echo "  rclone:          OK"
 
@@ -244,34 +246,32 @@ python3 "$SCRIPT_DIR/render_table.py" "$RESULT_TMP"
 
 echo ""
 echo "=========================================="
-echo " Batch metrics from $DAEMON_BAT:"
+echo " Concurrent-delete metrics from $DAEMON_BAT:"
 echo "=========================================="
 if [ -f "$DAEMON_BAT" ]; then
-    FLUSH_LINES=$(grep -c 'batched_delete: flush' "$DAEMON_BAT" 2>/dev/null | head -1)
-    FLUSH_LINES=${FLUSH_LINES:-0}
-    MULTI=$(grep 'batched_delete: flush' "$DAEMON_BAT" | grep -cE 'batch_size=([2-9]|[1-9][0-9]+)' 2>/dev/null | head -1)
-    MULTI=${MULTI:-0}
-    if [ "$FLUSH_LINES" -gt 0 ] 2>/dev/null; then
-        MAX_BS=$(grep -oE 'batch_size=[0-9]+' "$DAEMON_BAT" | awk -F= '{print $2}' | sort -n | tail -1)
-        MEAN_BS=$(grep -oE 'batch_size=[0-9]+' "$DAEMON_BAT" | awk -F= '{sum+=$2; n++} END {if(n>0) printf "%.1f", sum/n; else print 0}')
-        SINGLE=$(grep -oE 'batch_size=[0-9]+' "$DAEMON_BAT" | awk -F= '$2==1 {n++} END {print n+0}')
-        FAIL_K=$(grep -cE 'batched_delete.*failed=[1-9]' "$DAEMON_BAT" 2>/dev/null | head -1)
-        FAIL_K=${FAIL_K:-0}
-        RETRY=$(grep -cE 'batched_delete.*retries=[1-9]' "$DAEMON_BAT" 2>/dev/null | head -1)
-        RETRY=${RETRY:-0}
-        echo "  flushes:               $FLUSH_LINES"
-        echo "  multi-key (>=2):       $MULTI"
-        echo "  max batch_size:        $MAX_BS"
-        echo "  mean batch_size:       $MEAN_BS"
-        echo "  single-key batches:    $SINGLE"
-        echo "  flushes w/ failed>=1:  $FAIL_K"
-        echo "  flushes w/ retries>=1: $RETRY"
+    # Issue #572 follow-up: the metrics here measure the
+    # N concurrent single-DELETE workers (default 8) per
+    # issue #568 stage 6 / #570. The historical
+    # `batched_delete: flush batch_size=N` lines are gone —
+    # every flush is now a per-key DELETE that logs
+    # `batched_delete` -> `concurrent_delete: single-key
+    # DELETE: ...` lines.
+    SINGLE=$(grep -cE 'single-key DELETE' "$DAEMON_BAT" 2>/dev/null | head -1)
+    SINGLE=${SINGLE:-0}
+    FAIL=$(grep -cE 'S3 single-object DELETE HTTP [45]' "$DAEMON_BAT" 2>/dev/null | head -1)
+    FAIL=${FAIL:-0}
+    RETRY=$(grep -cE 'retrying after (retryable status|transport error)' "$DAEMON_BAT" 2>/dev/null | head -1)
+    RETRY=${RETRY:-0}
+    if [ "$SINGLE" -gt 0 ] 2>/dev/null; then
+        echo "  per-key DELETEs:       $SINGLE"
+        echo "  failed DELETEs:        $FAIL"
+        echo "  retried DELETEs:       $RETRY"
     else
-        echo "  no flush log lines found — write-behind not engaging"
+        echo "  no DELETE log lines found — concurrent_delete not engaging"
     fi
     echo ""
-    echo "  --- sample flush lines ---"
-    grep 'batched_delete: flush' "$DAEMON_BAT" | head -5
+    echo "  --- sample DELETE lines ---"
+    grep 'single-object DELETE' "$DAEMON_BAT" | head -5
 fi
 
 echo ""

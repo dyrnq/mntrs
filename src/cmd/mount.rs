@@ -44,7 +44,7 @@ pub(crate) struct BuiltOperator {
 /// Inputs the S3 batched deleter needs that opendal doesn't
 /// surface through its public API. Built by `build_s3` from
 /// the storage URL + opts; consumed by `MntrsFs` to construct
-/// the `batched_delete::WorkerConfig` (plan #64 step 7).
+/// the `concurrent_delete::WorkerConfig` (plan #64 step 7).
 #[allow(dead_code)]
 pub(crate) struct S3DeleteMountConfig {
     pub endpoint: url::Url,
@@ -1091,12 +1091,12 @@ pub fn mount(
     let user_set_env = std::env::var_os("MNTRS_UNLINK_BATCH").is_some();
     let enable_batch =
         resolve_unlink_batch(unlink_batch, user_set_env, built.s3_delete_config.is_some());
-    let batched_delete_config = match built.s3_delete_config {
+    let concurrent_delete_config = match built.s3_delete_config {
         Some(cfg) if enable_batch => {
             // Plan #64 stage B: build the WorkerConfig first so the
             // startup log line reflects the env-var-overridden
             // batch_size + flush_delay rather than the defaults.
-            let wc = crate::batched_delete::WorkerConfig::from_s3(
+            let wc = crate::concurrent_delete::WorkerConfig::from_s3(
                 cfg.endpoint.clone(),
                 cfg.bucket.clone(),
                 cfg.prefix.clone(),
@@ -1106,7 +1106,7 @@ pub fn mount(
                 built.http.clone(),
             );
             tracing::info!(
-                target: "mntrs::batched_delete",
+                target: "mntrs::concurrent_delete",
                 bucket = %cfg.bucket,
                 prefix = %cfg.prefix,
                 worker_count = wc.worker_count,
@@ -1114,15 +1114,15 @@ pub fn mount(
                 credential_source = if cfg.access_key_id.is_some() { "explicit" } else { "default-chain" },
                 unlink_batch_flag = %unlink_batch,
                 user_set_env = user_set_env,
-                "batched_delete: enabled"
+                "concurrent_delete: enabled"
             );
             Some(wc)
         }
         Some(_) => {
             tracing::debug!(
-                target: "mntrs::batched_delete",
+                target: "mntrs::concurrent_delete",
                 unlink_batch_flag = %unlink_batch,
-                "batched_delete: not enabled"
+                "concurrent_delete: not enabled"
             );
             None
         }
@@ -1394,8 +1394,8 @@ pub fn mount(
         handle_caching: std::time::Duration::from_secs(vfs_handle_caching),
         disk_total_size: vfs_disk_space_total_size * 1024 * 1024 * 1024 * 1024, // TB to bytes
         writeback_sender: std::sync::OnceLock::new(),
-        batched_delete_config,
-        batched_deleter: std::sync::OnceLock::new(),
+        concurrent_delete_config,
+        concurrent_deleter: std::sync::OnceLock::new(),
         // Unix-only — see MntrsFs::fuse_notifier in lib.rs.
         // The setter (set_fuse_notifier) is also unix-only and is
         // called from this same mount path immediately after this

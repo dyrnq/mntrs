@@ -157,57 +157,31 @@ echo "  $(date -Iseconds): mntrs mount returned (exit=$?)"
 # surface so the only delta is the batching.
 #
 # Issue #536: the default `burst_threshold=32` /
-# `batch_threshold=32` / `flush_delay_ms=50` triple gates the
-# batcher out of the typical rm -rf workloads (10/100/500
-# files), so the bench measures only FUSE callback time, not
-# the S3 DeleteObjects wall time. Lowering these env vars on
-# the bench-only batched mount makes the A/B reflect the actual
-# batching fast path.
+# `burst_window_ms=100` pair gates the burst detector so
+# that typical rm -rf workloads (10/100/500 files) stay in
+# burst mode. After issue #568 stage 6 the deleter has no
+# flush-coalescing window — every enqueue fires a single
+# DELETE — so the bench measures pure N-concurrent DELETE
+# wall time on the batched mount, not batch XML overhead.
 #   * MNTRS_BURST_WINDOW_MS=200   — caller-side burst window
 #                                   widened so a 100/500-file
 #                                   rm -rf stays in burst mode
 #                                   for its full duration
 #   * MNTRS_BURST_THRESHOLD=4     — caller-side burst detector
 #                                   trips after just 4 unlinks
-#   * MNTRS_BATCH_FLUSH_DELAY_MS=10 — flush window halved
-#   * MNTRS_BATCH_THRESHOLD=0     — deleter-side enqueue gate
-#                                   bypassed entirely (the
-#                                   `current_len < threshold`
-#                                   check is satisfied only
-#                                   once the queue already has
-#                                   `threshold` jobs in it,
-#                                   which can never happen
-#                                   without an initial bypass;
-#                                   0 means "always batch")
-#   * MNTRS_BATCH_SIZE=20         — size-driven flush at 20
-#                                   keys (S3 DeleteObjects
-#                                   caps at 1000 anyway, and
-#                                   20 keeps individual batches
-#                                   cheap for mixed loads)
+# Historical knobs (MNTRS_BATCH_FLUSH_DELAY_MS,
+# MNTRS_BATCH_THRESHOLD, MNTRS_BATCH_SIZE, MNTRS_BATCH_PROFILE)
+# were removed in issue #568 stage 6 / #570 — the batched
+# deleter is now rclone-style N concurrent single-DELETE.
 # The default policy at runtime is unchanged.
-echo "  $(date -Iseconds): starting mntrs-batched mount (MNTRS_UNLINK_BATCH=1, fast-path thresholds)..."
+echo "  $(date -Iseconds): starting mntrs-concurrent mount (MNTRS_UNLINK_BATCH=1, caller-side burst tuning)..."
 export MNTRS_BATCH_DAEMON_LOG="${MNTRS_BATCH_DAEMON_LOG:-/tmp/mntrs-daemon-batch.log}"
-# Issue #562 stage 3: leave MNTRS_BATCH_PROFILE unset so the
-# auto profile is exercised end-to-end. The burst classifier
-# should keep the system in `small` for `rm -rf 10/100`,
-# flip to `medium` for the deep / mixed cases, and flip to
-# `bulk` for the 500/1000 cases — verify by grepping the
-# daemon log for `batched_delete: profile transition`.
-# Issue #562 stage 5: the Calibrator runs alongside the
-# controller and emits `batched_delete: calibrator
-# recommendation` lines when the running workload crosses
-# a trigger. The bench fixture is well-fit by the current
-# Profile defaults so under normal runs this count is 0;
-# verify by grepping `calibrator_recommendations_total` in
-# the snapshot or `calibrator recommendation` in the daemon
-# log.
+# Issue #572 follow-up: the tracing target renamed from
+# `mntrs::batched_delete` to `mntrs::concurrent_delete`.
 MNTRS_UNLINK_BATCH=1 \
 MNTRS_BURST_WINDOW_MS=200 \
 MNTRS_BURST_THRESHOLD=4 \
-MNTRS_BATCH_FLUSH_DELAY_MS=10 \
-MNTRS_BATCH_THRESHOLD=0 \
-MNTRS_BATCH_SIZE=20 \
-RUST_LOG=info,mntrs::batched_delete=info \
+RUST_LOG=info,mntrs::concurrent_delete=info \
 "$MNTRS_BIN" mount "s3://$BATCH_BUCKET" "$MNTRS_BATCH_MNT" \
     --opt "endpoint=$ENDPOINT" --opt "access-key=$ACCESS_KEY" \
     --opt "secret-key=$SECRET_KEY" --opt "region=$REGION" \
