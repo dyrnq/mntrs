@@ -33,18 +33,19 @@ opendal = { version = "0.58", features = ["services-s3", "services-gcs", "servic
 # depend on it directly so we can name `ReqwestTransport` in code
 # without depending on opendal's internal type re-exports.
 opendal-http-transport-reqwest = "0.58"
-# Direct S3 DeleteObjects path for plan #64 (batched deleter).
-# Versions mirror the transitive versions opendal-service-s3 0.58.1
-# already pulls in (see Cargo.lock); pinning avoids adding a
-# second reqsign/quick-xml generation to the resolved graph.
+# Direct S3 DeleteObjects path for plan #64 (concurrent_delete).
+# Versions track reqsign 3.x line; PR #575 (#574) advanced the
+# lockfile to 3.2/3.3/3.0.5, PR #576 aligns the manifest. New
+# transitive `reqsign-aws-core 3.1.0` is pulled in by aws-v4 3.2
+# (extracted submodule).
 # opendal's BatchDeleter<S3Deleter> can't batch across FUSE
 # callbacks (each op.delete() builds a fresh deleter), so we
 # bypass opendal's delete path entirely and call S3 DeleteObjects
 # directly. reqsign-aws-v4 signs the request, quick-xml builds
 # the body, md-5+base64 compute the mandatory Content-MD5.
-reqsign-aws-v4 = "3.0"
-reqsign-core = "3.2"
-reqsign-file-read-tokio = "3.0"
+reqsign-aws-v4 = "3.2"
+reqsign-core = "3.3"
+reqsign-file-read-tokio = "3.0.5"
 http = "1"
 quick-xml = "0.41"
 md-5 = "0.11"
