@@ -12,7 +12,16 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
+  # ctor 1.0 (issue #574 PR 3) makes the `unsafe` keyword on
+  # `#[ctor]` mandatory by default — static initializers run
+  # arbitrary code before main, so the crate refuses to emit
+  # the linktime section unless the call site opts in. The
+  # cfg flag below suppresses that error and emits a warning
+  # instead, so existing call sites that pre-date 1.0 (e.g.
+  # `tests/platform/windows/winfsp_integration_test.rs:21`'s
+  # `__init_tracing`) keep compiling unchanged. The flag is
+  # a no-op for code that doesn't use the `ctor` crate.
+  RUSTFLAGS: "--cfg linktime_no_fail_on_missing_unsafe -D warnings"
 
 jobs:
   windows:

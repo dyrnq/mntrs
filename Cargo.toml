@@ -177,7 +177,7 @@ path = "tests/mount_internal_test.rs"
 # is already a regular dep, but listed here too so test-only filter
 # logic compiles even if the main dep ever moves behind a feature.
 [dev-dependencies]
-ctor = "0.2"
+ctor = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 

@@ -741,16 +741,6 @@ dependencies = [
 
 [[package]]
 name = "ctor"
-version = "0.2.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32a2785755761f3ddc1492979ce1e48d2c00d09311c39e4466429188f3dd6501"
-dependencies = [
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "ctor"
 version = "1.0.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "914a755b7c2d4af2bdcff7ce1739e2db9a1b81a9b07123d8015786ae03c0980d"
@@ -2176,7 +2166,7 @@ dependencies = [
  "clap",
  "crc32c",
  "crossbeam-channel",
- "ctor 0.2.9",
+ "ctor",
  "dashmap",
  "foyer-memory",
  "fuser",
@@ -2412,7 +2402,7 @@ version = "0.58.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f20562cc7447fcc915fc5c23df305a412ea80a733c9f2fd9e2d267e2815be6d"
 dependencies = [
- "ctor 1.0.13",
+ "ctor",
  "opendal-core",
  "opendal-http-transport-reqwest",
  "opendal-layer-capability-check",
