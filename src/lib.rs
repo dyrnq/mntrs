@@ -2,11 +2,11 @@
 #![cfg_attr(windows, allow(dead_code, unused_imports, unused_variables))]
 #![recursion_limit = "256"]
 pub mod backpressure;
-pub(crate) mod batched_delete;
 pub mod block_format;
 pub mod cache;
 pub(crate) mod cache_layer;
 pub mod cmd;
+pub(crate) mod concurrent_delete;
 pub mod core_fs;
 pub mod disk_write_pool;
 pub mod error_log;
@@ -441,22 +441,39 @@ impl FileHandleState {
     }
 }
 
+/// Issue #530: caller-side burst-gating defaults. The window
+/// (100 ms) and threshold (32) were chosen empirically when the
+/// S3 deleter still had a Profile subsystem (issue #530
+/// / #562). After issue #568 stage 6 the threshold gates no
+/// longer drive a fast-flush decision (the deleter is now N
+/// concurrent single-DELETE), but the constants remain so the
+/// `UnlinkBurstState` fallback policy is unchanged for callers
+/// that don't set `MNTRS_BURST_WINDOW_MS` /
+/// `MNTRS_BURST_THRESHOLD` in the environment.
+const DEFAULT_UNLINK_BURST_WINDOW_MS: u64 = 100;
+/// Renamed from `concurrent_delete::DEFAULT_BATCH_THRESHOLD`
+/// in issue #572: the constant lives here (with the policy
+/// that consumes it) rather than in the concurrent_delete
+/// module where it no longer has any meaning.
+pub(crate) const DEFAULT_UNLINK_BURST_THRESHOLD: u32 = 32;
+
 /// Issue #530: caller-side burst detection state for
 /// `enqueue_backend_delete`. See the doc-comment on
 /// `MntrsFs::unlink_burst_state` for the rationale. Two
 /// parameters govern the gating policy:
 ///   * `burst_window` — how long after a previous unlink we
 ///     still consider ourselves "in a burst". Default 100 ms
-///     (matches the 50 ms flush_delay × 2, so an `rm -rf`
-///     where unlinks arrive faster than the batched deleter
-///     can flush them stays in burst mode).
+///     (matches the original 50 ms flush_delay × 2, so an
+///     `rm -rf` where unlinks arrive faster than the
+///     concurrent deleter can drain them stays in burst mode).
 ///   * `burst_threshold` — how many unlinks within
 ///     `burst_window` are required before we route the next
-///     delete through the batched deleter. Below this we
+///     delete through the concurrent deleter. Below this we
 ///     fall through to `delete_backend_strict`. Default 32
-///     (bench crossover for "1 batched `DeleteObjects` beats
-///     32 serial `op.delete()` calls" on the local MinIO
-///     fixture; conservative for real S3 latencies).
+///     (bench crossover from the issue #530 days when 1 batched
+///     `DeleteObjects` beat 32 serial `op.delete()` calls; the
+///     constant is retained for callers that opt into the
+///     strict path via `MNTRS_BURST_THRESHOLD=0`).
 struct UnlinkBurstState {
     /// `Instant` of the last unlink that updated this state.
     /// Compared against `Instant::now()` under the mutex.
@@ -468,7 +485,7 @@ struct UnlinkBurstState {
     /// How wide a window we treat as "still bursting".
     burst_window: std::time::Duration,
     /// How many unlinks within the window before we route
-    /// to the batched deleter.
+    /// to the concurrent deleter.
     burst_threshold: u32,
 }
 
@@ -479,17 +496,17 @@ impl UnlinkBurstState {
     /// unlinks) when env vars are unset or fail to parse —
     /// runtime behaviour is unchanged for callers that do not
     /// opt in via env. Bench harness overrides these to enable
-    /// the batched_delete fast path on small rm -rf workloads
+    /// the concurrent_delete fast path on small rm -rf workloads
     /// (issue #536 follow-up).
     fn from_env() -> Self {
         let window_ms = std::env::var("MNTRS_BURST_WINDOW_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(100);
+            .unwrap_or(DEFAULT_UNLINK_BURST_WINDOW_MS);
         let threshold = std::env::var("MNTRS_BURST_THRESHOLD")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(crate::batched_delete::DEFAULT_BATCH_THRESHOLD as u32);
+            .unwrap_or(DEFAULT_UNLINK_BURST_THRESHOLD);
         Self::with_policy(
             std::time::Duration::from_millis(window_ms.clamp(1, 10_000)),
             threshold,
@@ -758,22 +775,24 @@ pub struct MntrsFs {
     pub(crate) cache_poll_interval: Duration,
     pub(crate) disk_total_size: u64,
     writeback_sender: std::sync::OnceLock<writeback::Sender>,
-    /// Plan #64 step 7: per-mount config for the S3 batched
+    /// Plan #64 step 7: per-mount config for the S3 concurrent
     /// deleter. `Some(_)` only when (a) the backend is S3 and (b)
-    /// `MNTRS_UNLINK_BATCH=1` is set; `None` for non-S3 backends
-    /// or when batching is disabled (default off). Set once in
-    /// `common_init_wb` if `batched_delete_config.is_some()` and
-    /// `batched_delete::spawn` returns `Ok`.
+    /// the deleter is enabled (S3 default since issue #568
+    /// stage C). `None` for non-S3 backends or when the deleter
+    /// is explicitly disabled via `--unlink-batch=off` /
+    /// `MNTRS_UNLINK_BATCH=0`. Set once in
+    /// `common_init_wb` if `concurrent_delete_config.is_some()` and
+    /// `concurrent_delete::spawn` returns `Ok`.
     #[allow(dead_code)]
-    pub(crate) batched_delete_config: Option<batched_delete::WorkerConfig>,
-    /// Plan #64 step 7: long-lived batched-delete handle.
+    pub(crate) concurrent_delete_config: Option<concurrent_delete::WorkerConfig>,
+    /// Plan #64 step 7: long-lived concurrent-delete handle.
     /// `OnceLock` because the worker task must be spawned from
     /// inside `rt()` (see `common_init_wb`'s `crate::rt().block_on`
-    /// wrapper). `None` for non-S3, or when batching is disabled,
-    /// or when the worker fails to spawn (e.g. signer build
-    /// failure — recoverable; logged + counter increments).
+    /// wrapper). `None` for non-S3, or when the concurrent deleter
+    /// is disabled, or when the worker fails to spawn (e.g. signer
+    /// build failure — recoverable; logged + counter increments).
     #[allow(dead_code)]
-    pub(crate) batched_deleter: std::sync::OnceLock<batched_delete::BatchedDeleter>,
+    pub(crate) concurrent_deleter: std::sync::OnceLock<concurrent_delete::ConcurrentDeleter>,
     /// #89: FUSE kernel notifier for attr cache invalidation after
     /// writes. Set once in `set_fuse_notifier()` from the mount
     /// command path. The write handler calls
@@ -827,16 +846,16 @@ pub struct MntrsFs {
     /// Issue #530: caller-side burst detection for
     /// `enqueue_backend_delete`. Tracks the timing of recent
     /// unlinks so we can decide whether the next delete
-    /// should go through the batched deleter (sustained
+    /// should go through the concurrent deleter (sustained
     /// burst) or fall back to a direct `delete_backend_strict`
-    /// (single / scattered unlinks). Without this, the
-    /// batched deleter's 50 ms flush_delay would penalize
-    /// small `rm` workloads (bench showed 0.37x for 10/100
-    /// file bursts) — the S3 batched DELETE pays its
-    /// flush_delay latency floor whether or not the burst
-    /// is large enough to amortise it. Updated under
-    /// `unlink_burst_mu`; the lock is held only long enough
-    /// to read+write a few atomics-worth of state.
+    /// (single / scattered unlinks). After issue #568 stage 6
+    /// the concurrent deleter has no flush-coalescing window —
+    /// every enqueue fires a single DELETE on the next available
+    /// worker — so the gating here only routes traffic away from
+    /// the deleter for tiny non-burst workloads where the
+    /// strict path skips the enqueue+oneshot overhead. Updated
+    /// under `unlink_burst_mu`; the lock is held only long
+    /// enough to read+write a few atomics-worth of state.
     unlink_burst_state: std::sync::Mutex<UnlinkBurstState>,
 
     /// Issue #325: in-memory symlink target table.
@@ -1644,7 +1663,7 @@ impl MntrsFs {
         // mount()/session start, not FUSE callbacks. Failures are
         // logged and the deleter stays absent (callers fall back
         // to opendal).
-        if let Some(cfg) = self.batched_delete_config.as_ref() {
+        if let Some(cfg) = self.concurrent_delete_config.as_ref() {
             // `spawn` is sync (it builds tokio tasks and returns
             // immediately); the controller + flushers run on
             // `crate::rt()`. No block_on needed here — `spawn`
@@ -1653,20 +1672,21 @@ impl MntrsFs {
             //
             // Issue #562 stage 1: the worker handle bundle is
             // discarded (fire-and-forget). Shutdown is implicit:
-            // when every `BatchedDeleter` clone drops the
-            // `flush_tx` closes → controller's `rx.recv()` returns
-            // `None` → controller exits → its `wake_tx` drops →
-            // flushers' `wake_rx.recv()` returns `Err(Closed)` →
-            // flushers exit. The handles don't need awaiting.
-            match crate::batched_delete::spawn(cfg.clone(), self.delete_tombstones.clone()) {
+            // when every `ConcurrentDeleter` clone drops the
+            // `flush_tx` closes → drain worker's `rx.recv()` returns
+            // `None` → drain worker exits → the N deleter loops
+            // idle on their `notify.notified()` future and get
+            // cleaned up when `crate::rt()` drops. The handles
+            // don't need awaiting.
+            match crate::concurrent_delete::spawn(cfg.clone(), self.delete_tombstones.clone()) {
                 Ok((deleter, _handles)) => {
-                    self.batched_deleter.set(deleter).ok();
+                    self.concurrent_deleter.set(deleter).ok();
                 }
                 Err(e) => {
                     tracing::error!(
-                        target: "mntrs::batched_delete",
+                        target: "mntrs::concurrent_delete",
                         error = %e,
-                        "batched_delete: failed to spawn worker; falling back to opendal delete path"
+                        "concurrent_delete: failed to spawn worker; falling back to opendal delete path"
                     );
                 }
             }
@@ -1840,7 +1860,7 @@ impl MntrsFs {
         path: &str,
         op_label: &'static str,
     ) -> std::io::Result<()> {
-        if let Some(deleter) = self.batched_deleter.get() {
+        if let Some(deleter) = self.concurrent_deleter.get() {
             // Strict path: enqueue + await. Workers are
             // single-flight per chunk but the wait is bounded by
             // batch size and request timeout. The wait has the
@@ -1860,7 +1880,7 @@ impl MntrsFs {
             // where `op.delete()` was always the fallback.
             // The pre-#530 fallback branch is preserved
             // verbatim below for the case where
-            // `batched_deleter` itself is unavailable
+            // `concurrent_deleter` itself is unavailable
             // (non-S3, disabled, spawn failure).
             // Issue #530: pass the `Option<Receiver>` through
             // directly so a `None` from the deleter's own
@@ -1878,7 +1898,7 @@ impl MntrsFs {
                     Ok(Err(e)) => Err(e),
                     Err(_) => Err(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
-                        "batched_deleter: worker dropped result sender",
+                        "concurrent_deleter: worker dropped result sender",
                     )),
                 },
                 None => {
@@ -1928,7 +1948,7 @@ impl MntrsFs {
         &self,
         path: &str,
     ) -> Option<tokio::sync::oneshot::Receiver<std::io::Result<()>>> {
-        let deleter = self.batched_deleter.get()?;
+        let deleter = self.concurrent_deleter.get()?;
 
         // Issue #530: caller-side burst gating. The `Mutex`
         // here is uncontended on the steady-state burst path
@@ -6093,14 +6113,14 @@ impl CoreFilesystem for MntrsFs {
         // queued job; subsequent lookup sees the path as writable,
         // and no DeleteObjects is sent for it.
         if self.delete_tombstones.contains(&full_path) {
-            if let Some(deleter) = self.batched_deleter.get() {
+            if let Some(deleter) = self.concurrent_deleter.get() {
                 let cancelled = deleter.cancel_pending(&full_path);
                 if cancelled > 0 {
                     tracing::debug!(
-                        target: "mntrs::batched_delete",
+                        target: "mntrs::concurrent_delete",
                         path = %full_path,
                         cancelled,
-                        "batched_delete: cancelled in-flight delete due to recreate"
+                        "concurrent_delete: cancelled in-flight delete due to recreate"
                     );
                 }
             } else {
@@ -6381,7 +6401,7 @@ impl CoreFilesystem for MntrsFs {
         // `rmdir foo && mkdir foo` shouldn't hit ENOENT from the
         // tombstone or race the in-flight delete.
         if self.delete_tombstones.contains(&full_path) {
-            if let Some(deleter) = self.batched_deleter.get() {
+            if let Some(deleter) = self.concurrent_deleter.get() {
                 let _ = deleter.cancel_pending(&full_path);
             } else {
                 self.delete_tombstones.remove(&full_path);
@@ -6889,7 +6909,7 @@ impl CoreFilesystem for MntrsFs {
         // backends (some pre-check emptyness, some don't).
         // Plan #64 step 10: rmdir is the **directory barrier**
         // for write-behind deletes. Two paths:
-        //   - batched_deleter enabled: enqueue the dir marker
+        //   - concurrent_deleter enabled: enqueue the dir marker
         //     (trailing slash; S3 directory objects), then
         //     `flush().await` to drain any in-flight file
         //     deletes before the user's `rm -rf` returns.
@@ -6897,18 +6917,18 @@ impl CoreFilesystem for MntrsFs {
         //     is "dir is gone before you see the next prompt."
         //   - otherwise: strict delete (same as unlink); no
         //     barrier because op.delete is synchronous.
-        if self.batched_deleter.get().is_some() {
+        if self.concurrent_deleter.get().is_some() {
             if let Some(rx) = self.enqueue_backend_delete(&dir_path) {
                 drop(rx);
             }
             // barrier: drain all pending file deletes + the
             // dir marker before the kernel sees rmdir return.
-            if let Some(deleter) = self.batched_deleter.get()
+            if let Some(deleter) = self.concurrent_deleter.get()
                 && let Err(e) = crate::rt().block_on(deleter.flush())
             {
                 tracing::warn!(
                     path = %dir_path, error = %e,
-                    "FUSE rmdir: batched_deleter flush failed; some deletes may not be requested yet"
+                    "FUSE rmdir: concurrent_deleter flush failed; some deletes may not be requested yet"
                 );
                 return Err(std::io::Error::other("rmdir: batched deleter flush failed"));
             }
@@ -8417,8 +8437,8 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         // deleter (no S3 backend in tests). Leave None / empty;
         // the gating helpers in step 8 fall back to opendal
         // path when these are absent.
-        batched_delete_config: None,
-        batched_deleter: std::sync::OnceLock::new(),
+        concurrent_delete_config: None,
+        concurrent_deleter: std::sync::OnceLock::new(),
         #[cfg(not(windows))]
         fuse_notifier: std::sync::OnceLock::new(),
         writeback_pending: Arc::new(dashmap::DashSet::new()),

@@ -23,7 +23,7 @@
 //!
 //! ## Shutdown
 //!
-//! Mirrors `writeback::spawn`: dropping the last `BatchedDeleter`
+//! Mirrors `writeback::spawn`: dropping the last `ConcurrentDeleter`
 //! handle closes the control channel and the worker exits on
 //! `rx.recv().await → None`. In-flight pending deletes are completed
 //! with `io::ErrorKind::BrokenPipe` (same pattern writeback uses on
@@ -71,13 +71,6 @@ pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const DEFAULT_MAX_RETRIES: u32 = 3;
 pub(crate) const DEFAULT_RETRY_FACTOR: f64 = 2.0;
 pub(crate) const DEFAULT_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
-
-/// Issue #530: caller-side threshold gating (kept as a stub for
-/// `UnlinkBurstState::from_env` callers — see `src/lib.rs:492`).
-/// The batched-deleter threshold gate was removed in issue #568
-/// stage 6, but this constant remains so external readers don't
-/// see a breaking constant drop. New code should ignore it.
-pub(crate) const DEFAULT_BATCH_THRESHOLD: usize = 32;
 
 /// Issue #562 stage 1 (kept): default deleter pool size. Aligned
 /// with rclone `--checkers=8` in issue #568 stage 6 — the N
@@ -265,11 +258,11 @@ struct Shared {
 
 /// Cheap-clone handle for FUSE callbacks to enqueue deletes. The
 /// worker task is owned by the `JoinHandle` returned from `spawn`.
-/// Dropping all `BatchedDeleter` handles (including the one stored
+/// Dropping all `ConcurrentDeleter` handles (including the one stored
 /// in `MntrsFs`) closes the control channel and the worker exits on
 /// `rx.recv().await → None`.
 #[derive(Clone)]
-pub(crate) struct BatchedDeleter {
+pub(crate) struct ConcurrentDeleter {
     shared: Arc<Shared>,
     flush_tx: mpsc::Sender<Control>,
 }
@@ -278,7 +271,7 @@ pub(crate) struct BatchedDeleter {
 
 /// Construction-time config. Built by `cmd/mount.rs::build_s3` after
 /// parsing the storage URL and CLI options; passed to
-/// `batched_delete::spawn`.
+/// `concurrent_delete::spawn`.
 #[derive(Clone)]
 pub(crate) struct WorkerConfig {
     pub endpoint: url::Url,
@@ -364,7 +357,7 @@ enum Control {
     Wake,
     /// Force a flush of all pending keys; signal `done` with the
     /// number of keys flushed (or `Err` on transport-level failure).
-    /// Used by `BatchedDeleter::flush()` (Policy B rmdir barrier).
+    /// Used by `ConcurrentDeleter::flush()` (Policy B rmdir barrier).
     Flush {
         done: oneshot::Sender<std::io::Result<usize>>,
     },
@@ -391,7 +384,7 @@ enum Control {
 /// scope); or await the drain handle first and then
 /// the deleter handles for a clean shutdown. MntrsFs
 /// currently takes the drop path (fire-and-forget): all
-/// `BatchedDeleter` clones drop → `flush_tx` drops →
+/// `ConcurrentDeleter` clones drop → `flush_tx` drops →
 /// controller's `rx.recv()` returns `None` → controller
 /// exits → `wake_tx` drops → flushers' `wake_rx.recv()`
 /// returns `Err(Sender)` → flushers exit.
@@ -421,7 +414,7 @@ pub(crate) struct WorkerHandles {
 pub(crate) fn spawn(
     config: WorkerConfig,
     tombs: std::sync::Arc<dashmap::DashSet<String>>,
-) -> std::io::Result<(BatchedDeleter, WorkerHandles)> {
+) -> std::io::Result<(ConcurrentDeleter, WorkerHandles)> {
     let (tx, rx) = mpsc::channel::<Control>(64);
     // **Stage 6 (issue #568):** Shared now also carries the
     // `tokio::sync::Notify` used to wake N concurrent deleter
@@ -434,7 +427,7 @@ pub(crate) fn spawn(
         notify: tokio::sync::Notify::new(),
         tombs,
     });
-    let deleter = BatchedDeleter {
+    let deleter = ConcurrentDeleter {
         shared: shared.clone(),
         flush_tx: tx,
     };
@@ -472,9 +465,9 @@ pub(crate) fn spawn(
     ))
 }
 
-// ===== BatchedDeleter API =====
+// ===== ConcurrentDeleter API =====
 
-impl BatchedDeleter {
+impl ConcurrentDeleter {
     /// Enqueue a relative path for deletion. Returns `None` if the
     /// worker is shutting down (handle will not accept new work);
     /// returns `Some(oneshot::Receiver)` otherwise. The caller
@@ -553,7 +546,7 @@ impl BatchedDeleter {
                 if job.relative_path == relative_path {
                     let _ = job.result_tx.send(Err(std::io::Error::new(
                         std::io::ErrorKind::Interrupted,
-                        "batched_deleter: cancelled by recreate",
+                        "concurrent_deleter: cancelled by recreate",
                     )));
                     cancelled += 1;
                 } else {
@@ -595,13 +588,13 @@ impl BatchedDeleter {
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
-                "batched_deleter: worker channel closed",
+                "concurrent_deleter: worker channel closed",
             ));
         }
         done_rx.await.map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
-                "batched_deleter: worker dropped flush response",
+                "concurrent_deleter: worker dropped flush response",
             )
         })?
     }
@@ -675,7 +668,7 @@ impl BatchedDeleter {
 ///
 /// * `Control::Wake` — fan-out wake to all currently
 ///   sleeping deleters (`Shared::notify.notify_waiters()`).
-///   Used by the caller-side `BatchedDeleter::enqueue` first-
+///   Used by the caller-side `ConcurrentDeleter::enqueue` first-
 ///   push path to break any deleter out of
 ///   `notify.notified().await`. (After the rewrite, deleters
 ///   also call `notify_one()` themselves on every push, so the
@@ -683,7 +676,7 @@ impl BatchedDeleter {
 ///   race the threshold gate — kept for API compatibility.)
 /// * `Control::Flush { done }` — sync drain of all pending
 ///   keys, ack the oneshot with the number flushed. Used by
-///   `BatchedDeleter::flush()` (Policy B rmdir barrier):
+///   `ConcurrentDeleter::flush()` (Policy B rmdir barrier):
 ///   the caller blocks until the drain completes so a
 ///   subsequent `op.readdir` sees the directory as empty.
 /// * `Control::Shutdown { drain, done }` — graceful shutdown.
@@ -710,11 +703,11 @@ async fn drain_worker_loop(
         Ok(s) => s,
         Err(e) => {
             tracing::error!(
-                target: "mntrs::batched_delete",
+                target: "mntrs::concurrent_delete",
                 bucket = %config.bucket,
                 prefix = %config.prefix,
                 error = %e,
-                "batched_delete: drain worker failed to build signer, exiting"
+                "concurrent_delete: drain worker failed to build signer, exiting"
             );
             shared.accepting.store(false, Ordering::Release);
             fail_all_pending(&shared);
@@ -723,12 +716,12 @@ async fn drain_worker_loop(
     };
 
     tracing::info!(
-        target: "mntrs::batched_delete",
+        target: "mntrs::concurrent_delete",
         bucket = %config.bucket,
         prefix = %config.prefix,
         worker_count = config.worker_count,
         credential_source = if config.access_key_id.is_some() { "explicit" } else { "default-chain" },
-        "batched_delete: drain worker started"
+        "concurrent_delete: drain worker started"
     );
 
     while let Some(cmd) = rx.recv().await {
@@ -740,7 +733,7 @@ async fn drain_worker_loop(
                 // this is mostly a no-op — but the caller-side
                 // FUSE unlink path still sends `Wake` on the
                 // first push of an empty queue (see
-                // `BatchedDeleter::enqueue`) for the
+                // `ConcurrentDeleter::enqueue`) for the
                 // "break the worker out of `rx.recv().await`"
                 // legacy semantics. `notify_waiters()` is
                 // cheap (one atomic op, no allocation).
@@ -784,8 +777,8 @@ async fn drain_worker_loop(
     }
     fail_all_pending(&shared);
     tracing::info!(
-        target: "mntrs::batched_delete",
-        "batched_delete: drain worker exiting"
+        target: "mntrs::concurrent_delete",
+        "concurrent_delete: drain worker exiting"
     );
 }
 
@@ -822,7 +815,7 @@ async fn drain_worker_loop(
 /// The deleter loop runs forever — there is no graceful
 /// shutdown path for an individual deleter. The drain
 /// worker marks `Shared::accepting = false` on shutdown,
-/// which causes `BatchedDeleter::enqueue` to return `None`;
+/// which causes `ConcurrentDeleter::enqueue` to return `None`;
 /// in-flight jobs continue processing until the queue is
 /// empty. When the drain worker exits it drops the
 /// `Shared::notify` along with everything else, so the
@@ -840,20 +833,20 @@ async fn deleter_loop(deleter_id: usize, config: WorkerConfig, shared: Arc<Share
         Ok(s) => s,
         Err(e) => {
             tracing::error!(
-                target: "mntrs::batched_delete",
+                target: "mntrs::concurrent_delete",
                 deleter_id,
                 error = %e,
-                "batched_delete: deleter failed to build signer, exiting"
+                "concurrent_delete: deleter failed to build signer, exiting"
             );
             return;
         }
     };
 
     tracing::info!(
-        target: "mntrs::batched_delete",
+        target: "mntrs::concurrent_delete",
         deleter_id,
         worker_count = config.worker_count,
-        "batched_delete: deleter started"
+        "concurrent_delete: deleter started"
     );
 
     loop {
@@ -896,7 +889,7 @@ async fn deleter_loop(deleter_id: usize, config: WorkerConfig, shared: Arc<Share
             // chunk); treat as a transport error.
             let outcome = results.into_iter().next().unwrap_or_else(|| {
                 Err(std::io::Error::other(
-                    "batched_delete: send_single_delete_with_retry returned empty result",
+                    "concurrent_delete: send_single_delete_with_retry returned empty result",
                 ))
             });
 
@@ -963,7 +956,7 @@ async fn do_flush_all(
         let results = send_single_delete_with_retry(config, signer, &key).await;
         let outcome = results.into_iter().next().unwrap_or_else(|| {
             Err(std::io::Error::other(
-                "batched_delete: send_single_delete_with_retry returned empty result",
+                "concurrent_delete: send_single_delete_with_retry returned empty result",
             ))
         });
         // Same accounting as the deleter loop: per-key counters,
@@ -1004,15 +997,15 @@ fn fail_all_pending(shared: &Shared) {
             shared.tombs.remove(&job.relative_path);
         }
         tracing::warn!(
-            target: "mntrs::batched_delete",
+            target: "mntrs::concurrent_delete",
             lost = count,
-            "batched_delete: shutdown dropped pending deletes"
+            "concurrent_delete: shutdown dropped pending deletes"
         );
     }
     for job in jobs {
         let _ = job.result_tx.send(Err(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
-            "batched_deleter: shutdown lost",
+            "concurrent_deleter: shutdown lost",
         )));
     }
 }
@@ -1076,7 +1069,7 @@ async fn send_single_delete_with_retry(
                 404 => return vec![Ok(())],
                 s if is_retryable_status(s) && attempt < config.max_retries => {
                     tracing::warn!(
-                        target: "mntrs::batched_delete",
+                        target: "mntrs::concurrent_delete",
                         status = s,
                         attempt = attempt + 1,
                         backoff_ms = backoff.as_millis() as u64,
@@ -1096,7 +1089,7 @@ async fn send_single_delete_with_retry(
                 }
                 s => {
                     let msg = format!(
-                        "batched_delete: S3 single-object DELETE HTTP {} for key `{}`",
+                        "concurrent_delete: S3 single-object DELETE HTTP {} for key `{}`",
                         s, key
                     );
                     return vec![Err(std::io::Error::other(msg))];
@@ -1105,7 +1098,7 @@ async fn send_single_delete_with_retry(
             Err(e) => {
                 if attempt < config.max_retries {
                     tracing::warn!(
-                        target: "mntrs::batched_delete",
+                        target: "mntrs::concurrent_delete",
                         error = %e,
                         attempt = attempt + 1,
                         backoff_ms = backoff.as_millis() as u64,
@@ -1124,7 +1117,7 @@ async fn send_single_delete_with_retry(
                     continue;
                 }
                 let msg = format!(
-                    "batched_delete: single-object DELETE transport failure after {} retries: {}",
+                    "concurrent_delete: single-object DELETE transport failure after {} retries: {}",
                     config.max_retries, e
                 );
                 return vec![Err(std::io::Error::other(msg))];
@@ -1354,7 +1347,7 @@ mod tests {
         drop(deleter);
         // Issue #562 stage 1 + Issue #568 stage 6: the drain
         // worker owns the `mpsc::Receiver<Control>`. When the
-        // last `BatchedDeleter` clone is dropped, `flush_tx`
+        // last `ConcurrentDeleter` clone is dropped, `flush_tx`
         // closes → drain's `rx.recv()` returns `None` → drain
         // exits. The deleter loops do not exit on their own
         // (they idle on `notify.notified().await`); they are
@@ -1384,7 +1377,7 @@ mod tests {
             tombs: tombs.clone(),
         });
         let (tx, _rx) = mpsc::channel::<Control>(8);
-        let deleter = BatchedDeleter {
+        let deleter = ConcurrentDeleter {
             shared: shared.clone(),
             flush_tx: tx,
         };
@@ -1427,7 +1420,7 @@ mod tests {
             tombs: tombs.clone(),
         });
         let (tx, _rx) = mpsc::channel::<Control>(8);
-        let deleter = BatchedDeleter {
+        let deleter = ConcurrentDeleter {
             shared: shared.clone(),
             flush_tx: tx,
         };
@@ -1448,7 +1441,7 @@ mod tests {
             tombs: tombs.clone(),
         });
         let (tx, _rx) = mpsc::channel::<Control>(8);
-        let deleter = BatchedDeleter {
+        let deleter = ConcurrentDeleter {
             shared: shared.clone(),
             flush_tx: tx,
         };
@@ -1460,7 +1453,7 @@ mod tests {
     // ===== make_test_deleter helper =====
 
     /// Helper for tests: build a Shared literal + a stub
-    /// BatchedDeleter whose `flush_tx` channel is a dead end
+    /// ConcurrentDeleter whose `flush_tx` channel is a dead end
     /// (no worker is spawned — the tests don't actually need
     /// the worker; they only inspect `enqueue()`'s return
     /// value and `pending_len()`).
@@ -1475,7 +1468,7 @@ mod tests {
     /// the deleted tests).
     fn make_test_deleter_with_threshold(
         threshold: usize,
-    ) -> (BatchedDeleter, std::sync::Arc<dashmap::DashSet<String>>) {
+    ) -> (ConcurrentDeleter, std::sync::Arc<dashmap::DashSet<String>>) {
         let _ = threshold;
         let tombs = std::sync::Arc::new(dashmap::DashSet::<String>::new());
         let shared = std::sync::Arc::new(Shared {
@@ -1485,7 +1478,7 @@ mod tests {
             tombs: tombs.clone(),
         });
         let (tx, _rx) = mpsc::channel::<Control>(8);
-        let deleter = BatchedDeleter {
+        let deleter = ConcurrentDeleter {
             shared: shared.clone(),
             flush_tx: tx,
         };
