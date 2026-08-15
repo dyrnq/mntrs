@@ -8576,7 +8576,23 @@ fn to_core_attr(a: &FileAttr) -> CoreFileAttr {
     }
 }
 
+/// Default test helper — `CacheMode::Writes` for
+/// pre-#583 backwards compatibility with the existing test
+/// suite. Most tests were authored before the off-mode path
+/// existed and assume the writes-mode durability contract
+/// (disk file + fdatasync on flush/release).
 pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> MntrsFs {
+    new_test_fs_with_mode(op, cache_dir, crate::util::CacheMode::Writes)
+}
+
+/// Issue #583 test helper — pick the cache_mode. Used by
+/// the write-throughput A/B benchmark under
+/// `tests/issue_583_write_ab.rs`.
+pub fn new_test_fs_with_mode(
+    op: opendal::Operator,
+    cache_dir: std::path::PathBuf,
+    cache_mode: crate::util::CacheMode,
+) -> MntrsFs {
     // Initialize the global op for the write path's
     // background thread. The thread can't borrow the
     // `&self` op (it outlives any single `write()` call),
@@ -8626,7 +8642,7 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         // tests that want to exercise the immediate path can
         // override this field directly.
         writeback_immediate_threshold: 0,
-        cache_mode: crate::util::CacheMode::Writes,
+        cache_mode,
         read_ahead: 0,
         prefetch_threshold: 16 * 1024 * 1024,
         prefetch_queue_mb: 64,
