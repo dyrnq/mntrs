@@ -107,23 +107,24 @@ impl Harness {
     /// Write `content` to a cache file and create the `.dirty` sidecar.
     /// Returns the cache path + the .dirty path.
     fn stage_file(&self, name: &str, content: &[u8]) -> (PathBuf, PathBuf) {
-        let cache_path = self.cache_dir.join(name);
-        std::fs::write(&cache_path, content).unwrap();
-        let dirty = cache_path.with_extension("dirty");
+        let write_buffer_path = self.cache_dir.join(name);
+        std::fs::write(&write_buffer_path, content).unwrap();
+        let dirty = write_buffer_path.with_extension("dirty");
         std::fs::write(&dirty, name).unwrap();
-        (cache_path, dirty)
+        (write_buffer_path, dirty)
     }
 
     /// Enqueue a fresh upload (cycle=0) with the given per-task
     /// delay. Pass `Duration::ZERO` to test the immediate-upload
     /// path (issue #202); pass the harness default (100 ms) to
     /// test the uniform-delay fallback path.
-    fn enqueue(&self, ino: u64, remote: &str, cache_path: PathBuf, delay: Duration) {
+    fn enqueue(&self, ino: u64, remote: &str, write_buffer_path: PathBuf, delay: Duration) {
         self.sender
             .send(WritebackTask {
                 ino,
                 remote_path: remote.to_string(),
-                cache_path,
+                write_buffer_path,
+                in_memory_payload: None,
                 retry_cycle: 0,
                 per_task_delay: delay,
             })
@@ -134,9 +135,9 @@ impl Harness {
     /// (the pre-#202 uniform behavior). Preserves the call shape
     /// of the 7 tests added in PR #216 — they all use the uniform
     /// delay to keep the timing assumptions simple.
-    fn enqueue_default(&self, ino: u64, remote: &str, cache_path: PathBuf) {
+    fn enqueue_default(&self, ino: u64, remote: &str, write_buffer_path: PathBuf) {
         let delay = self.spawn_delay;
-        self.enqueue(ino, remote, cache_path, delay);
+        self.enqueue(ino, remote, write_buffer_path, delay);
     }
 
     /// Wait for the .dirty sidecar to disappear (upload completed).
@@ -175,7 +176,7 @@ impl Drop for Harness {
 #[test]
 fn happy_path_uploads_and_removes_dirty_sidecar() {
     let h = Harness::new("happy");
-    let (cache_path, dirty) = h.stage_file("a.bin", b"hello writeback");
+    let (write_buffer_path, dirty) = h.stage_file("a.bin", b"hello writeback");
 
     // Track in inodes so the upload updates mtime.
     h.inodes.insert(
@@ -188,7 +189,7 @@ fn happy_path_uploads_and_removes_dirty_sidecar() {
         },
     );
 
-    h.enqueue_default(100, "/remote/a.bin", cache_path);
+    h.enqueue_default(100, "/remote/a.bin", write_buffer_path);
 
     assert!(
         h.wait_drain(&dirty, 5_000),
@@ -205,14 +206,14 @@ fn happy_path_uploads_and_removes_dirty_sidecar() {
 #[test]
 fn cache_file_vanished_cleans_dirty_without_panic() {
     let h = Harness::new("vanished");
-    let (cache_path, dirty) = h.stage_file("gone.bin", b"data");
+    let (write_buffer_path, dirty) = h.stage_file("gone.bin", b"data");
 
     // Remove the cache file BEFORE upload fires (simulates LRU eviction)
-    std::fs::remove_file(&cache_path).unwrap();
+    std::fs::remove_file(&write_buffer_path).unwrap();
     // dirty sidecar must still be present (orphan)
     assert!(dirty.exists());
 
-    h.enqueue_default(42, "/remote/gone.bin", cache_path);
+    h.enqueue_default(42, "/remote/gone.bin", write_buffer_path);
 
     // Worker should drop the task cleanly:
     //   PENDING_COUNT -= 1
@@ -233,10 +234,14 @@ fn cache_file_vanished_cleans_dirty_without_panic() {
 #[test]
 fn ino_recovery_sentinel_uploads_without_inode_update() {
     let h = Harness::new("recovery");
-    let (cache_path, dirty) = h.stage_file("recovery.bin", b"recovered data");
+    let (write_buffer_path, dirty) = h.stage_file("recovery.bin", b"recovered data");
 
     // INO_RECOVERY_SENTINEL = 0 — no inodes entry to update.
-    h.enqueue_default(mntrs::INO_RECOVERY_SENTINEL, "/recovery/path", cache_path);
+    h.enqueue_default(
+        mntrs::INO_RECOVERY_SENTINEL,
+        "/recovery/path",
+        write_buffer_path,
+    );
 
     assert!(h.wait_drain(&dirty, 5_000), "dirty removed within 5s");
 
@@ -252,9 +257,9 @@ fn ino_recovery_sentinel_uploads_without_inode_update() {
 #[test]
 fn empty_file_uploads_successfully() {
     let h = Harness::new("empty");
-    let (cache_path, dirty) = h.stage_file("empty.bin", b"");
+    let (write_buffer_path, dirty) = h.stage_file("empty.bin", b"");
 
-    h.enqueue_default(7, "/remote/empty.bin", cache_path);
+    h.enqueue_default(7, "/remote/empty.bin", write_buffer_path);
 
     assert!(h.wait_drain(&dirty, 5_000), "dirty removed for empty file");
 
@@ -276,8 +281,12 @@ fn multiple_files_upload_in_order_or_out_of_order_but_all_complete() {
     for i in 0..8 {
         let name = format!("file_{i}.bin");
         let content = format!("content of file {i}");
-        let (cache_path, dirty) = h.stage_file(&name, content.as_bytes());
-        h.enqueue_default((i + 1) as u64, &format!("/remote/{name}"), cache_path);
+        let (write_buffer_path, dirty) = h.stage_file(&name, content.as_bytes());
+        h.enqueue_default(
+            (i + 1) as u64,
+            &format!("/remote/{name}"),
+            write_buffer_path,
+        );
         dirtys.push(dirty);
     }
 
@@ -301,13 +310,13 @@ fn writeback_pending_set_cleared_after_upload() {
     // Issue #38: writeback_pending must remove the path after upload
     // so the next flush/release with new content can enqueue a fresh task.
     let h = Harness::new("pending");
-    let (cache_path, dirty) = h.stage_file("pending.bin", b"x");
+    let (write_buffer_path, dirty) = h.stage_file("pending.bin", b"x");
 
     // Mimic flush/release inserting into writeback_pending
     h.writeback_pending
         .insert("/remote/pending.bin".to_string());
 
-    h.enqueue_default(50, "/remote/pending.bin", cache_path);
+    h.enqueue_default(50, "/remote/pending.bin", write_buffer_path);
 
     assert!(h.wait_drain(&dirty, 5_000), "dirty removed");
 
@@ -343,13 +352,14 @@ fn small_file_with_immediate_delay_uploads_fast() {
     // Duration::ZERO so the worker's cycle=0 branch sees a real
     // per-task delay, not the harness's 100ms spawn-time fallback.
     let h = Harness::new("small-immediate");
-    let (cache_path, dirty) = h.stage_file("small.bin", b"tiny payload");
+    let (write_buffer_path, dirty) = h.stage_file("small.bin", b"tiny payload");
 
     h.sender
         .send(WritebackTask {
             ino: 1,
             remote_path: "/remote/small.bin".to_string(),
-            cache_path,
+            write_buffer_path,
+            in_memory_payload: None,
             retry_cycle: 0,
             per_task_delay: Duration::ZERO,
         })
@@ -380,13 +390,14 @@ fn large_file_with_default_delay_uses_5s() {
     // be flaky on a slow CI runner. Instead we assert the negative:
     // at 1s, .dirty must still be present.
     let h = Harness::new("large-delayed");
-    let (cache_path, dirty) = h.stage_file("large.bin", b"big payload");
+    let (write_buffer_path, dirty) = h.stage_file("large.bin", b"big payload");
 
     h.sender
         .send(WritebackTask {
             ino: 2,
             remote_path: "/remote/large.bin".to_string(),
-            cache_path,
+            write_buffer_path,
+            in_memory_payload: None,
             retry_cycle: 0,
             per_task_delay: Duration::from_secs(5),
         })
@@ -397,6 +408,65 @@ fn large_file_with_default_delay_uses_5s() {
         !h.wait_drain(&dirty, 1_000),
         "5s-delay upload still pending at 1s (issue #202 non-immediate path)"
     );
+}
+
+/// Issue #583: in `CacheMode::Off`, the FUSE worker packs the
+/// dirty buffer into `WritebackTask.in_memory_payload` instead of
+/// staging a cache file + `.dirty` sidecar. The worker must
+/// upload the inline bytes and leave no `.dirty` artifact
+/// (because none was created in the first place).
+///
+/// This is the regression guard for the off-mode writeback path.
+/// Pre-#583 the field didn't exist and the worker always did
+/// `fs::read(cpath)`; a future refactor that re-introduces that
+/// branch unconditionally would trip this test (the cache file
+/// doesn't exist — only the inline payload does).
+#[test]
+fn in_memory_payload_uploads_inline_bytes_without_cache_file() {
+    let h = Harness::new("off-mode");
+
+    // Deliberately do NOT call `stage_file` — the off-mode path
+    // must work with no on-disk cache file at all. Construct a
+    // dummy path that won't exist; the worker must never touch
+    // it because `in_memory_payload` is `Some(_)`.
+    let phantom_path = h.cache_dir.join("phantom.bin");
+    assert!(!phantom_path.exists());
+
+    let payload = bytes::Bytes::from_static(b"off-mode inline bytes");
+    h.sender
+        .send(WritebackTask {
+            ino: 7,
+            remote_path: "/remote/off.bin".to_string(),
+            // Worker ignores this path when in_memory_payload is
+            // Some(_) — passing the phantom confirms the field
+            // takes precedence and no fs::read is attempted.
+            write_buffer_path: phantom_path.clone(),
+            in_memory_payload: Some(payload.clone()),
+            retry_cycle: 0,
+            per_task_delay: Duration::ZERO,
+        })
+        .unwrap();
+
+    // Wait for the upload to land — polled via a small busy
+    // loop on the backend, not on `.dirty` (off mode never
+    // writes one).
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(5) {
+        let got =
+            h.rt.block_on(async { h.op.read("/remote/off.bin").await.ok() });
+        let matches = matches!(&got, Some(buf) if buf.to_vec() == payload.to_vec());
+        if matches {
+            // Backend received the inline bytes — the path
+            // through `in_memory_payload` worked.
+            assert!(
+                !phantom_path.exists(),
+                "off-mode writeback must NOT touch the on-disk phantom path"
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("off-mode inline payload did not upload within 5s");
 }
 
 /// Issue #TBD: when a writeback upload fails, the `.dirty` sidecar
@@ -463,12 +533,15 @@ fn dirty_sidecar_lingers_with_no_surface_on_upload_failure() {
     });
 
     // Stage cache file + .dirty sidecar (mimics flush/release).
-    let cache_path = cache_dir.join("stuck.bin");
-    std::fs::write(&cache_path, b"data destined to be stuck").unwrap();
-    let dirty = cache_path.with_extension("dirty");
+    let write_buffer_path = cache_dir.join("stuck.bin");
+    std::fs::write(&write_buffer_path, b"data destined to be stuck").unwrap();
+    let dirty = write_buffer_path.with_extension("dirty");
     std::fs::write(&dirty, "stuck.bin").unwrap();
     assert!(dirty.exists(), "precondition: .dirty sidecar present");
-    assert!(cache_path.exists(), "precondition: cache file present");
+    assert!(
+        write_buffer_path.exists(),
+        "precondition: cache file present"
+    );
 
     // Mimic flush/release inserting into writeback_pending first
     // (so the worker's eventual failure path actually clears it).
@@ -479,7 +552,8 @@ fn dirty_sidecar_lingers_with_no_surface_on_upload_failure() {
     tx.send(WritebackTask {
         ino: 1,
         remote_path: "/remote/stuck.bin".to_string(),
-        cache_path: cache_path.clone(),
+        write_buffer_path: write_buffer_path.clone(),
+        in_memory_payload: None,
         retry_cycle: 0,
         per_task_delay: Duration::ZERO,
     })
@@ -503,7 +577,7 @@ fn dirty_sidecar_lingers_with_no_surface_on_upload_failure() {
          The user's write is silently lost from the application layer."
     );
     assert!(
-        cache_path.exists(),
+        write_buffer_path.exists(),
         "cache file should also persist (writeback leaves the file \
          for next-mount recovery — see lib.rs:1239)"
     );

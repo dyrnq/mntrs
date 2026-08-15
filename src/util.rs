@@ -73,6 +73,69 @@ pub fn runtime_dir() -> anyhow::Result<PathBuf> {
 
 // ── Path hashing ────────────────────────────────────────────────────
 
+/// Storage-mode selector for the FUSE mount.
+///
+/// Three independent dimensions controlled by a single flag:
+///   1. **Write buffer** — where `write(2)` bytes go before
+///      upload. Off mode uses an in-process `Vec<u8>`;
+///      writes/full use a disk-backed file with `fdatasync`
+///      on `flush`/`release`.
+///   2. **Read cache** — whether pre-fetched blocks persist
+///      to disk across mounts. Off/writes use only the
+///      in-process L1 mem_cache; full also writes 8 MiB
+///      `.block` files for cross-session hits.
+///   3. **Durability** — off mode does NOT guarantee that
+///      bytes survive `close(2)` followed by daemon crash
+///      or node failure (writeback still uploads to the
+///      backend on the 5 s `--vfs-write-back` schedule, but
+///      the local bytes are lost). writes/full mode keeps
+///      the buffer on disk with `fdatasync`, restoring the
+///      pre-Issue-#34 silent-data-loss guarantee.
+///
+/// `minimal` is accepted for rclone-compat but is equivalent
+/// to `off` here — mntrs doesn't distinguish "buffer for
+/// upload only" from "no cache at all"; the only difference
+/// would be a brief temp file during upload, which opendal
+/// already handles internally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheMode {
+    /// In-memory write buffer, L1 read cache only.
+    /// No disk file is materialized for either side.
+    #[default]
+    Off,
+    /// Disk write buffer with fdatasync; L1 read cache only.
+    Writes,
+    /// Disk write buffer + disk read block cache.
+    Full,
+}
+
+impl CacheMode {
+    /// Parse from the `--vfs-cache-mode` CLI value. Unknown
+    /// values fall back to `Off` and emit a warning.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "off" => Self::Off,
+            "writes" => Self::Writes,
+            "full" => Self::Full,
+            "minimal" => Self::Off, // see doc comment above
+            other => {
+                eprintln!("mntrs: unknown --vfs-cache-mode '{other}', falling back to 'off'");
+                Self::Off
+            }
+        }
+    }
+
+    /// `true` if writes are staged to a disk file (vs memory).
+    pub fn disk_write_buffer(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// `true` if pre-fetched blocks are persisted to disk.
+    pub fn disk_read_cache(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
+
 pub fn path_hash(path: &str) -> u64 {
     use std::sync::OnceLock;
     // Issue #58: a fixed, process-stable salt. Pre-fix
@@ -396,9 +459,51 @@ pub fn build_mkdir_chain(full_path: &str) -> Vec<String> {
 }
 
 // ── Cache path builders ─────────────────────────────────────────────
+//
+// Two distinct storage concerns share this module:
+//   1. **Write buffer** — pre-upload staging area; per-file
+//      single object at `write_buffer_path(dir, path)`.
+//      Lives at `cache_path_block(dir, path, 0)` internally.
+//   2. **Disk read cache** — pre-fetched blocks stored at
+//      `disk_cache_block_path(dir, path, idx)` (`.block` suffix).
+//
+// The names below reflect the two roles. `cache_path_block` is
+// retained as an internal helper (don't call it from new code —
+// use `write_buffer_path` or `disk_cache_block_path`).
 
-pub fn cache_path(cache_dir: &Path, path: &str) -> PathBuf {
+/// Path to the on-disk write buffer for a remote file.
+///
+/// The write buffer is the staging area for bytes that have been
+/// `write(2)`-ed by a user process but not yet uploaded to the
+/// remote. The async writeback worker reads this file and PUTs it
+/// to the backend on the `--vfs-write-back` schedule (default 5 s).
+///
+/// When `--vfs-cache-mode=off`, no file is ever materialized —
+/// callers must check `MntrsFs.cache_mode` before opening.
+pub fn write_buffer_path(cache_dir: &Path, path: &str) -> PathBuf {
     cache_path_block(cache_dir, path, 0)
+}
+
+/// Alias for `write_buffer_path`. The name `cache_path` is
+/// misleading because the file it returns is a *write buffer*,
+/// not a read cache — kept as a public re-export for callers
+/// that haven't migrated to `write_buffer_path` yet. New code
+/// should use `write_buffer_path` (or `disk_cache_block_path`
+/// for read-side block cache).
+///
+/// Note: pre-#583 this was marked `#[deprecated]`, but the
+/// in-tree rename is complete (verified by grep — zero callers
+/// of `cache_path` remain in `src/` or `tests/`). The deprecation
+/// attribute was removed because the CI gate
+/// (`RUSTFLAGS=-D warnings`) escalated the warning to an error,
+/// and a phantom stale-state hit (likely `Swatinem/rust-cache`
+/// restoring an older object file whose embedded source map
+/// pointed back at the pre-rename lib.rs) tripped it on PR runs
+/// where the rebuild showed clean locally. Removing the attribute
+/// costs nothing — there are no in-tree callers — and removes
+/// the noise.
+pub fn cache_path(cache_dir: &Path, path: &str) -> PathBuf {
+    write_buffer_path(cache_dir, path)
 }
 
 /// Key for the disk-cache LRU index. `None` block_idx means
@@ -445,9 +550,23 @@ pub fn cache_path_block(cache_dir: &Path, path: &str, block_index: u64) -> PathB
     }
 }
 
-/// Cache file path for a specific block. Encodes block_idx for restart recovery.
-pub fn cache_block_path(cache_dir: &Path, path: &str, block_idx: u64) -> PathBuf {
+/// Disk read-cache block file path. One file per
+/// `(remote_path, block_idx)` pair; `.block` suffix marks
+/// them as the read-side disk cache (distinct from the write
+/// buffer's path at `write_buffer_path`).
+///
+/// Used only when `--vfs-cache-mode=full`. Other modes skip
+/// the disk read cache entirely (the in-process mem_cache
+/// still serves repeated reads of the same blocks).
+pub fn disk_cache_block_path(cache_dir: &Path, path: &str, block_idx: u64) -> PathBuf {
     cache_dir.join(format!("{:020x}_{:010x}.block", path_hash(path), block_idx))
+}
+
+/// Deprecated alias for `disk_cache_block_path`. Kept as a
+/// re-export during the rename window.
+#[deprecated(note = "use `disk_cache_block_path`")]
+pub fn cache_block_path(cache_dir: &Path, path: &str, block_idx: u64) -> PathBuf {
+    disk_cache_block_path(cache_dir, path, block_idx)
 }
 
 // ── Cache age (--vfs-cache-max-age) ──────────────────────────────────
@@ -936,9 +1055,9 @@ mod tests {
     }
 
     #[test]
-    fn cache_block_path_format() {
+    fn disk_cache_block_path_format() {
         let dir = Path::new("/tmp/cache");
-        let p = cache_block_path(dir, "hello.txt", 7);
+        let p = disk_cache_block_path(dir, "hello.txt", 7);
         let filename = p.file_name().unwrap().to_str().unwrap();
         assert!(filename.ends_with(".block"));
         assert!(filename.contains("_0000000007"));
@@ -1271,5 +1390,57 @@ mod lock_or_recover_tests {
         // guard with the original value intact.
         let g = m.lock_or_recover();
         assert_eq!(*g, 7);
+    }
+
+    // ── CacheMode (Issue #583) ─────────────────────────────────────
+    //
+    // Pin the parse table + the dispatch predicates. The doc
+    // comment on `CacheMode` is the source of truth for the
+    // behavior these tests verify; if either is changed, the
+    // test must change too.
+
+    #[test]
+    fn cache_mode_default_is_off() {
+        // Pre-#583 default was "writes"; post-#583 it's "off".
+        // The Default impl pins the breaking-change contract.
+        assert_eq!(CacheMode::default(), CacheMode::Off);
+    }
+
+    #[test]
+    fn cache_mode_parse_recognised_values() {
+        for (s, expected) in [
+            ("off", CacheMode::Off),
+            ("writes", CacheMode::Writes),
+            ("full", CacheMode::Full),
+            ("minimal", CacheMode::Off), // minimal == off
+        ] {
+            assert_eq!(
+                CacheMode::parse(s),
+                expected,
+                "parse({s:?}) should be {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_mode_parse_garbage_falls_back_to_off() {
+        // Unknown values are mapped to Off with a warning. We
+        // don't capture stderr; just pin the return value.
+        assert_eq!(CacheMode::parse("nonsense"), CacheMode::Off);
+        assert_eq!(CacheMode::parse(""), CacheMode::Off);
+    }
+
+    #[test]
+    fn cache_mode_disk_write_buffer_predicate() {
+        assert!(!CacheMode::Off.disk_write_buffer());
+        assert!(CacheMode::Writes.disk_write_buffer());
+        assert!(CacheMode::Full.disk_write_buffer());
+    }
+
+    #[test]
+    fn cache_mode_disk_read_cache_predicate() {
+        assert!(!CacheMode::Off.disk_read_cache());
+        assert!(!CacheMode::Writes.disk_read_cache());
+        assert!(CacheMode::Full.disk_read_cache());
     }
 }

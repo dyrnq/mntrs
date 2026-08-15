@@ -10,12 +10,12 @@ use std::time::SystemTime;
 /// uploads they otherwise can't see. Fields:
 /// - `remote`: backend path read from the sidecar (the line the daemon
 ///   would `op.write` to). Trimmed of trailing whitespace.
-/// - `cache_path`: on-disk cache file the sidecar points at (path minus
+/// - `write_buffer_path`: on-disk cache file the sidecar points at (path minus
 ///   the `.dirty` extension). May not exist — orphan sidecar.
 pub struct DirtyRow {
     pub sidecar_path: std::path::PathBuf,
     pub remote: String,
-    pub cache_path: std::path::PathBuf,
+    pub write_buffer_path: std::path::PathBuf,
     pub cache_exists: bool,
     pub cache_size: u64,
     pub sidecar_mtime: SystemTime,
@@ -45,8 +45,8 @@ pub fn scan_dirty_sidecars(cache_dir: &Path) -> Result<Vec<DirtyRow>> {
         if p.extension().is_none_or(|ext| ext != "dirty") {
             continue;
         }
-        let cache_path = p.with_extension("");
-        let (cache_exists, cache_size) = match fs::metadata(&cache_path) {
+        let write_buffer_path = p.with_extension("");
+        let (cache_exists, cache_size) = match fs::metadata(&write_buffer_path) {
             Ok(m) => (true, m.len()),
             Err(_) => (false, 0),
         };
@@ -62,7 +62,7 @@ pub fn scan_dirty_sidecars(cache_dir: &Path) -> Result<Vec<DirtyRow>> {
         rows.push(DirtyRow {
             sidecar_path: p,
             remote,
-            cache_path,
+            write_buffer_path,
             cache_exists,
             cache_size,
             sidecar_mtime,

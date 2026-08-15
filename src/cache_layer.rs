@@ -29,7 +29,7 @@ pub(crate) trait CacheLayer: Send + Sync {
     /// Look up a cached block. Returns `None` on miss.
     ///
     /// `path` is the remote storage path (needed by L2 for the
-    /// on-disk file name via `cache_block_path`). `ino` is the FUSE
+    /// on-disk file name via `disk_cache_block_path`). `ino` is the FUSE
     /// inode number (needed by L1 for the DashMap key). `block_idx`
     /// is `offset / CACHE_BLOCK_SIZE`.
     fn get_block(&self, path: &str, ino: u64, block_idx: u64) -> Option<Bytes>;
@@ -135,7 +135,7 @@ impl CacheLayer for DiskBlockCache {
         // eviction logic in `disk_cache_index` sees entries as
         // they're touched, which is fine for cache pressure
         // decisions.
-        let cpath = crate::cache_block_path(&self.cache_dir, path, block_idx);
+        let cpath = crate::disk_cache_block_path(&self.cache_dir, path, block_idx);
         if !cpath.exists() {
             return None;
         }
@@ -182,7 +182,7 @@ impl CacheLayer for DiskBlockCache {
         if self.direct_io {
             return false;
         }
-        let blk_path = crate::cache_block_path(&self.cache_dir, path, block_idx);
+        let blk_path = crate::disk_cache_block_path(&self.cache_dir, path, block_idx);
         if let Some(parent) = blk_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -220,7 +220,7 @@ impl CacheLayer for DiskBlockCache {
         );
         for key in to_remove {
             if let Some(idx) = key.1 {
-                let blk_path = crate::cache_block_path(&self.cache_dir, &key.0, idx);
+                let blk_path = crate::disk_cache_block_path(&self.cache_dir, &key.0, idx);
                 let _ = std::fs::remove_file(&blk_path);
             }
             self.disk_cache_index.remove(&key);
@@ -382,7 +382,7 @@ mod tests {
             l2.get_block("test/file.bin", 10, 3).is_none(),
             "age-expired L2 entry must read as None"
         );
-        let cpath = crate::cache_block_path(&dir, "test/file.bin", 3);
+        let cpath = crate::disk_cache_block_path(&dir, "test/file.bin", 3);
         assert!(
             !cpath.exists(),
             "age-expired .block must be removed on hit-miss"

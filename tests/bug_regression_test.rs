@@ -346,7 +346,7 @@ fn bug_f_lookup_considers_cache_file_size() {
     // still reports 5, but the cache file is 20). This is the
     // state the filesystem is in for ~5s after a real write,
     // before the writeback worker uploads the cache file.
-    let cpath = mntrs::cache_path(&fs.cache_dir, "file.bin");
+    let cpath = mntrs::write_buffer_path(&fs.cache_dir, "file.bin");
     let cache_content = b"hello_world_appended!";
     std::fs::write(&cpath, cache_content).unwrap();
     assert_eq!(
@@ -425,7 +425,7 @@ fn bug_g_rename_falls_back_when_op_copy_unsupported() {
     });
     // Seed the cache file so the stage-2 read returns the
     // payload (not 0 bytes from a missing cache file).
-    let cpath_src = mntrs::cache_path(&fs.cache_dir, src);
+    let cpath_src = mntrs::write_buffer_path(&fs.cache_dir, src);
     if let Some(parent) = cpath_src.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
