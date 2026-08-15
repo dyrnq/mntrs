@@ -33,7 +33,7 @@ pub(crate) use block_format::{
 };
 // Re-export disk_write_pool items used in lib.rs and cmd/.
 pub(crate) use disk_write_pool::{
-    DiskWriteJob, register_dirty_cache_path, submit_block_cache_write, submit_disk_write,
+    DiskWriteJob, register_pending_writeback, submit_block_cache_write, submit_disk_write,
 };
 pub use disk_write_pool::{init_disk_write_pool, set_opendal_sync_op};
 
@@ -389,7 +389,16 @@ enum FileHandleState {
     },
     Write {
         path: Arc<str>,
-        cache_fd: Option<Arc<std::sync::Mutex<std::fs::File>>>,
+        /// Disk-backed buffer (writes/full mode).
+        /// `None` in off mode — bytes go to `in_memory_buffer`
+        /// instead and never touch the filesystem.
+        write_buffer_fd: Option<Arc<std::sync::Mutex<std::fs::File>>>,
+        /// Memory-backed buffer (off mode). `Some(_)` iff
+        /// `MntrsFs.cache_mode == CacheMode::Off` at handle
+        /// open time. Holds the entire dirty file body; the
+        /// async writeback worker reads it directly when the
+        /// flush/upload fires.
+        in_memory_buffer: Option<Arc<std::sync::Mutex<Vec<u8>>>>,
         dirty: bool,
         dirty_since: Option<std::time::Instant>,
         expires_at: Option<std::time::Instant>,
@@ -414,13 +423,15 @@ impl Clone for FileHandleState {
             },
             FileHandleState::Write {
                 path,
-                cache_fd,
+                write_buffer_fd,
+                in_memory_buffer,
                 dirty,
                 dirty_since,
                 expires_at,
             } => FileHandleState::Write {
                 path: path.clone(),
-                cache_fd: cache_fd.clone(),
+                write_buffer_fd: write_buffer_fd.clone(),
+                in_memory_buffer: in_memory_buffer.clone(),
                 dirty: *dirty,
                 dirty_since: *dirty_since,
                 expires_at: *expires_at,
@@ -665,7 +676,7 @@ pub struct MntrsFs {
     /// `Duration::ZERO` and the worker uploads them right away.
     /// Large files still batch through the delay queue.
     pub(crate) writeback_immediate_threshold: u64,
-    pub(crate) cache_mode: String,
+    pub(crate) cache_mode: crate::util::CacheMode,
     pub(crate) read_ahead: u64,
     /// Minimum file size (bytes) for which the read-path prefetcher
     /// is activated on open(). 0 disables prefetching entirely.
@@ -978,9 +989,9 @@ pub struct MntrsFs {
     /// Index of every on-disk cache file (file-level *and*
     /// block-level) for the LRU sweeper. The key is a
     /// `(remote_path, Option<block_idx>)` tuple: `None`
-    /// means "the whole-file cache at `cache_path(p)`",
+    /// means "the whole-file cache at `write_buffer_path(p)`",
     /// `Some(idx)` means "the per-block file at
-    /// `cache_block_path(p, idx)`". Tracked together so a
+    /// `disk_cache_block_path(p, idx)`". Tracked together so a
     /// single `evict_lru` sweep removes the most-cold
     /// entries across both layers, regardless of which
     /// layer the read path populated. The value is
@@ -1024,9 +1035,9 @@ impl MntrsFs {
     ///    `.dirty` sidecars on whole-file cache entries are
     ///    skipped (writeback is the only legitimate cleaner).
     ///
-    /// The index tracks both whole-file cache (`cache_path`,
+    /// The index tracks both whole-file cache (`write_buffer_path`,
     /// keyed by `(path, None)`) and per-block cache
-    /// (`cache_block_path`, keyed by `(path, Some(block_idx))`).
+    /// (`disk_cache_block_path`, keyed by `(path, Some(block_idx))`).
     /// Either kind is evicted under the same LRU order — a v1
     /// index (no block entries) just has fewer children to
     /// consider; a freshly-read large file accumulates block
@@ -1141,8 +1152,8 @@ impl MntrsFs {
             for entry in self.disk_cache_index.iter() {
                 let key = entry.key();
                 let cpath = match key.1 {
-                    Some(idx) => crate::cache_block_path(&self.cache_dir, &key.0, idx),
-                    None => crate::cache_path(&self.cache_dir, &key.0),
+                    Some(idx) => crate::disk_cache_block_path(&self.cache_dir, &key.0, idx),
+                    None => crate::write_buffer_path(&self.cache_dir, &key.0),
                 };
                 if !cpath.exists() {
                     // File already gone (manual rm, prior sweep);
@@ -1161,10 +1172,10 @@ impl MntrsFs {
             let removed = to_remove_age.len();
             for key in &to_remove_age {
                 if let Some(idx) = key.1 {
-                    let cpath = crate::cache_block_path(&self.cache_dir, &key.0, idx);
+                    let cpath = crate::disk_cache_block_path(&self.cache_dir, &key.0, idx);
                     let _ = std::fs::remove_file(&cpath);
                 } else {
-                    let cpath = crate::cache_path(&self.cache_dir, &key.0);
+                    let cpath = crate::write_buffer_path(&self.cache_dir, &key.0);
                     let _ = std::fs::remove_file(&cpath);
                     // Whole-file cache has a `.meta` sidecar too.
                     let _ = std::fs::remove_file(cpath.with_extension("meta"));
@@ -1207,7 +1218,7 @@ impl MntrsFs {
 
         // Pop oldest entries until enough space freed. Each pop
         // removes the corresponding cache file (file-level
-        // via `cache_path`, block-level via `cache_block_path`)
+        // via `write_buffer_path`, block-level via `disk_cache_block_path`)
         // and the index entry.
         let mut remaining = to_free;
         let mut freed: u64 = 0;
@@ -1221,8 +1232,8 @@ impl MntrsFs {
                 break;
             }
             let cpath = match block_idx {
-                Some(idx) => crate::cache_block_path(&self.cache_dir, &path, idx),
-                None => crate::cache_path(&self.cache_dir, &path),
+                Some(idx) => crate::disk_cache_block_path(&self.cache_dir, &path, idx),
+                None => crate::write_buffer_path(&self.cache_dir, &path),
             };
             let _ = std::fs::remove_file(&cpath);
             // `.meta` sidecar (whole-file only — block files
@@ -1804,8 +1815,8 @@ impl MntrsFs {
             for e in entries.flatten() {
                 let p = e.path();
                 if p.extension().is_some_and(|ext| ext == "dirty") {
-                    let cache_path = p.with_extension("");
-                    if !cache_path.exists() {
+                    let write_buffer_path = p.with_extension("");
+                    if !write_buffer_path.exists() {
                         // Orphan sidecar — cache file missing, safe to remove
                         tracing::debug!(sidecar=?p, "removing orphan dirty sidecar");
                         let _ = std::fs::remove_file(&p);
@@ -1816,7 +1827,7 @@ impl MntrsFs {
                         Ok(remote) => {
                             let remote = remote.trim().to_string();
                             if let Some(tx) = self.writeback_sender.get() {
-                                tracing::info!(path=%remote, ?cache_path, "recovering dirty writeback");
+                                tracing::info!(path=%remote, ?write_buffer_path, "recovering dirty writeback");
                                 // Bug 18: use the named sentinel
                                 // INO_RECOVERY_SENTINEL (= 0) instead of
                                 // the bare `0` literal. The writeback
@@ -1845,13 +1856,14 @@ impl MntrsFs {
                                 if let Err(e) = tx.send(WritebackTask {
                                     ino: INO_RECOVERY_SENTINEL,
                                     remote_path: remote,
-                                    cache_path: cache_path.clone(),
+                                    write_buffer_path: write_buffer_path.clone(),
+                                    in_memory_payload: None,
                                     retry_cycle: 0, // fresh enqueue
                                     per_task_delay: self.write_back_delay, // #202: recovery never immediate
                                 }) {
                                     send_err_count += 1;
                                     tracing::warn!(
-                                        cache_path=?cache_path,
+                                        write_buffer_path=?write_buffer_path,
                                         error=%e,
                                         "writeback recovery send failed (worker dropped?); \
                                          .dirty sidecar kept for next-mount retry"
@@ -1868,7 +1880,7 @@ impl MntrsFs {
                                 // worker is gone; treat as send_err.
                                 no_sender_count += 1;
                                 tracing::warn!(
-                                    cache_path=?cache_path,
+                                    write_buffer_path=?write_buffer_path,
                                     "writeback recovery: writeback_sender.get() = None; \
                                      .dirty sidecar kept for next-mount retry"
                                 );
@@ -2280,7 +2292,7 @@ impl MntrsFs {
         if self.direct_io {
             return false;
         }
-        let blk_path = crate::cache_block_path(&self.cache_dir, path, block_idx);
+        let blk_path = crate::disk_cache_block_path(&self.cache_dir, path, block_idx);
         if let Some(parent) = blk_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -3619,7 +3631,7 @@ impl MntrsFs {
         // the same kernel path, and a `lookup` from one
         // adapter misses what the other stored. Bare
         // basename for root-parented is the canonical form
-        // (matches `cache_path`'s hash input and the existing
+        // (matches `write_buffer_path`'s hash input and the existing
         // unit tests).
         let name = if parent_path.is_empty() && name.starts_with('/') {
             &name[1..]
@@ -3767,7 +3779,7 @@ impl MntrsFs {
             mtime: m,
         }) = self.stat_op_async(&full_path).await
         {
-            let cpath = crate::cache_path(&self.cache_dir, &full_path);
+            let cpath = crate::write_buffer_path(&self.cache_dir, &full_path);
             let cache_size = std::fs::metadata(&cpath).map(|m| m.len()).unwrap_or(0);
             // Issue #301: detect a stale dir_cache via a successful
             // lookup whose name is not in the parent's listing. A
@@ -3865,13 +3877,13 @@ impl MntrsFs {
                 let s = if kind == FileType::Directory {
                     0
                 } else {
-                    let cpath = crate::cache_path(&self.cache_dir, &full_path);
+                    let cpath = crate::write_buffer_path(&self.cache_dir, &full_path);
                     let cache_size = std::fs::metadata(&cpath).map(|m| m.len()).unwrap_or(0);
                     size.max(cache_size)
                 };
                 (kind, s, Some(mtime))
             } else {
-                let cpath = crate::cache_path(&self.cache_dir, &full_path);
+                let cpath = crate::write_buffer_path(&self.cache_dir, &full_path);
                 match std::fs::metadata(&cpath) {
                     Ok(meta) => {
                         let mt = meta.modified().ok();
@@ -4042,9 +4054,10 @@ impl CoreFilesystem for MntrsFs {
             // the file through mntrs in the meantime).
             let (size, mtime) = if let Some(inodes_mtime) = inodes_mtime {
                 // Fast path: trust the inodes entry.
-                let cache_size = std::fs::metadata(crate::cache_path(&self.cache_dir, &path))
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                let cache_size =
+                    std::fs::metadata(crate::write_buffer_path(&self.cache_dir, &path))
+                        .map(|m| m.len())
+                        .unwrap_or(0);
                 (inodes_size.max(cache_size), inodes_mtime)
             } else {
                 // Slow path: file was never written locally;
@@ -4058,9 +4071,10 @@ impl CoreFilesystem for MntrsFs {
                     size: inodes_size,
                     mtime: None,
                 });
-                let cache_size = std::fs::metadata(crate::cache_path(&self.cache_dir, &path))
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                let cache_size =
+                    std::fs::metadata(crate::write_buffer_path(&self.cache_dir, &path))
+                        .map(|m| m.len())
+                        .unwrap_or(0);
                 let size = inodes_size.max(backend_size).max(cache_size);
                 let mtime = backend_mtime
                     .or(inodes_mtime)
@@ -4193,7 +4207,7 @@ impl CoreFilesystem for MntrsFs {
                     //     per-fd lock).
                     // If the fh is stale (the handle map no
                     // longer has the entry) or doesn't carry a
-                    // cache_fd (e.g. a read-only handle that
+                    // write_buffer_fd (e.g. a read-only handle that
                     // happened to get a setattr), we silently
                     // fall through to the path-based branch
                     // below — same final on-disk state, just
@@ -4202,7 +4216,8 @@ impl CoreFilesystem for MntrsFs {
                     if let Some(fh_val) = fh
                         && let Some(entry) = self.handles.get(&fh_val)
                         && let crate::FileHandleState::Write {
-                            cache_fd: Some(fd), ..
+                            write_buffer_fd: Some(fd),
+                            ..
                         } = entry.value()
                         && let Ok(f) = fd.lock()
                     {
@@ -4229,7 +4244,7 @@ impl CoreFilesystem for MntrsFs {
                         // Truncating here would destroy a valid
                         // cache file before the user even has an
                         // fd open — see issue #89.
-                        let cpath = crate::cache_path(&self.cache_dir, &_p);
+                        let cpath = crate::write_buffer_path(&self.cache_dir, &_p);
                         if cpath.exists() {
                             // Open with write access so the resulting File
                             // holds a writable handle; the set_len() call below
@@ -4520,7 +4535,7 @@ impl CoreFilesystem for MntrsFs {
         // Windows open() to a Read handle — every write
         // afterwards failed because `handles.get(fh)`
         // saw `FileHandleState::Read` and `write()`'s
-        // cache_fd extraction returned None. The flag
+        // write_buffer_fd extraction returned None. The flag
         // mask (O_RDONLY=0, O_WRONLY=1, O_RDWR=2) is a
         // platform-independent POSIX convention; the
         // platform adapter is responsible for passing
@@ -4539,49 +4554,72 @@ impl CoreFilesystem for MntrsFs {
             // when the cache file already exists or the
             // backend has no file at this path.
             self.populate_cache_from_backend(&path);
-            let cpath = crate::cache_path(&self.cache_dir, &path);
-            if let Some(parent) = cpath.parent() {
-                // Force 0o700 on the cache sub-dir (best-effort).
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::DirBuilderExt;
-                    let _ = std::fs::DirBuilder::new()
-                        .mode(0o700)
-                        .recursive(true)
-                        .create(parent);
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ =
-                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            let cpath = crate::write_buffer_path(&self.cache_dir, &path);
+            // CacheMode::Off: skip the disk file entirely.
+            // Bytes go into `in_memory_buffer` below; no
+            // directory, no file, no 0o600. The disk write
+            // path (write(), release()) also short-circuits in
+            // this mode.
+            let write_buffer_fd = if self.cache_mode == crate::util::CacheMode::Off {
+                None
+            } else {
+                if let Some(parent) = cpath.parent() {
+                    // Force 0o700 on the cache sub-dir (best-effort).
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::DirBuilderExt;
+                        let _ = std::fs::DirBuilder::new()
+                            .mode(0o700)
+                            .recursive(true)
+                            .create(parent);
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            parent,
+                            std::fs::Permissions::from_mode(0o700),
+                        );
+                    }
+                    #[cfg(not(unix))]
+                    let _ = std::fs::create_dir_all(parent);
                 }
+                // Force 0o600 on the cache file (plaintext object bodies).
+                #[cfg(unix)]
+                let fd = {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .truncate(false)
+                        .write(true)
+                        .read(true)
+                        .mode(0o600)
+                        .open(&cpath)
+                        .ok()
+                };
                 #[cfg(not(unix))]
-                let _ = std::fs::create_dir_all(parent);
-            }
-            // Force 0o600 on the cache file (plaintext object bodies).
-            #[cfg(unix)]
-            let cache_fd = {
-                use std::os::unix::fs::OpenOptionsExt;
-                std::fs::OpenOptions::new()
+                let fd = std::fs::OpenOptions::new()
                     .create(true)
                     .truncate(false)
                     .write(true)
                     .read(true)
-                    .mode(0o600)
                     .open(&cpath)
-                    .ok()
+                    .ok();
+                fd
             };
-            #[cfg(not(unix))]
-            let cache_fd = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .read(true)
-                .open(&cpath)
-                .ok();
             self.handles.insert(
                 fh,
                 FileHandleState::Write {
                     path,
-                    cache_fd: cache_fd.map(|f| std::sync::Arc::new(std::sync::Mutex::new(f))),
+                    write_buffer_fd: write_buffer_fd
+                        .map(|f| std::sync::Arc::new(std::sync::Mutex::new(f))),
+                    // In off mode the disk fd is unused (writes
+                    // accumulate in memory and the worker's
+                    // read path consumes the Vec). For writes/
+                    // full the disk fd is the buffer and the
+                    // Vec stays empty.
+                    in_memory_buffer: if self.cache_mode == crate::util::CacheMode::Off {
+                        Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+                    } else {
+                        None
+                    },
                     dirty: false,
                     dirty_since: None,
                     expires_at: None,
@@ -4648,11 +4686,34 @@ impl CoreFilesystem for MntrsFs {
 
         // 1. Try read from cache fd first (write handle still open)
         if !self.direct_io {
-            let cache_fd = self.handles.get(&fh).and_then(|e| {
+            // CacheMode::Off: read from the in-memory buffer
+            // when this fh holds a write handle. Same role
+            // as the disk fd — serves read-after-write from
+            // the local buffer before falling through to the
+            // backend. Returns the bytes the most-recent write
+            // for this fh put there.
+            if self.cache_mode == crate::util::CacheMode::Off
+                && let Some(entry) = self.handles.get(&fh)
+                && let crate::FileHandleState::Write {
+                    in_memory_buffer: Some(buf),
+                    ..
+                } = entry.value()
+                && let Ok(v) = buf.lock()
+            {
+                let buf_len = v.len() as u64;
+                if offset < buf_len {
+                    let read_size = (size as u64).min(buf_len - offset) as usize;
+                    let mut out = vec![0u8; read_size];
+                    out.copy_from_slice(&v[offset as usize..offset as usize + read_size]);
+                    return Ok(out);
+                }
+            }
+            let write_buffer_fd = self.handles.get(&fh).and_then(|e| {
                 if let crate::FileHandleState::Read { .. } = e.value() {
                     None
                 } else if let crate::FileHandleState::Write {
-                    cache_fd: Some(fd), ..
+                    write_buffer_fd: Some(fd),
+                    ..
                 } = e.value()
                 {
                     Some(fd.clone())
@@ -4660,7 +4721,7 @@ impl CoreFilesystem for MntrsFs {
                     None
                 }
             });
-            if let Some(fd) = cache_fd {
+            if let Some(fd) = write_buffer_fd {
                 use std::io::{Read, Seek};
                 let mut f = fd.lock().unwrap();
                 let file_len = f.metadata()?.len();
@@ -4787,7 +4848,7 @@ impl CoreFilesystem for MntrsFs {
 
         // 4. File-level disk cache (whole file)
         if !self.direct_io {
-            let fcpath = crate::cache_path(&self.cache_dir, &path);
+            let fcpath = crate::write_buffer_path(&self.cache_dir, &path);
             if fcpath.exists() {
                 // ── --vfs-cache-max-age check (issue #507) + .dirty guard ─
                 // Whole-file cache files have a `.dirty` sidecar
@@ -4795,7 +4856,7 @@ impl CoreFilesystem for MntrsFs {
                 // those — the writeback worker is the only
                 // legitimate cleaner (`src/writeback.rs:299, 434`).
                 // Sidecar filename is `{fcpath}.dirty` per
-                // `cache_path.with_extension("dirty")` — see
+                // `write_buffer_path.with_extension("dirty")` — see
                 // writeback.rs:84. `Duration::ZERO` is the
                 // "disabled" sentinel — helper short-circuits.
                 let dirty_sidecar = fcpath.with_extension("dirty");
@@ -5303,18 +5364,20 @@ impl CoreFilesystem for MntrsFs {
     fn write(&self, _ino: u64, _fh: u64, _offset: u64, _data: &[u8]) -> std::io::Result<u32> {
         let fh_val = _fh;
         // #17 (small-write hot-path): single handles.get
-        // call extracts path AND cache_fd in one shard
+        // call extracts path AND write_buffer_fd in one shard
         // lock. Pre-fix did two separate gets (one for
-        // path, one for cache_fd) — each acquired a
+        // path, one for write_buffer_fd) — each acquired a
         // DashMap shard lock + cloned an Arc<Mutex<File>>.
         // For 4 KiB writes (FUSE block size) this was a
         // measurable fraction of the per-write cost vs
         // the single-RTT rclone path.
-        let (path, cache_fd) = match self.handles.get(&fh_val) {
+        let (path, write_buffer_fd) = match self.handles.get(&fh_val) {
             Some(entry) => match entry.value() {
-                crate::FileHandleState::Write { path, cache_fd, .. } => {
-                    (path.to_string(), cache_fd.clone())
-                }
+                crate::FileHandleState::Write {
+                    path,
+                    write_buffer_fd,
+                    ..
+                } => (path.to_string(), write_buffer_fd.clone()),
                 // Non-Write handle: keep the old behavior
                 // of consulting only `path()` (the
                 // pre-fix code did this implicitly via
@@ -5393,7 +5456,7 @@ impl CoreFilesystem for MntrsFs {
         // concurrent writers to different files now
         // proceed in parallel (each has its own disk I/O
         // thread). Multiple writers to the same file
-        // serialize on the cache_fd Mutex inside the
+        // serialize on the write_buffer_fd Mutex inside the
         // thread, not in the FUSE worker.
         //
         // The data is in the OS page cache after
@@ -5412,7 +5475,7 @@ impl CoreFilesystem for MntrsFs {
         // FUSE worker. The bench improvement is ~3.4x
         // for 1 MiB parallel writes (sync 17ms/write vs
         // rclone 5ms/write — most of rclone's lead was
-        // FUSE-worker serialization on the cache_fd
+        // FUSE-worker serialization on the write_buffer_fd
         // mutex, which async sidesteps).
         // #27 (disk-IO thread pool): build a
         // `DiskWriteJob` and submit it to the pool.
@@ -5433,7 +5496,7 @@ impl CoreFilesystem for MntrsFs {
         // bytes, fall through to the remote fetch, and
         // return EIO because the writeback hasn't landed.
         //
-        // Fix: when cache_fd is Some, write to it
+        // Fix: when write_buffer_fd is Some, write to it
         // synchronously on the FUSE worker. The cache
         // file write is a page-cache memcpy (sub-µs),
         // cheaper than the old async path's pool submit
@@ -5464,11 +5527,11 @@ impl CoreFilesystem for MntrsFs {
             path = %path,
             offset = _offset,
             data_len = _data.len(),
-            has_cache_fd = cache_fd.is_some(),
+            has_write_buffer_fd = write_buffer_fd.is_some(),
             "write: entry"
         );
         let gap_data: Option<Vec<u8>> = if _offset > 0 {
-            if let Some(fd) = &cache_fd {
+            if let Some(fd) = &write_buffer_fd {
                 let cache_len = fd
                     .lock()
                     .ok()
@@ -5515,7 +5578,29 @@ impl CoreFilesystem for MntrsFs {
             None
         };
 
-        if let Some(fd) = &cache_fd
+        // Off-mode: bytes go into the per-handle Vec<u8>, not a
+        // disk file. Splice into the buffer at `_offset`,
+        // growing it (and zero-filling any gap) the same way
+        // the disk-fd path does. Gap backfill (issue #128) is
+        // implicit — Vec resize+overwrite covers it for the
+        // append / overwrite shape we see from FUSE.
+        if self.cache_mode == crate::util::CacheMode::Off {
+            if let Some(entry) = self.handles.get(&fh_val)
+                && let crate::FileHandleState::Write {
+                    in_memory_buffer: Some(buf),
+                    ..
+                } = entry.value()
+                && let Ok(mut v) = buf.lock()
+            {
+                let end = _offset + _data.len() as u64;
+                if (v.len() as u64) < end {
+                    v.resize(end as usize, 0u8);
+                }
+                let off = _offset as usize;
+                v[off..off + _data.len()].copy_from_slice(_data);
+            }
+            // Skip the disk-fd block entirely.
+        } else if let Some(fd) = &write_buffer_fd
             && let Ok(mut f) = fd.lock()
         {
             use std::io::{Seek, Write};
@@ -5559,9 +5644,9 @@ impl CoreFilesystem for MntrsFs {
         // writeback immediately so the file doesn't
         // wait for flush/release.
         {
-            let cpath = crate::cache_path(&self.cache_dir, &path);
+            let cpath = crate::write_buffer_path(&self.cache_dir, &path);
             if cpath.exists() {
-                register_dirty_cache_path(&cpath);
+                register_pending_writeback(&cpath);
                 if let Some(tx) = self.writeback_sender.get()
                     && self.writeback_pending.insert((*path).to_string())
                 {
@@ -5592,7 +5677,8 @@ impl CoreFilesystem for MntrsFs {
                     let task = WritebackTask {
                         ino: _ino,
                         remote_path: path.to_string(),
-                        cache_path: cpath,
+                        write_buffer_path: cpath,
+                        in_memory_payload: None,
                         retry_cycle: 0,
                         per_task_delay: delay,
                     };
@@ -5636,9 +5722,9 @@ impl CoreFilesystem for MntrsFs {
         // kernel's lazy page-cache flushback can zero
         // the cache file.
         //
-        // Single registration point: the `register_dirty_cache_path`
+        // Single registration point: the `register_dirty_write_buffer_path`
         // call inside the `cpath.exists()` block above covers both
-        // the cache_fd path (cache_fd.is_some() ⇒ cpath.exists()) and
+        // the write_buffer_fd path (write_buffer_fd.is_some() ⇒ cpath.exists()) and
         // the no-fd fallback (pre-existing file). A second call here
         // was redundant (DashSet insert is idempotent) — removed in
         // issue #135#1.
@@ -5648,11 +5734,11 @@ impl CoreFilesystem for MntrsFs {
         // unwritable), still submit to the pool so the
         // write eventually lands on disk. The pool
         // worker re-opens the file and writes.
-        let job = match &cache_fd {
+        let job = match &write_buffer_fd {
             Some(_) => None, // Already wrote synchronously above; no pool work.
             None => Some(DiskWriteJob {
-                cache_fd: None,
-                cache_path: Some(crate::cache_path(&self.cache_dir, &path)),
+                write_buffer_fd: None,
+                write_buffer_path: Some(crate::write_buffer_path(&self.cache_dir, &path)),
                 remote_path: path.to_string(),
                 offset: _offset,
                 data: _data.to_vec(),
@@ -5788,7 +5874,7 @@ impl CoreFilesystem for MntrsFs {
 
         // #17 (small-write hot-path): pre-fix did a
         // full `handles.insert(fh, Write { path: ...,
-        // cache_fd, dirty: true, dirty_since: now })`
+        // write_buffer_fd, dirty: true, dirty_since: now })`
         // every single write — that rewrote the
         // FileHandleState variant from scratch (path
         // clone, Arc clone, fresh struct alloc) even
@@ -5812,7 +5898,14 @@ impl CoreFilesystem for MntrsFs {
             })
             .or_insert_with(|| crate::FileHandleState::Write {
                 path: Arc::from(path.as_str()),
-                cache_fd: cache_fd.clone(),
+                write_buffer_fd: write_buffer_fd.clone(),
+                // Mirror open(): off mode allocates an in-memory
+                // buffer so an open-missing write doesn't crash.
+                in_memory_buffer: if self.cache_mode == crate::util::CacheMode::Off {
+                    Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+                } else {
+                    None
+                },
                 dirty: true,
                 dirty_since: Some(std::time::Instant::now()),
                 expires_at: None,
@@ -5823,16 +5916,16 @@ impl CoreFilesystem for MntrsFs {
     fn flush(&self, _ino: u64, _fh: u64) -> std::io::Result<()> {
         // Look up the handle to find the path and dirty state
         let fh_val = _fh;
-        let (path, dirty, cache_fd) = {
+        let (path, dirty, write_buffer_fd) = {
             let entry = self.handles.get(&fh_val).map(|r| r.clone());
             if let Some(crate::FileHandleState::Write {
                 path: p,
                 dirty: d,
-                cache_fd,
+                write_buffer_fd,
                 ..
             }) = entry
             {
-                (p, d, cache_fd)
+                (p, d, write_buffer_fd)
             } else {
                 return Ok(());
             }
@@ -5863,7 +5956,7 @@ impl CoreFilesystem for MntrsFs {
             // process deserves to see it (typically as
             // EIO from close()) rather than discovering
             // the corruption on the next read.
-            if let Some(fd) = &cache_fd
+            if let Some(fd) = &write_buffer_fd
                 && let Ok(f) = fd.lock()
                 && let Err(e) = f.sync_data()
             {
@@ -5875,7 +5968,7 @@ impl CoreFilesystem for MntrsFs {
                 return Err(e);
             }
             // Push single cache file to writeback queue
-            let cpath = crate::cache_path(&self.cache_dir, &path);
+            let cpath = crate::write_buffer_path(&self.cache_dir, &path);
             if cpath.exists() {
                 let sidecar = cpath.with_extension("dirty");
                 if let Err(e) = std::fs::write(&sidecar, path.as_bytes()) {
@@ -5918,7 +6011,27 @@ impl CoreFilesystem for MntrsFs {
                         if let Err(e) = tx.send(WritebackTask {
                             ino: _ino,
                             remote_path: (*path).to_string(),
-                            cache_path: cpath,
+                            write_buffer_path: cpath,
+                            // flush() runs before the user-
+                            // facing close(); pack whatever
+                            // bytes are already in the buffer.
+                            // For writes/full the on-disk
+                            // path takes precedence and the
+                            // worker reads from `cpath`.
+                            in_memory_payload: if self.cache_mode == crate::util::CacheMode::Off {
+                                let entry = self.handles.get(&_fh);
+                                match entry.as_deref() {
+                                    Some(crate::FileHandleState::Write {
+                                        in_memory_buffer: Some(buf),
+                                        ..
+                                    }) => {
+                                        buf.lock().ok().map(|v| bytes::Bytes::copy_from_slice(&v))
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            },
                             retry_cycle: 0,
                             per_task_delay: delay,
                         }) {
@@ -5946,7 +6059,7 @@ impl CoreFilesystem for MntrsFs {
             // Audit finding A6: pre-fix used `handles.get()` +
             // `handles.insert(...)` to change ONE bool + ONE
             // Option<Instant>. The insert cloned `path` (~50 B)
-            // and the `cache_fd` Arc, and reallocated a
+            // and the `write_buffer_fd` Arc, and reallocated a
             // `FileHandleState::Write`. Use `and_modify` to
             // mutate the existing entry in place — no clone,
             // no allocation, no second shard lock for the
@@ -5981,13 +6094,24 @@ impl CoreFilesystem for MntrsFs {
         // backend is "synchronous-or-bust" (no async
         // writeback), this method should also block on
         // the upload completing before returning Ok.
-        let cache_fd = self.handles.get(&fh).and_then(|e| match e.value() {
+        let write_buffer_fd = self.handles.get(&fh).and_then(|e| match e.value() {
             crate::FileHandleState::Write {
-                cache_fd: Some(fd), ..
+                write_buffer_fd: Some(fd),
+                ..
             } => Some(fd.clone()),
             _ => None,
         });
-        let Some(fd) = cache_fd else {
+        let Some(fd) = write_buffer_fd else {
+            // CacheMode::Off: the handle carries no cache fd
+            // (bytes are in `in_memory_buffer`). The bytes
+            // are already "durable enough" for the
+            // FUSE-side contract — they're in process memory
+            // and the writeback worker will upload them on
+            // the 5 s schedule. Nothing to fdatasync, so
+            // honour the user's fsync(2) call with Ok.
+            if self.cache_mode == crate::util::CacheMode::Off {
+                return Ok(());
+            }
             // No open cache fd (e.g. setattr with no fh,
             // or a read-only handle that never opened a
             // cache file). Surface NotFound so the
@@ -6020,9 +6144,9 @@ impl CoreFilesystem for MntrsFs {
         // On release, trigger writeback for dirty handles.
         //
         // Issue T0-2 (pre-fix was a single `let-else` requiring
-        // `cache_fd: Some(fd)`): the pre-fix match required all four
-        // conditions — Write + dirty:true + cache_fd:Some. When
-        // `cache_fd` was `None` (open failed in create/create_excl,
+        // `write_buffer_fd: Some(fd)`): the pre-fix match required all four
+        // conditions — Write + dirty:true + write_buffer_fd:Some. When
+        // `write_buffer_fd` was `None` (open failed in create/create_excl,
         // because $HOME was unwritable or the cache directory
         // permission was wrong), the entire block short-circuited
         // to `was_dirty = false`. The .dirty sidecar was never
@@ -6067,17 +6191,19 @@ impl CoreFilesystem for MntrsFs {
             // libfuse passthrough_hp's dup+close pattern.
             //
             // Only attempt the fdatasync when we hold the fd.
-            // The `cache_fd: None` path means the open()
+            // The `write_buffer_fd: None` path means the open()
             // at create/create_excl failed; the data was
             // persisted via the disk-write pool worker
             // (which re-opens the file), and the
             // periodic-fsync thread (see #8) is responsible
             // for durability on that path, not us.
-            let cache_fd_opt = match entry.value() {
-                crate::FileHandleState::Write { cache_fd, .. } => cache_fd.as_ref(),
+            let write_buffer_fd_opt = match entry.value() {
+                crate::FileHandleState::Write {
+                    write_buffer_fd, ..
+                } => write_buffer_fd.as_ref(),
                 _ => None,
             };
-            if let Some(fd) = cache_fd_opt
+            if let Some(fd) = write_buffer_fd_opt
                 && let Ok(f) = fd.lock()
                 && let Err(e) = f.sync_data()
             {
@@ -6088,10 +6214,37 @@ impl CoreFilesystem for MntrsFs {
                 );
                 return Err(e);
             }
-            let cpath = crate::cache_path(&self.cache_dir, path);
-            if cpath.exists() {
+            let cpath = crate::write_buffer_path(&self.cache_dir, path);
+            // CacheMode::Off: bytes live in `in_memory_buffer`
+            // and there is no on-disk file to flag. Pack the
+            // dirty buffer contents into the task; the worker
+            // uploads them RAM-to-RAM. `cpath` is unused in
+            // that branch but still carried on the task for
+            // the `drop_block_cache_for_path` post-upload
+            // (no-op for off mode — no block cache exists).
+            let in_memory_payload: Option<bytes::Bytes> =
+                if self.cache_mode == crate::util::CacheMode::Off {
+                    let entry = self.handles.get(&fh);
+                    match entry.as_deref() {
+                        Some(crate::FileHandleState::Write {
+                            in_memory_buffer: Some(buf),
+                            ..
+                        }) => buf.lock().ok().map(|v| bytes::Bytes::copy_from_slice(&v)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+            // Off mode never writes a .dirty sidecar — there
+            // is no next-mount recovery path (the in-memory
+            // payload is gone if the daemon crashes before
+            // the worker flushes). Document this explicitly.
+            if in_memory_payload.is_none() && cpath.exists() {
                 let sidecar = cpath.with_extension("dirty");
                 let _ = std::fs::write(&sidecar, path.as_bytes());
+            }
+            let should_enqueue = in_memory_payload.is_some() || cpath.exists();
+            if should_enqueue {
                 if let Some(tx) = self.writeback_sender.get() {
                     // Bug 22 (release-side mirror of the flush
                     // fix above). Same rationale + same
@@ -6117,7 +6270,8 @@ impl CoreFilesystem for MntrsFs {
                         if let Err(e) = tx.send(WritebackTask {
                             ino: _ino,
                             remote_path: (*path).to_string(),
-                            cache_path: cpath,
+                            write_buffer_path: cpath,
+                            in_memory_payload,
                             retry_cycle: 0,
                             per_task_delay: delay,
                         }) {
@@ -6169,7 +6323,7 @@ impl CoreFilesystem for MntrsFs {
             // open() can reuse the cache fd (Write)
             // and the in-flight prefetcher (Read).
             // Pre-fix this branch only retained
-            // Write handles with a cache_fd; Read
+            // Write handles with a write_buffer_fd; Read
             // handles fell through to handles.remove
             // and the entry's prefetcher was cancelled
             // above. Now both Read and Write handles
@@ -6204,7 +6358,7 @@ impl CoreFilesystem for MntrsFs {
                 // can sweep expired entries and prevent fd leaks.
                 // Without this, retained handles stay in the
                 // DashMap forever (bounded only by process
-                // lifetime), accumulating cache_fd Arc<Mutex<File>>
+                // lifetime), accumulating write_buffer_fd Arc<Mutex<File>>
                 // that each hold an open fd.
                 let ttl = self.handle_caching;
                 self.handles.entry(fh).and_modify(|e| match e {
@@ -6327,27 +6481,38 @@ impl CoreFilesystem for MntrsFs {
         let fh = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Insert Write handle so follow-up write() can find the path
         // Create cache file for write handle
-        let cpath = crate::cache_path(&self.cache_dir, &full_path);
+        let cpath = crate::write_buffer_path(&self.cache_dir, &full_path);
         if let Some(parent) = cpath.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let cache_fd = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true) // N-8 fix: truncate old cache content on create;
-            // the backend now has a 0-byte file and the cache must match.
-            // Pre-fix `.truncate(false)` preserved stale cache from a
-            // prior session, causing reads to return old data after
-            // `touch existing.txt` (create without write).
-            .write(true)
-            .read(true)
-            .open(&cpath)
-            .ok()
-            .map(|f| Arc::new(std::sync::Mutex::new(f)));
+        let write_buffer_fd = if self.cache_mode == crate::util::CacheMode::Off {
+            None
+        } else {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true) // N-8 fix: truncate old cache content on create;
+                // the backend now has a 0-byte file and the cache must match.
+                // Pre-fix `.truncate(false)` preserved stale cache from a
+                // prior session, causing reads to return old data after
+                // `touch existing.txt` (create without write).
+                .write(true)
+                .read(true)
+                .open(&cpath)
+                .ok()
+                .map(|f| Arc::new(std::sync::Mutex::new(f)))
+        };
         self.handles.insert(
             fh,
             FileHandleState::Write {
                 path: Arc::from(full_path.as_str()),
-                cache_fd,
+                write_buffer_fd,
+                // Mirror open(): off mode allocates a fresh
+                // empty buffer; writes/full leave it None.
+                in_memory_buffer: if self.cache_mode == crate::util::CacheMode::Off {
+                    Some(Arc::new(std::sync::Mutex::new(Vec::new())))
+                } else {
+                    None
+                },
                 dirty: false,
                 dirty_since: None,
                 expires_at: None,
@@ -6494,23 +6659,32 @@ impl CoreFilesystem for MntrsFs {
         let now = SystemTime::now();
         let ino = self.alloc_ino_with_mtime(&full_path, kind, size, mtime.unwrap_or(now));
         let fh = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let cpath = crate::cache_path(&self.cache_dir, &full_path);
+        let cpath = crate::write_buffer_path(&self.cache_dir, &full_path);
         if let Some(parent) = cpath.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let cache_fd = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .read(true)
-            .open(&cpath)
-            .ok()
-            .map(|f| Arc::new(std::sync::Mutex::new(f)));
+        let write_buffer_fd = if self.cache_mode == crate::util::CacheMode::Off {
+            None
+        } else {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .read(true)
+                .open(&cpath)
+                .ok()
+                .map(|f| Arc::new(std::sync::Mutex::new(f)))
+        };
         self.handles.insert(
             fh,
             FileHandleState::Write {
                 path: Arc::from(full_path.as_str()),
-                cache_fd,
+                write_buffer_fd,
+                in_memory_buffer: if self.cache_mode == crate::util::CacheMode::Off {
+                    Some(Arc::new(std::sync::Mutex::new(Vec::new())))
+                } else {
+                    None
+                },
                 dirty: false,
                 dirty_since: None,
                 expires_at: None,
@@ -6762,7 +6936,7 @@ impl CoreFilesystem for MntrsFs {
             // registered. Drop the placeholder and any pending
             // writeback sidecar so the next New-Item at the same
             // path sees NotFound and proceeds to create.
-            let cpath = crate::cache_path(&self.cache_dir, stored);
+            let cpath = crate::write_buffer_path(&self.cache_dir, stored);
             let _ = std::fs::remove_file(&cpath);
             let dirty_path = cpath.with_extension("dirty");
             let _ = std::fs::remove_file(&dirty_path);
@@ -6846,7 +7020,7 @@ impl CoreFilesystem for MntrsFs {
             full_path = %full_path,
             "FUSE unlink entry"
         );
-        let cpath = crate::cache_path(&self.cache_dir, &full_path);
+        let cpath = crate::write_buffer_path(&self.cache_dir, &full_path);
 
         // Backend delete FIRST. For a file that IS in the
         // backend (the common case via `write_remote` /
@@ -7867,7 +8041,7 @@ impl MntrsFs {
                 if !self.read_stale_on_backend_error {
                     return Err(backend_err);
                 }
-                let fcpath = crate::cache_path(&self.cache_dir, path);
+                let fcpath = crate::write_buffer_path(&self.cache_dir, path);
                 let cache_meta = std::fs::metadata(&fcpath).ok();
                 let cache_len = cache_meta.as_ref().map(|m| m.len()).unwrap_or(0);
                 let end = offset.saturating_add(size as u64);
@@ -7956,7 +8130,7 @@ impl MntrsFs {
     /// `setattr(size=...)` path updates both
     /// `inodes.size` and the cache fd correctly.
     fn populate_cache_from_backend(&self, path: &str) {
-        let cpath = crate::cache_path(&self.cache_dir, path);
+        let cpath = crate::write_buffer_path(&self.cache_dir, path);
         if cpath.exists() {
             return;
         }
@@ -8236,7 +8410,7 @@ impl MntrsFs {
                             //
                             // Issue #78 regression: pre-fix this
                             // stage read the local cache file
-                            // (`std::fs::read(cache_path)`), which
+                            // (`std::fs::read(write_buffer_path)`), which
                             // only works for files the user
                             // wrote via the mount. For files
                             // created directly via the opendal
@@ -8343,8 +8517,8 @@ impl MntrsFs {
             Err(io_err) => return Err(io_err),
         }
         // Migrate cache file
-        let cpath_src = crate::cache_path(&self.cache_dir, &src);
-        let cpath_dst = crate::cache_path(&self.cache_dir, &dst);
+        let cpath_src = crate::write_buffer_path(&self.cache_dir, &src);
+        let cpath_dst = crate::write_buffer_path(&self.cache_dir, &dst);
         if cpath_src.exists() && !cpath_dst.exists() {
             if let Some(parent) = cpath_dst.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -8394,7 +8568,7 @@ impl MntrsFs {
         // and resurrect the source on the backend after the rename
         // already deleted it (the same race the in-process
         // writeback task hit, see writeback.rs).
-        let cpath_src = crate::cache_path(&self.cache_dir, &src);
+        let cpath_src = crate::write_buffer_path(&self.cache_dir, &src);
         let _ = std::fs::remove_file(cpath_src.with_extension("dirty"));
         self.invalidate_dir_cache(&src);
         self.invalidate_dir_cache(&dst);
@@ -8459,7 +8633,23 @@ fn to_core_attr(a: &FileAttr) -> CoreFileAttr {
     }
 }
 
+/// Default test helper — `CacheMode::Writes` for
+/// pre-#583 backwards compatibility with the existing test
+/// suite. Most tests were authored before the off-mode path
+/// existed and assume the writes-mode durability contract
+/// (disk file + fdatasync on flush/release).
 pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> MntrsFs {
+    new_test_fs_with_mode(op, cache_dir, crate::util::CacheMode::Writes)
+}
+
+/// Issue #583 test helper — pick the cache_mode. Used by
+/// the write-throughput A/B benchmark under
+/// `tests/issue_583_write_ab.rs`.
+pub fn new_test_fs_with_mode(
+    op: opendal::Operator,
+    cache_dir: std::path::PathBuf,
+    cache_mode: crate::util::CacheMode,
+) -> MntrsFs {
     // Initialize the global op for the write path's
     // background thread. The thread can't borrow the
     // `&self` op (it outlives any single `write()` call),
@@ -8509,7 +8699,7 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         // tests that want to exercise the immediate path can
         // override this field directly.
         writeback_immediate_threshold: 0,
-        cache_mode: "writes".into(),
+        cache_mode,
         read_ahead: 0,
         prefetch_threshold: 16 * 1024 * 1024,
         prefetch_queue_mb: 64,
@@ -8741,7 +8931,7 @@ mod tests {
 
     /// Insert a synthetic cache entry (file on disk + index).
     fn insert_cache_entry(fs: &MntrsFs, path: &str, size: u64, atime: Instant) {
-        let cpath = cache_path(&fs.cache_dir, path);
+        let cpath = write_buffer_path(&fs.cache_dir, path);
         std::fs::write(&cpath, vec![0u8; size as usize]).unwrap();
         fs.disk_cache_index
             .insert((path.to_string(), None), (size, atime));
@@ -8829,7 +9019,7 @@ mod tests {
         insert_cache_entry(&fs, "big.bin", 1024, now);
         // two block-level entries for the same file (idx 0, idx 1)
         for blk in 0..2u64 {
-            let cpath = cache_block_path(&fs.cache_dir, "big.bin", blk);
+            let cpath = disk_cache_block_path(&fs.cache_dir, "big.bin", blk);
             std::fs::write(&cpath, vec![0u8; 512]).unwrap();
             fs.disk_cache_index.insert(
                 ("big.bin".to_string(), Some(blk)),
@@ -9021,7 +9211,7 @@ mod tests {
         let fs2 = new_test_fs_evict(dir2, 1024 * 1024);
         let now = Instant::now();
         let entry_size: u64 = 4 * 1024 * 1024;
-        let cpath = crate::cache_block_path(&fs2.cache_dir, "f.bin", 0);
+        let cpath = crate::disk_cache_block_path(&fs2.cache_dir, "f.bin", 0);
         std::fs::write(&cpath, vec![0u8; entry_size as usize]).unwrap();
         fs2.disk_cache_index
             .insert(("f.bin".to_string(), Some(0)), (entry_size, now));
@@ -9051,7 +9241,7 @@ mod tests {
         // 3072 4-KiB blocks. free_blocks should drop by another
         // 2048 from the previous value.
         let entry_size2: u64 = 8 * 1024 * 1024;
-        let cpath2 = crate::cache_block_path(&fs2.cache_dir, "f.bin", 1);
+        let cpath2 = crate::disk_cache_block_path(&fs2.cache_dir, "f.bin", 1);
         std::fs::write(&cpath2, vec![0u8; entry_size2 as usize]).unwrap();
         fs2.disk_cache_index
             .insert(("f.bin".to_string(), Some(1)), (entry_size2, now));
@@ -9440,7 +9630,7 @@ mod tests {
         // is 2000 bytes (a local write extended it). The
         // lookup should return 2000.
         fs.cache_add_entry("", "wfile", EntryMode::FILE, 1000, mtime, 42);
-        let cpath = crate::cache_path(&fs.cache_dir, "wfile");
+        let cpath = crate::write_buffer_path(&fs.cache_dir, "wfile");
         if let Some(parent) = cpath.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -9773,10 +9963,10 @@ mod tests {
         );
 
         // Seed the file-level cache file directly. The
-        // path matches what `cache_path()` returns for
+        // path matches what `write_buffer_path()` returns for
         // "cacheable.bin" -- a hash-named file under
         // cache_dir.
-        let fcpath = crate::cache_path(&fs.cache_dir, "cacheable.bin");
+        let fcpath = crate::write_buffer_path(&fs.cache_dir, "cacheable.bin");
         let payload = b"stale-but-readable-bytes!";
         std::fs::write(&fcpath, payload).unwrap();
 
@@ -9809,7 +9999,7 @@ mod tests {
         // NOT serve it. Seed the cache file so we can
         // assert the error kind is preserved (proving we
         // didn't accidentally fall through to disk).
-        let fcpath = crate::cache_path(&fs.cache_dir, "strict.bin");
+        let fcpath = crate::write_buffer_path(&fs.cache_dir, "strict.bin");
         std::fs::write(&fcpath, b"would-be-stale").unwrap();
 
         let backend_err = std::io::Error::other("synthetic backend failure");
@@ -9845,7 +10035,7 @@ mod tests {
         fs.read_stale_on_backend_error = true;
 
         // Cache file is only 5 bytes; request asks for 100.
-        let fcpath = crate::cache_path(&fs.cache_dir, "tiny.bin");
+        let fcpath = crate::write_buffer_path(&fs.cache_dir, "tiny.bin");
         std::fs::write(&fcpath, b"short").unwrap();
 
         let backend_err = std::io::Error::other("synthetic backend failure");

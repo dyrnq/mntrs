@@ -1,4 +1,4 @@
-use mntrs::{cache_path, fnmatch, path_hash};
+use mntrs::{fnmatch, path_hash, write_buffer_path};
 
 // ============================================================
 // statfs — verify df output values are reasonable
@@ -117,9 +117,9 @@ fn path_hash_different_paths() {
 }
 
 #[test]
-fn cache_path_format() {
+fn write_buffer_path_format() {
     let tmp = std::env::temp_dir();
-    let p = cache_path(&tmp, "hello/world");
+    let p = write_buffer_path(&tmp, "hello/world");
     let parent = p.parent().unwrap();
     assert_eq!(parent, tmp);
     let name = p.file_name().unwrap().to_str().unwrap();
@@ -187,21 +187,21 @@ fn path_hash_uniqueness() {
     assert_ne!(h1, h2);
 }
 
-/// cache_path produces expected format
+/// write_buffer_path produces expected format
 #[test]
-fn cache_path_format_verified() {
+fn write_buffer_path_format_verified() {
     let tmp = std::env::temp_dir();
-    let p = cache_path(&tmp, "hello/world");
+    let p = write_buffer_path(&tmp, "hello/world");
     let name = p.file_name().unwrap().to_str().unwrap();
     assert_eq!(name.len(), 20, "cache path filename should be 20-char hex");
     assert!(name.chars().all(|c| c.is_ascii_hexdigit()), "should be hex");
 }
 
-/// cache_block_path includes block index in filename
+/// disk_cache_block_path includes block index in filename
 #[test]
-fn cache_block_path_includes_block_idx() {
+fn disk_cache_block_path_includes_block_idx() {
     let tmp = std::env::temp_dir();
-    let p = mntrs::cache_block_path(&tmp, "hello/world", 42);
+    let p = mntrs::disk_cache_block_path(&tmp, "hello/world", 42);
     let name = p.file_name().unwrap().to_str().unwrap();
     assert!(name.ends_with(".block"), "should end with .block");
     assert!(

@@ -1327,7 +1327,7 @@ pub fn mount(
         // Duration::ZERO (immediate) vs write_back_delay
         // (5s batch). 0 disables the fast path entirely.
         writeback_immediate_threshold,
-        cache_mode: vfs_cache_mode.to_string(),
+        cache_mode: crate::util::CacheMode::parse(vfs_cache_mode),
         read_ahead: vfs_read_ahead,
         read_chunk_size: vfs_read_chunk_size,
         read_chunk_size_limit: vfs_read_chunk_size_limit,

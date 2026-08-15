@@ -2,11 +2,9 @@
 
 > **Scope:** This document describes the actual writeback and
 > durability behavior of mntrs as of the current `main` branch.
-> It supersedes the older "per cache mode" framing — there is
-> only one writeback path; the rclone-compat `vfs_cache_mode`
-> flag is a **shadow field** that does not affect behavior
-> (see [Shadow fields](#shadow-fields-rclone-compat-not-implemented)
-> below).
+> The `--vfs-cache-mode` flag is now a real per-mode selector
+> (off / writes / full) backed by a typed `CacheMode` enum — see
+> [`--vfs-cache-mode` per mode](#vfs-cache-mode-per-mode) below.
 
 ## Three writeback concepts (terminology)
 
@@ -40,29 +38,37 @@ relevant to most debugging.
 
 ## The single writeback path
 
-All writes — regardless of which rclone-compat flag you set —
-flow through the same path:
+All writes — regardless of `--vfs-cache-mode` — flow through the
+same upload pipeline. The mode only changes where the bytes live
+locally and whether the `.dirty` sidecar is written.
 
 ```
 user process               kernel                mntrs FUSE worker        writeback worker
 ─────────────              ──────                ─────────────────        ────────────────
 write(2)                   page cache            write handler
-                           accumulates bytes     creates/opens cache file
+                           accumulates bytes     creates cache file (writes/full)
+                                                  OR
+                                                  Vec<u8> in fh (off)
 
 fsync(2) / close(2)        fdatasync cache fd ──►  flush()/release()
+                                                (writes/full only)        (off: nothing to sync)
                                                 1. f.sync_data()
                                                 2. write .dirty sidecar
+                                                   (writes/full only)
                                                 3. writeback_pending.insert(path)
-                                                4. tx.send((ino, path, cpath, 0))
+                                                4. tx.send((ino, path, cpath, payload))
+                                                   payload = in_memory_bytes (off)
+                                                   payload = None  (writes/full)
                            returns Ok to user ──►  user thinks "durable"
 
                                                 ────────────────────►   DelayQueue holds task for
                                                                             --vfs-write-back (default 5s)
-                                                                            
+
                                                                             then: 5 attempts upload with
                                                                             exponential backoff
-                                                                            
+
                                                                             on success: drop .dirty sidecar
+                                                                                       (writes/full only)
                                                                             on exhaustion: cycle + 1
                                                                               (60s cooldown, capped at 10)
 ```
@@ -190,35 +196,74 @@ delay for cycle=0 tasks; cycle>0 tasks always use the 60 s
 permanently-failing backend always falls into the 60 s
 cooldown path.
 
-## Shadow fields (rclone-compat, not implemented)
+## `--vfs-cache-mode` per mode
 
-These flags are parsed, stored in `MntrsFs`, and never read.
-They are **no-ops** today. A user who sets them expecting
-rclone semantics will get the standard writeback queue with
-fdatasync — the same as the default.
+`--vfs-cache-mode` selects three orthogonal things in one flag:
+**where the write buffer lives**, **whether read blocks are
+persisted to disk**, and **what crash-safety guarantees apply**.
+Backed by `crate::util::CacheMode` (`src/util.rs`); parsed in
+`cmd/mount.rs` via `CacheMode::parse`.
 
-| CLI flag | Mntrs field | Status |
-|---|---|---|
-| `--vfs-cache-mode <mode>` | `cache_mode: String` | Accepted: `off / minimal / writes / full`. **No `match` anywhere**. The mount.rs default is `"off"` (`mount.rs:331`) but `new_test_fs` uses `"writes"` (`lib.rs:4399`) — defaults are inconsistent. |
-| `--vfs-cache-max-age <secs>` | `cache_max_age: Duration` | Set from CLI; never read. |
-| `--poll-interval <secs>` | `poll_interval: Duration` | Set from CLI; never read. |
-| `--vfs-cache-poll-interval <secs>` | (only in `main` args) | Accepted; never plumbed to `MntrsFs`. |
-| `--vfs-refresh` | `vfs_refresh: bool` | Set from CLI; never read. |
+| Mode       | CLI value | Write buffer                  | Read cache                     | `.dirty` sidecar | Crash safety                                                    |
+|------------|-----------|-------------------------------|--------------------------------|------------------|------------------------------------------------------------------|
+| `off`      | `off`     | in-process `Vec<u8>` per fh   | L1 mem_cache only              | not written      | **dirty bytes lost on daemon crash** before the 5 s write-back lands |
+| `writes`   | `writes`  | disk file with `fdatasync`    | L1 mem_cache only              | written          | dirty bytes durable across daemon crash (recovery scan re-enqueues) |
+| `full`     | `full`    | disk file with `fdatasync`    | L1 mem_cache + L2 `.block` files | written        | same as `writes`; pre-fetched blocks also persist for cross-session hits |
+| `minimal`  | `minimal` | maps to `off` (no separate temp-file stage; opendal handles multipart temp internally) | | | |
 
-### What this means in practice
+**Default**: `off`. The user is opting in to crash-safety when
+they pass `--vfs-cache-mode=writes` or `--vfs-cache-mode=full`.
+This is the inverse of the pre-Issue-B default (`writes`), and
+the change is intentional — see [Migration notes](#migration-notes)
+below.
 
-- `--vfs-cache-mode=off` does **not** mean "write-through to the
-  backend on close without materializing a local cache." It is
-  identical to `--vfs-cache-mode=writes`. Implementing the
-  off-mode semantics is a real feature (write-through code
-  path) and is not a doc change.
-- `--vfs-cache-max-age` does **not** trigger TTL-based cache
-  eviction. The disk cache's LRU is bounded by
-  `--vfs-cache-max-size` (`lib.rs:544-570`) but has no time
-  component.
-- `--vfs-cache-poll-interval` and `--vfs-refresh` do **not**
-  trigger background stat revalidation. Stale-attribute
-  detection is event-driven (open, getattr, read), not polled.
+### Off mode
+
+No on-disk cache file. The FUSE worker accumulates bytes in
+`FileHandleState::Write::in_memory_buffer: Option<Arc<Mutex<Vec<u8>>>>`
+(`src/lib.rs`) and the async writeback worker reads from a copy
+of that Vec packed into `WritebackTask.in_memory_payload`
+(`src/writeback.rs`). The user-facing `fsync(2)` returns `Ok(())`
+immediately (bytes are already "durable enough" — they're in
+process memory and the writeback worker will upload them on the
+5 s schedule). A daemon crash before the upload lands **drops
+the dirty bytes**; there is no `.dirty` sidecar to recover from.
+
+`read(2)` consults the in-memory buffer first (read-after-write
+view), then falls through to the backend. The L1 mem_cache
+(Moka DashMap, see `src/cache.rs`) is still populated on cache
+misses — only the on-disk write buffer is gone.
+
+### Writes mode
+
+The pre-Issue-B default. Cache file at
+`crate::write_buffer_path(cache_dir, path)` (see Issue A's
+rename), `fdatasync` on flush/release (Issue #34), `.dirty`
+sidecar for crash recovery, async upload via `writeback::spawn`.
+
+### Full mode
+
+Same as `writes` for writes. Additionally, pre-fetched read
+blocks persist to disk (`.block` files, see
+`crate::disk_cache_block_path` and `src/block_format.rs`) for
+cross-session hits. Useful for read-heavy workloads with stable
+file content where re-warming the L1 cache on every mount is
+expensive.
+
+### Migration notes
+
+The pre-Issue-B default was `writes`. The new default is `off`.
+Existing deployments that relied on the implicit crash safety
+of `writes` must now pass `--vfs-cache-mode=writes` (or `full`)
+explicitly. CSI deployments in particular should set this in the
+mount options — pod reschedule is "soft crash" and loses
+un-uploaded bytes only in `off` mode.
+
+For an existing user with `cache_mode: "writes"` baked into a
+config file, the field type changed from `String` to `CacheMode`
+enum — string values (`"off"`, `"writes"`, `"full"`,
+`"minimal"`) still parse via `CacheMode::parse`, so the CLI
+contract is source-compatible.
 
 ## What the rclone-compat flags that ARE wired up do
 
@@ -232,12 +277,12 @@ fdatasync — the same as the default.
 
 ## See also
 
-- `src/lib.rs:3293` — `fn flush`
-- `src/lib.rs:3480` — `fn release`
-- `src/writeback.rs:47` — `pub type Task`
-- `src/writeback.rs:75` — `MAX_REENQUEUE_CYCLES`
-- `src/writeback.rs:85` — `REENQUEUE_COOLDOWN`
-- `src/writeback.rs:98` — `pub fn spawn`
+- `src/lib.rs` — `fn flush`, `fn release`, `fn open`, `fn create`,
+  `fn read`, `fn write`, `fn fsync`
+- `src/writeback.rs` — `WritebackTask`, `MAX_REENQUEUE_CYCLES`,
+  `REENQUEUE_COOLDOWN`, `pub fn spawn`
+- `src/util.rs` — `CacheMode` enum + `write_buffer_path` /
+  `disk_cache_block_path` path helpers
 - `docs/benchmark_cat_head_tail.md` — read-path benchmark
 - `bench/run_all.sh` — A/B bench for `mem_cache_impl`
   (related but separate concern)
@@ -254,3 +299,6 @@ fdatasync — the same as the default.
   read-after-write consistency half)
 - **#142** — this document (re-framed from "per cache mode"
   to "actual uniform behavior")
+- **#583** — `--vfs-cache-mode` three-mode selector
+  implementation (the typed `CacheMode` enum, off-mode in-memory
+  write buffer, `WritebackTask.in_memory_payload` field)

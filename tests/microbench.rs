@@ -162,7 +162,7 @@ fn microbench_find_ino_by_path_500_entries() {
 enum FakeHandle {
     Write {
         path: String,
-        cache_fd: Option<Arc<Mutex<()>>>,
+        write_buffer_fd: Option<Arc<Mutex<()>>>,
         dirty: bool,
         dirty_since: Option<Instant>,
     },
@@ -182,10 +182,11 @@ fn write_old_pattern(handles: &DashMap<u64, FakeHandle>, fh: u64, _data: &[u8]) 
             FakeHandle::Read { path } => path.clone(),
         })
         .unwrap();
-    // Second get: extract cache_fd.
-    let cache_fd = handles.get(&fh).and_then(|e| {
+    // Second get: extract write_buffer_fd.
+    let write_buffer_fd = handles.get(&fh).and_then(|e| {
         if let FakeHandle::Write {
-            cache_fd: Some(fd), ..
+            write_buffer_fd: Some(fd),
+            ..
         } = e.value()
         {
             Some(fd.clone())
@@ -198,7 +199,7 @@ fn write_old_pattern(handles: &DashMap<u64, FakeHandle>, fh: u64, _data: &[u8]) 
         fh,
         FakeHandle::Write {
             path,
-            cache_fd,
+            write_buffer_fd,
             dirty: true,
             dirty_since: Some(Instant::now()),
         },
@@ -208,9 +209,13 @@ fn write_old_pattern(handles: &DashMap<u64, FakeHandle>, fh: u64, _data: &[u8]) 
 /// Post-fix: one combined match + and_modify in-place update.
 fn write_new_pattern(handles: &DashMap<u64, FakeHandle>, fh: u64, _data: &[u8]) {
     // Single get with pattern match.
-    let (_path, _cache_fd) = match handles.get(&fh) {
+    let (_path, _write_buffer_fd) = match handles.get(&fh) {
         Some(entry) => match entry.value() {
-            FakeHandle::Write { path, cache_fd, .. } => (path.clone(), cache_fd.clone()),
+            FakeHandle::Write {
+                path,
+                write_buffer_fd,
+                ..
+            } => (path.clone(), write_buffer_fd.clone()),
             FakeHandle::Read { path } => (path.clone(), None),
         },
         None => return,
@@ -239,7 +244,7 @@ fn microbench_write_hot_path() {
         42,
         FakeHandle::Write {
             path: "bench.bin".to_string(),
-            cache_fd: Some(fd),
+            write_buffer_fd: Some(fd),
             dirty: false,
             dirty_since: None,
         },

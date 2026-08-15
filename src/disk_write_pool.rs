@@ -94,19 +94,19 @@ pub fn set_opendal_sync_op(op: opendal::Operator) {
 ///      are submitted as a batch and run in parallel on
 ///      the worker pool — that gives cold-read
 ///      concurrency vs the cc2667f/23d22d9 serial loop.
-///   2. **Whole-file write via fd** (`cache_fd` is `Some`):
+///   2. **Whole-file write via fd** (`write_buffer_fd` is `Some`):
 ///      write at `offset` in an already-opened cache file.
-///   3. **Whole-file write via path** (`cache_path` is `Some`):
-///      open the cache file from `cache_dir + cache_path`,
+///   3. **Whole-file write via path** (`write_buffer_path` is `Some`):
+///      open the cache file from `cache_dir + write_buffer_path`,
 ///      then write at `offset`.
 pub(crate) struct DiskWriteJob {
     /// Open file handle + `Mutex` (per-handle). `None`
     /// → use the fallback path that re-opens the cache
-    /// file from `self.cache_dir + cache_path`.
-    pub(crate) cache_fd: Option<Arc<std::sync::Mutex<std::fs::File>>>,
+    /// file from `self.cache_dir + write_buffer_path`.
+    pub(crate) write_buffer_fd: Option<Arc<std::sync::Mutex<std::fs::File>>>,
     /// Fallback path inside `self.cache_dir` (only
-    /// used when `cache_fd` is `None`).
-    pub(crate) cache_path: Option<PathBuf>,
+    /// used when `write_buffer_fd` is `None`).
+    pub(crate) write_buffer_path: Option<PathBuf>,
     /// Remote path (for the rare "write at offset >
     /// current length" prefix fetch). Used by the
     /// whole-file write modes; ignored when
@@ -121,7 +121,7 @@ pub(crate) struct DiskWriteJob {
     pub(crate) data: Vec<u8>,
     /// Block-cache write: full on-disk path of the
     /// `.block` file to create. `Some` overrides
-    /// `cache_fd` / `cache_path` / `offset` / `remote_path`
+    /// `write_buffer_fd` / `write_buffer_path` / `offset` / `remote_path`
     /// — the worker writes the new format
     /// (`MNCR || version || data || CRC32C`) at this
     /// path. The dashmap LRU index update is done by
@@ -284,7 +284,7 @@ impl DiskWriteJob {
             Self::do_block_cache_write(path, &self.remote_path, &self.data);
             return;
         }
-        match self.cache_fd {
+        match self.write_buffer_fd {
             Some(fd) => {
                 let mut f = match fd.lock() {
                     Ok(f) => f,
@@ -333,13 +333,13 @@ impl DiskWriteJob {
                         tracing::debug!(
                             path = %self.remote_path,
                             error = %e,
-                            "disk cache write (cache_fd) failed"
+                            "disk cache write (write_buffer_fd) failed"
                         );
                     }
                 }
             }
             None => {
-                let cpath = match &self.cache_path {
+                let cpath = match &self.write_buffer_path {
                     Some(p) => p,
                     None => return,
                 };
@@ -390,7 +390,7 @@ impl DiskWriteJob {
                     Err(_) => return,
                 };
                 // Same retry-after-ENOSPC pattern as the
-                // cache_fd branch (issue #39). The
+                // write_buffer_fd branch (issue #39). The
                 // fall-back open path doesn't have a
                 // long-lived fd to keep across the
                 // retry, but the FUSE-side eviction
@@ -433,13 +433,13 @@ impl DiskWriteJob {
         // periodic fsync. The write above only landed in
         // the OS page cache; without a periodic sync, a
         // power loss or kernel panic can truncate the
-        // file to 0 bytes (the cache_fd open created the
+        // file to 0 bytes (the write_buffer_fd open created the
         // inode metadata before the data was written).
         // The fsync thread batches sync_data() calls
         // every 5 s, amortizing the cost across all
         // dirty paths.
-        if let Some(p) = &self.cache_path {
-            register_dirty_cache_path(p);
+        if let Some(p) = &self.write_buffer_path {
+            register_pending_writeback(p);
         }
     }
 
@@ -515,7 +515,7 @@ impl DiskWriteJob {
         // kernel's lazy writeback leaves a 0-byte (or
         // truncated) .block file that the next read sees
         // as corrupt (CRC mismatch → unlink → re-fetch).
-        register_dirty_cache_path(blk_path);
+        register_pending_writeback(blk_path);
     }
 
     fn do_write(
@@ -782,7 +782,7 @@ static DIRTY_CACHE_PATHS: once_cell::sync::Lazy<dashmap::DashSet<PathBuf>> =
 /// successful sync, so a steady-state hot file
 /// oscillates between "in set" and "not in set" at
 /// the tick frequency.
-pub(crate) fn register_dirty_cache_path(path: &std::path::Path) {
+pub(crate) fn register_pending_writeback(path: &std::path::Path) {
     DIRTY_CACHE_PATHS.insert(path.to_path_buf());
 }
 
@@ -977,10 +977,10 @@ pub(crate) fn submit_block_cache_write(
     block_idx: u64,
     data: Vec<u8>,
 ) {
-    let blk_path = crate::cache_block_path(cache_dir, remote_path, block_idx);
+    let blk_path = crate::disk_cache_block_path(cache_dir, remote_path, block_idx);
     let job = DiskWriteJob {
-        cache_fd: None,
-        cache_path: None,
+        write_buffer_fd: None,
+        write_buffer_path: None,
         remote_path: remote_path.to_string(),
         offset: 0,
         data,
@@ -1006,8 +1006,8 @@ mod tests {
         let dir = scratch_dir("blk");
         let blk_path = dir.join("test.block");
         let job = DiskWriteJob {
-            cache_fd: None,
-            cache_path: None,
+            write_buffer_fd: None,
+            write_buffer_path: None,
             remote_path: "remote/path.bin".into(),
             offset: 0,
             data: vec![0xAB; 4096],
@@ -1020,12 +1020,12 @@ mod tests {
     }
 
     #[test]
-    fn execute_cache_path_mode_writes_and_registers_dirty() {
+    fn execute_write_buffer_path_mode_writes_and_registers_dirty() {
         let dir = scratch_dir("cp");
         let cpath = dir.join("cache-file.bin");
         let job = DiskWriteJob {
-            cache_fd: None,
-            cache_path: Some(cpath.clone()),
+            write_buffer_fd: None,
+            write_buffer_path: Some(cpath.clone()),
             remote_path: "remote/cp.bin".into(),
             offset: 0,
             data: b"cache path data".to_vec(),
@@ -1040,13 +1040,13 @@ mod tests {
     }
 
     #[test]
-    fn execute_cache_path_mode_appends_at_offset() {
+    fn execute_write_buffer_path_mode_appends_at_offset() {
         let dir = scratch_dir("cpoff");
         let cpath = dir.join("offset.bin");
         std::fs::write(&cpath, b"aaaaaaaaaa").unwrap();
         let job = DiskWriteJob {
-            cache_fd: None,
-            cache_path: Some(cpath.clone()),
+            write_buffer_fd: None,
+            write_buffer_path: Some(cpath.clone()),
             remote_path: "offset.bin".into(),
             offset: 10,
             data: b"bbbbbbbbbb".to_vec(),
@@ -1059,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_cache_fd_mode_writes_via_fd() {
+    fn execute_write_buffer_fd_mode_writes_via_fd() {
         let dir = scratch_dir("fd");
         let cpath = dir.join("fd-cache.bin");
         let f = std::fs::OpenOptions::new()
@@ -1071,8 +1071,8 @@ mod tests {
             .unwrap();
         let f = Arc::new(std::sync::Mutex::new(f));
         let job = DiskWriteJob {
-            cache_fd: Some(f),
-            cache_path: Some(cpath.clone()),
+            write_buffer_fd: Some(f),
+            write_buffer_path: Some(cpath.clone()),
             remote_path: "fd.bin".into(),
             offset: 0,
             data: b"fd data".to_vec(),
@@ -1087,10 +1087,10 @@ mod tests {
     #[test]
     fn register_dirty_idempotent() {
         let p = std::path::PathBuf::from("/tmp/mntrs-test-dirty-xxx");
-        register_dirty_cache_path(&p);
+        register_pending_writeback(&p);
         assert!(DIRTY_CACHE_PATHS.contains(&p));
         let before = DIRTY_CACHE_PATHS.len();
-        register_dirty_cache_path(&p);
+        register_pending_writeback(&p);
         assert_eq!(DIRTY_CACHE_PATHS.len(), before);
         DIRTY_CACHE_PATHS.remove(&p);
     }

@@ -1427,7 +1427,7 @@ fn winfsp_flush_readonly_handle_is_noop() {
 
     // Open it read-only via `File::open` (no write
     // access). The kernel will hand the adapter a
-    // handle with no cache_fd; a subsequent
+    // handle with no write_buffer_fd; a subsequent
     // `FlushFileBuffers` exercises the fsync
     // NotFound path.
     use std::io::Read;

@@ -3,39 +3,39 @@
 
 use std::path::Path;
 
-use mntrs::{cache_path, fnmatch, path_hash};
+use mntrs::{fnmatch, path_hash, write_buffer_path};
 
 // ============================================================
 // Cache operations
 // ============================================================
 
 #[test]
-fn cache_path_returns_hex_filename() {
-    let p = cache_path(Path::new("/tmp/cache"), "hello.txt");
+fn write_buffer_path_returns_hex_filename() {
+    let p = write_buffer_path(Path::new("/tmp/cache"), "hello.txt");
     let name = p.file_name().unwrap().to_str().unwrap();
     assert_eq!(name.len(), 20);
     assert!(name.chars().all(|c| c.is_ascii_hexdigit()));
 }
 
 #[test]
-fn cache_path_different_paths_different_files() {
-    let a = cache_path(Path::new("/cache"), "a.txt");
-    let b = cache_path(Path::new("/cache"), "b.txt");
+fn write_buffer_path_different_paths_different_files() {
+    let a = write_buffer_path(Path::new("/cache"), "a.txt");
+    let b = write_buffer_path(Path::new("/cache"), "b.txt");
     assert_ne!(a, b);
 }
 
 #[test]
-fn cache_path_same_path_same_file() {
+fn write_buffer_path_same_path_same_file() {
     assert_eq!(
-        cache_path(Path::new("/cache"), "x"),
-        cache_path(Path::new("/cache"), "x")
+        write_buffer_path(Path::new("/cache"), "x"),
+        write_buffer_path(Path::new("/cache"), "x")
     );
 }
 
 #[test]
-fn cache_path_different_cache_dirs() {
-    let a = cache_path(Path::new("/a"), "x.txt");
-    let b = cache_path(Path::new("/b"), "x.txt");
+fn write_buffer_path_different_cache_dirs() {
+    let a = write_buffer_path(Path::new("/a"), "x.txt");
+    let b = write_buffer_path(Path::new("/b"), "x.txt");
     assert_ne!(a, b);
 }
 
