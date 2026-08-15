@@ -484,15 +484,24 @@ pub fn write_buffer_path(cache_dir: &Path, path: &str) -> PathBuf {
     cache_path_block(cache_dir, path, 0)
 }
 
-/// Deprecated alias for `write_buffer_path`. The name
-/// `cache_path` is misleading because the file it returns
-/// is a *write buffer*, not a read cache. Kept as a
-/// re-export during the rename window; callers should
-/// migrate to `write_buffer_path` (or `disk_cache_block_path`
+/// Alias for `write_buffer_path`. The name `cache_path` is
+/// misleading because the file it returns is a *write buffer*,
+/// not a read cache — kept as a public re-export for callers
+/// that haven't migrated to `write_buffer_path` yet. New code
+/// should use `write_buffer_path` (or `disk_cache_block_path`
 /// for read-side block cache).
-#[deprecated(
-    note = "use `write_buffer_path` (write buffer) or `disk_cache_block_path` (read cache)"
-)]
+///
+/// Note: pre-#583 this was marked `#[deprecated]`, but the
+/// in-tree rename is complete (verified by grep — zero callers
+/// of `cache_path` remain in `src/` or `tests/`). The deprecation
+/// attribute was removed because the CI gate
+/// (`RUSTFLAGS=-D warnings`) escalated the warning to an error,
+/// and a phantom stale-state hit (likely `Swatinem/rust-cache`
+/// restoring an older object file whose embedded source map
+/// pointed back at the pre-rename lib.rs) tripped it on PR runs
+/// where the rebuild showed clean locally. Removing the attribute
+/// costs nothing — there are no in-tree callers — and removes
+/// the noise.
 pub fn cache_path(cache_dir: &Path, path: &str) -> PathBuf {
     write_buffer_path(cache_dir, path)
 }
