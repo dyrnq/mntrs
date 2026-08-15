@@ -27,10 +27,19 @@ caches**, each with its own TTL/policy knob:
 | 4 | `mem_cache` (in-memory blocks, bounded) | `--mem-limit` |
 | 5 | `multi_cache` (combines mem + disk) | (composite; see [`mntrs-cache-knobs.md`](mntrs-cache-knobs.md)) |
 
-A single `--vfs-cache-mode=off|full|minimal` switch is
+A single `--vfs-cache-mode=off|writes|full|minimal` switch is
 meaningless in a 5-layer system — each layer needs its
-own bypass. See the **`vfs-cache-mode` semantics** section
-below for the composition recipe.
+own bypass.
+
+> **Wire-up status (issues #583, #T2-N)**: `--vfs-cache-mode`
+> actually drives `CacheMode` in `src/util.rs` for all four
+> values. `off`, `writes`, and `full` landed in #583;
+> `minimal` is a real distinct mode as of #T2-N (was
+> previously a silent alias for `off`). Canonical semantics
+> live in [`docs/durability.md`](durability.md#cache-mode-summary).
+> The "SHADOW" classification in the per-flag rationale below
+> predates #583 and is partially stale; the canonical cache-
+> mode doc supersedes it.
 
 ## Inventory of shadow flags (verified)
 

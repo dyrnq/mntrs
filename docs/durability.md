@@ -209,7 +209,7 @@ Backed by `crate::util::CacheMode` (`src/util.rs`); parsed in
 | `off`      | `off`     | in-process `Vec<u8>` per fh   | L1 mem_cache only              | not written      | **dirty bytes lost on daemon crash** before the 5 s write-back lands |
 | `writes`   | `writes`  | disk file with `fdatasync`    | L1 mem_cache only              | written          | dirty bytes durable across daemon crash (recovery scan re-enqueues) |
 | `full`     | `full`    | disk file with `fdatasync`    | L1 mem_cache + L2 `.block` files | written        | same as `writes`; pre-fetched blocks also persist for cross-session hits |
-| `minimal`  | `minimal` | maps to `off` (no separate temp-file stage; opendal handles multipart temp internally) | | | |
+| `minimal`  | `minimal` | disk file with `fdatasync`; **unlinked after upload** | L1 mem_cache only | written | same crash safety as `writes` during upload window; **no on-disk footprint between writes** |
 
 **Default**: `off`. The user is opting in to crash-safety when
 they pass `--vfs-cache-mode=writes` or `--vfs-cache-mode=full`.
