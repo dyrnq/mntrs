@@ -401,6 +401,16 @@ enum FileHandleState {
         in_memory_buffer: Option<Arc<std::sync::Mutex<Vec<u8>>>>,
         dirty: bool,
         dirty_since: Option<std::time::Instant>,
+        /// Issue #T2-N+1: wall-clock timestamp of the most
+        /// recent `write()` syscall on this handle. Used by
+        /// `per_task_writeback_delay` to compute
+        /// `--vfs-write-wait`-driven per_task_delay (hold the
+        /// upload for `write_wait - elapsed` after the last
+        /// write, so a subsequent write+close on the same
+        /// path within the window can coalesce before the
+        /// worker reads the cache file). `None` until the
+        /// first write arrives.
+        last_write_at: Option<std::time::Instant>,
         expires_at: Option<std::time::Instant>,
     },
 }
@@ -427,6 +437,7 @@ impl Clone for FileHandleState {
                 in_memory_buffer,
                 dirty,
                 dirty_since,
+                last_write_at,
                 expires_at,
             } => FileHandleState::Write {
                 path: path.clone(),
@@ -434,6 +445,7 @@ impl Clone for FileHandleState {
                 in_memory_buffer: in_memory_buffer.clone(),
                 dirty: *dirty,
                 dirty_since: *dirty_since,
+                last_write_at: *last_write_at,
                 expires_at: *expires_at,
             },
         }
@@ -682,6 +694,18 @@ pub struct MntrsFs {
     /// is a no-op. Effective only in Full mode — Off / Writes /
     /// Minimal ignore it. See `maybe_create_prefetcher`.
     pub(crate) read_ahead: u64,
+    /// Issue #T2-N+1: wall-clock duration the writeback worker
+    /// waits after the most recent `write()` on a handle before
+    /// uploading a *large* file (one above
+    /// `writeback_immediate_threshold`). 0 disables the wait (the
+    /// worker uploads the next time the periodic-fsync thread /
+    /// release enqueue fires). Default 1 s — matches rclone.
+    ///
+    /// The goal is coalescing: a write-then-close inside the
+    /// window avoids a redundant upload of a still-warming file.
+    /// Small files (below the threshold) are unaffected — they
+    /// always upload immediately.
+    pub(crate) write_wait: Duration,
     /// Minimum file size (bytes) for which the read-path prefetcher
     /// is activated on open(). 0 disables prefetching entirely.
     /// Default: 16 MiB. See `maybe_create_prefetcher` for the
@@ -1748,7 +1772,7 @@ impl MntrsFs {
     /// sentinels like `INO_RECOVERY_SENTINEL = 0` which never have
     /// an inodes entry), returns `write_back_delay` — the safe
     /// non-immediate path.
-    fn per_task_writeback_delay(&self, ino: u64) -> Duration {
+    fn per_task_writeback_delay(&self, ino: u64, fh: u64) -> Duration {
         if self.writeback_immediate_threshold == 0 {
             // Threshold disabled — every upload goes through
             // the uniform delay queue (pre-#202 behavior).
@@ -1760,10 +1784,36 @@ impl MntrsFs {
             .map(|v| v.size < self.writeback_immediate_threshold)
             .unwrap_or(false);
         if immediate {
-            Duration::ZERO
-        } else {
-            self.write_back_delay
+            // Small files upload immediately (issue #202).
+            // `--vfs-write-wait` is intentionally ignored on
+            // this path — the whole point of the threshold
+            // is "no waiting, upload right now".
+            return Duration::ZERO;
         }
+        // Issue #T2-N+1: large files coalesce writes. After
+        // the last `write()` on the handle, hold the upload
+        // for `write_wait` so a follow-up write+close inside
+        // the window doesn't trigger a wasted upload of a
+        // still-warming file. The periodic-fsync / release
+        // enqueue path is the fallback when the handle has
+        // already gone away (recovery scan, flush w/o fh,
+        // etc.) — in those cases `last_write_at` is None
+        // and we keep the legacy `write_back_delay`.
+        let last_write_at = self
+            .handles
+            .get(&fh)
+            .and_then(|entry| match entry.value() {
+                FileHandleState::Write { last_write_at, .. } => *last_write_at,
+                _ => None,
+            })
+            .unwrap_or_else(std::time::Instant::now);
+        let elapsed = last_write_at.elapsed();
+        let wait = self.write_wait.saturating_sub(elapsed);
+        // Cap the per-task delay at `write_back_delay` so the
+        // periodic queue (firing every `write_back_delay`)
+        // will eventually pick up the task even if our wait
+        // window is longer than the batch period.
+        wait.min(self.write_back_delay)
     }
 
     /// Recover writeback queue + spawn worker. Shared by fuser + CoreFilesystem init.
@@ -4664,6 +4714,7 @@ impl CoreFilesystem for MntrsFs {
                     },
                     dirty: false,
                     dirty_since: None,
+                    last_write_at: None,
                     expires_at: None,
                 },
             );
@@ -5702,7 +5753,7 @@ impl CoreFilesystem for MntrsFs {
                     // Duration::ZERO for files < threshold) so
                     // SQLite / etcd / RocksDB writes hit S3
                     // before the next flush, not 5s after.
-                    let delay = self.per_task_writeback_delay(_ino);
+                    let delay = self.per_task_writeback_delay(_ino, _fh);
                     // Issue #268.2 O9: symmetry with the
                     // flush/release handlers at L3733/L3902.
                     // Pre-fix this `let _ =` was silent —
@@ -5942,11 +5993,15 @@ impl CoreFilesystem for MntrsFs {
             .entry(fh_val)
             .and_modify(|h| {
                 if let crate::FileHandleState::Write {
-                    dirty, dirty_since, ..
+                    dirty,
+                    dirty_since,
+                    last_write_at,
+                    ..
                 } = h
                 {
                     *dirty = true;
                     *dirty_since = Some(std::time::Instant::now());
+                    *last_write_at = Some(std::time::Instant::now());
                 }
             })
             .or_insert_with(|| crate::FileHandleState::Write {
@@ -5963,6 +6018,7 @@ impl CoreFilesystem for MntrsFs {
                 },
                 dirty: true,
                 dirty_since: Some(std::time::Instant::now()),
+                last_write_at: Some(std::time::Instant::now()),
                 expires_at: None,
             });
         Ok(written)
@@ -6062,7 +6118,7 @@ impl CoreFilesystem for MntrsFs {
                         // Small files skip the 5s delay queue
                         // (Duration::ZERO); large files keep the
                         // 5s batching behavior.
-                        let delay = self.per_task_writeback_delay(_ino);
+                        let delay = self.per_task_writeback_delay(_ino, _fh);
                         if let Err(e) = tx.send(WritebackTask {
                             ino: _ino,
                             remote_path: (*path).to_string(),
@@ -6344,7 +6400,7 @@ impl CoreFilesystem for MntrsFs {
                         // writeback_delay doc comment for the
                         // size source (inodes.size) and the
                         // recovery-sentinel fallback.
-                        let delay = self.per_task_writeback_delay(_ino);
+                        let delay = self.per_task_writeback_delay(_ino, fh);
                         if let Err(e) = tx.send(WritebackTask {
                             ino: _ino,
                             remote_path: (*path).to_string(),
@@ -6610,6 +6666,7 @@ impl CoreFilesystem for MntrsFs {
                 },
                 dirty: false,
                 dirty_since: None,
+                last_write_at: None,
                 expires_at: None,
             },
         );
@@ -6788,6 +6845,7 @@ impl CoreFilesystem for MntrsFs {
                 },
                 dirty: false,
                 dirty_since: None,
+                last_write_at: None,
                 expires_at: None,
             },
         );
@@ -8802,6 +8860,7 @@ pub fn new_test_fs_with_mode(
         writeback_immediate_threshold: 0,
         cache_mode,
         read_ahead: 0,
+        write_wait: Duration::from_secs(1),
         prefetch_threshold: 16 * 1024 * 1024,
         prefetch_queue_mb: 64,
         read_chunk_size: 0,
@@ -9297,6 +9356,141 @@ mod tests {
             fs.compute_prefetch_queue_bytes(),
             1024 * 1024 + 1024,
             "base clamp (1 MiB) must survive; read_ahead adds on top"
+        );
+    }
+
+    /// Issue #T2-N+1: `per_task_writeback_delay` factors in
+    /// `write_wait` for large files so a follow-up write+close
+    /// inside the window coalesces. Pins the four-case
+    /// matrix: small files (zero, always), threshold disabled
+    /// (uniform `write_back_delay`, no coalescing), large
+    /// file with a fresh write (full `write_wait`), large
+    /// file with a stale write (clamped to zero).
+    #[test]
+    fn per_task_writeback_delay_write_wait_matrix() {
+        let dir = scratch_dir("write-wait");
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        let mut fs = new_test_fs_with_mode(op, dir, crate::util::CacheMode::Writes);
+        fs.write_back_delay = Duration::from_secs(5);
+        fs.write_wait = Duration::from_secs(1);
+        fs.writeback_immediate_threshold = 1024; // 1 KiB
+
+        // Allocate two inodes: small (100 B) and large (8 KiB).
+        let small_ino = fs.alloc_ino("small", FileType::RegularFile, 100);
+        let large_ino = fs.alloc_ino("large", FileType::RegularFile, 8 * 1024);
+
+        // Open handles — fh=1 small, fh=2 large. The handles
+        // start with `last_write_at: None` (no write yet).
+        fs.handles.insert(
+            1,
+            FileHandleState::Write {
+                path: Arc::from("small"),
+                write_buffer_fd: None,
+                in_memory_buffer: None,
+                dirty: false,
+                dirty_since: None,
+                last_write_at: None,
+                expires_at: None,
+            },
+        );
+        fs.handles.insert(
+            2,
+            FileHandleState::Write {
+                path: Arc::from("large"),
+                write_buffer_fd: None,
+                in_memory_buffer: None,
+                dirty: false,
+                dirty_since: None,
+                // Stamp a fresh write 100 ms ago — well inside
+                // the 1 s write_wait window.
+                last_write_at: Some(
+                    std::time::Instant::now()
+                        .checked_sub(Duration::from_millis(100))
+                        .unwrap(),
+                ),
+                expires_at: None,
+            },
+        );
+        fs.handles.insert(
+            3,
+            FileHandleState::Write {
+                path: Arc::from("large-stale"),
+                write_buffer_fd: None,
+                in_memory_buffer: None,
+                dirty: false,
+                dirty_since: None,
+                // Stamp a write 5 s ago — well past the 1 s
+                // write_wait window.
+                last_write_at: Some(
+                    std::time::Instant::now()
+                        .checked_sub(Duration::from_secs(5))
+                        .unwrap(),
+                ),
+                expires_at: None,
+            },
+        );
+        // Allocate the inode backing the stale-write handle so
+        // the size lookup hits.
+        fs.alloc_ino("large-stale", FileType::RegularFile, 8 * 1024);
+
+        // Small file → zero, regardless of write_wait.
+        assert_eq!(
+            fs.per_task_writeback_delay(small_ino, 1),
+            Duration::ZERO,
+            "small files must upload immediately (write_wait is irrelevant)"
+        );
+
+        // Large file, fresh write → write_wait (1 s) capped
+        // by write_back_delay (5 s) = ~1 s minus the
+        // ~100 ms already elapsed since we stamped the
+        // handle. Allow a wide window so the test isn't
+        // sensitive to scheduling jitter.
+        let delay = fs.per_task_writeback_delay(large_ino, 2);
+        assert!(
+            delay >= Duration::from_millis(700) && delay <= Duration::from_secs(1),
+            "fresh write: per_task_delay must equal write_wait - elapsed (got {delay:?})"
+        );
+
+        // Large file, stale write → zero (write_wait elapsed).
+        let stale_ino = fs
+            .inodes
+            .iter()
+            .find(|e| *e.key() != small_ino && *e.key() != large_ino)
+            .map(|e| *e.key())
+            .expect("third inode exists");
+        assert_eq!(
+            fs.per_task_writeback_delay(stale_ino, 3),
+            Duration::ZERO,
+            "stale write: write_wait already elapsed; upload immediately"
+        );
+
+        // Threshold disabled → uniform write_back_delay,
+        // write_wait ignored.
+        fs.writeback_immediate_threshold = 0;
+        assert_eq!(
+            fs.per_task_writeback_delay(large_ino, 2),
+            fs.write_back_delay,
+            "threshold disabled: write_wait must not apply (uniform delay queue)"
+        );
+
+        // write_wait=0 → zero (caller disabled the coalescing
+        // window).
+        fs.writeback_immediate_threshold = 1024;
+        fs.write_wait = Duration::ZERO;
+        assert_eq!(
+            fs.per_task_writeback_delay(large_ino, 2),
+            Duration::ZERO,
+            "write_wait=0 disables the coalescing wait"
+        );
+
+        // No handle for fh → uses write_wait (elapsed=0,
+        // capped at write_back_delay). This is the recovery
+        // scan / flush-without-fh path.
+        fs.write_wait = Duration::from_secs(1);
+        let delay = fs.per_task_writeback_delay(large_ino, 99);
+        assert!(
+            delay >= Duration::from_millis(700) && delay <= Duration::from_secs(1),
+            "no open handle: legacy write_back_delay fallback (got {delay:?})"
         );
     }
 
