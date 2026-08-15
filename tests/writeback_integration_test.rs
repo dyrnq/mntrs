@@ -124,6 +124,7 @@ impl Harness {
                 ino,
                 remote_path: remote.to_string(),
                 write_buffer_path,
+                in_memory_payload: None,
                 retry_cycle: 0,
                 per_task_delay: delay,
             })
@@ -358,6 +359,7 @@ fn small_file_with_immediate_delay_uploads_fast() {
             ino: 1,
             remote_path: "/remote/small.bin".to_string(),
             write_buffer_path,
+            in_memory_payload: None,
             retry_cycle: 0,
             per_task_delay: Duration::ZERO,
         })
@@ -395,6 +397,7 @@ fn large_file_with_default_delay_uses_5s() {
             ino: 2,
             remote_path: "/remote/large.bin".to_string(),
             write_buffer_path,
+            in_memory_payload: None,
             retry_cycle: 0,
             per_task_delay: Duration::from_secs(5),
         })
@@ -405,6 +408,65 @@ fn large_file_with_default_delay_uses_5s() {
         !h.wait_drain(&dirty, 1_000),
         "5s-delay upload still pending at 1s (issue #202 non-immediate path)"
     );
+}
+
+/// Issue #583: in `CacheMode::Off`, the FUSE worker packs the
+/// dirty buffer into `WritebackTask.in_memory_payload` instead of
+/// staging a cache file + `.dirty` sidecar. The worker must
+/// upload the inline bytes and leave no `.dirty` artifact
+/// (because none was created in the first place).
+///
+/// This is the regression guard for the off-mode writeback path.
+/// Pre-#583 the field didn't exist and the worker always did
+/// `fs::read(cpath)`; a future refactor that re-introduces that
+/// branch unconditionally would trip this test (the cache file
+/// doesn't exist — only the inline payload does).
+#[test]
+fn in_memory_payload_uploads_inline_bytes_without_cache_file() {
+    let h = Harness::new("off-mode");
+
+    // Deliberately do NOT call `stage_file` — the off-mode path
+    // must work with no on-disk cache file at all. Construct a
+    // dummy path that won't exist; the worker must never touch
+    // it because `in_memory_payload` is `Some(_)`.
+    let phantom_path = h.cache_dir.join("phantom.bin");
+    assert!(!phantom_path.exists());
+
+    let payload = bytes::Bytes::from_static(b"off-mode inline bytes");
+    h.sender
+        .send(WritebackTask {
+            ino: 7,
+            remote_path: "/remote/off.bin".to_string(),
+            // Worker ignores this path when in_memory_payload is
+            // Some(_) — passing the phantom confirms the field
+            // takes precedence and no fs::read is attempted.
+            write_buffer_path: phantom_path.clone(),
+            in_memory_payload: Some(payload.clone()),
+            retry_cycle: 0,
+            per_task_delay: Duration::ZERO,
+        })
+        .unwrap();
+
+    // Wait for the upload to land — polled via a small busy
+    // loop on the backend, not on `.dirty` (off mode never
+    // writes one).
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(5) {
+        let got =
+            h.rt.block_on(async { h.op.read("/remote/off.bin").await.ok() });
+        let matches = matches!(&got, Some(buf) if buf.to_vec() == payload.to_vec());
+        if matches {
+            // Backend received the inline bytes — the path
+            // through `in_memory_payload` worked.
+            assert!(
+                !phantom_path.exists(),
+                "off-mode writeback must NOT touch the on-disk phantom path"
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("off-mode inline payload did not upload within 5s");
 }
 
 /// Issue #TBD: when a writeback upload fails, the `.dirty` sidecar
@@ -491,6 +553,7 @@ fn dirty_sidecar_lingers_with_no_surface_on_upload_failure() {
         ino: 1,
         remote_path: "/remote/stuck.bin".to_string(),
         write_buffer_path: write_buffer_path.clone(),
+        in_memory_payload: None,
         retry_cycle: 0,
         per_task_delay: Duration::ZERO,
     })

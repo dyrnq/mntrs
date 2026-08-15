@@ -73,6 +73,69 @@ pub fn runtime_dir() -> anyhow::Result<PathBuf> {
 
 // ── Path hashing ────────────────────────────────────────────────────
 
+/// Storage-mode selector for the FUSE mount.
+///
+/// Three independent dimensions controlled by a single flag:
+///   1. **Write buffer** — where `write(2)` bytes go before
+///      upload. Off mode uses an in-process `Vec<u8>`;
+///      writes/full use a disk-backed file with `fdatasync`
+///      on `flush`/`release`.
+///   2. **Read cache** — whether pre-fetched blocks persist
+///      to disk across mounts. Off/writes use only the
+///      in-process L1 mem_cache; full also writes 8 MiB
+///      `.block` files for cross-session hits.
+///   3. **Durability** — off mode does NOT guarantee that
+///      bytes survive `close(2)` followed by daemon crash
+///      or node failure (writeback still uploads to the
+///      backend on the 5 s `--vfs-write-back` schedule, but
+///      the local bytes are lost). writes/full mode keeps
+///      the buffer on disk with `fdatasync`, restoring the
+///      pre-Issue-#34 silent-data-loss guarantee.
+///
+/// `minimal` is accepted for rclone-compat but is equivalent
+/// to `off` here — mntrs doesn't distinguish "buffer for
+/// upload only" from "no cache at all"; the only difference
+/// would be a brief temp file during upload, which opendal
+/// already handles internally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheMode {
+    /// In-memory write buffer, L1 read cache only.
+    /// No disk file is materialized for either side.
+    #[default]
+    Off,
+    /// Disk write buffer with fdatasync; L1 read cache only.
+    Writes,
+    /// Disk write buffer + disk read block cache.
+    Full,
+}
+
+impl CacheMode {
+    /// Parse from the `--vfs-cache-mode` CLI value. Unknown
+    /// values fall back to `Off` and emit a warning.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "off" => Self::Off,
+            "writes" => Self::Writes,
+            "full" => Self::Full,
+            "minimal" => Self::Off, // see doc comment above
+            other => {
+                eprintln!("mntrs: unknown --vfs-cache-mode '{other}', falling back to 'off'");
+                Self::Off
+            }
+        }
+    }
+
+    /// `true` if writes are staged to a disk file (vs memory).
+    pub fn disk_write_buffer(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// `true` if pre-fetched blocks are persisted to disk.
+    pub fn disk_read_cache(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
+
 pub fn path_hash(path: &str) -> u64 {
     use std::sync::OnceLock;
     // Issue #58: a fixed, process-stable salt. Pre-fix
@@ -1318,5 +1381,57 @@ mod lock_or_recover_tests {
         // guard with the original value intact.
         let g = m.lock_or_recover();
         assert_eq!(*g, 7);
+    }
+
+    // ── CacheMode (Issue #583) ─────────────────────────────────────
+    //
+    // Pin the parse table + the dispatch predicates. The doc
+    // comment on `CacheMode` is the source of truth for the
+    // behavior these tests verify; if either is changed, the
+    // test must change too.
+
+    #[test]
+    fn cache_mode_default_is_off() {
+        // Pre-#583 default was "writes"; post-#583 it's "off".
+        // The Default impl pins the breaking-change contract.
+        assert_eq!(CacheMode::default(), CacheMode::Off);
+    }
+
+    #[test]
+    fn cache_mode_parse_recognised_values() {
+        for (s, expected) in [
+            ("off", CacheMode::Off),
+            ("writes", CacheMode::Writes),
+            ("full", CacheMode::Full),
+            ("minimal", CacheMode::Off), // minimal == off
+        ] {
+            assert_eq!(
+                CacheMode::parse(s),
+                expected,
+                "parse({s:?}) should be {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_mode_parse_garbage_falls_back_to_off() {
+        // Unknown values are mapped to Off with a warning. We
+        // don't capture stderr; just pin the return value.
+        assert_eq!(CacheMode::parse("nonsense"), CacheMode::Off);
+        assert_eq!(CacheMode::parse(""), CacheMode::Off);
+    }
+
+    #[test]
+    fn cache_mode_disk_write_buffer_predicate() {
+        assert!(!CacheMode::Off.disk_write_buffer());
+        assert!(CacheMode::Writes.disk_write_buffer());
+        assert!(CacheMode::Full.disk_write_buffer());
+    }
+
+    #[test]
+    fn cache_mode_disk_read_cache_predicate() {
+        assert!(!CacheMode::Off.disk_read_cache());
+        assert!(!CacheMode::Writes.disk_read_cache());
+        assert!(CacheMode::Full.disk_read_cache());
     }
 }

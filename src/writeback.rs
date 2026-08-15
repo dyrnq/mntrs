@@ -81,8 +81,15 @@ pub struct WritebackTask {
     /// Backend path the upload targets.
     pub remote_path: String,
     /// On-disk cache file path (the source of bytes for the
-    /// upload). `.dirty` sidecar lives next to it.
+    /// upload). `.dirty` sidecar lives next to it. Ignored
+    /// when `in_memory_payload` is `Some(_)` — the payload
+    /// bytes replace the disk read in off mode.
     pub write_buffer_path: PathBuf,
+    /// Off-mode inline payload. When set, the worker uploads
+    /// these bytes directly instead of reading the file at
+    /// `write_buffer_path`. The task is also marked so no
+    /// `.dirty` sidecar is created or required.
+    pub in_memory_payload: Option<bytes::Bytes>,
     /// 0 = fresh enqueue — honors `per_task_delay`.
     /// 1 or higher = re-enqueue — always uses
     /// `REENQUEUE_COOLDOWN`, the `per_task_delay` field
@@ -277,28 +284,39 @@ pub fn spawn(
                     cycle = task.retry_cycle,
                     "writeback: dequeued for upload"
                 );
-                let data: bytes::Bytes = match std::fs::read(&task.write_buffer_path) {
-                    Ok(d) => d.into(),
-                    Err(_) => {
-                        // Issue #53 + #268.1 O1: cache file
-                        // vanished (e.g. evicted by LRU
-                        // between enqueue and dequeue) — drop
-                        // the task cleanly. Without this, the
-                        // pre-fix code would have read
-                        // failed with a confusing error and
-                        // the .dirty sidecar would linger.
-                        // Log at info so operators can
-                        // distinguish "LRU evicted before
-                        // upload" from "filesystem gone".
-                        PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
-                        tracing::info!(
-                            path = %task.write_buffer_path.display(),
-                            cycle = task.retry_cycle,
-                            "writeback: cache file vanished (LRU evicted?); dropping task"
-                        );
-                        let _ =
-                            std::fs::remove_file(task.write_buffer_path.with_extension("dirty"));
-                        continue;
+                let data: bytes::Bytes = if let Some(payload) = task.in_memory_payload.clone() {
+                    // Off-mode inline payload (CacheMode::Off):
+                    // the FUSE thread copied the dirty buffer
+                    // into the task. No on-disk file to read,
+                    // no .dirty sidecar to clean up — bytes
+                    // travel RAM-to-RAM, and the upload is
+                    // still async / retry-aware.
+                    payload
+                } else {
+                    match std::fs::read(&task.write_buffer_path) {
+                        Ok(d) => d.into(),
+                        Err(_) => {
+                            // Issue #53 + #268.1 O1: cache file
+                            // vanished (e.g. evicted by LRU
+                            // between enqueue and dequeue) — drop
+                            // the task cleanly. Without this, the
+                            // pre-fix code would have read
+                            // failed with a confusing error and
+                            // the .dirty sidecar would linger.
+                            // Log at info so operators can
+                            // distinguish "LRU evicted before
+                            // upload" from "filesystem gone".
+                            PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
+                            tracing::info!(
+                                path = %task.write_buffer_path.display(),
+                                cycle = task.retry_cycle,
+                                "writeback: cache file vanished (LRU evicted?); dropping task"
+                            );
+                            let _ = std::fs::remove_file(
+                                task.write_buffer_path.with_extension("dirty"),
+                            );
+                            continue;
+                        }
                     }
                 };
                 let op = op.clone();
@@ -306,6 +324,7 @@ pub fn spawn(
                 let ino = task.ino;
                 let write_buffer_path = task.write_buffer_path;
                 let cycle = task.retry_cycle;
+                let in_memory_payload = task.in_memory_payload;
                 // Upload in a separate task so DelayQueue keeps ticking.
                 static UPLOAD_SEM: std::sync::LazyLock<Semaphore> =
                     std::sync::LazyLock::new(|| Semaphore::new(4));
@@ -431,9 +450,19 @@ pub fn spawn(
                                 // Keep cache file on disk as a read cache.
                                 // Only remove the .dirty sidecar to mark upload complete.
                                 // The cache eviction logic handles disk space separately.
+                                //
+                                // Off-mode (no on-disk file): the
+                                // .dirty sidecar was never written
+                                // and `write_buffer_path` is a dummy
+                                // (the bytes rode in `data`).
+                                // `remove_file` returns NotFound
+                                // which we already swallow via `let _`.
                                 PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
-                                let _ =
-                                    std::fs::remove_file(write_buffer_path.with_extension("dirty"));
+                                if in_memory_payload.is_none() {
+                                    let _ = std::fs::remove_file(
+                                        write_buffer_path.with_extension("dirty"),
+                                    );
+                                }
                                 // Issue #38: clear the
                                 // pending entry so the
                                 // next flush/release
@@ -593,6 +622,13 @@ pub fn spawn(
                         ino,
                         remote_path: remote,
                         write_buffer_path,
+                        // Retries also ride in-memory when the
+                        // task was created with an inline
+                        // payload (off mode). Forwarding the
+                        // original Bytes keeps the upload
+                        // consistent — bytes don't change
+                        // between cycles, only the cycle count.
+                        in_memory_payload,
                         retry_cycle: next_cycle,
                         per_task_delay: REENQUEUE_COOLDOWN,
                     });
@@ -653,6 +689,7 @@ mod tests {
             ino: 42,
             remote_path: "/remote/path".to_string(),
             write_buffer_path: PathBuf::from("/cache/path"),
+            in_memory_payload: None,
             retry_cycle: 0,
             per_task_delay: Duration::from_secs(5),
         };
@@ -668,6 +705,7 @@ mod tests {
             ino: task.ino,
             remote_path: task.remote_path.clone(),
             write_buffer_path: task.write_buffer_path.clone(),
+            in_memory_payload: None,
             retry_cycle: task.retry_cycle + 1,
             per_task_delay: REENQUEUE_COOLDOWN,
         };

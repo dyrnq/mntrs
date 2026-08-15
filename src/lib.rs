@@ -389,7 +389,16 @@ enum FileHandleState {
     },
     Write {
         path: Arc<str>,
+        /// Disk-backed buffer (writes/full mode).
+        /// `None` in off mode — bytes go to `in_memory_buffer`
+        /// instead and never touch the filesystem.
         write_buffer_fd: Option<Arc<std::sync::Mutex<std::fs::File>>>,
+        /// Memory-backed buffer (off mode). `Some(_)` iff
+        /// `MntrsFs.cache_mode == CacheMode::Off` at handle
+        /// open time. Holds the entire dirty file body; the
+        /// async writeback worker reads it directly when the
+        /// flush/upload fires.
+        in_memory_buffer: Option<Arc<std::sync::Mutex<Vec<u8>>>>,
         dirty: bool,
         dirty_since: Option<std::time::Instant>,
         expires_at: Option<std::time::Instant>,
@@ -415,12 +424,14 @@ impl Clone for FileHandleState {
             FileHandleState::Write {
                 path,
                 write_buffer_fd,
+                in_memory_buffer,
                 dirty,
                 dirty_since,
                 expires_at,
             } => FileHandleState::Write {
                 path: path.clone(),
                 write_buffer_fd: write_buffer_fd.clone(),
+                in_memory_buffer: in_memory_buffer.clone(),
                 dirty: *dirty,
                 dirty_since: *dirty_since,
                 expires_at: *expires_at,
@@ -665,7 +676,7 @@ pub struct MntrsFs {
     /// `Duration::ZERO` and the worker uploads them right away.
     /// Large files still batch through the delay queue.
     pub(crate) writeback_immediate_threshold: u64,
-    pub(crate) cache_mode: String,
+    pub(crate) cache_mode: crate::util::CacheMode,
     pub(crate) read_ahead: u64,
     /// Minimum file size (bytes) for which the read-path prefetcher
     /// is activated on open(). 0 disables prefetching entirely.
@@ -1846,6 +1857,7 @@ impl MntrsFs {
                                     ino: INO_RECOVERY_SENTINEL,
                                     remote_path: remote,
                                     write_buffer_path: write_buffer_path.clone(),
+                                    in_memory_payload: None,
                                     retry_cycle: 0, // fresh enqueue
                                     per_task_delay: self.write_back_delay, // #202: recovery never immediate
                                 }) {
@@ -4486,49 +4498,71 @@ impl CoreFilesystem for MntrsFs {
             // backend has no file at this path.
             self.populate_cache_from_backend(&path);
             let cpath = crate::write_buffer_path(&self.cache_dir, &path);
-            if let Some(parent) = cpath.parent() {
-                // Force 0o700 on the cache sub-dir (best-effort).
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::DirBuilderExt;
-                    let _ = std::fs::DirBuilder::new()
-                        .mode(0o700)
-                        .recursive(true)
-                        .create(parent);
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ =
-                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            // CacheMode::Off: skip the disk file entirely.
+            // Bytes go into `in_memory_buffer` below; no
+            // directory, no file, no 0o600. The disk write
+            // path (write(), release()) also short-circuits in
+            // this mode.
+            let write_buffer_fd = if self.cache_mode == crate::util::CacheMode::Off {
+                None
+            } else {
+                if let Some(parent) = cpath.parent() {
+                    // Force 0o700 on the cache sub-dir (best-effort).
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::DirBuilderExt;
+                        let _ = std::fs::DirBuilder::new()
+                            .mode(0o700)
+                            .recursive(true)
+                            .create(parent);
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            parent,
+                            std::fs::Permissions::from_mode(0o700),
+                        );
+                    }
+                    #[cfg(not(unix))]
+                    let _ = std::fs::create_dir_all(parent);
                 }
+                // Force 0o600 on the cache file (plaintext object bodies).
+                #[cfg(unix)]
+                let fd = {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .truncate(false)
+                        .write(true)
+                        .read(true)
+                        .mode(0o600)
+                        .open(&cpath)
+                        .ok()
+                };
                 #[cfg(not(unix))]
-                let _ = std::fs::create_dir_all(parent);
-            }
-            // Force 0o600 on the cache file (plaintext object bodies).
-            #[cfg(unix)]
-            let write_buffer_fd = {
-                use std::os::unix::fs::OpenOptionsExt;
-                std::fs::OpenOptions::new()
+                let fd = std::fs::OpenOptions::new()
                     .create(true)
                     .truncate(false)
                     .write(true)
                     .read(true)
-                    .mode(0o600)
                     .open(&cpath)
-                    .ok()
+                    .ok();
+                fd
             };
-            #[cfg(not(unix))]
-            let write_buffer_fd = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .read(true)
-                .open(&cpath)
-                .ok();
             self.handles.insert(
                 fh,
                 FileHandleState::Write {
                     path,
                     write_buffer_fd: write_buffer_fd
                         .map(|f| std::sync::Arc::new(std::sync::Mutex::new(f))),
+                    // In off mode the disk fd is unused (writes
+                    // accumulate in memory and the worker's
+                    // read path consumes the Vec). For writes/
+                    // full the disk fd is the buffer and the
+                    // Vec stays empty.
+                    in_memory_buffer: if self.cache_mode == crate::util::CacheMode::Off {
+                        Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+                    } else {
+                        None
+                    },
                     dirty: false,
                     dirty_since: None,
                     expires_at: None,
@@ -4595,6 +4629,28 @@ impl CoreFilesystem for MntrsFs {
 
         // 1. Try read from cache fd first (write handle still open)
         if !self.direct_io {
+            // CacheMode::Off: read from the in-memory buffer
+            // when this fh holds a write handle. Same role
+            // as the disk fd — serves read-after-write from
+            // the local buffer before falling through to the
+            // backend. Returns the bytes the most-recent write
+            // for this fh put there.
+            if self.cache_mode == crate::util::CacheMode::Off
+                && let Some(entry) = self.handles.get(&fh)
+                && let crate::FileHandleState::Write {
+                    in_memory_buffer: Some(buf),
+                    ..
+                } = entry.value()
+                && let Ok(v) = buf.lock()
+            {
+                let buf_len = v.len() as u64;
+                if offset < buf_len {
+                    let read_size = (size as u64).min(buf_len - offset) as usize;
+                    let mut out = vec![0u8; read_size];
+                    out.copy_from_slice(&v[offset as usize..offset as usize + read_size]);
+                    return Ok(out);
+                }
+            }
             let write_buffer_fd = self.handles.get(&fh).and_then(|e| {
                 if let crate::FileHandleState::Read { .. } = e.value() {
                     None
@@ -5465,7 +5521,29 @@ impl CoreFilesystem for MntrsFs {
             None
         };
 
-        if let Some(fd) = &write_buffer_fd
+        // Off-mode: bytes go into the per-handle Vec<u8>, not a
+        // disk file. Splice into the buffer at `_offset`,
+        // growing it (and zero-filling any gap) the same way
+        // the disk-fd path does. Gap backfill (issue #128) is
+        // implicit — Vec resize+overwrite covers it for the
+        // append / overwrite shape we see from FUSE.
+        if self.cache_mode == crate::util::CacheMode::Off {
+            if let Some(entry) = self.handles.get(&fh_val)
+                && let crate::FileHandleState::Write {
+                    in_memory_buffer: Some(buf),
+                    ..
+                } = entry.value()
+                && let Ok(mut v) = buf.lock()
+            {
+                let end = _offset + _data.len() as u64;
+                if (v.len() as u64) < end {
+                    v.resize(end as usize, 0u8);
+                }
+                let off = _offset as usize;
+                v[off..off + _data.len()].copy_from_slice(_data);
+            }
+            // Skip the disk-fd block entirely.
+        } else if let Some(fd) = &write_buffer_fd
             && let Ok(mut f) = fd.lock()
         {
             use std::io::{Seek, Write};
@@ -5543,6 +5621,7 @@ impl CoreFilesystem for MntrsFs {
                         ino: _ino,
                         remote_path: path.to_string(),
                         write_buffer_path: cpath,
+                        in_memory_payload: None,
                         retry_cycle: 0,
                         per_task_delay: delay,
                     };
@@ -5763,6 +5842,13 @@ impl CoreFilesystem for MntrsFs {
             .or_insert_with(|| crate::FileHandleState::Write {
                 path: Arc::from(path.as_str()),
                 write_buffer_fd: write_buffer_fd.clone(),
+                // Mirror open(): off mode allocates an in-memory
+                // buffer so an open-missing write doesn't crash.
+                in_memory_buffer: if self.cache_mode == crate::util::CacheMode::Off {
+                    Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+                } else {
+                    None
+                },
                 dirty: true,
                 dirty_since: Some(std::time::Instant::now()),
                 expires_at: None,
@@ -5869,6 +5955,26 @@ impl CoreFilesystem for MntrsFs {
                             ino: _ino,
                             remote_path: (*path).to_string(),
                             write_buffer_path: cpath,
+                            // flush() runs before the user-
+                            // facing close(); pack whatever
+                            // bytes are already in the buffer.
+                            // For writes/full the on-disk
+                            // path takes precedence and the
+                            // worker reads from `cpath`.
+                            in_memory_payload: if self.cache_mode == crate::util::CacheMode::Off {
+                                let entry = self.handles.get(&_fh);
+                                match entry.as_deref() {
+                                    Some(crate::FileHandleState::Write {
+                                        in_memory_buffer: Some(buf),
+                                        ..
+                                    }) => {
+                                        buf.lock().ok().map(|v| bytes::Bytes::copy_from_slice(&v))
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            },
                             retry_cycle: 0,
                             per_task_delay: delay,
                         }) {
@@ -5939,6 +6045,16 @@ impl CoreFilesystem for MntrsFs {
             _ => None,
         });
         let Some(fd) = write_buffer_fd else {
+            // CacheMode::Off: the handle carries no cache fd
+            // (bytes are in `in_memory_buffer`). The bytes
+            // are already "durable enough" for the
+            // FUSE-side contract — they're in process memory
+            // and the writeback worker will upload them on
+            // the 5 s schedule. Nothing to fdatasync, so
+            // honour the user's fsync(2) call with Ok.
+            if self.cache_mode == crate::util::CacheMode::Off {
+                return Ok(());
+            }
             // No open cache fd (e.g. setattr with no fh,
             // or a read-only handle that never opened a
             // cache file). Surface NotFound so the
@@ -6042,9 +6158,36 @@ impl CoreFilesystem for MntrsFs {
                 return Err(e);
             }
             let cpath = crate::write_buffer_path(&self.cache_dir, path);
-            if cpath.exists() {
+            // CacheMode::Off: bytes live in `in_memory_buffer`
+            // and there is no on-disk file to flag. Pack the
+            // dirty buffer contents into the task; the worker
+            // uploads them RAM-to-RAM. `cpath` is unused in
+            // that branch but still carried on the task for
+            // the `drop_block_cache_for_path` post-upload
+            // (no-op for off mode — no block cache exists).
+            let in_memory_payload: Option<bytes::Bytes> =
+                if self.cache_mode == crate::util::CacheMode::Off {
+                    let entry = self.handles.get(&fh);
+                    match entry.as_deref() {
+                        Some(crate::FileHandleState::Write {
+                            in_memory_buffer: Some(buf),
+                            ..
+                        }) => buf.lock().ok().map(|v| bytes::Bytes::copy_from_slice(&v)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+            // Off mode never writes a .dirty sidecar — there
+            // is no next-mount recovery path (the in-memory
+            // payload is gone if the daemon crashes before
+            // the worker flushes). Document this explicitly.
+            if in_memory_payload.is_none() && cpath.exists() {
                 let sidecar = cpath.with_extension("dirty");
                 let _ = std::fs::write(&sidecar, path.as_bytes());
+            }
+            let should_enqueue = in_memory_payload.is_some() || cpath.exists();
+            if should_enqueue {
                 if let Some(tx) = self.writeback_sender.get() {
                     // Bug 22 (release-side mirror of the flush
                     // fix above). Same rationale + same
@@ -6071,6 +6214,7 @@ impl CoreFilesystem for MntrsFs {
                             ino: _ino,
                             remote_path: (*path).to_string(),
                             write_buffer_path: cpath,
+                            in_memory_payload,
                             retry_cycle: 0,
                             per_task_delay: delay,
                         }) {
@@ -6284,23 +6428,34 @@ impl CoreFilesystem for MntrsFs {
         if let Some(parent) = cpath.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let write_buffer_fd = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true) // N-8 fix: truncate old cache content on create;
-            // the backend now has a 0-byte file and the cache must match.
-            // Pre-fix `.truncate(false)` preserved stale cache from a
-            // prior session, causing reads to return old data after
-            // `touch existing.txt` (create without write).
-            .write(true)
-            .read(true)
-            .open(&cpath)
-            .ok()
-            .map(|f| Arc::new(std::sync::Mutex::new(f)));
+        let write_buffer_fd = if self.cache_mode == crate::util::CacheMode::Off {
+            None
+        } else {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true) // N-8 fix: truncate old cache content on create;
+                // the backend now has a 0-byte file and the cache must match.
+                // Pre-fix `.truncate(false)` preserved stale cache from a
+                // prior session, causing reads to return old data after
+                // `touch existing.txt` (create without write).
+                .write(true)
+                .read(true)
+                .open(&cpath)
+                .ok()
+                .map(|f| Arc::new(std::sync::Mutex::new(f)))
+        };
         self.handles.insert(
             fh,
             FileHandleState::Write {
                 path: Arc::from(full_path.as_str()),
                 write_buffer_fd,
+                // Mirror open(): off mode allocates a fresh
+                // empty buffer; writes/full leave it None.
+                in_memory_buffer: if self.cache_mode == crate::util::CacheMode::Off {
+                    Some(Arc::new(std::sync::Mutex::new(Vec::new())))
+                } else {
+                    None
+                },
                 dirty: false,
                 dirty_since: None,
                 expires_at: None,
@@ -6451,19 +6606,28 @@ impl CoreFilesystem for MntrsFs {
         if let Some(parent) = cpath.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let write_buffer_fd = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .read(true)
-            .open(&cpath)
-            .ok()
-            .map(|f| Arc::new(std::sync::Mutex::new(f)));
+        let write_buffer_fd = if self.cache_mode == crate::util::CacheMode::Off {
+            None
+        } else {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .read(true)
+                .open(&cpath)
+                .ok()
+                .map(|f| Arc::new(std::sync::Mutex::new(f)))
+        };
         self.handles.insert(
             fh,
             FileHandleState::Write {
                 path: Arc::from(full_path.as_str()),
                 write_buffer_fd,
+                in_memory_buffer: if self.cache_mode == crate::util::CacheMode::Off {
+                    Some(Arc::new(std::sync::Mutex::new(Vec::new())))
+                } else {
+                    None
+                },
                 dirty: false,
                 dirty_since: None,
                 expires_at: None,
@@ -8462,7 +8626,7 @@ pub fn new_test_fs(op: opendal::Operator, cache_dir: std::path::PathBuf) -> Mntr
         // tests that want to exercise the immediate path can
         // override this field directly.
         writeback_immediate_threshold: 0,
-        cache_mode: "writes".into(),
+        cache_mode: crate::util::CacheMode::Writes,
         read_ahead: 0,
         prefetch_threshold: 16 * 1024 * 1024,
         prefetch_queue_mb: 64,
