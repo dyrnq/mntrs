@@ -125,6 +125,10 @@ impl Harness {
                 remote_path: remote.to_string(),
                 write_buffer_path,
                 in_memory_payload: None,
+                // Issue #T2-N: existing tests don't exercise
+                // Minimal mode; they want the on-disk file to
+                // survive upload (Writes/Full semantics).
+                delete_cache_on_success: false,
                 retry_cycle: 0,
                 per_task_delay: delay,
             })
@@ -360,6 +364,10 @@ fn small_file_with_immediate_delay_uploads_fast() {
             remote_path: "/remote/small.bin".to_string(),
             write_buffer_path,
             in_memory_payload: None,
+            // Issue #T2-N: harness tests don't exercise
+            // Minimal mode; keep the on-disk file after
+            // upload (Writes/Full semantics).
+            delete_cache_on_success: false,
             retry_cycle: 0,
             per_task_delay: Duration::ZERO,
         })
@@ -398,6 +406,8 @@ fn large_file_with_default_delay_uses_5s() {
             remote_path: "/remote/large.bin".to_string(),
             write_buffer_path,
             in_memory_payload: None,
+            // Issue #T2-N: not Minimal; keep file on disk.
+            delete_cache_on_success: false,
             retry_cycle: 0,
             per_task_delay: Duration::from_secs(5),
         })
@@ -442,6 +452,11 @@ fn in_memory_payload_uploads_inline_bytes_without_cache_file() {
             // takes precedence and no fs::read is attempted.
             write_buffer_path: phantom_path.clone(),
             in_memory_payload: Some(payload.clone()),
+            // Issue #T2-N: off-mode tasks carry no on-disk
+            // file; the worker's `delete_cache_on_success &&
+            // in_memory_payload.is_none()` guard ensures this
+            // is a no-op for off-mode tasks.
+            delete_cache_on_success: false,
             retry_cycle: 0,
             per_task_delay: Duration::ZERO,
         })
@@ -554,6 +569,8 @@ fn dirty_sidecar_lingers_with_no_surface_on_upload_failure() {
         remote_path: "/remote/stuck.bin".to_string(),
         write_buffer_path: write_buffer_path.clone(),
         in_memory_payload: None,
+        // Issue #T2-N: not Minimal; file should survive.
+        delete_cache_on_success: false,
         retry_cycle: 0,
         per_task_delay: Duration::ZERO,
     })
@@ -618,4 +635,104 @@ fn dirty_sidecar_lingers_with_no_surface_on_upload_failure() {
     drop(tx);
     handle.abort();
     rt.shutdown_timeout(Duration::from_millis(100));
+}
+
+/// Issue #T2-N: CacheMode::Minimal semantics — the worker unlinks
+/// the on-disk cache file after a successful upload. Writes/Full
+/// keep the file as a read cache; Off never wrote one to begin with.
+///
+/// This pins the worker branch at `src/writeback.rs:490`:
+/// `if delete_cache_on_success && in_memory_payload.is_none() { unlink }`.
+///
+/// Pre-fix regression: a future refactor that drops the unlink (or
+/// flips the predicate to `Writes`-style "keep") would silently
+/// regress Minimal to Writes semantics — users would suddenly see
+/// disk usage they didn't ask for. This test catches that.
+#[test]
+fn minimal_mode_unlinks_cache_file_after_successful_upload() {
+    let h = Harness::new("minimal-unlinks");
+
+    // Stage a fake cache file + .dirty sidecar (the worker
+    // unlinks both, but the test cares about the cache file —
+    // the .dirty lifecycle is already covered by other tests).
+    let (write_buffer_path, dirty) = h.stage_file("minimal.bin", b"minimal payload");
+
+    assert!(
+        write_buffer_path.exists(),
+        "precondition: cache file present on disk"
+    );
+    assert!(dirty.exists(), "precondition: .dirty sidecar present");
+
+    // Build the task with delete_cache_on_success = true (the
+    // enqueue path in lib.rs sets this from
+    // `cache_mode.delete_cache_on_success()` — currently only
+    // true for `CacheMode::Minimal`).
+    let payload_bytes = bytes::Bytes::from_static(b"minimal payload");
+    h.sender
+        .send(WritebackTask {
+            ino: 42,
+            remote_path: "/remote/minimal.bin".to_string(),
+            write_buffer_path: write_buffer_path.clone(),
+            in_memory_payload: None,
+            delete_cache_on_success: true,
+            retry_cycle: 0,
+            per_task_delay: Duration::ZERO,
+        })
+        .unwrap();
+
+    // Poll for completion — Minimal-mode cleanup should leave
+    // the cache file GONE while the backend received the bytes.
+    // Both transitions must be observed; if the .dirty disappeared
+    // but the cache file remained, the unlink branch is broken.
+    let started = std::time::Instant::now();
+    let mut backend_received = false;
+    let mut cache_unlinked = false;
+    while started.elapsed() < Duration::from_secs(5) {
+        if !dirty.exists() && !cache_unlinked {
+            // .dirty removed: upload completed. The unlink
+            // branch fires immediately after, on the same
+            // task. Poll for the cache file removal with a
+            // tight retry — in practice both are near-instant.
+            let mut gone_at = false;
+            let inner_start = std::time::Instant::now();
+            while inner_start.elapsed() < Duration::from_millis(500) {
+                if !write_buffer_path.exists() {
+                    gone_at = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            cache_unlinked = gone_at;
+        }
+        if !cache_unlinked {
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        // Cache file is gone — verify the backend has the bytes.
+        let got =
+            h.rt.block_on(async { h.op.read("/remote/minimal.bin").await.ok() });
+        if let Some(buf) = got
+            && buf.to_vec() == payload_bytes.to_vec()
+        {
+            backend_received = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(
+        cache_unlinked,
+        "Minimal mode must unlink the cache file after upload (still present at {})",
+        write_buffer_path.display()
+    );
+    assert!(
+        backend_received,
+        "Minimal mode must still upload the bytes — backend never received /remote/minimal.bin"
+    );
+    // And the .dirty sidecar is gone too (existing cleanup, not
+    // specific to Minimal — but assert for completeness).
+    assert!(
+        !dirty.exists(),
+        ".dirty sidecar must be cleaned (existing worker contract)"
+    );
 }

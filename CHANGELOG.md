@@ -22,7 +22,7 @@ use the YYYY-MM-DD form.
   | `off`      | in-memory `Vec<u8>`   | L1 mem_cache only   | dirty bytes lost on crash    |
   | `writes`   | disk file + fdatasync | L1 mem_cache only   | dirty bytes durable          |
   | `full`     | disk file + fdatasync | L1 + L2 `.block`    | dirty bytes durable          |
-  | `minimal`  | maps to `off`         | L1 mem_cache only   | dirty bytes lost on crash    |
+  | `minimal`  | disk file + fdatasync, unlinked after upload | L1 mem_cache only | dirty bytes durable across the upload window, no on-disk footprint between writes |
 
   **Default changed from `writes` to `off`.** Users who relied on
   the implicit crash safety of the previous default must now pass
@@ -44,6 +44,37 @@ use the YYYY-MM-DD form.
   directly will fail to compile and need to switch to pattern
   matching on the enum (or use `CacheMode::parse` to convert
   from a string).
+
+### Additions
+
+- **`--vfs-cache-mode=minimal` is now a distinct mode.** Previously
+  it parsed to `CacheMode::Off` (silent alias). It is now backed
+  by a new `CacheMode::Minimal` variant with the following
+  semantics:
+
+  - Write buffer: on-disk cache file with `fdatasync` (same as
+    `writes` / `full`).
+  - Read cache: L1 mem_cache only — the on-disk file is
+    `remove_file`'d after a successful upload, so it does not
+    survive between writes.
+  - Crash safety: dirty bytes are `fdatasync`'d during the upload
+    window and re-enqueued by the recovery scan if the daemon
+    crashes; once an upload completes, the file is removed and
+    there is no on-disk footprint.
+
+  This is the mode to use when you want disk-backed write
+  durability (your bytes survive a daemon crash or a power
+  loss) without retaining a permanent local cache file. The
+  `WritebackTask` struct gained a `delete_cache_on_success: bool`
+  field to thread the unlink decision from the enqueue site
+  (`src/lib.rs`) into the worker (`src/writeback.rs`).
+
+  Implementation: issue #T2-N. The 13 `== CacheMode::Off` dispatch
+  sites in `src/lib.rs` were also refactored to use the
+  `disk_write_buffer()` / `disk_read_cache()` /
+  `delete_cache_on_success()` predicates so a future cache-mode
+  variant cannot silently mis-route. No CLI change — `minimal`
+  already parsed before #T2-N; only its behavior changed.
 
 ### Migration
 

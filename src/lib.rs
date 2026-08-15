@@ -394,10 +394,10 @@ enum FileHandleState {
         /// instead and never touch the filesystem.
         write_buffer_fd: Option<Arc<std::sync::Mutex<std::fs::File>>>,
         /// Memory-backed buffer (off mode). `Some(_)` iff
-        /// `MntrsFs.cache_mode == CacheMode::Off` at handle
-        /// open time. Holds the entire dirty file body; the
-        /// async writeback worker reads it directly when the
-        /// flush/upload fires.
+        /// `!MntrsFs.cache_mode.disk_write_buffer()` at handle
+        /// open time — i.e. only `CacheMode::Off`. Holds the
+        /// entire dirty file body; the async writeback worker
+        /// reads it directly when the flush/upload fires.
         in_memory_buffer: Option<Arc<std::sync::Mutex<Vec<u8>>>>,
         dirty: bool,
         dirty_since: Option<std::time::Instant>,
@@ -1858,6 +1858,13 @@ impl MntrsFs {
                                     remote_path: remote,
                                     write_buffer_path: write_buffer_path.clone(),
                                     in_memory_payload: None,
+                                    // Issue #T2-N: Minimal-mode mounts
+                                    // also unlink their cache files after
+                                    // a recovery upload completes —
+                                    // matches the steady-state contract.
+                                    delete_cache_on_success: self
+                                        .cache_mode
+                                        .delete_cache_on_success(),
                                     retry_cycle: 0, // fresh enqueue
                                     per_task_delay: self.write_back_delay, // #202: recovery never immediate
                                 }) {
@@ -4555,12 +4562,14 @@ impl CoreFilesystem for MntrsFs {
             // backend has no file at this path.
             self.populate_cache_from_backend(&path);
             let cpath = crate::write_buffer_path(&self.cache_dir, &path);
-            // CacheMode::Off: skip the disk file entirely.
+            // Off mode: skip the disk file entirely.
             // Bytes go into `in_memory_buffer` below; no
             // directory, no file, no 0o600. The disk write
             // path (write(), release()) also short-circuits in
-            // this mode.
-            let write_buffer_fd = if self.cache_mode == crate::util::CacheMode::Off {
+            // this mode. Use `disk_write_buffer()` rather than
+            // `== Off` so a future variant (e.g. Minimal —
+            // issue #T2-N) can't silently land here.
+            let write_buffer_fd = if !self.cache_mode.disk_write_buffer() {
                 None
             } else {
                 if let Some(parent) = cpath.parent() {
@@ -4610,12 +4619,16 @@ impl CoreFilesystem for MntrsFs {
                     path,
                     write_buffer_fd: write_buffer_fd
                         .map(|f| std::sync::Arc::new(std::sync::Mutex::new(f))),
-                    // In off mode the disk fd is unused (writes
-                    // accumulate in memory and the worker's
-                    // read path consumes the Vec). For writes/
-                    // full the disk fd is the buffer and the
-                    // Vec stays empty.
-                    in_memory_buffer: if self.cache_mode == crate::util::CacheMode::Off {
+                    // Only Off mode keeps a memory buffer (the disk fd
+                    // is unused and writes accumulate in RAM
+                    // for the worker's read path). For
+                    // Writes/Full/Minimal the disk fd is the
+                    // buffer and the Vec stays empty.
+                    // `disk_write_buffer()` is the
+                    // canonical predicate — equivalent to
+                    // `== Off` today but explicit about
+                    // intent (issue #T2-N).
+                    in_memory_buffer: if !self.cache_mode.disk_write_buffer() {
                         Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
                     } else {
                         None
@@ -4686,13 +4699,15 @@ impl CoreFilesystem for MntrsFs {
 
         // 1. Try read from cache fd first (write handle still open)
         if !self.direct_io {
-            // CacheMode::Off: read from the in-memory buffer
-            // when this fh holds a write handle. Same role
-            // as the disk fd — serves read-after-write from
-            // the local buffer before falling through to the
-            // backend. Returns the bytes the most-recent write
-            // for this fh put there.
-            if self.cache_mode == crate::util::CacheMode::Off
+            // Off mode: read from the in-memory buffer when
+            // this fh holds a write handle. Same role as
+            // the disk fd — serves read-after-write from
+            // the local buffer before falling through to
+            // the backend. Returns the bytes the
+            // most-recent write for this fh put there.
+            // `disk_write_buffer()` is the canonical
+            // predicate (issue #T2-N).
+            if !self.cache_mode.disk_write_buffer()
                 && let Some(entry) = self.handles.get(&fh)
                 && let crate::FileHandleState::Write {
                     in_memory_buffer: Some(buf),
@@ -5583,8 +5598,11 @@ impl CoreFilesystem for MntrsFs {
         // growing it (and zero-filling any gap) the same way
         // the disk-fd path does. Gap backfill (issue #128) is
         // implicit — Vec resize+overwrite covers it for the
-        // append / overwrite shape we see from FUSE.
-        if self.cache_mode == crate::util::CacheMode::Off {
+        // append / overwrite shape we see from FUSE. Use
+        // `disk_write_buffer()` (canonical predicate,
+        // issue #T2-N) rather than `== Off` so a future
+        // variant can't silently land here.
+        if !self.cache_mode.disk_write_buffer() {
             if let Some(entry) = self.handles.get(&fh_val)
                 && let crate::FileHandleState::Write {
                     in_memory_buffer: Some(buf),
@@ -5679,6 +5697,12 @@ impl CoreFilesystem for MntrsFs {
                         remote_path: path.to_string(),
                         write_buffer_path: cpath,
                         in_memory_payload: None,
+                        // Issue #T2-N: Minimal-mode unlinks the
+                        // cache file after upload. write() falls
+                        // back to this path on op.write() failure,
+                        // so the cache file may already exist on
+                        // disk and needs the same unlink treatment.
+                        delete_cache_on_success: self.cache_mode.delete_cache_on_success(),
                         retry_cycle: 0,
                         per_task_delay: delay,
                     };
@@ -5900,8 +5924,10 @@ impl CoreFilesystem for MntrsFs {
                 path: Arc::from(path.as_str()),
                 write_buffer_fd: write_buffer_fd.clone(),
                 // Mirror open(): off mode allocates an in-memory
-                // buffer so an open-missing write doesn't crash.
-                in_memory_buffer: if self.cache_mode == crate::util::CacheMode::Off {
+                // buffer so an open-missing write doesn't
+                // crash. Use `disk_write_buffer()` (issue
+                // #T2-N) rather than `== Off`.
+                in_memory_buffer: if !self.cache_mode.disk_write_buffer() {
                     Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
                 } else {
                     None
@@ -6018,7 +6044,15 @@ impl CoreFilesystem for MntrsFs {
                             // For writes/full the on-disk
                             // path takes precedence and the
                             // worker reads from `cpath`.
-                            in_memory_payload: if self.cache_mode == crate::util::CacheMode::Off {
+                            in_memory_payload: if !self.cache_mode.disk_write_buffer() {
+                                // Issue #583: only Off mode packs
+                                // dirty bytes inline; Writes/Full/
+                                // Minimal read from the on-disk
+                                // cache file at upload time. Use
+                                // `disk_write_buffer()` rather than
+                                // `== Off` so a future variant like
+                                // Minimal (issue #T2-N) can't
+                                // silently land here.
                                 let entry = self.handles.get(&_fh);
                                 match entry.as_deref() {
                                     Some(crate::FileHandleState::Write {
@@ -6032,6 +6066,13 @@ impl CoreFilesystem for MntrsFs {
                             } else {
                                 None
                             },
+                            // Issue #T2-N: Minimal-mode flushes
+                            // also unlink the cache file after
+                            // upload. Same predicate as write()
+                            // (issue #T2-N) — the disk file may
+                            // already exist on disk when flush()
+                            // enqueues a task.
+                            delete_cache_on_success: self.cache_mode.delete_cache_on_success(),
                             retry_cycle: 0,
                             per_task_delay: delay,
                         }) {
@@ -6102,14 +6143,16 @@ impl CoreFilesystem for MntrsFs {
             _ => None,
         });
         let Some(fd) = write_buffer_fd else {
-            // CacheMode::Off: the handle carries no cache fd
+            // Off mode: the handle carries no cache fd
             // (bytes are in `in_memory_buffer`). The bytes
             // are already "durable enough" for the
             // FUSE-side contract — they're in process memory
             // and the writeback worker will upload them on
             // the 5 s schedule. Nothing to fdatasync, so
             // honour the user's fsync(2) call with Ok.
-            if self.cache_mode == crate::util::CacheMode::Off {
+            // Use `disk_write_buffer()` (issue #T2-N)
+            // rather than `== Off`.
+            if !self.cache_mode.disk_write_buffer() {
                 return Ok(());
             }
             // No open cache fd (e.g. setattr with no fh,
@@ -6222,19 +6265,25 @@ impl CoreFilesystem for MntrsFs {
             // that branch but still carried on the task for
             // the `drop_block_cache_for_path` post-upload
             // (no-op for off mode — no block cache exists).
-            let in_memory_payload: Option<bytes::Bytes> =
-                if self.cache_mode == crate::util::CacheMode::Off {
-                    let entry = self.handles.get(&fh);
-                    match entry.as_deref() {
-                        Some(crate::FileHandleState::Write {
-                            in_memory_buffer: Some(buf),
-                            ..
-                        }) => buf.lock().ok().map(|v| bytes::Bytes::copy_from_slice(&v)),
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
+            let in_memory_payload: Option<bytes::Bytes> = if !self.cache_mode.disk_write_buffer() {
+                // Issue #583: only Off mode packs dirty
+                // bytes inline; Writes/Full/Minimal read
+                // from the on-disk cache file at upload
+                // time. Use `disk_write_buffer()` rather
+                // than `== Off` so a future variant
+                // (e.g. Minimal — issue #T2-N) can't
+                // silently land here.
+                let entry = self.handles.get(&fh);
+                match entry.as_deref() {
+                    Some(crate::FileHandleState::Write {
+                        in_memory_buffer: Some(buf),
+                        ..
+                    }) => buf.lock().ok().map(|v| bytes::Bytes::copy_from_slice(&v)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             // Off mode never writes a .dirty sidecar — there
             // is no next-mount recovery path (the in-memory
             // payload is gone if the daemon crashes before
@@ -6272,6 +6321,17 @@ impl CoreFilesystem for MntrsFs {
                             remote_path: (*path).to_string(),
                             write_buffer_path: cpath,
                             in_memory_payload,
+                            // Issue #T2-N: Minimal-mode
+                            // releases unlink the cache
+                            // file after upload. Same
+                            // predicate as write()/flush().
+                            // The cache file may have been
+                            // fdatasync'd moments ago by
+                            // the release path above, so the
+                            // unlink here is the only piece
+                            // that distinguishes Minimal
+                            // from Writes.
+                            delete_cache_on_success: self.cache_mode.delete_cache_on_success(),
                             retry_cycle: 0,
                             per_task_delay: delay,
                         }) {
@@ -6485,7 +6545,11 @@ impl CoreFilesystem for MntrsFs {
         if let Some(parent) = cpath.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let write_buffer_fd = if self.cache_mode == crate::util::CacheMode::Off {
+        // Off mode: skip the cache file entirely. Use
+        // `disk_write_buffer()` (canonical predicate,
+        // issue #T2-N) rather than `== Off` so a future
+        // variant can't silently land here.
+        let write_buffer_fd = if !self.cache_mode.disk_write_buffer() {
             None
         } else {
             std::fs::OpenOptions::new()
@@ -6508,7 +6572,9 @@ impl CoreFilesystem for MntrsFs {
                 write_buffer_fd,
                 // Mirror open(): off mode allocates a fresh
                 // empty buffer; writes/full leave it None.
-                in_memory_buffer: if self.cache_mode == crate::util::CacheMode::Off {
+                // Use `disk_write_buffer()` (issue #T2-N)
+                // rather than `== Off`.
+                in_memory_buffer: if !self.cache_mode.disk_write_buffer() {
                     Some(Arc::new(std::sync::Mutex::new(Vec::new())))
                 } else {
                     None
@@ -6663,7 +6729,10 @@ impl CoreFilesystem for MntrsFs {
         if let Some(parent) = cpath.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let write_buffer_fd = if self.cache_mode == crate::util::CacheMode::Off {
+        // Off mode: skip the cache file entirely. Use
+        // `disk_write_buffer()` (canonical predicate,
+        // issue #T2-N) rather than `== Off`.
+        let write_buffer_fd = if !self.cache_mode.disk_write_buffer() {
             None
         } else {
             std::fs::OpenOptions::new()
@@ -6680,7 +6749,10 @@ impl CoreFilesystem for MntrsFs {
             FileHandleState::Write {
                 path: Arc::from(full_path.as_str()),
                 write_buffer_fd,
-                in_memory_buffer: if self.cache_mode == crate::util::CacheMode::Off {
+                // Use `disk_write_buffer()` (issue #T2-N) rather than
+                // `== Off` so a future variant can't silently
+                // land here.
+                in_memory_buffer: if !self.cache_mode.disk_write_buffer() {
                     Some(Arc::new(std::sync::Mutex::new(Vec::new())))
                 } else {
                     None

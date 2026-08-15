@@ -218,7 +218,7 @@ Three-tier cache: **memory → disk → remote**. Block-level (8 MB) indexing. D
 | `--vfs-cache-max-size` | `0` (off) | none (post-#243) | `0` = no LRU | Disk cache upper limit (LRU) |
 | `--vfs-cache-min-free-space` | `0` (off) | none (post-#243) | `0` = no floor check | Min free space before eviction |
 | `--vfs-cache-max-age` | 3600s | — | 3600s | Max cache file age (absolute mtime, 0 disables — see [Cache flags](docs/vfs-cache-flags.md#vfs-cache-max-age-wired-issue-507)) |
-| `--vfs-cache-mode` | `off` | — | `off` | `off` / `minimal` / `writes` / `full` (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
+| `--vfs-cache-mode` | `off` | — | `off` | `off` / `minimal` / `writes` / `full` (wired — see [Durability](docs/durability.md#cache-mode-summary)) |
 | `--vfs-cache-poll-interval` | 60s | — | 60s | Stale-object poll interval (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
 | `--mem-limit` | 256 MB | — | 256 MB | Memory cache upper limit |
 | `--dir-cache-time` | 10s | — | 10s | Directory listing TTL |
