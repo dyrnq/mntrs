@@ -461,9 +461,13 @@ enum Commands {
         #[arg(long, value_parser = ["STANDARD", "STANDARD_IA", "ONEZONE_IA", "INTELLIGENT_TIERING", "GLACIER_IR", "GLACIER", "DEEP_ARCHIVE", "OUTPOSTS", "REDUCED_REDUNDANCY"])]
         storage_class: Option<String>,
         /// Write wait timeout in seconds (default: 1, matches rclone).
-        /// **No effect in mntrs** — writeback is governed by
-        /// `--writeback-immediate-threshold`. Accepted for rclone
-        /// compat. See docs/vfs-cache-flags.md.
+        /// After the most recent `write()` on a file handle, hold
+        /// the upload for this many seconds so a follow-up
+        /// write+close inside the window coalesces into a single
+        /// upload. Only affects files *above*
+        /// `--writeback-immediate-threshold` (small files upload
+        /// immediately, as before). See docs/vfs-cache-flags.md
+        /// (issue #T2-N+1).
         #[arg(long, default_value = "1")]
         vfs_write_wait: u64,
         /// Read wait timeout in seconds (default: 1).
@@ -684,9 +688,12 @@ fn main() -> anyhow::Result<()> {
             if hash_filter.is_some() {
                 shadow.push("--hash-filter");
             }
-            if vfs_write_wait != 1 {
-                shadow.push("--vfs-write-wait");
-            }
+            // --vfs-write-wait is now wired (issue #T2-N+1):
+            // removed from the SHADOW list. --vfs-read-wait
+            // stays SHADOW (deferred — no per-handle read
+            // backpressure knob in mntrs; reads are throttled
+            // by --vfs-prefetch-threshold / --vfs-prefetch-
+            // queue-mb / --read-chunk-streams instead).
             if vfs_read_wait != 1 {
                 shadow.push("--vfs-read-wait");
             }

@@ -1329,6 +1329,13 @@ pub fn mount(
         writeback_immediate_threshold,
         cache_mode: crate::util::CacheMode::parse(vfs_cache_mode),
         read_ahead: vfs_read_ahead,
+        // Issue #T2-N+1: per-task writeback delay. The
+        // worker holds the upload for `vfs_write_wait -
+        // elapsed_since_last_write` after the most recent
+        // write on the handle, so a follow-up write+close
+        // inside the window coalesces. Default 1 s (matches
+        // rclone).
+        write_wait: std::time::Duration::from_secs(vfs_write_wait),
         read_chunk_size: vfs_read_chunk_size,
         read_chunk_size_limit: vfs_read_chunk_size_limit,
         read_chunk_streams: vfs_read_chunk_streams,

@@ -45,9 +45,10 @@ own bypass.
 
 | CLI flag | MntrsFs field | Status |
 |---|---|---|
-| `--vfs-cache-mode` | `cache_mode: String` | SHADOW |
+| `--vfs-cache-mode` | `cache_mode: String` | WIRED (issue #583) |
 | `--vfs-cache-max-age` | `cache_max_age: Duration` | WIRED (issue #507) |
 | `--vfs-read-ahead` | `read_ahead: u64` | WIRED (issue #588) |
+| `--vfs-write-wait` | `write_wait: Duration` | WIRED (issue #T2-N+1) |
 | `--vfs-fast-fingerprint` | `fast_fingerprint: bool` | SHADOW |
 | `--vfs-case-insensitive` | `case_insensitive: bool` | SHADOW |
 | `--vfs-links` | `links: bool` | SHADOW |
@@ -144,6 +145,40 @@ so a value of 0 doesn't silently disable prefetching.
 (that's `--vfs-prefetch-threshold`). It is purely the queue
 cap; rclone users migrating scripts that rely on rclone's
 "hold N bytes ahead" semantics get the equivalent here.
+
+### `--vfs-write-wait` (WIRED, issue #T2-N+1)
+
+Coalescing window: after the most recent `write()` on a
+file handle, the writeback worker holds the upload for
+this many seconds so a follow-up write+close inside the
+window lands in a single upload rather than triggering
+a wasted upload of a still-warming file.
+
+Effect: `per_task_writeback_delay` (the value passed into
+`WritebackTask::per_task_delay`) is now
+`write_wait - elapsed_since_last_write` for *large*
+files (above `--writeback-immediate-threshold`). Small
+files (below the threshold) are unchanged — they still
+upload immediately (the threshold's whole purpose is
+"no waiting"). The delay is capped at `--write-back`
+so the periodic queue (which fires every `--write-back`
+seconds) will still pick up the task even if the
+`write_wait` window is longer than the batch period.
+
+Handles are stamped with `last_write_at: Instant` on
+every `write()` syscall. When the handle is gone (recovery
+scan, flush-without-fh, etc.) `per_task_writeback_delay`
+falls back to the legacy `--write-back` value — no
+coalescing info available.
+
+Default 1 s (matches rclone). The SHADOW warning in the
+mount log for `--vfs-write-wait != 1` is gone.
+
+`--vfs-read-wait` (the read-side analog) remains SHADOW:
+mntrs's read backpressure is governed by
+`--vfs-prefetch-threshold`, `--vfs-prefetch-queue-mb`,
+and `--read-chunk-streams` — no per-handle read
+backpressure knob to anchor it.
 
 ### `--vfs-fast-fingerprint` (SHADOW)
 
