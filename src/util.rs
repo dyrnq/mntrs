@@ -92,11 +92,14 @@ pub fn runtime_dir() -> anyhow::Result<PathBuf> {
 ///      the buffer on disk with `fdatasync`, restoring the
 ///      pre-Issue-#34 silent-data-loss guarantee.
 ///
-/// `minimal` is accepted for rclone-compat but is equivalent
-/// to `off` here — mntrs doesn't distinguish "buffer for
-/// upload only" from "no cache at all"; the only difference
-/// would be a brief temp file during upload, which opendal
-/// already handles internally.
+/// `minimal` (issue #T2-N, follow-up to #583): rclone's
+/// `--vfs-cache-mode=minimal` is **not** equivalent to `off` —
+/// it's a transient disk write buffer: bytes hit the cache
+/// file + `fdatasync` for crash safety during the upload
+/// window, and the cache file is unlinked once the upload
+/// succeeds. Same crash-safety contract as `writes`, but no
+/// on-disk footprint remains after upload — between two
+/// write+release cycles the cache directory is empty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CacheMode {
     /// In-memory write buffer, L1 read cache only.
@@ -104,7 +107,13 @@ pub enum CacheMode {
     #[default]
     Off,
     /// Disk write buffer with fdatasync; L1 read cache only.
+    /// Cache file persists on disk after upload as a read cache.
     Writes,
+    /// Disk write buffer with fdatasync; **cache file unlinked**
+    /// after upload. No read cache. rclone `--vfs-cache-mode=minimal`
+    /// parity. Crash-safe for the upload window, no on-disk
+    /// footprint between writes.
+    Minimal,
     /// Disk write buffer + disk read block cache.
     Full,
 }
@@ -117,7 +126,7 @@ impl CacheMode {
             "off" => Self::Off,
             "writes" => Self::Writes,
             "full" => Self::Full,
-            "minimal" => Self::Off, // see doc comment above
+            "minimal" => Self::Minimal,
             other => {
                 eprintln!("mntrs: unknown --vfs-cache-mode '{other}', falling back to 'off'");
                 Self::Off
@@ -126,13 +135,31 @@ impl CacheMode {
     }
 
     /// `true` if writes are staged to a disk file (vs memory).
+    /// `Minimal` returns `true` — it has a disk write buffer
+    /// during the upload window, even though it's unlinked
+    /// afterward.
     pub fn disk_write_buffer(self) -> bool {
         !matches!(self, Self::Off)
     }
 
     /// `true` if pre-fetched blocks are persisted to disk.
+    /// `Minimal` returns `false` — it has no read cache
+    /// (matches rclone's `--vfs-cache-mode=minimal`).
     pub fn disk_read_cache(self) -> bool {
         matches!(self, Self::Full)
+    }
+
+    /// `true` iff the worker should `remove_file(write_buffer_path)`
+    /// after a successful upload. Currently only `Minimal`
+    /// returns `true` — `Off` has no on-disk file to remove,
+    /// `Writes` and `Full` keep the cache file as a read cache.
+    ///
+    /// Enqueue sites should set `WritebackTask.delete_cache_on_success`
+    /// to this value. The worker checks the flag rather than
+    /// re-deriving from the cache mode (the task doesn't carry
+    /// cache_mode).
+    pub fn delete_cache_on_success(self) -> bool {
+        matches!(self, Self::Minimal)
     }
 }
 
@@ -1412,7 +1439,10 @@ mod lock_or_recover_tests {
             ("off", CacheMode::Off),
             ("writes", CacheMode::Writes),
             ("full", CacheMode::Full),
-            ("minimal", CacheMode::Off), // minimal == off
+            // Issue #T2-N: minimal is its own variant now
+            // (transient disk buffer; rclone parity), not an
+            // alias for off.
+            ("minimal", CacheMode::Minimal),
         ] {
             assert_eq!(
                 CacheMode::parse(s),
@@ -1434,6 +1464,9 @@ mod lock_or_recover_tests {
     fn cache_mode_disk_write_buffer_predicate() {
         assert!(!CacheMode::Off.disk_write_buffer());
         assert!(CacheMode::Writes.disk_write_buffer());
+        // Minimal: has a disk write buffer during the upload
+        // window (fdatasync crash safety) — just unlinks after.
+        assert!(CacheMode::Minimal.disk_write_buffer());
         assert!(CacheMode::Full.disk_write_buffer());
     }
 
@@ -1441,6 +1474,19 @@ mod lock_or_recover_tests {
     fn cache_mode_disk_read_cache_predicate() {
         assert!(!CacheMode::Off.disk_read_cache());
         assert!(!CacheMode::Writes.disk_read_cache());
+        // Minimal: no read cache (matches rclone).
+        assert!(!CacheMode::Minimal.disk_read_cache());
         assert!(CacheMode::Full.disk_read_cache());
+    }
+
+    #[test]
+    fn cache_mode_delete_cache_on_success_predicate() {
+        // Only Minimal unlinks the cache file after a successful
+        // upload. Off has no file to unlink; Writes/Full keep
+        // the file as a read cache.
+        assert!(CacheMode::Minimal.delete_cache_on_success());
+        assert!(!CacheMode::Off.delete_cache_on_success());
+        assert!(!CacheMode::Writes.delete_cache_on_success());
+        assert!(!CacheMode::Full.delete_cache_on_success());
     }
 }

@@ -101,6 +101,14 @@ pub struct WritebackTask {
     /// `Duration::MAX` opts into the spawn-time `delay`
     /// fallback for uniform-delay tests.
     pub per_task_delay: Duration,
+    /// `true` iff the worker should `remove_file(write_buffer_path)`
+    /// after a successful upload. Set by the enqueue site based on
+    /// `cache_mode.delete_cache_on_success()` (issue #T2-N,
+    /// currently only `CacheMode::Minimal`). `false` keeps the
+    /// cache file on disk as a read cache (`Writes` / `Full`),
+    /// or no-ops when the file doesn't exist (`Off` with
+    /// `in_memory_payload`).
+    pub delete_cache_on_success: bool,
 }
 
 /// The shared sender used by FUSE threads to enqueue writeback work.
@@ -325,6 +333,12 @@ pub fn spawn(
                 let write_buffer_path = task.write_buffer_path;
                 let cycle = task.retry_cycle;
                 let in_memory_payload = task.in_memory_payload;
+                // Issue #T2-N: Minimal mode unlinks the cache
+                // file after successful upload. Captured here
+                // (rather than re-derived from cache_mode, which
+                // the task doesn't carry) so the worker can
+                // branch cheaply on a primitive.
+                let delete_cache_on_success = task.delete_cache_on_success;
                 // Upload in a separate task so DelayQueue keeps ticking.
                 static UPLOAD_SEM: std::sync::LazyLock<Semaphore> =
                     std::sync::LazyLock::new(|| Semaphore::new(4));
@@ -462,6 +476,19 @@ pub fn spawn(
                                     let _ = std::fs::remove_file(
                                         write_buffer_path.with_extension("dirty"),
                                     );
+                                }
+                                // Issue #T2-N: `--vfs-cache-mode=minimal`
+                                // unlinks the cache file after a
+                                // successful upload — keeps the
+                                // fdatasync'd crash safety of
+                                // `Writes` during the upload window,
+                                // but leaves no on-disk footprint
+                                // afterward (rclone parity). Fires
+                                // only when an on-disk file
+                                // actually existed (Off-mode tasks
+                                // carry a dummy path).
+                                if delete_cache_on_success && in_memory_payload.is_none() {
+                                    let _ = std::fs::remove_file(&write_buffer_path);
                                 }
                                 // Issue #38: clear the
                                 // pending entry so the
@@ -629,6 +656,10 @@ pub fn spawn(
                         // consistent — bytes don't change
                         // between cycles, only the cycle count.
                         in_memory_payload,
+                        // Issue #T2-N: forward the unlink
+                        // flag so a successful retry still
+                        // honors Minimal-mode cleanup.
+                        delete_cache_on_success,
                         retry_cycle: next_cycle,
                         per_task_delay: REENQUEUE_COOLDOWN,
                     });
@@ -690,12 +721,18 @@ mod tests {
             remote_path: "/remote/path".to_string(),
             write_buffer_path: PathBuf::from("/cache/path"),
             in_memory_payload: None,
+            // Issue #T2-N: Minimal-mode tests pass `true`,
+            // everything else `false`. Pin `false` here so
+            // the field's identity is captured by the
+            // struct literal.
+            delete_cache_on_success: false,
             retry_cycle: 0,
             per_task_delay: Duration::from_secs(5),
         };
         assert_eq!(task.ino, 42);
         assert_eq!(task.remote_path, "/remote/path");
         assert_eq!(task.write_buffer_path, PathBuf::from("/cache/path"));
+        assert!(!task.delete_cache_on_success);
         assert_eq!(task.retry_cycle, 0);
         assert_eq!(task.per_task_delay, Duration::from_secs(5));
         // Cycle count advances on re-enqueue and the
@@ -706,11 +743,13 @@ mod tests {
             remote_path: task.remote_path.clone(),
             write_buffer_path: task.write_buffer_path.clone(),
             in_memory_payload: None,
+            delete_cache_on_success: false,
             retry_cycle: task.retry_cycle + 1,
             per_task_delay: REENQUEUE_COOLDOWN,
         };
         assert_eq!(retried.retry_cycle, 1);
         assert_eq!(retried.per_task_delay, REENQUEUE_COOLDOWN);
+        assert!(!retried.delete_cache_on_success);
     }
 
     /// Issue #202: per_task_delay=Duration::MAX opts back
