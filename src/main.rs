@@ -157,8 +157,9 @@ enum Commands {
         #[arg(long, default_value = "off")]
         vfs_cache_mode: String,
         /// Read-ahead size in bytes (default: 0 = off, matches rclone).
-        /// **No effect in mntrs** — use `--vfs-prefetch-threshold` /
-        /// `--vfs-prefetch-queue-mb` instead. See docs/vfs-cache-flags.md.
+        /// Adds extra lookahead bytes on top of the prefetch queue
+        /// when `cache-mode=full`. Off/Writes/Minimal ignore the
+        /// value. See docs/vfs-cache-flags.md (issue #588).
         #[arg(long, default_value = "0")]
         vfs_read_ahead: u64,
         /// Read chunk size in bytes (default: 128MiB, matches rclone)
@@ -650,9 +651,13 @@ fn main() -> anyhow::Result<()> {
             // (3600s) and any user override flow into
             // `MultiLevelCache::new` as the L2 TTL.
             // (No shadow-warn entry needed here.)
-            if vfs_read_ahead != 0 {
-                shadow.push("--vfs-read-ahead");
-            }
+            //
+            // Issue #588: --vfs-read-ahead is now wired (was a
+            // shadow flag). Effective only with cache-mode=full;
+            // Off/Writes/Minimal silently ignore the value. The CLI
+            // value flows into `MntrsFs.read_ahead` and adds to the
+            // prefetcher's queue size in `maybe_create_prefetcher`.
+            // (No shadow-warn entry needed here.)
             if vfs_fast_fingerprint {
                 shadow.push("--vfs-fast-fingerprint");
             }

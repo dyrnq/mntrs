@@ -76,6 +76,21 @@ use the YYYY-MM-DD form.
   variant cannot silently mis-route. No CLI change — `minimal`
   already parsed before #T2-N; only its behavior changed.
 
+- **`--vfs-read-ahead` is now wired (issue #588).** The flag was
+  previously accepted but stored and discarded (a "shadow
+  flag"); it is now consumed by `MntrsFs::maybe_create_prefetcher`
+  under `cache-mode=full` only.
+
+  Effect: with `cache-mode=full`, the prefetcher's queue cap
+  becomes `prefetch_queue_mb + read_ahead` MiB. Off / Writes /
+  Minimal modes silently ignore the value (no L2 block cache to
+  amortize against, so an extra queue just wastes memory). The
+  formula is extracted into `compute_prefetch_queue_bytes` and
+  pinned by a unit test covering all four cache modes.
+
+  Default 0 (matches rclone). No CLI change. The SHADOW warning
+  in the mount log for `--vfs-read-ahead != 0` is gone.
+
 ### Migration
 
 - Add `--vfs-cache-mode=writes` (or `full`) to existing mount

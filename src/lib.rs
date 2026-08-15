@@ -677,6 +677,10 @@ pub struct MntrsFs {
     /// Large files still batch through the delay queue.
     pub(crate) writeback_immediate_threshold: u64,
     pub(crate) cache_mode: crate::util::CacheMode,
+    /// Issue #588: extra read-ahead bytes added to the
+    /// prefetcher's queue when `cache_mode == Full`. 0 (default)
+    /// is a no-op. Effective only in Full mode — Off / Writes /
+    /// Minimal ignore it. See `maybe_create_prefetcher`.
     pub(crate) read_ahead: u64,
     /// Minimum file size (bytes) for which the read-path prefetcher
     /// is activated on open(). 0 disables prefetching entirely.
@@ -1290,6 +1294,10 @@ impl MntrsFs {
     /// `release()` drops the handle and calls `HandlePrefetcher::cancel()`.
     /// Without cancel, the thread would spin on a full queue forever
     /// for partially-read files.
+    ///
+    /// Queue sizing: see `compute_prefetch_queue_bytes`. The
+    /// `--vfs-read-ahead` knob (issue #588) adds to this under
+    /// `cache_mode == Full` only.
     fn maybe_create_prefetcher(
         &self,
         ino: u64,
@@ -1302,7 +1310,7 @@ impl MntrsFs {
         // chunk_size cap matches the read-path hard cap (16 MiB) so
         // prefetched parts align with the mem_cache block size (8 MiB).
         let chunk = self.read_chunk_size.clamp(131072, 16 * 1024 * 1024);
-        let max_queue = self.prefetch_queue_mb.max(1) * 1024 * 1024;
+        let max_queue = self.compute_prefetch_queue_bytes();
         Some(std::sync::Arc::new(prefetcher::HandlePrefetcher::new(
             self.op.as_ref().clone(),
             path.to_string(),
@@ -1318,6 +1326,27 @@ impl MntrsFs {
             // limiter; on Err it shrinks the next window.
             self.mem_limiter.clone(),
         )))
+    }
+
+    /// Compute the prefetcher's queue size in bytes. Base cap is
+    /// `prefetch_queue_mb.max(1) * 1 MiB` (the original
+    /// pre-#588 behavior). Issue #588: under `cache_mode == Full`,
+    /// `--vfs-read-ahead` adds bytes on top so the prefetcher
+    /// holds `prefetch_queue_mb + read_ahead` MiB ahead of the
+    /// FUSE reader. Other cache modes ignore `read_ahead` —
+    /// Off / Writes / Minimal have no L2 block cache to amortize
+    /// against, so an extra queue just wastes memory.
+    ///
+    /// Extracted as a helper so the formula is unit-testable
+    /// without spinning up a real `HandlePrefetcher` (the
+    /// `HandlePrefetcher::queue.max_bytes` field is private).
+    fn compute_prefetch_queue_bytes(&self) -> u64 {
+        let base = self.prefetch_queue_mb.max(1) * 1024 * 1024;
+        if self.cache_mode == crate::util::CacheMode::Full && self.read_ahead > 0 {
+            base.saturating_add(self.read_ahead)
+        } else {
+            base
+        }
     }
 
     fn make_attr(&self, ino: u64, size: u64, kind: FileType, mtime: SystemTime) -> FileAttr {
@@ -9198,6 +9227,76 @@ mod tests {
             pre_total,
             fs.disk_cache_index.iter().map(|e| e.value().0).sum::<u64>(),
             "no entry sizes should change"
+        );
+    }
+
+    /// Issue #588: `--vfs-read-ahead` is a cache-mode=full-only
+    /// additive lookahead on top of `prefetch_queue_mb`. Off /
+    /// Writes / Minimal modes ignore the value.
+    ///
+    /// The formula lives in `compute_prefetch_queue_bytes`; this
+    /// test pins the per-cache-mode behavior so a future refactor
+    /// that accidentally applies `read_ahead` to non-Full modes
+    /// (or that drops it entirely from Full) trips CI.
+    #[test]
+    fn read_ahead_only_applies_under_cache_mode_full() {
+        let dir = scratch_dir("read-ahead-full");
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        // 64 MiB queue, 8 MiB read-ahead.
+        let mut fs = new_test_fs_with_mode(op, dir, crate::util::CacheMode::Full);
+        fs.prefetch_queue_mb = 64;
+        fs.read_ahead = 8 * 1024 * 1024;
+        let base = 64 * 1024 * 1024_u64;
+        assert_eq!(
+            fs.compute_prefetch_queue_bytes(),
+            base + 8 * 1024 * 1024,
+            "Full + read_ahead>0 must add read_ahead bytes"
+        );
+
+        // read_ahead=0 is a no-op even under Full.
+        fs.read_ahead = 0;
+        assert_eq!(
+            fs.compute_prefetch_queue_bytes(),
+            base,
+            "read_ahead=0 (default) must not change the queue size"
+        );
+
+        // Off mode: read_ahead is silently ignored even when set.
+        fs.cache_mode = crate::util::CacheMode::Off;
+        fs.read_ahead = 8 * 1024 * 1024;
+        assert_eq!(
+            fs.compute_prefetch_queue_bytes(),
+            base,
+            "Off mode must ignore read_ahead (no L2 block cache)"
+        );
+
+        // Writes mode: also ignored.
+        fs.cache_mode = crate::util::CacheMode::Writes;
+        assert_eq!(
+            fs.compute_prefetch_queue_bytes(),
+            base,
+            "Writes mode must ignore read_ahead (no L2 block cache)"
+        );
+
+        // Minimal mode: also ignored.
+        fs.cache_mode = crate::util::CacheMode::Minimal;
+        assert_eq!(
+            fs.compute_prefetch_queue_bytes(),
+            base,
+            "Minimal mode must ignore read_ahead (no L2 block cache)"
+        );
+
+        // prefetch_queue_mb=0 is clamped to 1 MiB (existing
+        // pre-#588 behavior); read_ahead must not collapse it
+        // back to 0. Issue #588: `saturating_add` on the base,
+        // not on the raw 0.
+        fs.cache_mode = crate::util::CacheMode::Full;
+        fs.prefetch_queue_mb = 0;
+        fs.read_ahead = 1024;
+        assert_eq!(
+            fs.compute_prefetch_queue_bytes(),
+            1024 * 1024 + 1024,
+            "base clamp (1 MiB) must survive; read_ahead adds on top"
         );
     }
 

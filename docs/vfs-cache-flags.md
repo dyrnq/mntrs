@@ -47,7 +47,7 @@ own bypass.
 |---|---|---|
 | `--vfs-cache-mode` | `cache_mode: String` | SHADOW |
 | `--vfs-cache-max-age` | `cache_max_age: Duration` | WIRED (issue #507) |
-| `--vfs-read-ahead` | `read_ahead: u64` | SHADOW |
+| `--vfs-read-ahead` | `read_ahead: u64` | WIRED (issue #588) |
 | `--vfs-fast-fingerprint` | `fast_fingerprint: bool` | SHADOW |
 | `--vfs-case-insensitive` | `case_insensitive: bool` | SHADOW |
 | `--vfs-links` | `links: bool` | SHADOW |
@@ -124,14 +124,26 @@ mntrs's per-layer TTLs (`--attr-cache-ttl`,
 specific caches; `--vfs-cache-max-age` covers the data
 cache (whole-file + block).
 
-### `--vfs-read-ahead` (SHADOW)
+### `--vfs-read-ahead` (WIRED, issue #588)
 
-rclone sets kernel-level read-ahead via `O_DIRECT` /
-`fadvise`. mntrs controls read-ahead through
-`--vfs-prefetch-threshold` + `--vfs-prefetch-queue-mb`
-(the prefetcher path, issue #201/#222) — a more
-aggressive model that issues the next chunk in the
-background while the kernel reads the current one.
+Additive lookahead bytes on top of the prefetcher's queue,
+applied only when `cache-mode=full`. Off / Writes / Minimal
+modes silently ignore the value (no L2 block cache to
+amortize against, so an extra queue just wastes memory).
+
+Concretely: with `cache-mode=full`,
+`--vfs-prefetch-queue-mb=64 --vfs-read-ahead=8MiB`, the
+prefetcher holds up to `64 MiB + 8 MiB = 72 MiB` ahead of
+the FUSE reader. With `cache-mode=full --vfs-read-ahead=0`
+(default), the queue caps at the `prefetch-queue-mb`
+limit. The base cap stays at `prefetch-queue-mb.max(1)` MiB
+so a value of 0 doesn't silently disable prefetching.
+
+`--vfs-read-ahead` does **not** change the fetch granularity
+(that's `--vfs-read-chunk-size`) or the activation threshold
+(that's `--vfs-prefetch-threshold`). It is purely the queue
+cap; rclone users migrating scripts that rely on rclone's
+"hold N bytes ahead" semantics get the equivalent here.
 
 ### `--vfs-fast-fingerprint` (SHADOW)
 
