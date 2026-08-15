@@ -91,6 +91,35 @@ use the YYYY-MM-DD form.
   Default 0 (matches rclone). No CLI change. The SHADOW warning
   in the mount log for `--vfs-read-ahead != 0` is gone.
 
+- **`--vfs-write-wait` is now wired (issue #T2-N+1).** The flag
+  was previously accepted but stored and discarded (a "shadow
+  flag"); it is now consumed by `per_task_writeback_delay` for
+  large files (above `--writeback-immediate-threshold`).
+
+  Effect: a writeback task for a large file is enqueued with
+  `per_task_delay = write_wait - elapsed_since_last_write`
+  instead of the uniform `--write-back` delay. The intent is
+  coalescing — a follow-up write+close inside the window
+  lands in a single upload rather than triggering a wasted
+  upload of a still-warming file. Small files (below the
+  threshold) are unaffected — they still upload immediately.
+  The delay is capped at `--write-back` so the periodic queue
+  (which fires every `--write-back` seconds) will still pick
+  up the task even if the `write_wait` window is longer than
+  the batch period.
+
+  Per-handle `FileHandleState::Write` gained a
+  `last_write_at: Option<Instant>` field; the `Clone` impl
+  forwards it. The function signature is now
+  `per_task_writeback_delay(&self, ino: u64, fh: u64)`.
+  When the handle is gone (recovery scan, flush-without-fh,
+  etc.) `per_task_writeback_delay` falls back to
+  `--write-back` — no coalescing info available.
+
+  Default 1 s (matches rclone). No CLI change. The SHADOW
+  warning in the mount log for `--vfs-write-wait != 1` is
+  gone.
+
 ### Migration
 
 - Add `--vfs-cache-mode=writes` (or `full`) to existing mount

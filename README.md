@@ -246,11 +246,11 @@ Three-tier cache: **memory → disk → remote**. Block-level (8 MB) indexing. D
 | `--vfs-read-chunk-size` | 128 MiB (134217728) | 128 MiB | Initial read chunk size |
 | `--vfs-read-chunk-size-limit` | 0 (off) | 128 MiB (fallback) | Chunk doubling ceiling |
 | `--vfs-read-chunk-streams` | 1 | 1 | Concurrent read streams (per FUSE read) |
-| `--vfs-read-ahead` | 131072 | 131072 | Bytes prefetched past EOF |
+| `--vfs-read-ahead` | 0 | 0 | Wired under `cache-mode=full` — extra lookahead bytes on top of prefetch queue (issue #588); other modes ignore |
 | `--async-read` | false | false | Async reads (FUSE kernel) |
 | `--vfs-fast-fingerprint` | false | false | Fast change detection (size+mtime) |
-| `--vfs-read-wait` | 1s | 1s | Sequential read wait threshold |
-| `--vfs-write-wait` | 1s | 1s | Sequential write wait threshold |
+| `--vfs-read-wait` | 1s | 1s | Sequential read wait threshold (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
+| `--vfs-write-wait` | 1s | 1s | Sequential write wait threshold (wired — coalesces writes on large files, issue #T2-N+1) |
 
 **Adaptive chunk reader**: chunk size doubles on sequential reads, resets to 128 KB on seek. Up to 8 MB cap.
 
