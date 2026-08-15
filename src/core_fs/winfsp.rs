@@ -693,7 +693,7 @@ fn filetime_u64_to_system_time(ft: u64) -> Option<SystemTime> {
 /// used as BOTH ino AND fh in every read/write/flush/
 /// close call. That collapsed all concurrent opens of
 /// the same file onto one synthetic fh, so each open's
-/// state (cache_fd, prefetcher, dirty flags in
+/// state (write_buffer_fd, prefetcher, dirty flags in
 /// FileHandleState) clobbered the others'. Adding a
 /// distinct `fh` minted by `CoreFilesystem::open`
 /// restores per-handle isolation and is what the Linux
@@ -733,13 +733,13 @@ pub struct WinFspHandle {
 /// model. Any write-style right (FILE_WRITE_DATA,
 /// FILE_APPEND_DATA, GENERIC_WRITE, GENERIC_ALL,
 /// MAXIMUM_ALLOWED) maps to O_RDWR rather than
-/// O_WRONLY — the cache_fd path opens the local cache
+/// O_WRONLY — the write_buffer_fd path opens the local cache
 /// file read+write (for prefix-fetch on offset writes),
 /// and a write-only POSIX flag would forbid that.
 ///
 /// Read-only access maps to O_RDONLY; the open() handler
 /// then takes the FileHandleState::Read branch (no
-/// cache_fd) and the read path uses the on-disk block
+/// write_buffer_fd) and the read path uses the on-disk block
 /// cache + remote fetch.
 fn winfsp_access_to_open_flags(granted_access: winfsp_sys::FILE_ACCESS_RIGHTS) -> u32 {
     // Windows access mask constants. Match
@@ -1084,7 +1084,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 let ino = attr.ino;
                 tracing::info!(name = %name, ino, is_dir, kind = ?attr.kind, "winfsp::open: lookup ok");
                 // Bug 11: actually call CoreFilesystem::open so
-                // the per-handle FileHandleState (cache_fd for
+                // the per-handle FileHandleState (write_buffer_fd for
                 // writes, prefetcher for reads) gets populated.
                 // Pre-fix the WinFspHandle was just { ino,
                 // is_dir } with no fh and no inner.open() — so
@@ -1274,7 +1274,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 // try to release the ino as if it were a fh
                 // and skip the real handle. With the real fh
                 // here, FileHandleState entries are actually
-                // removed and cache_fds (Arc<Mutex<File>>)
+                // removed and write_buffer_fds (Arc<Mutex<File>>)
                 // get their last strong ref dropped.
                 if !_context.is_dir {
                     let _ = self.inner.release(_context.ino, _context.fh);
@@ -2772,7 +2772,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                     // uploaded, not just on local disk).
                     //
                     // Issue #310: a read-only handle has no
-                    // `cache_fd` in the trait, so `fsync`
+                    // `write_buffer_fd` in the trait, so `fsync`
                     // returns `NotFound` to signal
                     // "nothing to flush". That is a
                     // semantic no-op for FlushFileBuffers

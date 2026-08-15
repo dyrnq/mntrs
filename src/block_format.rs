@@ -575,7 +575,7 @@ pub(crate) fn serialize_v3_block(path: &str, data: &[u8]) -> Option<Vec<u8>> {
 pub(crate) fn remove_block_cache_files(cache_dir: &Path, full_path: &str, size: u64) {
     let n_blocks = size.div_ceil(crate::CACHE_BLOCK_SIZE);
     for blk in 0..n_blocks {
-        let bpath = crate::cache_block_path(cache_dir, full_path, blk);
+        let bpath = crate::disk_cache_block_path(cache_dir, full_path, blk);
         let _ = std::fs::remove_file(&bpath);
     }
 }
@@ -599,7 +599,7 @@ pub(crate) fn drop_block_cache_for_path(
         .collect();
     for key in to_remove {
         if let Some(idx) = key.1 {
-            let bpath = crate::cache_block_path(cache_dir, &key.0, idx);
+            let bpath = crate::disk_cache_block_path(cache_dir, &key.0, idx);
             let _ = std::fs::remove_file(&bpath);
         }
         disk_cache_index.remove(&key);
@@ -621,7 +621,7 @@ pub struct CacheIndexEntry {
     /// File name on disk (e.g. `"abcd_000000002a.block"`).
     /// Encodes both the path hash prefix and the block
     /// index, so callers can re-derive the block path via
-    /// [`crate::cache_block_path`] when only this is kept.
+    /// [`crate::disk_cache_block_path`] when only this is kept.
     pub name: String,
     /// Block index within the file (parsed from the hex
     /// suffix of `name`). `0`-based.
@@ -1306,7 +1306,7 @@ mod disk_cache_crc_tests {
     // Disk cache #5: `write_block_cached` round-trip tests
     // ---------------------------------------------------------------
 
-    use crate::cache_block_path;
+    use crate::disk_cache_block_path;
     use crate::new_test_fs;
     use opendal::Operator;
     use opendal::services::Memory;
@@ -1337,7 +1337,7 @@ mod disk_cache_crc_tests {
             .map(|i| (i & 0xff) as u8)
             .collect();
         assert!(fs.write_block_cached("full.bin", 0, &content));
-        let blk_path = cache_block_path(&fs.cache_dir, "full.bin", 0);
+        let blk_path = disk_cache_block_path(&fs.cache_dir, "full.bin", 0);
         let meta = std::fs::metadata(&blk_path).unwrap();
         assert!(
             (meta.len() as usize) >= BLOCK_OVERHEAD + 4,
@@ -1370,7 +1370,7 @@ mod disk_cache_crc_tests {
         let fs = make_fs();
         let content: Vec<u8> = (0..4096u32).map(|i| (i & 0xff) as u8).collect();
         assert!(fs.write_block_cached("tail.bin", 7, &content));
-        let blk_path = cache_block_path(&fs.cache_dir, "tail.bin", 7);
+        let blk_path = disk_cache_block_path(&fs.cache_dir, "tail.bin", 7);
         let meta = std::fs::metadata(&blk_path).unwrap();
         assert!(
             (meta.len() as usize) <= content.len() + BLOCK_OVERHEAD + MAX_PAYLOAD_OVERHEAD,
@@ -1399,7 +1399,7 @@ mod disk_cache_crc_tests {
                 fs.disk_cache_index.contains_key(&key),
                 "block {blk} must be in disk_cache_index"
             );
-            let p = cache_block_path(&fs.cache_dir, "prefetched.bin", blk);
+            let p = disk_cache_block_path(&fs.cache_dir, "prefetched.bin", blk);
             let bytes = read_block_cached(&p, "prefetched.bin").expect("round-trip read");
             assert_eq!(bytes.len(), CACHE_BLOCK_SIZE as usize);
             assert_eq!(bytes.as_ref(), full.as_slice());

@@ -56,24 +56,24 @@ fn fnmatch_edge_cases() {
 }
 
 #[test]
-fn cache_path_is_stable() {
-    use mntrs::cache_path;
+fn write_buffer_path_is_stable() {
+    use mntrs::write_buffer_path;
     let tmp = std::env::temp_dir();
-    let p = cache_path(&tmp, "hello/world");
+    let p = write_buffer_path(&tmp, "hello/world");
     let name = p.file_name().unwrap().to_str().unwrap();
     assert_eq!(name.len(), 20);
     assert!(name.chars().all(|c| c.is_ascii_hexdigit()));
 }
 
 #[test]
-fn cache_path_deterministic() {
-    use mntrs::cache_path;
+fn write_buffer_path_deterministic() {
+    use mntrs::write_buffer_path;
     assert_eq!(
-        cache_path(std::path::Path::new("/a"), "x"),
-        cache_path(std::path::Path::new("/a"), "x")
+        write_buffer_path(std::path::Path::new("/a"), "x"),
+        write_buffer_path(std::path::Path::new("/a"), "x")
     );
     assert_ne!(
-        cache_path(std::path::Path::new("/a"), "x"),
-        cache_path(std::path::Path::new("/b"), "x")
+        write_buffer_path(std::path::Path::new("/a"), "x"),
+        write_buffer_path(std::path::Path::new("/b"), "x")
     );
 }

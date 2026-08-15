@@ -733,7 +733,7 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
     /// returned `ENOSYS`. The fuser 0.17 default body
     /// matches that behaviour, but the in-memory
     /// `register_dirty_cache_path` fsync thread + the
-    /// `cache_fd::sync_all` on close path are not
+    /// `write_buffer_fd::sync_all` on close path are not
     /// triggered by FUSE's fsync — they only fire from
     /// the kernel's own dirty-page writeback. A database
     /// workload depends on this hook to know "the bytes

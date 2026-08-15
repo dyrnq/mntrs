@@ -3,7 +3,7 @@
 //! Architecture (inspired by rclone's WriteBack + container/heap):
 //!
 //!   FUSE thread (flush/release):
-//!     → tx.send((ino, remote_path, cache_path))
+//!     → tx.send((ino, remote_path, write_buffer_path))
 //!       (tokio::sync::mpsc::UnboundedSender — lock-free)
 //!
 //!   Background tokio task:
@@ -82,7 +82,7 @@ pub struct WritebackTask {
     pub remote_path: String,
     /// On-disk cache file path (the source of bytes for the
     /// upload). `.dirty` sidecar lives next to it.
-    pub cache_path: PathBuf,
+    pub write_buffer_path: PathBuf,
     /// 0 = fresh enqueue — honors `per_task_delay`.
     /// 1 or higher = re-enqueue — always uses
     /// `REENQUEUE_COOLDOWN`, the `per_task_delay` field
@@ -277,7 +277,7 @@ pub fn spawn(
                     cycle = task.retry_cycle,
                     "writeback: dequeued for upload"
                 );
-                let data: bytes::Bytes = match std::fs::read(&task.cache_path) {
+                let data: bytes::Bytes = match std::fs::read(&task.write_buffer_path) {
                     Ok(d) => d.into(),
                     Err(_) => {
                         // Issue #53 + #268.1 O1: cache file
@@ -292,18 +292,19 @@ pub fn spawn(
                         // upload" from "filesystem gone".
                         PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
                         tracing::info!(
-                            path = %task.cache_path.display(),
+                            path = %task.write_buffer_path.display(),
                             cycle = task.retry_cycle,
                             "writeback: cache file vanished (LRU evicted?); dropping task"
                         );
-                        let _ = std::fs::remove_file(task.cache_path.with_extension("dirty"));
+                        let _ =
+                            std::fs::remove_file(task.write_buffer_path.with_extension("dirty"));
                         continue;
                     }
                 };
                 let op = op.clone();
                 let remote = task.remote_path;
                 let ino = task.ino;
-                let cache_path = task.cache_path;
+                let write_buffer_path = task.write_buffer_path;
                 let cycle = task.retry_cycle;
                 // Upload in a separate task so DelayQueue keeps ticking.
                 static UPLOAD_SEM: std::sync::LazyLock<Semaphore> =
@@ -431,7 +432,8 @@ pub fn spawn(
                                 // Only remove the .dirty sidecar to mark upload complete.
                                 // The cache eviction logic handles disk space separately.
                                 PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
-                                let _ = std::fs::remove_file(cache_path.with_extension("dirty"));
+                                let _ =
+                                    std::fs::remove_file(write_buffer_path.with_extension("dirty"));
                                 // Issue #38: clear the
                                 // pending entry so the
                                 // next flush/release
@@ -590,7 +592,7 @@ pub fn spawn(
                     let _ = tx_clone.send(WritebackTask {
                         ino,
                         remote_path: remote,
-                        cache_path,
+                        write_buffer_path,
                         retry_cycle: next_cycle,
                         per_task_delay: REENQUEUE_COOLDOWN,
                     });
@@ -650,13 +652,13 @@ mod tests {
         let task: WritebackTask = WritebackTask {
             ino: 42,
             remote_path: "/remote/path".to_string(),
-            cache_path: PathBuf::from("/cache/path"),
+            write_buffer_path: PathBuf::from("/cache/path"),
             retry_cycle: 0,
             per_task_delay: Duration::from_secs(5),
         };
         assert_eq!(task.ino, 42);
         assert_eq!(task.remote_path, "/remote/path");
-        assert_eq!(task.cache_path, PathBuf::from("/cache/path"));
+        assert_eq!(task.write_buffer_path, PathBuf::from("/cache/path"));
         assert_eq!(task.retry_cycle, 0);
         assert_eq!(task.per_task_delay, Duration::from_secs(5));
         // Cycle count advances on re-enqueue and the
@@ -665,7 +667,7 @@ mod tests {
         let retried = WritebackTask {
             ino: task.ino,
             remote_path: task.remote_path.clone(),
-            cache_path: task.cache_path.clone(),
+            write_buffer_path: task.write_buffer_path.clone(),
             retry_cycle: task.retry_cycle + 1,
             per_task_delay: REENQUEUE_COOLDOWN,
         };

@@ -441,8 +441,8 @@ mod tests {
 
         // Verify the .block files actually exist on disk
         // (sanity check for the test setup).
-        let cpath_a = crate::cache_block_path(&dir, "remote/path/file.bin", 0);
-        let cpath_b = crate::cache_block_path(&dir, "remote/path/file.bin", 5);
+        let cpath_a = crate::disk_cache_block_path(&dir, "remote/path/file.bin", 0);
+        let cpath_b = crate::disk_cache_block_path(&dir, "remote/path/file.bin", 5);
         assert!(
             cpath_a.exists(),
             "setup: .block file missing at {cpath_a:?}"
