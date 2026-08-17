@@ -49,6 +49,7 @@ own bypass.
 | `--vfs-cache-max-age` | `cache_max_age: Duration` | WIRED (issue #507) |
 | `--vfs-read-ahead` | `read_ahead: u64` | WIRED (issue #588) |
 | `--vfs-write-wait` | `write_wait: Duration` | WIRED (issue #T2-N+1) |
+| `--vfs-refresh` | `refresh_interval: Duration` | WIRED (issue #592) |
 | `--vfs-fast-fingerprint` | `fast_fingerprint: bool` | SHADOW |
 | `--vfs-case-insensitive` | `case_insensitive: bool` | SHADOW |
 | `--vfs-links` | `links: bool` | SHADOW |
@@ -179,6 +180,44 @@ mntrs's read backpressure is governed by
 `--vfs-prefetch-threshold`, `--vfs-prefetch-queue-mb`,
 and `--read-chunk-streams` — no per-handle read
 backpressure knob to anchor it.
+
+### `--vfs-refresh` (WIRED, issue #592)
+
+Periodic remote-state refresh interval. When set to a
+positive duration, a background tokio task clears
+`dir_cache` and `attr_cache` every N seconds so the next
+readdir / stat refetches from the remote.
+
+Effect: drops `dir_cache` and `attr_cache` only — `inodes`
+is left alone (the FUSE kernel holds `ino` references that
+would dangle if we removed the entries) and `disk_cache_index`
+is left alone (individual file contents are still valid
+until `--vfs-cache-max-age` expires them).
+
+Default `0` (disabled) — opt-in via the CLI flag. This is
+deliberately more conservative than rclone's `5m` default:
+mntrs's existing `--dir-cache-ttl` (10 s) and `--attr-cache-ttl`
+(1 s) already provide per-cache-class freshness on the lazy
+read path, so an eager periodic clear is only useful when the
+remote is being modified out-of-band (separate process, console
+update, etc.) and the operator wants tighter visibility.
+
+Distinct from `--vfs-cache-max-age` (lazy TTL on cache
+files) and `--dir-cache-ttl` (lazy TTL on readdir
+entries). `--vfs-refresh` is the **eager** counterpart:
+it forces the eviction on a fixed schedule rather than
+waiting for a read.
+
+The boolean `--vfs-refresh` flag (issue #210) still
+exists as a one-shot "skip attr_cache" toggle. This
+PR adds the **periodic** version alongside it as
+`--vfs-refresh <secs>` (clap takes either form, but the
+positional default `0` only applies to the periodic
+flag). The two are independent: setting
+`--vfs-refresh=true` (no value = boolean toggle) bypasses
+attr_cache on every stat; setting `--vfs-refresh 60`
+(periodic) spawns a background worker that clears the
+caches every 60 seconds.
 
 ### `--vfs-fast-fingerprint` (SHADOW)
 

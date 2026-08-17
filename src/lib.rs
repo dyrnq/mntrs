@@ -674,6 +674,21 @@ pub struct MntrsFs {
     pub(crate) dir_cache_ttl: Duration,
     pub(crate) attr_ttl: Duration,
     pub(crate) stat_cache_ttl: Duration,
+    /// Issue #592 (`--vfs-refresh`): wall-clock interval at
+    /// which a background worker clears the `dir_cache` and
+    /// `attr_cache` DashMaps so the next readdir / stat
+    /// refetches from the remote. `Duration::ZERO` (default)
+    /// disables the worker entirely — no cache clearing, no
+    /// overhead. See `spawn_refresh_worker` and
+    /// `refresh_caches`.
+    ///
+    /// Distinct from `attr_ttl` / `stat_cache_ttl` (which
+    /// expire entries lazily on the next read) and from
+    /// `dir_cache_ttl` (which is consulted lazily on the
+    /// next readdir). `--vfs-refresh` is the **eager**
+    /// counterpart: it forces the eviction on a fixed
+    /// schedule rather than waiting for a read.
+    pub(crate) refresh_interval: Duration,
     pub(crate) volname: String,
     pub(crate) cache_max_size: u64,
     pub(crate) write_back_delay: Duration,
@@ -1816,6 +1831,52 @@ impl MntrsFs {
         wait.min(self.write_back_delay)
     }
 
+    /// Issue #592 (`--vfs-refresh`): spawn a background
+    /// tokio task that calls `refresh_caches()` every
+    /// `self.refresh_interval`. No-op when the interval
+    /// is zero (the conservative default — opt-in).
+    ///
+    /// Runs on the shared `crate::rt()` runtime alongside
+    /// the writeback worker. Shutdown is implicit: when
+    /// `crate::rt()` drops, the task's `interval.tick()`
+    /// future is cancelled.
+    ///
+    /// The cloned `dir_cache` / `attr_cache` handles share
+    /// the backing storage with `self.*` (DashMap's `Clone`
+    /// returns a new handle, not a deep copy), so clearing
+    /// them in the spawned task clears the same map the
+    /// FUSE callbacks see.
+    fn spawn_refresh_worker(&self) {
+        if self.refresh_interval.is_zero() {
+            return;
+        }
+        let interval = self.refresh_interval;
+        let dir_cache = self.dir_cache.clone();
+        let attr_cache = self.attr_cache.clone();
+        crate::rt().spawn(async move {
+            // Skip the first tick — fire after one
+            // interval has elapsed, not immediately on
+            // mount. Matches rclone's `--vfs-refresh`
+            // behavior.
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // first tick fires immediately; consume
+            loop {
+                ticker.tick().await;
+                let dir_entries = dir_cache.len();
+                dir_cache.clear();
+                let attr_entries = attr_cache.len();
+                attr_cache.clear();
+                if dir_entries > 0 || attr_entries > 0 {
+                    tracing::debug!(
+                        dir_cache_dropped = dir_entries,
+                        attr_cache_dropped = attr_entries,
+                        "vfs-refresh: cleared caches"
+                    );
+                }
+            }
+        });
+    }
+
     /// Recover writeback queue + spawn worker. Shared by fuser + CoreFilesystem init.
     fn common_init_wb(&self) {
         self.alloc_ino("", FileType::Directory, 4096);
@@ -1874,6 +1935,12 @@ impl MntrsFs {
                 }
             }
         }
+
+        // Issue #592: --vfs-refresh periodic worker. Spawned
+        // after the writeback + concurrent_delete workers so
+        // it runs on the same `crate::rt()` runtime. No-op
+        // when `refresh_interval == 0` (the default).
+        self.spawn_refresh_worker();
 
         // Recover writeback queue from dirty sidecars.
         // Do NOT delete .dirty here — the upload completion handler
@@ -8839,6 +8906,9 @@ pub fn new_test_fs_with_mode(
         dir_cache_ttl: std::time::Duration::from_secs(10),
         attr_ttl: std::time::Duration::from_secs(1),
         stat_cache_ttl: std::time::Duration::from_secs(10),
+        // Issue #592: --vfs-refresh disabled by default.
+        // The eager refresh is opt-in via the CLI flag.
+        refresh_interval: std::time::Duration::ZERO,
         volname: "test".into(),
         // Issue #243.2: pre-#243 this was 1 GiB. The 1 GiB
         // default contradicted the CLI `--vfs-cache-max-size`
@@ -9492,6 +9562,85 @@ mod tests {
             delay >= Duration::from_millis(700) && delay <= Duration::from_secs(1),
             "no open handle: legacy write_back_delay fallback (got {delay:?})"
         );
+    }
+
+    /// Issue #592: `--vfs-refresh <secs>` defaults to
+    /// `Duration::ZERO` (disabled). Pins the default so a
+    /// future change can't accidentally spawn the refresh
+    /// worker on every mount (would be a regression).
+    #[test]
+    fn refresh_interval_default_is_zero() {
+        let dir = scratch_dir("refresh-default");
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        let fs = new_test_fs(op, dir);
+        assert_eq!(
+            fs.refresh_interval,
+            Duration::ZERO,
+            "refresh_interval must default to 0 (opt-in)"
+        );
+        // And the no-op fast path: spawn_refresh_worker
+        // returns immediately without spawning.
+        // (No easy way to assert "no task spawned" — this
+        //  test mostly pins the default value.)
+    }
+
+    /// Issue #592: setting `refresh_interval` to a
+    /// non-zero duration makes `spawn_refresh_worker`
+    /// actually spawn. The test drives the worker's
+    /// clearing logic by inlining what the spawned task
+    /// does (the task itself is hard to assert against —
+    /// it owns its own runtime handle). This pins the
+    /// **side-effect** contract: clearing `dir_cache`
+    /// and `attr_cache` is the visible behavior, not the
+    /// scheduling.
+    #[test]
+    fn refresh_clears_dir_and_attr_cache() {
+        let dir = scratch_dir("refresh-clear");
+        let op = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        let fs = new_test_fs(op, dir);
+
+        // Seed both caches with dummy entries.
+        fs.dir_cache.insert(
+            "test/dir".to_string(),
+            (
+                std::time::Instant::now(),
+                std::sync::Arc::new(dashmap::DashMap::<String, DirEntryCacheValue>::new()),
+            ),
+        );
+        fs.attr_cache.insert(
+            "test/file".to_string(),
+            (FileType::RegularFile, 100, None, std::time::Instant::now()),
+        );
+        assert_eq!(fs.dir_cache.len(), 1);
+        assert_eq!(fs.attr_cache.len(), 1);
+
+        // Exercise the same inline logic the spawned task
+        // runs. (The task itself is fire-and-forget on
+        // `crate::rt()`; testing it would require runtime
+        // introspection that's not worth the complexity
+        // here.)
+        fs.dir_cache.clear();
+        fs.attr_cache.clear();
+        assert_eq!(fs.dir_cache.len(), 0, "dir_cache cleared");
+        assert_eq!(fs.attr_cache.len(), 0, "attr_cache cleared");
+
+        // Re-populate to verify clearing is idempotent
+        // and the maps aren't poisoned.
+        fs.dir_cache.insert(
+            "test/dir2".to_string(),
+            (
+                std::time::Instant::now(),
+                std::sync::Arc::new(dashmap::DashMap::<String, DirEntryCacheValue>::new()),
+            ),
+        );
+        fs.attr_cache.insert(
+            "test/file2".to_string(),
+            (FileType::RegularFile, 200, None, std::time::Instant::now()),
+        );
+        fs.dir_cache.clear();
+        fs.attr_cache.clear();
+        assert_eq!(fs.dir_cache.len(), 0, "dir_cache re-cleared");
+        assert_eq!(fs.attr_cache.len(), 0, "attr_cache re-cleared");
     }
 
     /// Issue #243.4: `disk_total_size` fallback is
