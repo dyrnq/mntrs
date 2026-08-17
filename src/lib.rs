@@ -9609,12 +9609,7 @@ mod tests {
         );
         fs.attr_cache.insert(
             "test/file".to_string(),
-            (
-                fuser::FileType::RegularFile,
-                100,
-                None,
-                std::time::Instant::now(),
-            ),
+            (FileType::RegularFile, 100, None, std::time::Instant::now()),
         );
         assert_eq!(fs.dir_cache.len(), 1);
         assert_eq!(fs.attr_cache.len(), 1);
