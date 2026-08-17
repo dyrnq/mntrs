@@ -676,6 +676,7 @@ pub fn mount_internal(
         false,     // vfs_fast_fingerprint
         false,     // async_read
         false,     // vfs_refresh
+        0,         // vfs_refresh_secs (--vfs-refresh, issue #592; 0 = disabled)
         false,     // vfs_case_insensitive
         false,     // no_implicit_dir
         false,     // vfs_block_norm_dupes
@@ -985,6 +986,7 @@ pub fn mount(
     vfs_fast_fingerprint: bool,
     async_read: bool,
     vfs_refresh: bool,
+    vfs_refresh_secs: u64,
     vfs_case_insensitive: bool,
     no_implicit_dir: bool,
     vfs_block_norm_dupes: bool,
@@ -1359,6 +1361,12 @@ pub fn mount(
             poll_interval.unwrap_or(vfs_cache_poll_interval).max(1),
         ),
         cache_max_age: cache_max_age_for_mlc,
+        // Issue #592: --vfs-refresh periodic worker. Default
+        // 0 (disabled) — opt-in via the CLI flag. When set to
+        // a positive duration, the worker clears `dir_cache`
+        // and `attr_cache` every interval so the next readdir
+        // / stat refetches from the remote.
+        refresh_interval: std::time::Duration::from_secs(vfs_refresh_secs),
         // Issue #502: macFUSE 64 KiB xattr silent-truncation cap.
         // 0 disables the warning entirely. Non-zero values also
         // trigger a one-shot startup warn if the configured cap
