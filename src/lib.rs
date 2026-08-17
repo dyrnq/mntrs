@@ -9635,12 +9635,7 @@ mod tests {
         );
         fs.attr_cache.insert(
             "test/file2".to_string(),
-            (
-                fuser::FileType::RegularFile,
-                200,
-                None,
-                std::time::Instant::now(),
-            ),
+            (FileType::RegularFile, 200, None, std::time::Instant::now()),
         );
         fs.dir_cache.clear();
         fs.attr_cache.clear();
