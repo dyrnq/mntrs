@@ -422,9 +422,22 @@ enum Commands {
         /// Use async reads (don't wait for full read before replying to kernel)
         #[arg(long)]
         async_read: bool,
-        /// Refresh directory cache on mount
+        /// Refresh directory cache on mount (issue #210 — boolean
+        /// one-shot "skip attr_cache" mode; see also `--vfs-refresh`
+        /// for the periodic version).
         #[arg(long)]
         vfs_refresh: bool,
+        /// Periodic remote-state refresh interval in seconds
+        /// (default: 0 = disabled). When set to a positive
+        /// value, a background tokio task clears `dir_cache`
+        /// and `attr_cache` every N seconds so the next
+        /// readdir / stat refetches from the remote. Distinct
+        /// from `--vfs-cache-max-age` (lazy TTL on cache
+        /// files) and `--dir-cache-ttl` (lazy TTL on
+        /// readdir entries). See docs/vfs-cache-flags.md
+        /// (issue #592).
+        #[arg(long, default_value = "0")]
+        vfs_refresh_secs: u64,
         /// Case-insensitive file name matching.
         /// **No effect in mntrs** — case sensitivity is governed by the
         /// platform filesystem. See docs/vfs-cache-flags.md.
@@ -626,6 +639,7 @@ fn main() -> anyhow::Result<()> {
             vfs_fast_fingerprint,
             async_read,
             vfs_refresh,
+            vfs_refresh_secs,
             vfs_case_insensitive,
             no_implicit_dir,
             vfs_block_norm_dupes,
@@ -805,6 +819,7 @@ fn main() -> anyhow::Result<()> {
                 vfs_fast_fingerprint,
                 async_read,
                 vfs_refresh,
+                vfs_refresh_secs,
                 vfs_case_insensitive,
                 no_implicit_dir,
                 vfs_block_norm_dupes,

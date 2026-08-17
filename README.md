@@ -251,6 +251,7 @@ Three-tier cache: **memory → disk → remote**. Block-level (8 MB) indexing. D
 | `--vfs-fast-fingerprint` | false | false | Fast change detection (size+mtime) |
 | `--vfs-read-wait` | 1s | 1s | Sequential read wait threshold (shadow — see [Durability](docs/durability.md#shadow-fields-rclone-compat-not-implemented)) |
 | `--vfs-write-wait` | 1s | 1s | Sequential write wait threshold (wired — coalesces writes on large files, issue #T2-N+1) |
+| `--vfs-refresh` | 5m (rclone) | 0 (off) | Periodic remote-state refresh interval (wired; 0 = disabled, issue #592) |
 
 **Adaptive chunk reader**: chunk size doubles on sequential reads, resets to 128 KB on seek. Up to 8 MB cap.
 

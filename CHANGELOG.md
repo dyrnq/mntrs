@@ -120,6 +120,34 @@ use the YYYY-MM-DD form.
   warning in the mount log for `--vfs-write-wait != 1` is
   gone.
 
+- **`--vfs-refresh` periodic mode is now wired (issue #592).**
+  The flag was previously accepted only as a boolean one-shot
+  toggle (issue #210, "skip attr_cache on every stat"). A new
+  `--vfs-refresh <secs>` form takes a duration and spawns a
+  background tokio task that clears `dir_cache` and
+  `attr_cache` every N seconds so the next readdir / stat
+  refetches from the remote.
+
+  Effect: with `--vfs-refresh 60`, the readdir / stat caches
+  are dropped on a fixed 60-second schedule. `inodes` is left
+  alone (the FUSE kernel holds `ino` references that would
+  dangle if we removed the entries); `disk_cache_index` is
+  left alone (individual file contents are still valid until
+  `--vfs-cache-max-age` expires them).
+
+  Default `0` (disabled) — deliberately more conservative
+  than rclone's `5m` default. mntrs's existing
+  `--dir-cache-ttl` and `--attr-cache-ttl` already provide
+  per-cache-class freshness on the lazy read path; the eager
+  periodic clear is opt-in for users who need tighter
+  visibility into out-of-band remote changes.
+
+  `MntrsFs::refresh_interval: Duration` (default
+  `Duration::ZERO`) was added; `spawn_refresh_worker` is
+  invoked from `common_init_wb` after the writeback and
+  concurrent_delete workers. No CLI change beyond the new
+  `--vfs-refresh <secs>` form.
+
 ### Migration
 
 - Add `--vfs-cache-mode=writes` (or `full`) to existing mount
