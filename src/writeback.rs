@@ -109,6 +109,12 @@ pub struct WritebackTask {
     /// or no-ops when the file doesn't exist (`Off` with
     /// `in_memory_payload`).
     pub delete_cache_on_success: bool,
+    /// Issue #595: in-memory buffer size (bytes) used as the
+    /// opendal `OpWriter::chunk` for this task's `op.write()` /
+    /// `op.writer_with()` call. 0 keeps opendal's default (8 MiB).
+    /// Forwarded from `MntrsFs::buffer_size` at spawn time so
+    /// every upload from this mount honors the same `--buffer-size`.
+    pub buffer_size: u64,
 }
 
 /// The shared sender used by FUSE threads to enqueue writeback work.
@@ -177,6 +183,12 @@ pub fn spawn(
     writeback_pending: Arc<dashmap::DashSet<String>>,
     delay: Duration,
 ) -> (Sender, tokio::task::JoinHandle<()>) {
+    // Note (issue #595): upload chunk size is **not** stored
+    // here. Every `WritebackTask` carries its own `buffer_size`
+    // (set at the call site that constructs the task from
+    // `MntrsFs::buffer_size`). The worker reads it from
+    // `task.buffer_size` and forwards it on re-enqueue so
+    // cycles stay consistent.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WritebackTask>();
     // Clone for the upload task's re-enqueue path
     // (issue #53). The original `tx` is also
@@ -379,6 +391,12 @@ pub fn spawn(
                 tokio::spawn(async move {
                     let _permit = permit;
                     let mut last_err = None;
+                    // Issue #595: pin the task's buffer_size into
+                    // this async block so the upload chain
+                    // (`.chunk(buffer_size)`) and the re-enqueue
+                    // `WritebackTask { .. buffer_size, .. }`
+                    // both see the same value.
+                    let buffer_size = task.buffer_size;
                     for attempt in 0..5 {
                         // Issue #46: route large files
                         // through opendal's multipart
@@ -412,12 +430,26 @@ pub fn spawn(
                             // concurrent(2) keeps global HTTP
                             // in-flight at ~UPLOAD_SEM*2 = 8
                             // even with all permits busy).
+                            //
+                            // Issue #595: when buffer_size > 0
+                            // and >= 5 MiB (S3 minimum part
+                            // size), use it as the part size —
+                            // larger parts = fewer requests =
+                            // lower overhead. When buffer_size
+                            // is 0 or < 5 MiB, fall back to the
+                            // 5 MiB floor (S3 will reject smaller
+                            // parts anyway).
+                            let chunk_size = if buffer_size >= 5 * 1024 * 1024 {
+                                buffer_size as usize
+                            } else {
+                                5 * 1024 * 1024
+                            };
                             let path = remote.clone();
                             let data_clone = data.clone();
                             tokio::time::timeout(Duration::from_secs(120), async move {
                                 let mut w = op_for_multipart
                                     .writer_with(&path)
-                                    .chunk(5 * 1024 * 1024)
+                                    .chunk(chunk_size)
                                     .concurrent(2)
                                     .await?;
                                 w.write(data_clone).await?;
@@ -425,7 +457,15 @@ pub fn spawn(
                             })
                             .await
                         } else {
-                            let write_fut = op.write(&remote, data.clone());
+                            // Issue #595: chain `.chunk(buffer_size)`
+                            // on the one-shot write path. When
+                            // buffer_size is 0, opendal uses its
+                            // default chunk (8 MiB); when non-zero
+                            // it overrides the in-memory buffer
+                            // accumulation threshold before flush.
+                            let write_fut = op
+                                .write_with(&remote, data.clone())
+                                .chunk(buffer_size as usize);
                             tokio::time::timeout(Duration::from_secs(120), write_fut)
                                 .await
                                 .map(|res| res.map(|_meta| ()))
@@ -662,6 +702,10 @@ pub fn spawn(
                         delete_cache_on_success,
                         retry_cycle: next_cycle,
                         per_task_delay: REENQUEUE_COOLDOWN,
+                        // Issue #595: forward the upload chunk
+                        // size — the retry's `.chunk(buffer_size)`
+                        // call must match the original task.
+                        buffer_size,
                     });
                     // PENDING_COUNT stays the same —
                     // the task is still in flight,
@@ -728,6 +772,9 @@ mod tests {
             delete_cache_on_success: false,
             retry_cycle: 0,
             per_task_delay: Duration::from_secs(5),
+            // Issue #595: pin the buffer_size field. 16 MiB
+            // matches rclone default.
+            buffer_size: 16 * 1024 * 1024,
         };
         assert_eq!(task.ino, 42);
         assert_eq!(task.remote_path, "/remote/path");
@@ -735,6 +782,7 @@ mod tests {
         assert!(!task.delete_cache_on_success);
         assert_eq!(task.retry_cycle, 0);
         assert_eq!(task.per_task_delay, Duration::from_secs(5));
+        assert_eq!(task.buffer_size, 16 * 1024 * 1024);
         // Cycle count advances on re-enqueue and the
         // re-enqueue path forwards REENQUEUE_COOLDOWN
         // explicitly (not the original per-task delay).
@@ -746,10 +794,12 @@ mod tests {
             delete_cache_on_success: false,
             retry_cycle: task.retry_cycle + 1,
             per_task_delay: REENQUEUE_COOLDOWN,
+            buffer_size: task.buffer_size,
         };
         assert_eq!(retried.retry_cycle, 1);
         assert_eq!(retried.per_task_delay, REENQUEUE_COOLDOWN);
         assert!(!retried.delete_cache_on_success);
+        assert_eq!(retried.buffer_size, task.buffer_size);
     }
 
     /// Issue #202: per_task_delay=Duration::MAX opts back

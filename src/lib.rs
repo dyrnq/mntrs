@@ -709,6 +709,14 @@ pub struct MntrsFs {
     /// is a no-op. Effective only in Full mode — Off / Writes /
     /// Minimal ignore it. See `maybe_create_prefetcher`.
     pub(crate) read_ahead: u64,
+    /// Issue #595: in-memory buffer size for upload chunks.
+    /// Wired into opendal `OpWriter::chunk` on every
+    /// `op.write_with()` / `op.writer_with()` call that flows
+    /// through writeback (and the 2 FUSE-thread xattr full-object
+    /// rewrite sites). 0 = use opendal default (8 MiB). Default
+    /// 16 MiB — matches rclone `--buffer-size`. Has no effect on
+    /// read / stat / list paths.
+    pub(crate) buffer_size: u64,
     /// Issue #T2-N+1: wall-clock duration the writeback worker
     /// waits after the most recent `write()` on a handle before
     /// uploading a *large* file (one above
@@ -2013,6 +2021,11 @@ impl MntrsFs {
                                         .delete_cache_on_success(),
                                     retry_cycle: 0, // fresh enqueue
                                     per_task_delay: self.write_back_delay, // #202: recovery never immediate
+                                    // Issue #595: forward the upload
+                                    // chunk size so recovery uploads
+                                    // use the same buffer as steady
+                                    // state.
+                                    buffer_size: self.buffer_size,
                                 }) {
                                     send_err_count += 1;
                                     tracing::warn!(
@@ -5887,6 +5900,8 @@ impl CoreFilesystem for MntrsFs {
                         delete_cache_on_success: self.cache_mode.delete_cache_on_success(),
                         retry_cycle: 0,
                         per_task_delay: delay,
+                        // Issue #595: forward upload chunk size.
+                        buffer_size: self.buffer_size,
                     };
                     if let Err(e) = tx.send(task) {
                         tracing::warn!(
@@ -6220,6 +6235,8 @@ impl CoreFilesystem for MntrsFs {
                             delete_cache_on_success: self.cache_mode.delete_cache_on_success(),
                             retry_cycle: 0,
                             per_task_delay: delay,
+                            // Issue #595: forward upload chunk size.
+                            buffer_size: self.buffer_size,
                         }) {
                             // Send failed — back out the
                             // pending insert so the next
@@ -6479,6 +6496,8 @@ impl CoreFilesystem for MntrsFs {
                             delete_cache_on_success: self.cache_mode.delete_cache_on_success(),
                             retry_cycle: 0,
                             per_task_delay: delay,
+                            // Issue #595: forward upload chunk size.
+                            buffer_size: self.buffer_size,
                         }) {
                             self.writeback_pending.remove(&**path);
                             tracing::warn!(
@@ -7811,6 +7830,7 @@ impl CoreFilesystem for MntrsFs {
             //    call sites.
             op.write_with(path.as_ref(), bytes)
                 .user_metadata(user_meta)
+                .chunk(self.buffer_size as usize)
                 .await
                 .map_err(|e| std::io::Error::other(format!("write_with failed: {e}")))?;
             Ok::<(), std::io::Error>(())
@@ -7892,6 +7912,7 @@ impl CoreFilesystem for MntrsFs {
                 .to_vec();
             op.write_with(path.as_ref(), bytes)
                 .user_metadata(new_map)
+                .chunk(self.buffer_size as usize)
                 .await
                 .map_err(|e| std::io::Error::other(format!("write_with failed: {e}")))?;
             Ok::<(), std::io::Error>(())
@@ -8923,6 +8944,11 @@ pub fn new_test_fs_with_mode(
         writeback_immediate_threshold: 0,
         cache_mode,
         read_ahead: 0,
+        // Issue #595: tests default to 0 (use opendal default
+        // chunk size). Production mounts thread the CLI value
+        // through `cmd::mount::mount_mntrs` — see
+        // `buffer_size: vfs_buffer_size`.
+        buffer_size: 0,
         write_wait: Duration::from_secs(1),
         prefetch_threshold: 16 * 1024 * 1024,
         prefetch_queue_mb: 64,

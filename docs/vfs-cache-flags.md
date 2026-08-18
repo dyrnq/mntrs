@@ -48,6 +48,7 @@ own bypass.
 | `--vfs-cache-mode` | `cache_mode: String` | WIRED (issue #583) |
 | `--vfs-cache-max-age` | `cache_max_age: Duration` | WIRED (issue #507) |
 | `--vfs-read-ahead` | `read_ahead: u64` | WIRED (issue #588) |
+| `--vfs-buffer-size` | `buffer_size: u64` | WIRED (issue #595) |
 | `--vfs-write-wait` | `write_wait: Duration` | WIRED (issue #T2-N+1) |
 | `--vfs-refresh` | `refresh_interval: Duration` | WIRED (issue #592) |
 | `--vfs-fast-fingerprint` | `fast_fingerprint: bool` | SHADOW |
@@ -146,6 +147,42 @@ so a value of 0 doesn't silently disable prefetching.
 (that's `--vfs-prefetch-threshold`). It is purely the queue
 cap; rclone users migrating scripts that rely on rclone's
 "hold N bytes ahead" semantics get the equivalent here.
+
+### `--vfs-buffer-size` (WIRED, issue #595)
+
+In-memory buffer size used as the opendal `OpWriter::chunk`
+for every writeback / upload call (`op.write_with()`,
+`op.writer_with()`). Defaults to 16 MiB, matching rclone.
+
+The flag controls how many bytes the upload path
+accumulates in memory before flushing to the backend. On
+S3 (and any other backend that supports multipart upload),
+the chunk size directly determines the multipart part
+size: larger chunks mean fewer parts, fewer requests, and
+lower upload overhead for big files. Smaller chunks reduce
+per-write latency at the cost of more requests.
+
+**Scope**: only writeback / upload paths are affected. The
+2 FUSE-thread xattr full-object rewrites (`setxattr`,
+`removexattr` via GET+PUT) and the worker's two upload
+branches (multipart for files >200 MiB, one-shot otherwise)
+both honor the value. Read / stat / list / mkdir / delete
+are unaffected — the read side has its own
+`--vfs-read-chunk-size`.
+
+**Service floors**: S3 enforces a minimum 5 MiB part size
+on multipart uploads (except the final part). When
+`--vfs-buffer-size` is below this floor, the multipart
+branch falls back to 5 MiB automatically; the one-shot
+branch uses the raw value and opendal will coalesce
+internally. Setting `--vfs-buffer-size=0` keeps opendal's
+default (8 MiB) — matches the pre-#595 behavior.
+
+**Coalescing**: independent of `--vfs-write-wait` (which
+controls the *timing* of uploads). Operators tuning both
+should pick `--vfs-buffer-size` first (it controls how
+much data lands per upload), then `--vfs-write-wait` (how
+long to wait for coalescing).
 
 ### `--vfs-write-wait` (WIRED, issue #T2-N+1)
 

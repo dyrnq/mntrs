@@ -131,6 +131,10 @@ impl Harness {
                 delete_cache_on_success: false,
                 retry_cycle: 0,
                 per_task_delay: delay,
+                // Issue #595: 16 MiB matches rclone's default.
+                // Tests don't assert on chunk; they only need
+                // the upload to succeed.
+                buffer_size: 16 * 1024 * 1024,
             })
             .unwrap();
     }
@@ -370,6 +374,7 @@ fn small_file_with_immediate_delay_uploads_fast() {
             delete_cache_on_success: false,
             retry_cycle: 0,
             per_task_delay: Duration::ZERO,
+            buffer_size: 16 * 1024 * 1024,
         })
         .unwrap();
 
@@ -410,6 +415,7 @@ fn large_file_with_default_delay_uses_5s() {
             delete_cache_on_success: false,
             retry_cycle: 0,
             per_task_delay: Duration::from_secs(5),
+            buffer_size: 16 * 1024 * 1024,
         })
         .unwrap();
 
@@ -459,6 +465,7 @@ fn in_memory_payload_uploads_inline_bytes_without_cache_file() {
             delete_cache_on_success: false,
             retry_cycle: 0,
             per_task_delay: Duration::ZERO,
+            buffer_size: 16 * 1024 * 1024,
         })
         .unwrap();
 
@@ -573,6 +580,7 @@ fn dirty_sidecar_lingers_with_no_surface_on_upload_failure() {
         delete_cache_on_success: false,
         retry_cycle: 0,
         per_task_delay: Duration::ZERO,
+        buffer_size: 16 * 1024 * 1024,
     })
     .unwrap();
 
@@ -677,6 +685,7 @@ fn minimal_mode_unlinks_cache_file_after_successful_upload() {
             delete_cache_on_success: true,
             retry_cycle: 0,
             per_task_delay: Duration::ZERO,
+            buffer_size: 16 * 1024 * 1024,
         })
         .unwrap();
 

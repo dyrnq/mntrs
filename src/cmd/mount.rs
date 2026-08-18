@@ -619,6 +619,7 @@ pub fn mount_internal(
         1024 * 1024, // writeback_immediate_threshold (1 MiB) — #202: small files skip the 5s delay queue
         "off",       // vfs_cache_mode
         0,           // vfs_read_ahead (off)
+        16 * 1024 * 1024, // vfs_buffer_size (16 MiB, matches rclone; issue #595)
         128 * 1024 * 1024, // vfs_read_chunk_size (128MiB)
         false,       // default_permissions
         None,        // uid
@@ -928,6 +929,12 @@ pub fn mount(
     writeback_immediate_threshold: u64,
     vfs_cache_mode: &str,
     vfs_read_ahead: u64,
+    // Issue #595: upload chunk size in bytes. Wired into
+    // opendal `OpWriter::chunk` on every writeback / upload
+    // call so the in-memory buffer accumulates this many
+    // bytes before flushing. 0 = use opendal default (8 MiB).
+    // Default 16 MiB matches rclone.
+    vfs_buffer_size: u64,
     vfs_read_chunk_size: u64,
     default_permissions: bool,
     uid: Option<u32>,
@@ -1331,6 +1338,11 @@ pub fn mount(
         writeback_immediate_threshold,
         cache_mode: crate::util::CacheMode::parse(vfs_cache_mode),
         read_ahead: vfs_read_ahead,
+        // Issue #595: passes through to writeback::spawn so the
+        // upload worker also honors the buffer size. The 2 FUSE-
+        // thread call sites at lib.rs (xattr full-object rewrites)
+        // read this field directly.
+        buffer_size: vfs_buffer_size,
         // Issue #T2-N+1: per-task writeback delay. The
         // worker holds the upload for `vfs_write_wait -
         // elapsed_since_last_write` after the most recent
