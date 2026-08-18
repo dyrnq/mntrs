@@ -120,6 +120,31 @@ use the YYYY-MM-DD form.
   warning in the mount log for `--vfs-write-wait != 1` is
   gone.
 
+  Fixed in the same change: the `write()` integration path was
+  enqueuing the writeback BEFORE updating the inodes entry's
+  size, so `per_task_writeback_delay` always saw `size == 0`
+  and always routed to the small-file `Duration::ZERO`
+  immediate-upload branch — making the entire
+  `--vfs-write-wait` flag dead code on `write()`. The inode
+  size update now runs before the enqueue. Pinned by
+  `tests/write_wait_microbench.rs`.
+
+- **`--vfs-write-wait` microbench (issue #T2-N+1).**
+  `tests/write_wait_microbench.rs` pins the three behavioral
+  claims of the coalescing window via
+  `mntrs::writeback::pending_count()` timing assertions:
+
+  - `write_wait=0` → upload drains inside 200 ms.
+  - `write_wait=2s` (capped at `--write-back`) → upload is
+    still pending at 200 ms, drains at ~1 s.
+  - Two back-to-back `write()+release()` cycles inside the
+    coalescing window produce ONE task, not two (the
+    `writeback_pending.insert()` skip-if-already-present check
+    holds).
+
+  Run with
+  `cargo test --release --test write_wait_microbench -- --test-threads=1`.
+
 - **`--vfs-refresh` periodic mode is now wired (issue #592).**
   The flag was previously accepted only as a boolean one-shot
   toggle (issue #210, "skip attr_cache on every stat"). A new

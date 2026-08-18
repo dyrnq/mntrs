@@ -5808,6 +5808,41 @@ impl CoreFilesystem for MntrsFs {
         // If op.write() fails (backend down), trigger
         // writeback immediately so the file doesn't
         // wait for flush/release.
+        //
+        // Issue #T2-N+1 (PR #591): update the inodes
+        // entry's size BEFORE the enqueue so that
+        // `per_task_writeback_delay` (which checks
+        // `v.size < writeback_immediate_threshold`)
+        // sees the post-write size and routes large
+        // files through the `--vfs-write-wait`
+        // coalescing window rather than the
+        // small-file `Duration::ZERO` branch.
+        // Pre-fix this update lived ~190 lines below
+        // (after the enqueue), so per_task_writeback_delay
+        // always saw size=0 and always returned
+        // Duration::ZERO — `--vfs-write-wait` was
+        // dead code on the write() integration path.
+        // The flush/release handlers weren't affected
+        // because their inode lookups happen against
+        // an already-stable inodes map.
+        {
+            let end = _offset + _data.len() as u64;
+            let write_mtime = std::time::SystemTime::now();
+            self.inodes
+                .entry(_ino)
+                .and_modify(|v| {
+                    if end > v.size {
+                        v.size = end;
+                    }
+                    v.mtime = Some(write_mtime);
+                })
+                .or_insert_with(|| InodeEntry {
+                    path: Arc::from(path.as_str()),
+                    kind: FileType::RegularFile,
+                    size: end,
+                    mtime: Some(write_mtime),
+                });
+        }
         {
             let cpath = crate::write_buffer_path(&self.cache_dir, &path);
             if cpath.exists() {
@@ -5971,48 +6006,6 @@ impl CoreFilesystem for MntrsFs {
         // math.
         self.evict_if_needed();
         let written = _data.len() as u32;
-
-        // Update inodes size — must CREATE the entry if it doesn't exist.
-        //
-        // The naive `entry(_ino).and_modify(...)` is a no-op when the
-        // ino has not been registered in the inodes map yet. This
-        // happens on the very first write to a brand-new file: the
-        // FUSE kernel can hand us a write() before the lookup()
-        // induced alloc_ino() ever runs (the kernel does a stat cache
-        // lookup in parallel, or the write is initiated by an
-        // application that already has a file descriptor from outside
-        // this mount). When that occurs, and_modify silently does
-        // nothing, the inodes map keeps a stale `None` (or a
-        // 0-sized entry from a prior iter), the kernel then sees
-        // size=0 from our getattr, asks for 0 bytes, and the user
-        // observes an empty file.
-        //
-        // The fix is the two-step `and_modify().or_insert_with()`:
-        //   - if an entry exists, only grow its size (never shrink
-        //     on a single write — setattr() owns truncation)
-        //   - if no entry exists, create one seeded with the new
-        //     write's end offset
-        //
-        // The initial mtime is set to `now()` (Bug C fix); the
-        // and_modify branch also updates it on every subsequent write
-        // so a read-after-write sees a fresh mtime even before the
-        // writeback upload has landed.
-        let end = _offset + _data.len() as u64;
-        let write_mtime = std::time::SystemTime::now();
-        self.inodes
-            .entry(_ino)
-            .and_modify(|v| {
-                if end > v.size {
-                    v.size = end;
-                }
-                v.mtime = Some(write_mtime);
-            })
-            .or_insert_with(|| InodeEntry {
-                path: Arc::from(path.as_str()),
-                kind: FileType::RegularFile,
-                size: end,
-                mtime: Some(write_mtime),
-            });
 
         // Invalidate mem_cache for this ino.
         //
@@ -9126,6 +9119,44 @@ impl MntrsFs {
     pub fn __xattr_oversize_warn_reset_for_test(&self) {
         self.xattr_oversize_warn_count
             .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Issue #T2-N+1 (`--vfs-write-wait`) microbench: override
+    /// the default 1 s coalescing window for tests that need
+    /// `Duration::ZERO` (immediate-upload control) or a long
+    /// window (deferred-upload + burst-coalesce). Mirrors the
+    /// `__metadata_set_for_test` / `__max_xattr_size_set_for_test`
+    /// pattern above. Field is `pub(crate)` so direct mutation
+    /// from `tests/` is impossible — this shim is the only
+    /// outside-crate entry point.
+    #[doc(hidden)]
+    pub fn __write_wait_set_for_test(&mut self, d: std::time::Duration) {
+        self.write_wait = d;
+    }
+
+    /// Issue #T2-N+1 microbench: override the immediate-upload
+    /// threshold (default 1 MiB) so the test payload can stay
+    /// small (8 KiB) while still landing in the
+    /// `--vfs-write-wait` large-file branch. Mirrors the
+    /// `__write_wait_set_for_test` pattern.
+    #[doc(hidden)]
+    pub fn __writeback_immediate_threshold_set_for_test(&mut self, n: u64) {
+        self.writeback_immediate_threshold = n;
+    }
+
+    /// Issue #T2-N+1 microbench: return the number of paths
+    /// currently in the per-fs `writeback_pending` DashSet.
+    /// The set is the dedup mechanism — `insert()` returns
+    /// `false` when the path is already present, so a second
+    /// `write()`+`release()` cycle inside the coalescing
+    /// window should NOT add a new entry. Use this in the
+    /// burst test to assert the set membership stayed at 1
+    /// after both cycles (rather than relying on
+    /// `pending_count()`, which only reflects in-flight tasks
+    /// and is hidden by the single-worker's serial processing).
+    #[doc(hidden)]
+    pub fn __writeback_pending_len_for_test(&self) -> usize {
+        self.writeback_pending.len()
     }
 }
 
