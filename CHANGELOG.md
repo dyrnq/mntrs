@@ -173,6 +173,18 @@ use the YYYY-MM-DD form.
   concurrent_delete workers. No CLI change beyond the new
   `--vfs-refresh <secs>` form.
 
+- **`--vfs-buffer-size <bytes>` wired into opendal upload
+  chunk (issue #595).** Default `16777216` (16 MiB),
+  matching rclone. The value is forwarded to opendal's
+  `OpWriter::chunk` on every writeback / upload path
+  (multipart for files >200 MiB, one-shot otherwise) plus
+  the 2 FUSE-thread xattr full-object rewrites at
+  `setxattr` / `removexattr`. 0 keeps opendal's default
+  (8 MiB) — pre-#595 behavior. Read / stat / list /
+  mkdir / delete are unaffected. See
+  `docs/vfs-cache-flags.md` for service-floor caveats
+  (S3 multipart enforces a 5 MiB minimum part size).
+
 ### Migration
 
 - Add `--vfs-cache-mode=writes` (or `full`) to existing mount

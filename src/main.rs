@@ -162,6 +162,14 @@ enum Commands {
         /// value. See docs/vfs-cache-flags.md (issue #588).
         #[arg(long, default_value = "0")]
         vfs_read_ahead: u64,
+        /// Issue #595: in-memory buffer size for upload chunks
+        /// (default: 16 MiB, matches rclone). Controls the
+        /// opendal `OpWriter::chunk` for `op.write_with()` /
+        /// `op.writer_with()` calls on the writeback path —
+        /// 0 keeps opendal's default. Has no effect on read,
+        /// stat, list, or non-upload op paths.
+        #[arg(long, default_value = "16777216")]
+        vfs_buffer_size: u64,
         /// Read chunk size in bytes (default: 128MiB, matches rclone)
         #[arg(long, default_value = "134217728")]
         vfs_read_chunk_size: u64,
@@ -591,6 +599,7 @@ fn main() -> anyhow::Result<()> {
             writeback_immediate_threshold,
             vfs_cache_mode,
             vfs_read_ahead,
+            vfs_buffer_size,
             vfs_read_chunk_size,
             default_permissions,
             uid,
@@ -771,6 +780,7 @@ fn main() -> anyhow::Result<()> {
                 writeback_immediate_threshold,
                 &vfs_cache_mode,
                 vfs_read_ahead,
+                vfs_buffer_size,
                 vfs_read_chunk_size,
                 default_permissions,
                 uid,
