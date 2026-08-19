@@ -1960,126 +1960,32 @@ impl MntrsFs {
         // for a mount-time summary. Per-task debug logs above
         // (existing) give per-sidecar detail; this single info
         // line gives the operator the headline number.
-        let mut recovered_count: u64 = 0;
-        let mut orphan_count: u64 = 0;
-        let mut send_err_count: u64 = 0;
-        let mut read_err_count: u64 = 0;
-        let mut no_sender_count: u64 = 0;
-        if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.extension().is_some_and(|ext| ext == "dirty") {
-                    let write_buffer_path = p.with_extension("");
-                    if !write_buffer_path.exists() {
-                        // Orphan sidecar — cache file missing, safe to remove
-                        tracing::debug!(sidecar=?p, "removing orphan dirty sidecar");
-                        let _ = std::fs::remove_file(&p);
-                        orphan_count += 1;
-                        continue;
-                    }
-                    match std::fs::read_to_string(&p) {
-                        Ok(remote) => {
-                            let remote = remote.trim().to_string();
-                            if let Some(tx) = self.writeback_sender.get() {
-                                tracing::info!(path=%remote, ?write_buffer_path, "recovering dirty writeback");
-                                // Bug 18: use the named sentinel
-                                // INO_RECOVERY_SENTINEL (= 0) instead of
-                                // the bare `0` literal. The writeback
-                                // completion handler explicitly checks
-                                // this value and skips its inodes mtime
-                                // update — without that branch, an
-                                // `entry(0).and_modify(...)` is a silent
-                                // no-op (ino 0 is reserved; see
-                                // NEXT_INO doc), but the silent no-op
-                                // obscured the intent. The sentinel
-                                // makes the contract grep-able + the
-                                // next stat() from user space refreshes
-                                // mtime from the remote anyway.
-                                // Bug 22: send().ok() previously
-                                // swallowed an Err silently. send
-                                // on an UnboundedSender returns
-                                // Err only when the receiver is
-                                // dropped — which here means the
-                                // writeback worker thread died.
-                                // The .dirty sidecar is still on
-                                // disk, so the next mount's
-                                // recovery scan will try again,
-                                // but an operator watching this
-                                // mount needs to know the worker
-                                // is gone NOW. Log at warn.
-                                if let Err(e) = tx.send(WritebackTask {
-                                    ino: INO_RECOVERY_SENTINEL,
-                                    remote_path: remote,
-                                    write_buffer_path: write_buffer_path.clone(),
-                                    in_memory_payload: None,
-                                    // Issue #T2-N: Minimal-mode mounts
-                                    // also unlink their cache files after
-                                    // a recovery upload completes —
-                                    // matches the steady-state contract.
-                                    delete_cache_on_success: self
-                                        .cache_mode
-                                        .delete_cache_on_success(),
-                                    retry_cycle: 0, // fresh enqueue
-                                    per_task_delay: self.write_back_delay, // #202: recovery never immediate
-                                    // Issue #595: forward the upload
-                                    // chunk size so recovery uploads
-                                    // use the same buffer as steady
-                                    // state.
-                                    buffer_size: self.buffer_size,
-                                }) {
-                                    send_err_count += 1;
-                                    tracing::warn!(
-                                        write_buffer_path=?write_buffer_path,
-                                        error=%e,
-                                        "writeback recovery send failed (worker dropped?); \
-                                         .dirty sidecar kept for next-mount retry"
-                                    );
-                                } else {
-                                    recovered_count += 1;
-                                }
-                            } else {
-                                // writeback_sender.get() returned None:
-                                // spawn() was not called yet (race) or
-                                // it was called twice (Bug 22 already
-                                // covers the dropped-receiver case
-                                // above). This branch indicates the
-                                // worker is gone; treat as send_err.
-                                no_sender_count += 1;
-                                tracing::warn!(
-                                    write_buffer_path=?write_buffer_path,
-                                    "writeback recovery: writeback_sender.get() = None; \
-                                     .dirty sidecar kept for next-mount retry"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            // Couldn't read the sidecar contents.
-                            // The cache file exists but the sidecar
-                            // is unreadable — leave it in place for
-                            // the operator to inspect.
-                            read_err_count += 1;
-                            tracing::warn!(
-                                sidecar=?p,
-                                error=%e,
-                                "writeback recovery: failed to read dirty sidecar contents"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        // Issue #268.4 O25: mount-time recovery summary.
-        // Single info line gives operators the headline counts;
-        // per-sidecar detail is at debug level above.
-        let total =
-            recovered_count + orphan_count + send_err_count + read_err_count + no_sender_count;
+        //
+        // The scan logic itself lives in
+        // `writeback::recover_dirty_sidecars` so integration
+        // tests can exercise it directly without spinning up
+        // a full MntrsFs (and so the per-bucket counters can
+        // be asserted in isolation, not just via log scraping).
+        let stats = crate::writeback::recover_dirty_sidecars(
+            &self.cache_dir,
+            self.writeback_sender.get(),
+            // Issue #T2-N: Minimal-mode mounts also unlink their
+            // cache files after a recovery upload completes —
+            // matches the steady-state contract.
+            self.cache_mode.delete_cache_on_success(),
+            self.write_back_delay, // #202: recovery never immediate
+            // Issue #595: forward the upload chunk size so recovery
+            // uploads use the same buffer as steady state.
+            self.buffer_size,
+        );
+        let total = stats.total();
         if total > 0 {
             tracing::info!(
-                recovered = recovered_count,
-                orphan_sidecars_removed = orphan_count,
-                send_failed = send_err_count,
-                no_sender = no_sender_count,
-                read_failed = read_err_count,
+                recovered = stats.recovered,
+                orphan_sidecars_removed = stats.orphan_sidecars_removed,
+                send_failed = stats.send_failed,
+                no_sender = stats.no_sender,
+                read_failed = stats.read_failed,
                 cache_dir = %self.cache_dir.display(),
                 "writeback: recovery scan complete"
             );
@@ -2091,7 +1997,7 @@ impl MntrsFs {
             // warnings above (debug-by-default in production). The
             // fix here + the `mntrs list-dirty` subcommand together
             // close the silent-failure loop end-to-end.
-            let stuck = send_err_count + no_sender_count + read_err_count;
+            let stuck = stats.stuck();
             if stuck > 0 {
                 tracing::warn!(
                     stuck_sidecars = stuck,

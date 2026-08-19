@@ -745,3 +745,351 @@ fn minimal_mode_unlinks_cache_file_after_successful_upload() {
         ".dirty sidecar must be cleaned (existing worker contract)"
     );
 }
+
+// ============================================================================
+// Issue #T2-N+2 (audit C): writeback::recover_dirty_sidecars integration tests.
+//
+// These exercise the mount-time recovery scan in isolation — the
+// scan is now a `pub fn` in `writeback.rs` that `MntrsFs::common_init_wb`
+// delegates to. We pre-stage .dirty sidecars in a scratch cache_dir,
+// call `recover_dirty_sidecars` with a live writeback Sender, and
+// assert both the per-bucket `RecoveryStats` counts and the end-to-end
+// state (.dirty removed / cache file present / backend received bytes).
+//
+// Recovery matters because:
+//
+//   - CSI pod reschedule = "soft crash" → .dirty sidecar on disk →
+//     next mount's recovery scan is the only thing that gets the
+//     bytes to the backend.
+//   - A regression here = permanent silent data loss on the next
+//     pod restart. Bug #268.4 (silent recovery drop) is the
+//     canonical example this guards against.
+//
+// Patterns reused from the worker tests: `scratch_dir` for
+// per-test isolation, `Harness` for a live `writeback::spawn`
+// Sender, `wait_drain` for the .dirty lifecycle.
+// ============================================================================
+
+/// Pre-stage a `cache_dir` with a cache file + .dirty sidecar
+/// holding `remote_path`. Mirrors what `flush()` / `release()`
+/// would have left behind right before a crash.
+fn stage_recovery_fixture(
+    cache_dir: &Path,
+    name: &str,
+    content: &[u8],
+    remote_path: &str,
+) -> PathBuf {
+    let write_buffer_path = cache_dir.join(name);
+    std::fs::write(&write_buffer_path, content).unwrap();
+    let dirty = write_buffer_path.with_extension("dirty");
+    std::fs::write(&dirty, remote_path).unwrap();
+    write_buffer_path
+}
+
+#[test]
+fn recovery_scan_uploads_preexisting_dirty_and_clears_sidecar() {
+    // The canonical crash-recovery happy path: a previous mount
+    // crashed after a write+close that produced a .dirty sidecar
+    // but before the upload landed. The next mount's recovery scan
+    // must (1) enqueue a fresh WritebackTask with INO_RECOVERY_SENTINEL,
+    // (2) the worker uploads the bytes, (3) the .dirty sidecar is
+    // removed, (4) no inodes entry is created (the sentinel skips
+    // the mtime update).
+    //
+    // NOTE on naming: production cache files have NO extension
+    // (`cache_path_block(cache_dir, path, 0)` joins the 20-char
+    // hex hash directly — see `src/util.rs:571`). The .dirty
+    // sidecar is `write_buffer_path.with_extension("dirty")`,
+    // which only produces a correct reverse-mapping
+    // (`p.with_extension("")` → original) when the original had
+    // no extension. We use extension-less names here so the
+    // reverse-mapping works — otherwise the recovery scan
+    // misidentifies them as orphans.
+    let h = Harness::new("recovery-happy");
+
+    let name = "crashed";
+    let remote = "/remote/crashed";
+    let payload = b"bytes the previous mount never managed to upload";
+    let write_buffer_path = stage_recovery_fixture(&h.cache_dir, name, payload, remote);
+
+    let dirty = write_buffer_path.with_extension("dirty");
+    assert!(dirty.exists(), "precondition: .dirty sidecar present");
+
+    // Drive the scan directly. Sender is `Some` (the harness has
+    // a live worker). delete_cache_on_success = false (Writes /
+    // Full mode — the cache file should survive as a read cache).
+    let stats = mntrs::writeback::recover_dirty_sidecars(
+        &h.cache_dir,
+        Some(&h.sender),
+        false,
+        h.spawn_delay,
+        // Issue #595: forward the buffer_size the recovery scan
+        // will thread through to the worker (16 MiB matches the
+        // rclone default; tests don't assert on chunk size, only
+        // that the upload succeeds).
+        16 * 1024 * 1024,
+    );
+
+    assert_eq!(stats.recovered, 1, "exactly one .dirty recovered");
+    assert_eq!(stats.orphan_sidecars_removed, 0);
+    assert_eq!(stats.send_failed, 0);
+    assert_eq!(stats.no_sender, 0);
+    assert_eq!(stats.read_failed, 0);
+    assert_eq!(stats.total(), 1);
+
+    // Wait for the worker to actually upload + clean the .dirty.
+    assert!(
+        h.wait_drain(&dirty, 5_000),
+        ".dirty sidecar removed within 5s after recovery enqueue"
+    );
+
+    // Backend has the bytes.
+    h.rt.block_on(async {
+        let buf = h.op.read(remote).await.unwrap();
+        assert_eq!(buf.to_vec(), payload);
+    });
+
+    // Writes-mode contract: cache file survives as a read cache.
+    assert!(
+        write_buffer_path.exists(),
+        "Writes mode must keep the cache file as a read cache after recovery upload"
+    );
+
+    // No inodes entry was created (INO_RECOVERY_SENTINEL skips
+    // mtime update — see writeback.rs completion handler).
+    assert!(
+        h.inodes.is_empty(),
+        "recovery upload must not create an inodes entry (INO_RECOVERY_SENTINEL skips the update)"
+    );
+}
+
+#[test]
+fn recovery_scan_removes_orphan_sidecar_when_cache_file_missing() {
+    // The cache file vanished (LRU eviction between flush and the
+    // upload firing, or operator rm'd it by mistake). The .dirty
+    // sidecar is now an orphan — there is nothing to upload, so the
+    // scan must remove the sidecar and bump `orphan_sidecars_removed`
+    // without panicking. This is the "tidy up" path.
+    let h = Harness::new("recovery-orphan");
+
+    let name = "evicted";
+    let remote = "/remote/evicted";
+    let write_buffer_path =
+        stage_recovery_fixture(&h.cache_dir, name, b"data destined for eviction", remote);
+
+    // Mimic LRU eviction removing the cache file BEFORE the recovery
+    // scan runs. .dirty sidecar stays.
+    std::fs::remove_file(&write_buffer_path).unwrap();
+    let dirty = write_buffer_path.with_extension("dirty");
+    assert!(dirty.exists(), "precondition: orphan .dirty present");
+    assert!(
+        !write_buffer_path.exists(),
+        "precondition: cache file is gone"
+    );
+
+    let stats = mntrs::writeback::recover_dirty_sidecars(
+        &h.cache_dir,
+        Some(&h.sender),
+        false,
+        h.spawn_delay,
+        16 * 1024 * 1024,
+    );
+
+    assert_eq!(
+        stats.orphan_sidecars_removed, 1,
+        "exactly one orphan .dirty removed"
+    );
+    assert_eq!(stats.recovered, 0);
+    assert_eq!(stats.total(), 1);
+
+    assert!(!dirty.exists(), "orphan .dirty removed from disk");
+
+    // Backend must NOT have the file (orphan branch never enqueues).
+    h.rt.block_on(async {
+        let res = h.op.read(remote).await;
+        assert!(res.is_err(), "backend must not have the file");
+    });
+}
+
+#[test]
+fn recovery_scan_leaves_unreadable_sidecar_for_operator() {
+    // The .dirty sidecar's contents are corrupted (non-UTF-8 bytes,
+    // or a partial write from the previous crash that didn't get a
+    // flush before the kernel killed us). The cache file is present
+    // and intact, but we can't decode the remote path. The scan must
+    // NOT remove the sidecar (we'd lose the ability to recover
+    // manually), NOT panic, and NOT enqueue (we don't know where to
+    // upload to). The operator discovers this via the
+    // `mntrs list-dirty` command (issue #395 fix #2 surface).
+    let h = Harness::new("recovery-unreadable");
+
+    let name = "torn";
+    let write_buffer_path = h.cache_dir.join(name);
+    std::fs::write(&write_buffer_path, b"intact cache bytes").unwrap();
+    let dirty = write_buffer_path.with_extension("dirty");
+    // Invalid UTF-8: 0xFF 0xFE 0xFD — `read_to_string` returns Err.
+    std::fs::write(&dirty, [0xFFu8, 0xFE, 0xFD]).unwrap();
+    assert!(dirty.exists(), "precondition: torn .dirty present");
+    assert!(
+        write_buffer_path.exists(),
+        "precondition: cache file present"
+    );
+
+    let stats = mntrs::writeback::recover_dirty_sidecars(
+        &h.cache_dir,
+        Some(&h.sender),
+        false,
+        h.spawn_delay,
+        16 * 1024 * 1024,
+    );
+
+    assert_eq!(stats.read_failed, 1, "exactly one .dirty failed to decode");
+    assert_eq!(stats.recovered, 0);
+    assert_eq!(stats.orphan_sidecars_removed, 0);
+    assert_eq!(stats.total(), 1);
+
+    assert!(
+        dirty.exists(),
+        "unreadable .dirty MUST stay on disk for operator inspection \
+         (issue #395 fix #2 surface)"
+    );
+    assert!(
+        write_buffer_path.exists(),
+        "cache file stays too — neither enqueued nor cleaned"
+    );
+}
+
+#[test]
+fn recovery_scan_recovers_multiple_files_in_one_mount() {
+    // After a crash, multiple files may be in-flight. The scan
+    // walks the whole cache_dir, enqueues each independently, and
+    // returns accurate per-bucket counts. Worker processes them
+    // concurrently (UPLOAD_SEM=4) — order may differ, but all
+    // must land.
+    let h = Harness::new("recovery-multi");
+
+    let fixtures: [(&str, &[u8], &str); 3] = [
+        ("alpha", b"first", "/remote/alpha"),
+        ("beta", b"second", "/remote/beta"),
+        ("gamma", b"third", "/remote/gamma"),
+    ];
+    for (name, content, remote) in &fixtures {
+        stage_recovery_fixture(&h.cache_dir, name, content, remote);
+    }
+
+    let stats = mntrs::writeback::recover_dirty_sidecars(
+        &h.cache_dir,
+        Some(&h.sender),
+        false,
+        // #202: recovery should use the configured write_back_delay,
+        // not ZERO — even small recovery tasks must wait the
+        // configured batch period. Override the harness's 100ms to
+        // a small but non-zero value to confirm the field is honored
+        // (the existing happy_path_uploads_and_removes_dirty_sidecar
+        // test asserts the ZERO path; this one pins the recovery path).
+        Duration::from_millis(50),
+        16 * 1024 * 1024,
+    );
+
+    assert_eq!(
+        stats.recovered,
+        fixtures.len() as u64,
+        "all 3 .dirty sidecars enqueued"
+    );
+    assert_eq!(stats.total(), fixtures.len() as u64);
+    assert_eq!(stats.orphan_sidecars_removed, 0);
+    assert_eq!(stats.send_failed, 0);
+
+    // Poll for all 3 .dirty sidecars to disappear.
+    for (name, _, _) in &fixtures {
+        let dirty = h.cache_dir.join(name).with_extension("dirty");
+        assert!(
+            h.wait_drain(&dirty, 5_000),
+            "{name}: .dirty removed within 5s after recovery enqueue"
+        );
+    }
+
+    // All 3 files landed on the backend.
+    h.rt.block_on(async {
+        for (name, content, remote) in &fixtures {
+            let buf = h.op.read(remote).await.unwrap();
+            assert_eq!(
+                buf.to_vec(),
+                *content,
+                "{name} contents match what was in the .dirty sidecar"
+            );
+        }
+    });
+}
+
+#[test]
+fn recovery_scan_honors_minimal_mode_unlink_after_upload() {
+    // Issue #T2-N: CacheMode::Minimal unlinks the cache file after
+    // a successful upload. The recovery path must honor the same
+    // contract — a recovery upload on a Minimal mount must
+    // upload the bytes AND remove the on-disk cache file. Without
+    // this, a Minimal mount would accumulate cache files on every
+    // crash restart, silently contradicting the
+    // "no on-disk footprint between writes" promise.
+    let h = Harness::new("recovery-minimal");
+
+    let name = "minimal";
+    let remote = "/remote/minimal";
+    let payload = b"minimal recovery payload";
+    let write_buffer_path = stage_recovery_fixture(&h.cache_dir, name, payload, remote);
+
+    let dirty = write_buffer_path.with_extension("dirty");
+    assert!(
+        write_buffer_path.exists(),
+        "precondition: cache file present"
+    );
+    assert!(dirty.exists(), "precondition: .dirty sidecar present");
+
+    // delete_cache_on_success = true mirrors
+    // `cache_mode.delete_cache_on_success()` for Minimal mode.
+    let stats = mntrs::writeback::recover_dirty_sidecars(
+        &h.cache_dir,
+        Some(&h.sender),
+        true, // Minimal-mode: unlink cache file after upload
+        h.spawn_delay,
+        16 * 1024 * 1024,
+    );
+
+    assert_eq!(stats.recovered, 1);
+
+    // Wait for .dirty to disappear (worker completion removes it
+    // regardless of mode).
+    assert!(h.wait_drain(&dirty, 5_000), ".dirty removed within 5s");
+
+    // Now poll for the cache file removal — the worker's
+    // `delete_cache_on_success && in_memory_payload.is_none()`
+    // branch fires after the upload completes. Backend must have
+    // the bytes; cache file must be gone.
+    let started = std::time::Instant::now();
+    let mut backend_received = false;
+    let mut cache_unlinked = false;
+    while started.elapsed() < Duration::from_secs(5) {
+        if !cache_unlinked && !write_buffer_path.exists() {
+            cache_unlinked = true;
+        }
+        if !cache_unlinked {
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        let got = h.rt.block_on(async { h.op.read(remote).await.ok() });
+        if let Some(buf) = got
+            && buf.to_vec() == payload.to_vec()
+        {
+            backend_received = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(
+        cache_unlinked,
+        "Minimal mode must unlink the cache file after a RECOVERY upload \
+         (same contract as steady-state; pre-T2-N Minimal would have kept it)"
+    );
+    assert!(backend_received, "backend received the recovery bytes");
+}
