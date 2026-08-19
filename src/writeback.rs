@@ -155,6 +155,178 @@ pub const MAX_REENQUEUE_CYCLES: u32 = 10;
 /// window.
 pub const REENQUEUE_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// Per-bucket counts returned by [`recover_dirty_sidecars`]. The
+/// `MntrsFs` mount init logs a single info/warn summary from
+/// these; integration tests assert the exact per-bucket counts
+/// to pin the recovery semantics.
+///
+/// `recovered` = .dirty sidecars successfully enqueued.
+/// `orphan_sidecars_removed` = .dirty sidecars whose cache
+///   file was missing — they had nothing to upload, so the
+///   sidecar was cleaned up.
+/// `send_failed` = sidecars whose `tx.send(...)` returned
+///   `Err` — the worker is gone, the sidecar stays.
+/// `no_sender` = sidecars seen but no sender was passed in
+///   (test injects `None`, or production race where the
+///   spawn hadn't completed yet — covered in `common_init_wb`
+///   by ordering spawn first).
+/// `read_failed` = sidecars whose contents couldn't be
+///   decoded as a remote path — left in place for the
+///   operator to inspect.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryStats {
+    pub recovered: u64,
+    pub orphan_sidecars_removed: u64,
+    pub send_failed: u64,
+    pub no_sender: u64,
+    pub read_failed: u64,
+}
+
+impl RecoveryStats {
+    /// Sum across all buckets — the headline count the mount
+    /// summary line logs (`"recovered=N ..."`). A non-zero
+    /// total is what triggers the info-level "recovery scan
+    /// complete" emission; zero stays at debug.
+    pub fn total(&self) -> u64 {
+        self.recovered
+            + self.orphan_sidecars_removed
+            + self.send_failed
+            + self.no_sender
+            + self.read_failed
+    }
+
+    /// Number of sidecars that the scan could not recover
+    /// automatically — i.e. require manual intervention
+    /// (`mntrs list-dirty` to inspect, then `rm` / fix the
+    /// backend / restart). Used by `common_init_wb` to
+    /// decide whether to emit the warn-level
+    /// "stuck .dirty sidecar(s)" line (issue #395 fix #2).
+    pub fn stuck(&self) -> u64 {
+        self.send_failed + self.no_sender + self.read_failed
+    }
+}
+
+/// Recover dirty writeback state from a previous crash.
+///
+/// Walks `cache_dir` for `*.dirty` sidecars, parses each to
+/// its remote path, and enqueues a fresh
+/// `WritebackTask { ino: INO_RECOVERY_SENTINEL, ... }` on the
+/// provided sender. Orphan sidecars (no corresponding cache
+/// file) are removed. Unreadable sidecars are left in place
+/// for the operator to inspect.
+///
+/// Returns the per-bucket counts via [`RecoveryStats`]; the
+/// caller decides what (if anything) to log. `tx == None`
+/// records `no_sender` for each sidecar seen and skips the
+/// enqueue (used by tests that drive the scan without a live
+/// worker, and by `common_init_wb` if a race makes the
+/// sender unavailable).
+///
+/// Issue #595: `buffer_size` is forwarded so recovery
+/// uploads use the same opendal chunk size as steady state.
+/// Issue #T2-N: `delete_cache_on_success` is honored so
+/// `CacheMode::Minimal` mounts unlink the cache file after
+/// the recovery upload completes — matching the steady-state
+/// contract.
+pub fn recover_dirty_sidecars(
+    cache_dir: &std::path::Path,
+    tx: Option<&Sender>,
+    delete_cache_on_success: bool,
+    write_back_delay: Duration,
+    buffer_size: u64,
+) -> RecoveryStats {
+    let mut stats = RecoveryStats::default();
+    let entries = match std::fs::read_dir(cache_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(
+                cache_dir = %cache_dir.display(),
+                error = %e,
+                "writeback recovery: read_dir failed"
+            );
+            return stats;
+        }
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension().is_none_or(|ext| ext != "dirty") {
+            continue;
+        }
+        let write_buffer_path = p.with_extension("");
+        if !write_buffer_path.exists() {
+            // Orphan sidecar — cache file missing, safe to remove.
+            tracing::debug!(sidecar = ?p, "removing orphan dirty sidecar");
+            let _ = std::fs::remove_file(&p);
+            stats.orphan_sidecars_removed += 1;
+            continue;
+        }
+        match std::fs::read_to_string(&p) {
+            Ok(remote) => {
+                let remote = remote.trim().to_string();
+                let Some(tx) = tx else {
+                    stats.no_sender += 1;
+                    tracing::warn!(
+                        write_buffer_path = ?write_buffer_path,
+                        "writeback recovery: no sender available; \
+                         .dirty sidecar kept for next-mount retry"
+                    );
+                    continue;
+                };
+                tracing::info!(
+                    path = %remote,
+                    ?write_buffer_path,
+                    "recovering dirty writeback"
+                );
+                // Bug 18: use the named sentinel INO_RECOVERY_SENTINEL
+                // (= 0) instead of the bare `0` literal. The
+                // writeback completion handler explicitly checks this
+                // value and skips its inodes mtime update.
+                //
+                // Bug 22: send().ok() previously swallowed an Err
+                // silently. send on an UnboundedSender returns Err
+                // only when the receiver is dropped — which here
+                // means the writeback worker thread died. The .dirty
+                // sidecar is still on disk, so the next mount's
+                // recovery scan will try again, but an operator
+                // watching THIS mount needs to know the worker is
+                // gone NOW. Log at warn.
+                if let Err(e) = tx.send(WritebackTask {
+                    ino: crate::INO_RECOVERY_SENTINEL,
+                    remote_path: remote,
+                    write_buffer_path: write_buffer_path.clone(),
+                    in_memory_payload: None,
+                    delete_cache_on_success,
+                    retry_cycle: 0,                   // fresh enqueue
+                    per_task_delay: write_back_delay, // #202: recovery never immediate
+                    buffer_size,
+                }) {
+                    stats.send_failed += 1;
+                    tracing::warn!(
+                        write_buffer_path = ?write_buffer_path,
+                        error = %e,
+                        "writeback recovery send failed (worker dropped?); \
+                         .dirty sidecar kept for next-mount retry"
+                    );
+                } else {
+                    stats.recovered += 1;
+                }
+            }
+            Err(e) => {
+                // Couldn't read the sidecar contents. The cache
+                // file exists but the sidecar is unreadable — leave
+                // it in place for the operator to inspect.
+                stats.read_failed += 1;
+                tracing::warn!(
+                    sidecar = ?p,
+                    error = %e,
+                    "writeback recovery: failed to read dirty sidecar contents"
+                );
+            }
+        }
+    }
+    stats
+}
+
 /// Spawn the writeback worker inside the global tokio runtime.
 ///
 /// Returns a `Sender` that is `Clone + Send`, usable from any FUSE thread.
