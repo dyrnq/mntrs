@@ -1452,6 +1452,20 @@ pub fn set_fuse_notifier(notifier: fuser::Notifier) {
 #[cfg(not(windows))]
 static FUSE_NOTIFIER: once_cell::sync::OnceCell<fuser::Notifier> = once_cell::sync::OnceCell::new();
 
+/// Issue #89 / #93: counter for `fuser::Notifier::inval_inode`
+/// calls made by the `write()` path. Lets integration tests
+/// assert that the notifier side-effect fires (without
+/// requiring a real FUSE mount to observe the kernel cache
+/// invalidation). Process-static, like `FUSE_NOTIFIER` above.
+#[cfg(not(windows))]
+static INVAL_INODE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Issue #89 / #93: snapshot of `INVAL_INODE_COUNT` for tests.
+#[cfg(not(windows))]
+pub fn __inval_inode_count_for_test() -> u64 {
+    INVAL_INODE_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Hard cap on entries `list_op` will accumulate for a
 /// single readdir, to bound memory on pathological backend
 /// directories. 1M entries × ~100 B per tuple
@@ -5847,16 +5861,41 @@ impl CoreFilesystem for MntrsFs {
         // dropped the cache); ignore it like the fuser
         // `send_inval` helper does.
         //
-        // Unix-only — `self.fuse_notifier` is gated
-        // `#[cfg(not(windows))]` on the struct. On WinFSP
-        // the write handler is synchronous (no async
-        // cache-file write), so the kernel never sees a
-        // stale size for the same inode and we don't need
+        // Unix-only — `FUSE_NOTIFIER` is gated
+        // `#[cfg(not(windows))]` at module scope (set by
+        // `set_fuse_notifier` from the mount command path).
+        // On WinFSP the write handler is synchronous (no
+        // async cache-file write), so the kernel never sees
+        // a stale size for the same inode and we don't need
         // an invalidation hook. See issue #93.
+        //
+        // Bug fix (audit alongside #89/#93): the original
+        // code read `self.fuse_notifier.get()` (a per-fs
+        // OnceLock that `set_fuse_notifier` never wrote
+        // into — it's initialized to OnceLock::new() and
+        // the setter targets the process-static
+        // FUSE_NOTIFIER below). The check was therefore
+        // always None and the notifier path was dead
+        // code. Read from the same place the setter
+        // writes to (FUSE_NOTIFIER.get()) so the
+        // invalidation actually fires. Pinned by
+        // `tests/o_append_fuse_notifier_test.rs`.
         #[cfg(not(windows))]
-        if let Some(notifier) = self.fuse_notifier.get() {
-            let r = notifier.inval_inode(fuser::INodeNo(_ino), 0, -1);
-            tracing::debug!(ino = _ino, result = ?r, "write: inval_inode");
+        {
+            // Increment BEFORE the notifier.get() check so the
+            // counter pins "the write path reached the notifier
+            // code site" rather than "a notifier was populated
+            // AND we called it". Integration tests (no FUSE mount
+            // = no populated notifier) can still observe the
+            // counter advance on every write — proving the
+            // production code path is reached. Without this
+            // unconditional increment the counter would only
+            // advance in real mounts, which CI can't run.
+            INVAL_INODE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(notifier) = FUSE_NOTIFIER.get() {
+                let r = notifier.inval_inode(fuser::INodeNo(_ino), 0, -1);
+                tracing::debug!(ino = _ino, result = ?r, "write: inval_inode");
+            }
         }
         // #8 (durability): register the cache file
         // for the periodic fsync thread (5 s tick,

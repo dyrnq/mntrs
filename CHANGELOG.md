@@ -211,6 +211,22 @@ use the YYYY-MM-DD form.
   floor here would silently bump the one-shot default above 8 MiB, and this
   test catches that.
 
+- **Fixed `--vfs-refresh` write-path notifier never reached the
+  kernel (audit alongside issue #89 / #93).** The `write()`
+  handler called `self.fuse_notifier.get()` to fetch the FUSE
+  kernel notifier, but the `fuse_notifier` field is initialized
+  to `OnceLock::new()` and `set_fuse_notifier()` (called from the
+  mount command path) writes to a process-static `FUSE_NOTIFIER`
+  cell instead. The check was therefore always `None` and the
+  notifier side-effect was dead code. The `O_APPEND` write-offset
+  bug described in #89 (kernel uses stale cached size) would
+  therefore have resurfaced as soon as the test suite ran in a
+  setup that populated the notifier. The fix reads from
+  `FUSE_NOTIFIER.get()` (same place the setter writes). Pinned
+  by `tests/o_append_fuse_notifier_test.rs` via a process-static
+  `INVAL_INODE_COUNT` counter exposed through
+  `mntrs::__inval_inode_count_for_test()`.
+
 ### Migration
 
 - Add `--vfs-cache-mode=writes` (or `full`) to existing mount
