@@ -185,6 +185,20 @@ use the YYYY-MM-DD form.
   `docs/vfs-cache-flags.md` for service-floor caveats
   (S3 multipart enforces a 5 MiB minimum part size).
 
+- **Fixed `--vfs-refresh` (issue #592 / PR #593) silently doing
+  nothing at runtime.** The refresh worker's `dir_cache.clear()`
+  and `attr_cache.clear()` were operating on a *deep-copy* clone
+  of the maps: `DashMap::clone` clones every entry into a new
+  map, so the spawned task was clearing its own private copy and
+  the main maps — what FUSE callbacks see — survived forever.
+  Both fields are now wrapped in `Arc<DashMap<...>>`; the worker's
+  `clone()` is now a refcount bump that shares backing storage,
+  and `clear()` actually drains the live maps. A new integration
+  test (`tests/refresh_interval_test.rs`) pins the three
+  behavioral claims: zero-interval fast-paths the worker out,
+  nonzero interval drains both caches within two ticks, and
+  `inodes` is left untouched.
+
 ### Migration
 
 - Add `--vfs-cache-mode=writes` (or `full`) to existing mount

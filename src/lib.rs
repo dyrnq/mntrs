@@ -636,12 +636,14 @@ pub struct MntrsFs {
     // sites that construct the inner map wrap in `Arc::new(...)`
     // before inserting — the type system forces every constructor
     // site, so a missed update won't compile.
-    dir_cache: dashmap::DashMap<
-        String,
-        (
-            std::time::Instant,
-            std::sync::Arc<dashmap::DashMap<String, DirEntryCacheValue>>,
-        ),
+    dir_cache: std::sync::Arc<
+        dashmap::DashMap<
+            String,
+            (
+                std::time::Instant,
+                std::sync::Arc<dashmap::DashMap<String, DirEntryCacheValue>>,
+            ),
+        >,
     >,
     /// Local on-disk cache directory. `pub` so integration tests
     /// can construct / inspect cache-file paths (e.g. for the Bug F
@@ -1000,14 +1002,16 @@ pub struct MntrsFs {
     /// FUSE worker threads + the metrics logger thread + the
     /// writeback task.
     pub mem_cache: std::sync::Arc<dyn crate::cache::MemCache>,
-    attr_cache: dashmap::DashMap<
-        String,
-        (
-            FileType,
-            u64,
-            Option<std::time::SystemTime>,
-            std::time::Instant,
-        ),
+    attr_cache: std::sync::Arc<
+        dashmap::DashMap<
+            String,
+            (
+                FileType,
+                u64,
+                Option<std::time::SystemTime>,
+                std::time::Instant,
+            ),
+        >,
     >,
     /// Issue #527 (sub-item B of #519): single-flight dedup for
     /// concurrent `stat_op_async` callers on the same path.
@@ -1849,16 +1853,28 @@ impl MntrsFs {
     /// `crate::rt()` drops, the task's `interval.tick()`
     /// future is cancelled.
     ///
-    /// The cloned `dir_cache` / `attr_cache` handles share
-    /// the backing storage with `self.*` (DashMap's `Clone`
-    /// returns a new handle, not a deep copy), so clearing
-    /// them in the spawned task clears the same map the
-    /// FUSE callbacks see.
+    /// P0-1 fix: `dir_cache` / `attr_cache` are wrapped in
+    /// `Arc<DashMap<...>>` so cloning the Arc inside this
+    /// function shares backing storage with `self.*`. A bare
+    /// `DashMap::clone()` is a **deep copy** (clones every
+    /// entry into a new map), which silently breaks the
+    /// refresh — clearing in the worker cleared the worker's
+    /// private copy and the main caches survived. See the
+    /// `refresh_interval_nonzero_clears_caches_after_tick`
+    /// test for the regression guard.
     fn spawn_refresh_worker(&self) {
         if self.refresh_interval.is_zero() {
             return;
         }
         let interval = self.refresh_interval;
+        // P0-1 fix: clone the Arc<>, not the inner DashMap. DashMap's
+        // Clone is a deep copy (clones every entry), so the spawned
+        // task's `dir_cache.clear()` was clearing its own private
+        // copy — the main map's cache entries survived forever and
+        // `--vfs-refresh` had zero observable effect. Wrapping in
+        // `Arc<DashMap<...>>` makes the clone share backing storage
+        // (the Arc is a refcount bump), so clearing in the worker
+        // clears what FUSE callbacks see.
         let dir_cache = self.dir_cache.clone();
         let attr_cache = self.attr_cache.clone();
         crate::rt().spawn(async move {
@@ -8817,7 +8833,7 @@ pub fn new_test_fs_with_mode(
         inodes: Default::default(),
         path_to_ino: Default::default(),
         lookup_count: Default::default(),
-        dir_cache: Default::default(),
+        dir_cache: std::sync::Arc::new(dashmap::DashMap::new()),
         cache_dir: cache_dir.clone(),
         handles: Default::default(),
         // Issue #23: per-fh readdir snapshots. Empty
@@ -8978,7 +8994,7 @@ pub fn new_test_fs_with_mode(
         // Unbounded mem_cache for unit tests. Production mounts
         // overwrite this in cmd/mount.rs after the size is known.
         mem_cache: std::sync::Arc::new(crate::cache::DashMapMemCache::new(0)),
-        attr_cache: Default::default(),
+        attr_cache: std::sync::Arc::new(dashmap::DashMap::new()),
         stat_inflight: Default::default(),
         #[cfg(test)]
         stat_backend_calls: std::sync::Mutex::new(0),
@@ -9089,6 +9105,69 @@ impl MntrsFs {
     #[doc(hidden)]
     pub fn __writeback_pending_len_for_test(&self) -> usize {
         self.writeback_pending.len()
+    }
+
+    /// Issue #592 (`--vfs-refresh`) test: override
+    /// `refresh_interval` so the integration test can drive the
+    /// periodic worker at a sub-second cadence. Default is
+    /// `Duration::ZERO` (disabled); the test sets a small value
+    /// (e.g. 100 ms) to observe clearing within the test
+    /// budget. Mirrors the `__write_wait_set_for_test` /
+    /// `__writeback_immediate_threshold_set_for_test` pattern.
+    #[doc(hidden)]
+    pub fn __refresh_interval_set_for_test(&mut self, d: std::time::Duration) {
+        self.refresh_interval = d;
+    }
+
+    /// Issue #592 test: return the current `dir_cache`
+    /// entry count so the test can verify whether the
+    /// periodic worker fired (post-clear length drops to 0).
+    /// Field is `pub(crate)` — this shim is the only
+    /// outside-crate entry point.
+    #[doc(hidden)]
+    pub fn __dir_cache_len_for_test(&self) -> usize {
+        self.dir_cache.len()
+    }
+
+    /// Issue #592 test: return the current `attr_cache`
+    /// entry count. Same rationale as
+    /// `__dir_cache_len_for_test`.
+    #[doc(hidden)]
+    pub fn __attr_cache_len_for_test(&self) -> usize {
+        self.attr_cache.len()
+    }
+
+    /// Issue #592 test: return the current `inodes`
+    /// entry count. Used to pin the contract that the
+    /// refresh worker does **NOT** clear `inodes` (FUSE
+    /// kernel holds ino refs that would dangle).
+    /// `inodes` is `pub`, but exposing the count via a
+    /// shim keeps the test isolated from any future
+    /// field-name refactor.
+    #[doc(hidden)]
+    pub fn __inodes_len_for_test(&self) -> usize {
+        self.inodes.len()
+    }
+
+    /// Issue #592 test: seed `attr_cache` with a single
+    /// entry so the refresh-worker test can observe its
+    /// clearing without having to drive a real `stat_op`.
+    /// Production callers populate via `stat_op` (src/lib.rs:2682);
+    /// tests use this shim to bypass the lookup / dir_cache
+    /// short-circuits that would otherwise make `lookup()`
+    /// return without writing `attr_cache`.
+    #[doc(hidden)]
+    pub fn __attr_cache_insert_for_test(&self, path: &str) {
+        use std::time::{Instant, SystemTime};
+        self.attr_cache.insert(
+            path.to_string(),
+            (
+                FileType::RegularFile,
+                0,
+                Some(SystemTime::UNIX_EPOCH),
+                Instant::now(),
+            ),
+        );
     }
 }
 
