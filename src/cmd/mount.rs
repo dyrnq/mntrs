@@ -1275,7 +1275,7 @@ pub fn mount(
         inodes: dashmap::DashMap::new(),
         path_to_ino: dashmap::DashMap::new(),
         lookup_count: dashmap::DashMap::new(),
-        dir_cache: dashmap::DashMap::new(),
+        dir_cache: std::sync::Arc::new(dashmap::DashMap::new()),
         cache_dir: cache_dir_path.clone(),
         handles: dashmap::DashMap::new(),
         // Issue #23: per-fh readdir snapshots. Empty
@@ -1432,7 +1432,7 @@ pub fn mount(
         fuse_notifier: std::sync::OnceLock::new(),
 
         mem_cache: mem_cache.clone(),
-        attr_cache: dashmap::DashMap::new(),
+        attr_cache: std::sync::Arc::new(dashmap::DashMap::new()),
         stat_inflight: dashmap::DashMap::new(),
         #[cfg(test)]
         stat_backend_calls: std::sync::Mutex::new(0),
