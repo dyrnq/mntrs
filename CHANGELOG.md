@@ -199,6 +199,18 @@ use the YYYY-MM-DD form.
   nonzero interval drains both caches within two ticks, and
   `inodes` is left untouched.
 
+- **Pinned `--vfs-buffer-size` chunk_size floor (issue #595).**
+  The multipart branch's `if buffer_size >= 5 MiB { buffer_size } else { 5 MiB }`
+  logic is now extracted into a pure `pub const fn multipart_chunk_size(u64) -> usize`
+  helper in `src/writeback.rs`, alongside a `pub const S3_MIN_MULTIPART_PART: u64 = 5 MiB`.
+  Three new unit tests in `writeback::tests` pin the boundary semantics:
+  below-floor falls back to 5 MiB, at-floor `buffer_size` wins (>=, not >),
+  above-floor `buffer_size` wins. A fourth test pins the one-shot path's
+  *non*-floor semantics: `buffer_size=0` is a valid value that delegates to
+  opendal's 8 MiB default — a future refactor that copy-pastes the multipart
+  floor here would silently bump the one-shot default above 8 MiB, and this
+  test catches that.
+
 ### Migration
 
 - Add `--vfs-cache-mode=writes` (or `full`) to existing mount
