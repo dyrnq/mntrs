@@ -2280,7 +2280,9 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 // path is just a safety net for malformed
                 // buffers (kernel-supplied but truncated).
                 let target_wide: Vec<u16> = buffer[sub_start..sub_end]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect();
                 let target = String::from_utf16_lossy(&target_wide);
