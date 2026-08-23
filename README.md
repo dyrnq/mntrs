@@ -232,6 +232,7 @@ Three-tier cache: **memory → disk → remote**. Block-level (8 MB) indexing. D
 | `--vfs-handle-caching` | 0s | — | 0s | Keep file handles open after last close for reuse |
 | `--vfs-write-back` | 5s | — | 5s | Max time before dirty file is uploaded |
 | `--write-back-cache` | false | — | false | **Opt-in.** FUSE kernel write-back cache. Off by default — daemon's `write()` is called per writeback segment under default. When enabled, the kernel buffers writes and daemon's write handler is skipped for multi-page files (3 known bugs + stress 01/05 fail under unconditional WRITEBACK_CACHE — see `docs/durability.md`). |
+| `--max-read-ahead` | 131072 | — | 131072 | FUSE kernel max read-ahead in bytes (matches rclone default). Wired to `fuser::KernelConfig::set_max_readahead` (audit fix). |
 
 > **Issue #243**: `--vfs-cache-max-size` and `--vfs-cache-min-free-space` both have CLI default `0` (= "off") but historically the code path fell back to 1 GiB / 100 MiB when the field was 0. Post-#243.2/3 the `0` value is honored literally (see `src/lib.rs` for the new behavior). If you want a 1 GiB cap, pass `--vfs-cache-max-size 1024` explicitly.
 
