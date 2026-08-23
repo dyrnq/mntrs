@@ -499,11 +499,13 @@ sync /mnt/s3/file.txt              # fdatasync → cache file durable on local d
 - **CRC64 integrity** for disk cache
 
 For the full durability model — including the remaining rclone-compat
-shadow fields (`--vfs-cache-mode`, `--vfs-cache-poll-interval`,
-`--poll-interval`, `--vfs-refresh`) that are accepted on the CLI but
-not yet implemented — see [`docs/durability.md`](docs/durability.md).
-`--vfs-cache-max-age` was wired in issue #507; see
-[`docs/vfs-cache-flags.md`](docs/vfs-cache-flags.md#vfs-cache-max-age-wired-issue-507).
+shadow fields (`--vfs-cache-poll-interval`, `--poll-interval`) that
+are accepted on the CLI but not yet implemented — see
+[`docs/durability.md`](docs/durability.md).
+`--vfs-cache-mode` (issues #583, #T2-N), `--vfs-refresh`
+(issue #592), and `--vfs-cache-max-age` (issue #507) are now wired;
+see [`docs/vfs-cache-flags.md`](docs/vfs-cache-flags.md) for the
+inventory.
 
 ---
 

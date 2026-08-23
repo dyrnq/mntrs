@@ -8,9 +8,11 @@
 >
 > Supersedes the older "per cache mode" framing in
 > [`durability.md`](durability.md). The rclone-compat
-> `vfs_cache_mode` flag is **not** a mode selector — it
-> is one of nine shadow fields that look like knobs but
-> have no effect.
+> `vfs_cache_mode` flag was previously a shadow field (parsed
+> and discarded); it is now wired (issues #583, #T2-N) and
+> dispatches the `CacheMode` enum at the relevant sites. See
+> [`docs/durability.md#cache-mode-summary`](durability.md#cache-mode-summary)
+> for the canonical four-mode semantics.
 
 ## Background: mntrs has 5 independent cache layers
 
@@ -73,14 +75,18 @@ guarantees never reach a read site (`_` prefix).
 
 ## Per-flag rationale
 
-### `--vfs-cache-mode` (SHADOW)
+### `--vfs-cache-mode` (WIRED, issues #583 + #T2-N)
 
-rclone's `off | writes | full | minimal` toggles the
-single VFS layer. mntrs has five independent caches
-controlled by individual knobs — there is no single
-"mode" selector. See the **`vfs-cache-mode` semantics**
-section below for the four-knob composition that maps
-to "no cache" intent.
+rclone's `off | writes | full | minimal` is now backed by
+a typed `crate::util::CacheMode` enum and dispatched at
+`open` / `create` / `read` / `write` / `flush` /
+`release`. The four-mode semantics live in
+[`docs/durability.md#cache-mode-summary`](durability.md#cache-mode-summary).
+Pre-#583 this was a shadow `String` field; pre-#T2-N
+`minimal` was a silent alias for `off`. Both gaps are
+closed; see `src/util.rs::CacheMode` for the dispatch
+predicates (`disk_write_buffer()` /
+`disk_read_cache()` / `delete_cache_on_success()`).
 
 ### `--vfs-cache-max-age` (WIRED, issue #507)
 
