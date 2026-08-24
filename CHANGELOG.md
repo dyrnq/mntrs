@@ -45,6 +45,29 @@ use the YYYY-MM-DD form.
   matching on the enum (or use `CacheMode::parse` to convert
   from a string).
 
+### Fixes
+
+- **`--max-read-ahead` is now wired (was silently shadowed).**
+  Pre-fix, `FuserAdapter::init()` hardcoded
+  `config.set_max_readahead(1024 * 1024)` (1 MiB) regardless of
+  the CLI value, and `cmd/mount.rs` accepted `--max-read-ahead`
+  into a `_max_read_ahead: u64` underscore-prefixed param — dead
+  at compile time. The flag parsed without error and silently had
+  no effect. Post-fix:
+
+  - `FuserAdapter` gains a `pub max_read_ahead: u32` field.
+  - `cmd/mount.rs` declares `max_read_ahead: u64` (no leading
+    underscore) and forwards the value through `FuserAdapter::new`.
+  - `init()` calls `config.set_max_readahead(self.max_read_ahead)`
+    instead of the hardcoded literal.
+
+  Default remains 131072 (128 KiB, matches rclone). Behavioural
+  change is observable only for users who set the flag explicitly
+  (pre-fix their value was discarded silently). Pin test:
+  `tests/max_read_ahead_test.rs` (3 cases: user override, rclone
+  default, zero passthrough). CLI drift guard:
+  `tests/cli_defaults_test.rs` now includes `--max-read-ahead`.
+
 ### Additions
 
 - **`--vfs-cache-mode=minimal` is now a distinct mode.** Previously

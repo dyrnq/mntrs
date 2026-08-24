@@ -144,6 +144,14 @@ fn readme_default_vfs_read_ahead(readme: &str) -> String {
     readme_default(readme, "vfs-read-ahead")
 }
 
+fn readme_default_max_read_ahead(readme: &str) -> String {
+    readme_default(readme, "max-read-ahead")
+}
+
+fn help_default_max_read_ahead(help: &str) -> Option<String> {
+    help_default_after_desc(help, "max-read-ahead")
+}
+
 fn readme_default_write_back_cache(readme: &str) -> String {
     readme_default(readme, "write-back-cache")
 }
@@ -280,6 +288,18 @@ const FLAGS: &[FlagSpec] = &[
         readme_default: readme_default_vfs_read_ahead,
         // help prints `0 = off`, README prints `0`.
         normalize: normalize_zero,
+    },
+    FlagSpec {
+        // Audit fix: --max-read-ahead was silently shadowed (CLI
+        // parsed, value dropped at cmd/mount.rs boundary via
+        // underscore-prefixed dead param, fuser init() hardcoded
+        // 1 MiB). Post-fix the field is wired and the default
+        // matches rclone (131072 = 128 KiB).
+        flag: "max-read-ahead",
+        help_default: help_default_max_read_ahead,
+        readme_default: readme_default_max_read_ahead,
+        // help prints `131072`, README prints `131072`.
+        normalize: normalize_default,
     },
     FlagSpec {
         flag: "write-back-cache",

@@ -87,6 +87,16 @@ pub struct FuserAdapter<F: CoreFilesystem + 'static> {
     pub attr_ttl: Duration,
     pub direct_io: bool,
     pub write_back_cache: bool,
+    /// `max_read_ahead` passed to `KernelConfig::set_max_readahead` in
+    /// `init()`. Default 131072 (128 KiB) matches rclone's
+    /// `--max-read-ahead` default and is the value previously
+    /// hardcoded in `init()` — the wiring was silently shadowed
+    /// because `cmd/mount.rs` accepted the CLI value into a
+    /// `_max_read_ahead: u64` underscore-prefixed param (dead).
+    /// fuser's `set_max_readahead` takes `u32`; values above
+    /// `u32::MAX` are clamped by fuser's internal `max_max_readahead`
+    /// cap (see `fuser::KernelConfig::set_max_readahead`).
+    pub max_read_ahead: u32,
 }
 
 impl<F: CoreFilesystem + 'static> FuserAdapter<F> {
@@ -96,6 +106,7 @@ impl<F: CoreFilesystem + 'static> FuserAdapter<F> {
         attr_ttl: Duration,
         direct_io: bool,
         write_back_cache: bool,
+        max_read_ahead: u32,
     ) -> Self {
         Self {
             inner,
@@ -103,6 +114,7 @@ impl<F: CoreFilesystem + 'static> FuserAdapter<F> {
             attr_ttl,
             direct_io,
             write_back_cache,
+            max_read_ahead,
         }
     }
 }
@@ -115,7 +127,16 @@ impl<F: CoreFilesystem + 'static> fuser::Filesystem for FuserAdapter<F> {
         // where each request has 10-100ms latency. Bump to 64/48 to let
         // more requests pipeline before kernel throttling.
         let _ = config.set_max_write(128 * 1024);
-        let _ = config.set_max_readahead(1024 * 1024);
+        // `--max-read-ahead` (CLI default 131072 = 128 KiB, matches
+        // rclone). Pre-fix this was hardcoded to 1024*1024 and the
+        // CLI value was dropped at the cmd/mount.rs boundary via a
+        // `_max_read_ahead` underscore-prefixed param. Wire the
+        // field through `set_max_readahead`. `Result<u32, u32>` is
+        // swallowed: if the kernel rejects the value, fuser falls
+        // back to its own cap silently and the mount still works
+        // (matches the pre-fix `let _ =` behaviour for the other
+        // tunables on this block).
+        let _ = config.set_max_readahead(self.max_read_ahead);
         let _ = config.set_max_background(64);
         let _ = config.set_congestion_threshold(48);
 

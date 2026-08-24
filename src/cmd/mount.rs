@@ -985,7 +985,7 @@ pub fn mount(
     volume_name: Option<&str>,
     finder_local: bool,
     no_finder_local: bool,
-    _max_read_ahead: u64,
+    max_read_ahead: u64,
     vfs_read_chunk_size_limit: u64,
     vfs_read_chunk_streams: u32,
     vfs_prefetch_threshold: u64,
@@ -1879,6 +1879,13 @@ pub fn mount(
             std::time::Duration::from_secs(attr_timeout),
             direct_io,
             write_back_cache,
+            // Fuser's `set_max_readahead` takes `u32`. Saturating cast
+            // (rather than `as u32`) keeps the user's intent for values
+            // above `u32::MAX`; in practice fuser's internal cap
+            // (`max_max_readahead`, set by the kernel ABI) rejects
+            // anything above ~`u32::MAX` anyway, and `set_max_readahead`
+            // returns the clamped value in the Err arm.
+            max_read_ahead.min(u32::MAX as u64) as u32,
         );
         tracing::info!(
             elapsed_ms = _t_mount.elapsed().as_millis() as u64,
