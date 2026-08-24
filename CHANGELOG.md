@@ -68,6 +68,37 @@ use the YYYY-MM-DD form.
   default, zero passthrough). CLI drift guard:
   `tests/cli_defaults_test.rs` now includes `--max-read-ahead`.
 
+- **Cleaned stale `--vfs-cache-mode` "no effect" docstring and
+  SHADOW-warn entry.** Three pieces of stale code were lingering
+  after the flag was wired in #583 / #T2-N:
+
+  - `src/main.rs` L150-156 docstring still read "**No effect in
+    mntrs** — this is a deprecation alias for the four-knob
+    composition `--attr-cache-ttl 0 --dir-cache-ttl 0
+    --cache-max-size 0 --writeback-immediate`". Rewritten to
+    describe the actual `CacheMode` dispatch (off / writes / full
+    / minimal) and point at `docs/durability.md#cache-mode-summary`.
+  - `src/main.rs` SHADOW-warn entry
+    (`if vfs_cache_mode != "off" { shadow.push("--vfs-cache-mode"); }`)
+    fired the spurious warn on every mount using a non-default
+    mode (`writes`, `full`, `minimal`). Deleted.
+  - `docs/vfs-cache-flags.md` top + L76 still classified
+    `--vfs-cache-mode` as SHADOW; updated to WIRED and pointed at
+    the four-mode semantics doc.
+  - `README.md` listed `--vfs-cache-mode` and `--vfs-refresh` in
+    the "not yet implemented" group; both are now wired, removed
+    from that group.
+
+- **Fixed octal-vs-decimal bug in `--link-perms` SHADOW-warn
+  comparison.** The flag's clap default is `default_value = "777"`
+  (parsed as decimal u32 = 777), but the warn check was
+  `link_perms != 0o777` (octal 511). The two values were never
+  equal, so the warn fired on EVERY mount using the default —
+  i.e. every mount that did not explicitly pass `--link-perms`.
+  Changed the comparison to `!= 777` (decimal) to match the
+  actual default. `--link-perms=755` (real shadow) still fires
+  the warn correctly.
+
 ### Additions
 
 - **`--vfs-cache-mode=minimal` is now a distinct mode.** Previously

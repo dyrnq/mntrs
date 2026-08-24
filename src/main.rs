@@ -147,13 +147,26 @@ enum Commands {
         /// Default: 1048576 (1 MiB).
         #[arg(long, default_value = "1048576")]
         writeback_immediate_threshold: u64,
-        /// VFS cache mode: off, writes, full (default: off, matches rclone).
-        /// **No effect in mntrs** — this is a **deprecation alias** for
-        /// the four-knob composition `--attr-cache-ttl 0
-        /// --dir-cache-ttl 0 --cache-max-size 0 --writeback-immediate`
-        /// (Interpretation 1, user-signed-off canonical 2026-06-26).
-        /// See docs/vfs-cache-flags.md for the decision matrix and
-        /// why Interpretations 2/3 were rejected.
+        /// VFS cache mode: off, writes, full, minimal (default: off, matches rclone).
+        ///
+        /// Wired (issues #583, #T2-N) — dispatches per-mode write buffer / read cache /
+        /// crash safety semantics at the `open` / `create` / `read` / `write` /
+        /// `flush` / `release` sites via the typed `crate::util::CacheMode` enum.
+        /// The four modes are:
+        ///
+        /// * `off` — in-memory `Vec<u8>` write buffer, L1 mem_cache only; dirty bytes
+        ///   lost on crash. **Default.**
+        /// * `writes` — disk file + fdatasync write buffer, L1 only; dirty bytes durable.
+        /// * `full` — disk file + fdatasync write buffer, L1 + L2 `.block`; dirty bytes
+        ///   durable.
+        /// * `minimal` — disk file + fdatasync, unlinked after successful upload;
+        ///   dirty bytes durable across the upload window, no on-disk footprint
+        ///   between writes.
+        ///
+        /// Pre-#583 the field was a shadow `String` stored and discarded — that stale
+        /// docstring was finally removed in this commit. See
+        /// `docs/durability.md#cache-mode-summary` for the canonical semantics and
+        /// `src/util.rs::CacheMode` for the dispatch predicates.
         #[arg(long, default_value = "off")]
         vfs_cache_mode: String,
         /// Read-ahead size in bytes (default: 0 = off, matches rclone).
@@ -669,10 +682,12 @@ fn main() -> anyhow::Result<()> {
             // shadow flags. clap defaults are applied, so we
             // check non-default values to detect "user explicitly
             // set this." One line per mount, not nine.
+            //
+            // --vfs-cache-mode was removed from this warn block in
+            // this commit: it was wired in #583 / #T2-N, and the
+            // previous `if vfs_cache_mode != "off"` check would
+            // have spuriously fired for every non-default mode.
             let mut shadow = Vec::new();
-            if vfs_cache_mode != "off" {
-                shadow.push("--vfs-cache-mode");
-            }
             // Issue #507: --vfs-cache-max-age is now wired (was a
             // shadow flag under the #455 audit). The CLI default
             // (3600s) and any user override flow into
@@ -705,7 +720,14 @@ fn main() -> anyhow::Result<()> {
             // the warn when the user explicitly moved it off its
             // default — clap applies the default in the destructure
             // above.
-            if link_perms != 0o777 {
+            //
+            // --link-perms default is the literal decimal `777`
+            // (per the clap `default_value = "777"` at L103 — clap
+            // parses the string as decimal u32, NOT octal). The
+            // previous `!= 0o777` compare was an octal-vs-decimal
+            // mismatch that spuriously fired the warn on every
+            // mount that used the default. Fixed in this commit.
+            if link_perms != 777 {
                 shadow.push("--link-perms");
             }
             if hash_filter.is_some() {
