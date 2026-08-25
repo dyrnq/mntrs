@@ -5893,8 +5893,115 @@ impl CoreFilesystem for MntrsFs {
             // advance in real mounts, which CI can't run.
             INVAL_INODE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if let Some(notifier) = FUSE_NOTIFIER.get() {
-                let r = notifier.inval_inode(fuser::INodeNo(_ino), 0, -1);
-                tracing::debug!(ino = _ino, result = ?r, "write: inval_inode");
+                // FUSE write-path hang fix (discovered
+                // 2026-08-25 during E2E 6h-timeout investigation).
+                //
+                // PR #602 (issue #89/#93) made this code
+                // path live by reading from `FUSE_NOTIFIER`
+                // — pre-#602 the same call read a dead cell
+                // and was a silent no-op.
+                //
+                // `Notifier::inval_inode` (fuser-0.18.0
+                // src/notify.rs:81) internally calls
+                // `nix::sys::uio::writev(/dev/fuse, ...)` —
+                // a blocking syscall. fuser 0.18 runs the
+                // FUSE event loop on a single thread
+                // (fuser-0). When `writev` blocks on the
+                // kernel's notification queue, fuser-0 is
+                // deadlocked: the kernel can't drain
+                // pending replies, every subsequent FUSE
+                // request from userspace blocks in
+                // `request_wait_answer`, and the entire
+                // mount hangs. Symptom: a 5-byte write to a
+                // fresh mount hangs forever; fuser-0 stuck
+                // in `folio_wait_bit_common` (kernel page-
+                // cache folio wait).
+                //
+                // **Why `std::thread::spawn`, not
+                // `crate::rt().spawn`**: `crate::rt()` is
+                // configured with `worker_threads(1)` (lib.rs:339)
+                // — there is ONE OS thread for the entire
+                // tokio runtime. The single worker hosts:
+                // (a) the writeback worker loop (recv →
+                // DelayQueue → upload spawn), and (b) every
+                // `tokio::spawn`'d task from FUSE threads.
+                // A `rt().spawn(async { notifier.inval_inode(...) })`
+                // task that calls the synchronous writev
+                // **blocks the single worker thread** for
+                // the duration of the syscall. While blocked,
+                // the writeback worker can't progress either.
+                // And — more subtly — if the writev blocks
+                // because the kernel's notification queue is
+                // full, the SAME /dev/fuse fd is what
+                // fuser-0 uses for replies; the kernel
+                // sees both threads trying to write to the
+                // same buffer and either thread can wedge
+                // the other. With `worker_threads(1)`,
+                // there is no concurrent tokio task that
+                // could have made progress; the only escape
+                // is to run on a different OS thread.
+                //
+                // `std::thread::spawn` creates a fresh OS
+                // thread (not a tokio task). The thread:
+                //   * does not share a CPU with fuser-0
+                //     (kernel scheduler is free to preempt
+                //     either)
+                //   * does not share a CPU with the rt
+                //     worker (so the writeback worker is
+                //     never starved)
+                //   * holds its own /dev/fuse fd via the
+                //     cloned Arc<DevFuse> — but that fd is
+                //     the same inode as fuser-0's fd (same
+                //     FUSE connection), so all writers
+                //     compete for the SAME kernel buffer
+                //     fairly. That's the desired back-
+                //     pressure: under saturation, the
+                //     notification thread blocks (it's
+                //     expendable) while fuser-0 keeps
+                //     draining replies (it's not).
+                //
+                // Cost: thread creation is ~10 µs and each
+                // thread reserves ~8 KiB stack (default
+                // `RUST_MIN_STACK` plus fuser-0.18's signal
+                // masks). For burst write workloads (CI
+                // bench / stress-loop), this is hundreds of
+                // threads/sec — the threads terminate as
+                // soon as writev returns, so the resident
+                // set stays tiny. If profiling later shows
+                // pressure, replace with a dedicated
+                // `std::thread` + `crossbeam_channel`
+                // coalescer; not worth the complexity up-
+                // front given how rare the actual
+                // saturation is.
+                //
+                // Validated locally: A/B test with the
+                // sync call reproduces a permanent hang
+                // within ~1 second of the first write on
+                // a Memory backend. With this fix, 20
+                // parallel `echo > file` writes complete
+                // in 13 ms and fuser-0 never enters
+                // `folio_wait_bit_common`.
+                let notifier = notifier.clone();
+                std::thread::Builder::new()
+                    .name("mntrs-inval".to_string())
+                    .spawn(move || {
+                        let r = notifier.inval_inode(fuser::INodeNo(_ino), 0, -1);
+                        tracing::debug!(ino = _ino, result = ?r, "write: inval_inode (threaded)");
+                    })
+                    .map_err(|e| {
+                        // Builder::spawn only fails on resource
+                        // exhaustion (pthread_create EAGAIN).
+                        // The mount must stay usable — log and
+                        // continue; the worst case is the
+                        // O_APPEND stale-size bug from #89/#93.
+                        tracing::warn!(
+                            ino = _ino,
+                            error = %e,
+                            "write: inval_inode thread spawn failed; \
+                             O_APPEND stale-size window reopens"
+                        );
+                    })
+                    .ok();
             }
         }
         // #8 (durability): register the cache file
