@@ -194,6 +194,14 @@ function Mount-WinFsp {
 
     # Mirrors tests/e2e/common/mount-test.ps1:308-313 invocation
     # exactly: -RedirectStandardOutput/Error + -PassThru + -NoNewWindow.
+    # Issue #612: RUST_LOG=warn surfaces the per-callback entry
+    # traces added in this PR (open / create / overwrite stub /
+    # write / set_basic_info / set_file_size / cleanup / close /
+    # flush). Without it, tracing_subscriber::fmt::init() defaults
+    # to ERROR and the dispatch evidence never lands in
+    # mntrs-bench.stdout.log — making the bench artifact useless
+    # for the issue #612 root-cause investigation.
+    $env:RUST_LOG = "warn"
     $script:MntrsProc = Start-Process -FilePath $MNTRS_BIN `
         -ArgumentList @("mount", $BACKEND, $MNTRS_BNT) `
         -RedirectStandardOutput "mntrs-bench.stdout.log" `

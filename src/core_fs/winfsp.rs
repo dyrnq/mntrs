@@ -1069,7 +1069,8 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 // Issue #307: NFC-normalize the kernel-supplied
                 // name (see get_security_by_name for rationale).
                 let name = crate::util::nfc(&file_name.to_string_lossy());
-                tracing::info!(
+                // Issue #612 instrumentation: warn-level (see create).
+                tracing::warn!(
                     name = %name,
                     create_options = %format_create_options(create_options),
                     granted_access = ?granted_access,
@@ -1173,7 +1174,17 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 // Issue #307: NFC-normalize the kernel-supplied
                 // name (see get_security_by_name for rationale).
                 let name = crate::util::nfc(&file_name.to_string_lossy());
-                tracing::info!(name = %name, ?create_options, file_attributes, "winfsp::create: entered");
+                // Issue #612 instrumentation: warn-level so it
+                // appears in bench-windows artifacts (RUST_LOG=info
+                // by default; bench-result.txt doesn't capture
+                // stdout, so we ship mntrs-bench.stdout.log as a
+                // separate artifact starting this PR).
+                tracing::warn!(
+                    name = %name,
+                    create_options,
+                    file_attributes,
+                    "winfsp::create: entered"
+                );
                 // Win32 create_options bits (matches
                 // windows::Win32::Storage::FileSystem):
                 //   FILE_DIRECTORY_FILE   = 0x0000_0001
@@ -1266,6 +1277,11 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         // `close` returns `()` (no error path to surface a
         // panic to the kernel), so we log + swallow instead of
         // mapping to STATUS_UNSUCCESSFUL.
+        tracing::warn!(
+            ino = _context.ino,
+            is_dir = _context.is_dir,
+            "winfsp::close: entered"
+        );
         swallow_panic(
             "close",
             AssertUnwindSafe(|| {
@@ -1290,6 +1306,36 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 }
             }),
         );
+    }
+
+    // Issue #612 instrumentation stub: log if WinFSP routes
+    // CREATE_ALWAYS / OVERWRITE to `overwrite` for the
+    // failing bench WriteNew case. The trait default returns
+    // STATUS_INVALID_DEVICE_REQUEST (winfsp-0.13.0/src/filesystem/
+    // context.rs:150-161), so this preserves the current
+    // behaviour while emitting a warn line we can grep for
+    // in the bench artifact. Real overwrite impl is a
+    // follow-up PR (#612) once we confirm dispatch.
+    fn overwrite(
+        &self,
+        context: &Self::FileContext,
+        file_attributes: u32,
+        replace_file_attributes: bool,
+        allocation_size: u64,
+        extra_buffer: Option<&[u8]>,
+        _file_info: &mut FileInfo,
+    ) -> Result<()> {
+        tracing::warn!(
+            ino = context.ino,
+            fh = context.fh,
+            is_dir = context.is_dir,
+            file_attributes,
+            replace_file_attributes,
+            allocation_size,
+            extra_buffer_len = extra_buffer.map(|b| b.len()).unwrap_or(0),
+            "winfsp::overwrite: STUB CALLED (returning STATUS_INVALID_DEVICE_REQUEST — fix in #612)"
+        );
+        Err(STATUS_INVALID_DEVICE_REQUEST.into())
     }
 
     fn get_file_info(&self, context: &Self::FileContext, file_info: &mut FileInfo) -> Result<()> {
@@ -1448,6 +1494,13 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         catch_panic(
             "write",
             AssertUnwindSafe(|| {
+                // Issue #612 instrumentation: warn-level (see create).
+                tracing::warn!(
+                    ino = context.ino,
+                    buffer_len = buffer.len(),
+                    offset,
+                    "winfsp::write: entered"
+                );
                 let written = self
                     .inner
                     .write(context.ino, context.fh, offset, buffer)
@@ -1591,6 +1644,13 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         // Issue #314: panic safety wrapper — `cleanup`
         // returns `()` (no Result), so we log + swallow
         // panics instead of mapping to STATUS_UNSUCCESSFUL.
+        // Issue #612 instrumentation: warn-level (see create).
+        tracing::warn!(
+            ino = context.ino,
+            is_dir = context.is_dir,
+            flags = %format_cleanup_flags(flags),
+            "winfsp::cleanup: entered"
+        );
         swallow_panic(
             "cleanup",
             AssertUnwindSafe(|| {
@@ -2484,6 +2544,13 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         catch_panic(
             "set_basic_info",
             AssertUnwindSafe(|| {
+                // Issue #612 instrumentation: warn-level (see create).
+                tracing::warn!(
+                    ino = context.ino,
+                    file_attributes,
+                    last_write_time,
+                    "winfsp::set_basic_info: entered"
+                );
                 // Issue #305 Tier 1: pre-fix this was a no-op, so
                 // Explorer Properties → Modified Date, robocopy /MIR, and
                 // PowerShell Set-LastWriteTime silently failed (kernel cache
@@ -2568,6 +2635,12 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         _file_info: &mut FileInfo,
     ) -> Result<()> {
         // Issue #314: panic safety wrapper — see catch_panic.
+        // Issue #612 instrumentation: warn-level (see create).
+        tracing::warn!(
+            ino = context.ino,
+            new_size,
+            "winfsp::set_file_size: entered"
+        );
         catch_panic(
             "set_file_size",
             AssertUnwindSafe(|| {
@@ -2751,6 +2824,8 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
 
     fn flush(&self, context: Option<&Self::FileContext>, _file_info: &mut FileInfo) -> Result<()> {
         // Issue #314: panic safety wrapper — see catch_panic.
+        // Issue #612 instrumentation: warn-level (see create).
+        tracing::warn!(ino = context.map(|c| c.ino), "winfsp::flush: entered");
         catch_panic(
             "flush",
             AssertUnwindSafe(|| {

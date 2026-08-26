@@ -161,6 +161,27 @@ jobs:
           path: bench-result.txt
           if-no-files-found: warn
 
+      # Issue #612: also upload mntrs.exe's own logs (bench/
+      # run_all.ps1:199-200 redirects them to these files via
+      # Start-Process -RedirectStandardOutput/Error). The bench
+      # instrumentation added in this PR emits tracing::warn! at
+      # the entry of every FileSystemContext callback (open /
+      # create / overwrite / write / set_basic_info / set_file_
+      # size / cleanup / close / flush); those lines are how we
+      # confirm which C callback WinFSP routes the failing bench
+      # WriteNew `_w_1K.bin` request to. Without this upload, the
+      # only artifact is bench-result.txt (the markdown table),
+      # which can't disambiguate dispatch paths.
+      - name: Upload mntrs bench logs (issue #612 instrumentation)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mntrs-bench-logs-windows
+          path: |
+            mntrs-bench.stdout.log
+            mntrs-bench.stderr.log
+          if-no-files-found: warn
+
       # Regression check. With no baseline, emits ::warning:: and
       # exits 0 (matches bash behavior). After the first main-push
       # run produces a bench-result.txt artifact, that file is
