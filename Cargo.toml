@@ -81,9 +81,12 @@ foyer-memory = "0.22.3"
 fuser = "0.18"
 
 [target.'cfg(windows)'.dependencies]
-winfsp = { version = "0.13", features = ["async-io", "notify"] }
+winfsp = { version = "0.13", features = ["async-io", "notify", "windows-62"] }
 winfsp-sys = "0.12.1"
-windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+# 0.62 introduced per-subfeature gates under `Win32_System`; we need
+# `Win32_System_Console` for src/cmd/mount.rs:2230 (set_window_text).
+# Issue #610.
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console"] }
 widestring = "1.2"
 
 [features]
