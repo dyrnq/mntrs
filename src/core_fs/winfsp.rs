@@ -1696,6 +1696,33 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                     .inner
                     .rename_paths(&src_full, &dst_full)
                     .map_err(io_err_to_status);
+                // Issue #614 v4 diagnostic: warn-level (vs the
+                // existing trace!) so v4 bench can see whether
+                // `do_rename` returned Ok or Err — the v3 bench
+                // had no errors at WARN level and Move-Item
+                // still FAILed with "Unable to find the specified
+                // file". The next-run bench artifact will tell us
+                // whether the failure is at rename_paths() (this
+                // log) or downstream (kernel sees stale dst).
+                match &r {
+                    Ok(()) => {
+                        tracing::warn!(
+                            ino = context.ino,
+                            src = %src_full,
+                            dst = %dst_full,
+                            "winfsp::rename: rename_paths returned Ok (issue #614 v4 diagnostic)"
+                        );
+                    }
+                    Err(status) => {
+                        tracing::warn!(
+                            ino = context.ino,
+                            src = %src_full,
+                            dst = %dst_full,
+                            status = ?status,
+                            "winfsp::rename: rename_paths returned Err (issue #614 v4 diagnostic)"
+                        );
+                    }
+                }
                 // Issue #614: on success, remember the source
                 // inode so the soon-to-arrive
                 // `cleanup(FspCleanupDelete)` (Win32
