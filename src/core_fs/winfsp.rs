@@ -20,7 +20,7 @@
 
 #![cfg(windows)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
@@ -821,6 +821,21 @@ pub struct WinFspAdapter<F: CoreFilesystem + 'static> {
     /// ≪ 1000 ops/s) and drains within one timer tick
     /// (100 ms), so an unbounded `VecDeque` is fine.
     pending_notifications: Mutex<VecDeque<(String, u32, u32)>>,
+    /// Issue #614: inodes that were just renamed and for which
+    /// the kernel will dispatch a `cleanup(FspCleanupDelete)`
+    /// next, as the Win32 "MoveFileEx delete-source-alias"
+    /// step. That post-rename cleanup-with-delete passes the
+    /// **destination** name as `file_name`, so a naive
+    /// `inner.unlink(parent_ino, basename)` hits the wrong
+    /// backend path — the dst file gets unlinked instead of
+    /// the (already-renamed) source. We track the ino here on
+    /// a successful `rename`, and in `cleanup` we recognise
+    /// the ino, remove it from the set, and skip the backend
+    /// delete (it's a no-op). The entry is also cleared on
+    /// any non-DELETE cleanup for the same ino, so the set
+    /// stays bounded even when the kernel drops the
+    /// delete-source-alias dispatch.
+    renamed_inos: Mutex<HashSet<u64>>,
 }
 
 impl<F: CoreFilesystem + 'static> WinFspAdapter<F> {
@@ -833,6 +848,7 @@ impl<F: CoreFilesystem + 'static> WinFspAdapter<F> {
             file_security_descriptor: synthesize_self_relative_sd(false),
             dir_security_descriptor: synthesize_self_relative_sd(true),
             pending_notifications: Mutex::new(VecDeque::new()),
+            renamed_inos: Mutex::new(HashSet::new()),
         }
     }
 
@@ -1598,7 +1614,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
 
     fn rename(
         &self,
-        _context: &Self::FileContext,
+        context: &Self::FileContext,
         file_name: &U16CStr,
         new_file_name: &U16CStr,
         _replace_if_exists: bool,
@@ -1667,9 +1683,29 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 // old `(parent, name)` derivation is correct on
                 // FUSE and the default impl on the trait
                 // preserves that behaviour.
-                self.inner
+                let r = self
+                    .inner
                     .rename_paths(&src_full, &dst_full)
-                    .map_err(io_err_to_status)
+                    .map_err(io_err_to_status);
+                // Issue #614: on success, remember the source
+                // inode so the soon-to-arrive
+                // `cleanup(FspCleanupDelete)` (Win32
+                // MoveFileEx's "delete-source-alias" step —
+                // see cleanup doc comment) can recognise it
+                // and skip the backend unlink. Without this,
+                // that cleanup passes the destination name
+                // (the kernel already renamed the FH) and the
+                // unlink targets the wrong path.
+                if r.is_ok() {
+                    let mut renamed = self.renamed_inos.lock_or_recover();
+                    renamed.insert(context.ino);
+                    tracing::trace!(
+                        ino = context.ino,
+                        renamed_set_len = renamed.len(),
+                        "winfsp::rename: tracked ino for post-rename cleanup"
+                    );
+                }
+                r
             }),
         )
     }
@@ -1722,6 +1758,37 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
             flags = %format_cleanup_flags(flags),
             "winfsp::cleanup: entered"
         );
+        // Issue #614: recognise the Win32 "MoveFileEx
+        // delete-source-alias" cleanup that follows a
+        // successful `rename`. The kernel dispatches that
+        // cleanup with the destination's name (the source
+        // FH's path was updated by the rename), so a
+        // backend unlink would target the wrong file. We
+        // recorded the ino in `rename`; consume the entry
+        // here (regardless of the DELETE flag — this keeps
+        // the set bounded even if the kernel drops the
+        // dispatch) and, when DELETE is also set, suppress
+        // the backend unlink.
+        let recently_renamed = {
+            let mut renamed = self.renamed_inos.lock_or_recover();
+            renamed.remove(&context.ino)
+        };
+        if recently_renamed {
+            tracing::trace!(
+                ino = context.ino,
+                "winfsp::cleanup: clearing renamed-tracking for ino"
+            );
+            if FspCleanupFlags::FspCleanupDelete.is_flagged(flags) {
+                tracing::info!(
+                    ino = context.ino,
+                    is_dir = context.is_dir,
+                    flags = %format_cleanup_flags(flags),
+                    "winfsp::cleanup: post-rename DELETE is a no-op (issue #614); \
+                     the source alias was already removed by `rename`"
+                );
+                return;
+            }
+        }
         swallow_panic(
             "cleanup",
             AssertUnwindSafe(|| {

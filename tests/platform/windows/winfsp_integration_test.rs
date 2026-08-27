@@ -1171,6 +1171,208 @@ fn winfsp_overwrite_zero_allocation_is_noop_on_data() {
 }
 
 // ============================================================
+// Issue #614 regression tests: cleanup-after-rename must NOT unlink
+// ============================================================
+//
+// WinFSP 2.1's `MoveFileEx` dispatches as
+// `rename(src_fh, dst_path)` followed by a `cleanup(src_fh, DELETE)`
+// (the "delete the source alias" step of the Win32 move semantics).
+// Pre-fix, the post-rename cleanup unconditionally called
+// `self.inner.unlink(parent_ino, file_name)`, where `file_name` had
+// already been updated to the **destination** path by the prior
+// `rename`. The unlink therefore deleted the just-renamed backend
+// file, leaving both the source and destination missing and the
+// user seeing `ERROR_FILE_NOT_FOUND` from `Move-Item` /
+// `Remove-Item`.
+//
+// Tests below exercise the trait methods directly (no Win32
+// `MoveFileEx` needed) so the rename + cleanup-DELETE sequence
+// runs deterministically without relying on kernel dispatch.
+
+// Helper: build a `U16CString` (owned) from a `&str` for direct
+// trait invocations. `winfsp::U16CStr` derefs from
+// `widestring::U16CString`, which has `from_str(&str)` returning
+// `Result<U16CString, _>`. We then pass `&str_to_ucstr(s)` (i.e.
+// `&U16CString` coerces to `&U16CStr`) to the trait methods.
+fn str_to_ucstr(s: &str) -> widestring::U16CString {
+    widestring::U16CString::from_str(s).expect("u16cstring")
+}
+
+// Helper: invoke the trait's `rename` with a UTF-8 path (the trait
+// takes `&U16CStr`; we build one from a `String`).
+fn rename_path(
+    adapter: &WinFspAdapter<MntrsFs>,
+    ctx: &WinFspHandle,
+    src_path: &str,
+    dst_path: &str,
+) {
+    let src = str_to_ucstr(src_path);
+    let dst = str_to_ucstr(dst_path);
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::rename(adapter, ctx, &src, &dst, true)
+        .expect("trait rename");
+}
+
+#[test]
+fn winfsp_cleanup_after_rename_preserves_destination() {
+    let fs = Arc::new(make_memory_fs());
+    let adapter = WinFspAdapter::new(fs.clone());
+
+    // Seed a file via write_remote (lands in opendal memory
+    // backend, inodes entry created via mount lookup).
+    let payload = b"data that must survive post-rename cleanup";
+    write_remote(&fs, "_mv_src.bin", payload);
+
+    let ctx = open_handle_for(&*fs, "_mv_src.bin");
+
+    // Step 1: rename src -> dst via the trait. This is
+    // WinFSP's `MoveFileEx` step 1. The path shape
+    // (`\_mv_src.bin`) matches the kernel dispatch for a
+    // root-level file (file was created at opendal key
+    // `_mv_src.bin`, so the ino lives at root; the kernel
+    // passes `\name` for that — backslash converts to
+    // slash + lowercase yields the lookup path).
+    rename_path(&adapter, &ctx, "\\_mv_src.bin", "\\_mv_dst.bin");
+
+    // After rename: src gone, dst present.
+    let backend =
+        rt_block_on(async { fs.op.read("_mv_src.bin").await.unwrap_or_default().to_vec() });
+    assert!(
+        backend.is_empty(),
+        "rename should have removed _mv_src.bin from backend"
+    );
+    let dst_payload =
+        rt_block_on(async { fs.op.read("_mv_dst.bin").await.unwrap_or_default().to_vec() });
+    assert_eq!(
+        dst_payload, payload,
+        "rename should have moved the payload to _mv_dst.bin"
+    );
+
+    // Step 2: cleanup(src_ino, DELETE) — the kernel's
+    // "delete the source alias" call after MoveFileEx.
+    // Pre-fix this unlinks _mv_dst.bin (the post-rename
+    // file_name) and the test fails at the dst-presence
+    // check below. Post-fix the cleanup is recognised as
+    // the post-rename no-op and leaves _mv_dst.bin alone.
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::cleanup(
+        &adapter,
+        &ctx,
+        // The file_name the kernel passes after a
+        // MoveFileEx points at the **destination** path
+        // (the source FH's kernel-level path was
+        // updated by the prior `rename` call). Encoding
+        // the dst path here matches the dispatch we
+        // see in mntrs-bench.stdout.log (run
+        // 33059193417, line ~1599) for the bench
+        // Move-Item FAIL.
+        Some(&*str_to_ucstr("\\_mv_dst.bin")),
+        0x01,
+    );
+
+    let dst_after =
+        rt_block_on(async { fs.op.read("_mv_dst.bin").await.unwrap_or_default().to_vec() });
+    assert_eq!(
+        dst_after, payload,
+        "post-rename cleanup-with-DELETE must NOT unlink the \
+         destination (issue #614). The Win32 'delete the \
+         source alias' step is a no-op when `rename` \
+         already moved the file."
+    );
+}
+
+#[test]
+fn winfsp_cleanup_without_rename_still_unlinks() {
+    // Counter-test: prove the #614 fix does NOT
+    // accidentally suppress legitimate unlinks. A
+    // cleanup-with-DELETE on an ino that was NOT just
+    // renamed must still drop the backend file.
+    let fs = Arc::new(make_memory_fs());
+    let adapter = WinFspAdapter::new(fs.clone());
+
+    let payload = b"data that should be deleted on cleanup";
+    write_remote(&fs, "_del.bin", payload);
+
+    let ctx = open_handle_for(&*fs, "_del.bin");
+
+    // No rename — go straight to cleanup-with-DELETE.
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::cleanup(
+        &adapter,
+        &ctx,
+        Some(&*str_to_ucstr("\\_del.bin")),
+        0x01,
+    );
+
+    let backend = rt_block_on(async { fs.op.read("_del.bin").await.unwrap_or_default().to_vec() });
+    assert!(
+        backend.is_empty(),
+        "cleanup-with-DELETE on a non-renamed ino must \
+         still unlink (issue #614 false-positive guard)"
+    );
+}
+
+#[test]
+fn winfsp_cleanup_after_rename_then_real_delete() {
+    // Sequence: rename, then real Remove-Item on the
+    // destination. The first cleanup-with-DELETE
+    // (post-rename) is a no-op; the second cleanup
+    // (after Remove-Item) actually unlinks.
+    let fs = Arc::new(make_memory_fs());
+    let adapter = WinFspAdapter::new(fs.clone());
+
+    let payload = b"data that moves and then gets deleted";
+    write_remote(&fs, "_mv2_src.bin", payload);
+
+    let ctx = open_handle_for(&*fs, "_mv2_src.bin");
+
+    // 1. Rename src -> dst
+    rename_path(&adapter, &ctx, "\\_mv2_src.bin", "\\_mv2_dst.bin");
+
+    // 2. Post-rename cleanup-with-DELETE (Win32 move's
+    //    "delete the source alias") — no-op.
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::cleanup(
+        &adapter,
+        &ctx,
+        Some(&*str_to_ucstr("\\_mv2_dst.bin")),
+        0x01,
+    );
+    let after_first = rt_block_on(async {
+        fs.op
+            .read("_mv2_dst.bin")
+            .await
+            .unwrap_or_default()
+            .to_vec()
+    });
+    assert_eq!(
+        after_first, payload,
+        "post-rename cleanup must leave dst intact"
+    );
+
+    // 3. Real Remove-Item on the dst path. This is a
+    //    fresh fh on the same ino (the renamed file
+    //    now lives at _mv2_dst.bin, same ino).
+    //    Cleanup-with-DELETE on this fh must actually
+    //    unlink.
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::cleanup(
+        &adapter,
+        &ctx,
+        Some(&*str_to_ucstr("\\_mv2_dst.bin")),
+        0x01,
+    );
+    let after_second = rt_block_on(async {
+        fs.op
+            .read("_mv2_dst.bin")
+            .await
+            .unwrap_or_default()
+            .to_vec()
+    });
+    assert!(
+        after_second.is_empty(),
+        "second cleanup-with-DELETE (post-Remove-Item) \
+         must unlink — proves the renamed-tracking flag \
+         clears after the first post-rename cleanup"
+    );
+}
+
+// ============================================================
 // Issue #306 regression tests: readdir_with_attrs (N+1 RTT + marker paging)
 // ============================================================
 
