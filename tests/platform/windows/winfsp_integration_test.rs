@@ -1372,6 +1372,139 @@ fn winfsp_cleanup_after_rename_then_real_delete() {
     );
 }
 
+// Issue #614 v2 regression: WinFSP 2.1's open-handle rename
+// (PowerShell `Move-Item`, Win32 `MoveFile` on an open
+// handle) is dispatched through the FSD internally — the
+// `rename` callback is NOT invoked. The visible side
+// effect is a `set_basic_info` with the current real
+// `file_attributes` (not the 0xFFFFFFFF "no-change"
+// sentinel) and `last_write_time=0` (no time update).
+// The kernel then dispatches `cleanup(FspCleanupDelete)`
+// on the same ino with the post-rename `file_name`. The
+// v1 fix (which only tracked inos in the `rename`
+// callback) doesn't cover this — `move` and `del` still
+// fail on the bench. The v2 fix detects the rename
+// signature in `set_basic_info` and inserts the ino into
+// the same `renamed_inos` set, so the subsequent
+// cleanup-with-DELETE early-returns as a no-op.
+#[test]
+fn winfsp_set_basic_info_rename_signal_skips_post_rename_cleanup() {
+    let fs = Arc::new(make_memory_fs());
+    let adapter = WinFspAdapter::new(fs.clone());
+
+    let payload = b"data that moves via set_basic_info IRP";
+    write_remote(&fs, "_mv3_src.bin", payload);
+
+    let ctx = open_handle_for(&*fs, "_mv3_src.bin");
+
+    // Step 1: set_basic_info with the kernel-internal
+    // rename signature — real attrs (FILE_ATTRIBUTE_ARCHIVE
+    // = 0x20) and last_write_time = 0. This is what
+    // WinFSP 2.1 dispatches for open-handle MoveFile on
+    // the bench trace (run 33071512354, line 3786:
+    // `winfsp::set_basic_info: entered ino=526
+    // file_attributes=32 last_write_time=0`).
+    let mut fi = FileInfo::default();
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::set_basic_info(
+        &adapter, &ctx, // file_attributes = real value (FILE_ATTRIBUTE_ARCHIVE)
+        0x20,
+        // creation_time, last_access_time, last_write_time,
+        // change_time: all 0 (the rename IRP doesn't carry
+        // timestamps). In particular last_write_time = 0
+        // is the discriminator vs. a legitimate
+        // attribute-only setattr (which would carry a real
+        // mtime).
+        0, 0, 0, 0, &mut fi,
+    )
+    .expect("trait set_basic_info");
+
+    // Step 2: cleanup-with-DELETE on the same ino, with
+    // the post-rename file_name. The kernel has already
+    // renamed the FCB to _mv3_dst.bin; our adapter
+    // receives the new name. Pre-v2 fix the unlink
+    // targets the backend path `data/_mv3_dst.bin` (which
+    // doesn't exist there — the rename was never
+    // performed in our adapter) and the test fails.
+    // Post-v2 the set_basic_info heuristic tracked the
+    // ino in renamed_inos, so cleanup early-returns.
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::cleanup(
+        &adapter,
+        &ctx,
+        Some(&*str_to_ucstr("\\_mv3_dst.bin")),
+        0x01,
+    );
+
+    let backend = rt_block_on(async {
+        fs.op
+            .read("_mv3_src.bin")
+            .await
+            .unwrap_or_default()
+            .to_vec()
+    });
+    assert_eq!(
+        backend, payload,
+        "set_basic_info-rename signal must register the ino for \
+         post-rename cleanup no-op (issue #614 v2). The backend \
+         file at the original path must survive; the kernel's \
+         delete-source-alias dispatch must not target the new \
+         (post-rename) name."
+    );
+}
+
+// Counter-test for the v2 heuristic: a legitimate
+// set_basic_info (with a real last_write_time) must NOT
+// trigger the renamed-tracking. Otherwise a user who sets
+// mtime via PowerShell and then deletes the file would
+// see the delete silently suppressed.
+#[test]
+fn winfsp_set_basic_info_with_real_mtime_does_not_block_later_cleanup() {
+    let fs = Arc::new(make_memory_fs());
+    let adapter = WinFspAdapter::new(fs.clone());
+
+    let payload = b"data that gets a real mtime then deleted";
+    write_remote(&fs, "_mv4.bin", payload);
+
+    let ctx = open_handle_for(&*fs, "_mv4.bin");
+
+    // set_basic_info with real attrs AND real mtime — this
+    // is a legitimate attribute/time set, NOT a rename
+    // IRP. The v2 heuristic must not register the ino.
+    let mut fi = FileInfo::default();
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::set_basic_info(
+        &adapter,
+        &ctx,
+        0x20, // file_attributes = ARCHIVE (real value)
+        0,
+        0,
+        // last_write_time = a real Win32 FILETIME (some
+        // arbitrary recent timestamp; the exact value is
+        // irrelevant — the point is it must be != 0).
+        134_323_072_067_238_517,
+        0,
+        &mut fi,
+    )
+    .expect("trait set_basic_info");
+
+    // Now cleanup-with-DELETE — must unlink normally
+    // because the v2 heuristic did NOT register the ino
+    // (real mtime was present).
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::cleanup(
+        &adapter,
+        &ctx,
+        Some(&*str_to_ucstr("\\_mv4.bin")),
+        0x01,
+    );
+
+    let backend = rt_block_on(async { fs.op.read("_mv4.bin").await.unwrap_or_default().to_vec() });
+    assert!(
+        backend.is_empty(),
+        "set_basic_info with real mtime must NOT trigger the \
+         rename-tracking heuristic — legitimate cleanup-with-DELETE \
+         after a real attr-set must still unlink (issue #614 v2 \
+         false-positive guard)"
+    );
+}
+
 // ============================================================
 // Issue #306 regression tests: readdir_with_attrs (N+1 RTT + marker paging)
 // ============================================================

@@ -1619,6 +1619,15 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         new_file_name: &U16CStr,
         _replace_if_exists: bool,
     ) -> Result<()> {
+        // Issue #612 instrumentation: warn-level so future
+        // bench runs surface whether this dispatch path was
+        // taken (see create()).
+        tracing::warn!(
+            ino = context.ino,
+            file_name = %file_name.to_string_lossy(),
+            new_file_name = %new_file_name.to_string_lossy(),
+            "winfsp::rename: entered"
+        );
         // Issue #314: panic safety wrapper — see catch_panic.
         catch_panic(
             "rename",
@@ -2686,9 +2695,59 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 tracing::warn!(
                     ino = context.ino,
                     file_attributes,
+                    creation_time,
+                    last_access_time,
                     last_write_time,
+                    change_time,
                     "winfsp::set_basic_info: entered"
                 );
+                // Issue #614: WinFSP 2.1 dispatches open-handle
+                // MoveFile (PowerShell `Move-Item`, .NET
+                // `File.Move`, Win32 `MoveFile(src, dst)` on an
+                // open handle) through the FSD internally — the
+                // user-mode `rename` callback is **not**
+                // invoked. The visible side effect is a
+                // `set_basic_info` with the current real
+                // `file_attributes` (not the 0xFFFFFFFF
+                // "no-change" sentinel) and `last_write_time=0`
+                // (no time update — the rename doesn't change
+                // mtime/atime). After this, WinFSP updates the
+                // FCB name internally and dispatches
+                // `cleanup(src_ino, FspCleanupDelete)` with
+                // the post-rename file_name — that's the
+                // "delete the source alias" step the kernel
+                // does on top of the rename.
+                //
+                // We must track the ino here (same as we do in
+                // the `rename` callback for the inter-dir-move
+                // case) so the subsequent cleanup-with-DELETE
+                // sees it and skips the backend unlink. The
+                // `cleanup` callback's existing
+                // renamed_inos-aware branch then early-returns
+                // and the dst file is preserved.
+                //
+                // Heuristic rationale: the
+                // `(file_attributes != 0xFFFFFFFF,
+                // last_write_time == 0)` combination is rare
+                // outside of rename IRPs. A legitimate
+                // user-initiated `Set-ItemProperty -Attributes
+                // Archive` would carry a real mtime (or the
+                // sentinel 0xFFFFFFFF for the attrs), so this
+                // heuristic avoids the false-positive of
+                // "every set_basic_info marks as renamed". If
+                // a future WinFSP release changes the
+                // signature we can refine; for now this
+                // matches the bench trace exactly.
+                if file_attributes != u32::MAX && last_write_time == 0 {
+                    let mut renamed = self.renamed_inos.lock_or_recover();
+                    renamed.insert(context.ino);
+                    tracing::info!(
+                        ino = context.ino,
+                        file_attributes,
+                        "winfsp::set_basic_info: detected kernel-internal rename IRP; \
+                         tracking ino for post-rename cleanup (issue #614)"
+                    );
+                }
                 // Issue #305 Tier 1: pre-fix this was a no-op, so
                 // Explorer Properties → Modified Date, robocopy /MIR, and
                 // PowerShell Set-LastWriteTime silently failed (kernel cache
