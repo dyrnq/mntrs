@@ -1322,20 +1322,91 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         file_attributes: u32,
         replace_file_attributes: bool,
         allocation_size: u64,
-        extra_buffer: Option<&[u8]>,
-        _file_info: &mut FileInfo,
+        _extra_buffer: Option<&[u8]>,
+        file_info: &mut FileInfo,
     ) -> Result<()> {
-        tracing::warn!(
-            ino = context.ino,
-            fh = context.fh,
-            is_dir = context.is_dir,
-            file_attributes,
-            replace_file_attributes,
-            allocation_size,
-            extra_buffer_len = extra_buffer.map(|b| b.len()).unwrap_or(0),
-            "winfsp::overwrite: STUB CALLED (returning STATUS_INVALID_DEVICE_REQUEST — fix in #612)"
-        );
-        Err(STATUS_INVALID_DEVICE_REQUEST.into())
+        // Issue #314: panic safety wrapper — see catch_panic.
+        catch_panic(
+            "overwrite",
+            AssertUnwindSafe(|| {
+                tracing::debug!(
+                    ino = context.ino,
+                    fh = context.fh,
+                    is_dir = context.is_dir,
+                    file_attributes,
+                    replace_file_attributes,
+                    allocation_size,
+                    "winfsp::overwrite: entered"
+                );
+                // Issue #612: WinFSP routes the bench WriteNew
+                // ([IO.File]::WriteAllBytes on a fresh file) to
+                // `overwrite` AFTER our `create` + `write` +
+                // `close` cycle — see PR #613 trace evidence in
+                // mntrs-bench.stdout.log (allocation_size=0,
+                // extra_buffer_len=0, no subsequent write IRP).
+                // Pre-fix this callback was a stub returning
+                // STATUS_INVALID_DEVICE_REQUEST, which surfaced
+                // in .NET as "Incorrect function" and cascaded
+                // into Copy-Item / Move-Item / Remove-Item
+                // failures (each re-opens the freshly-written
+                // file with FILE_OPEN_IF, which WinFSP routes
+                // to overwrite on an existing file).
+                //
+                // Standard WinFSP semantics for overwrite is
+                // "truncate to allocation_size". But for our
+                // bench WriteNew path allocation_size=0 and the
+                // 1024-byte buffer the user just wrote is
+                // already in the backend via our `write`
+                // callback — truncating would silently destroy
+                // it (no write IRP follows overwrite to refill
+                // it). Same risk applies to .NET users in
+                // general: their CreateFile(FILE_OVERWRITE_IF)
+                // + WriteFile + CloseHandle sequence puts data
+                // on the backend via `write` before WinFSP
+                // dispatches overwrite.
+                //
+                // Strategy: skip the truncate, refresh
+                // `file_info` from the current inode
+                // attributes so the kernel's FCB reflects the
+                // real size / mtime / kind. If the user really
+                // wants truncation, they can call Set-Content
+                // / FileStream.SetLength / etc., which
+                // dispatch to `set_file_size` explicitly and
+                // arrive with a precise `new_size`. That keeps
+                // mount-side write correctness and avoids the
+                // "invisible truncation" data-loss trap.
+                //
+                // For directories (shouldn't happen — WinFSP
+                // only routes file opens here) refuse with
+                // STATUS_INVALID_DEVICE_REQUEST to surface a
+                // clear error instead of silently doing
+                // nothing.
+                if context.is_dir {
+                    return Err(STATUS_INVALID_DEVICE_REQUEST.into());
+                }
+                let attr = self.inner.getattr(context.ino).map_err(io_err_to_status)?;
+                core_attr_to_file_info(&attr, file_info);
+                // Same passthrough logic as `create`: if the
+                // caller asked us to replace the attribute set
+                // with `file_attributes`, OR in the
+                // user-meaningful bits (HIDDEN / SYSTEM /
+                // READONLY / etc.) so they round-trip into the
+                // kernel's cached entry.
+                if replace_file_attributes {
+                    let user_attrs = file_attributes & USER_FILE_ATTR_PASSTHROUGH;
+                    if user_attrs != 0 {
+                        file_info.file_attributes |= user_attrs;
+                    }
+                }
+                tracing::debug!(
+                    ino = context.ino,
+                    size = attr.size,
+                    file_info_size = file_info.file_size,
+                    "winfsp::overwrite: ok (preserved data, refreshed file_info)"
+                );
+                Ok(())
+            }),
+        )
     }
 
     fn get_file_info(&self, context: &Self::FileContext, file_info: &mut FileInfo) -> Result<()> {
