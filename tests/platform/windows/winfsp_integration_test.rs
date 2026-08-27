@@ -12,7 +12,7 @@ use mntrs::core_fs::CoreFilesystem;
 use mntrs::core_fs::winfsp::{WinFspAdapter, WinFspHandle};
 use mntrs::core_fs::{CoreFileAttr, CoreVolumeStat};
 
-use winfsp::filesystem::FileSystemContext;
+use winfsp::filesystem::{FileInfo, FileSystemContext};
 
 // One-shot tracing subscriber init. The `mntrs.exe` binary
 // initializes a global subscriber in main.rs; the test binary
@@ -985,115 +985,189 @@ fn winfsp_write_large_file() {
 // ============================================================
 // Issue #612 regression tests: WinFspAdapter::overwrite path
 // ============================================================
+//
+// We test the `overwrite` callback directly through the
+// `FileSystemContext` trait, not by issuing Win32 file ops on
+// the mounted drive. Reasons:
+//
+//  * `std::fs::write` on Windows uses `OPEN_ALWAYS +
+//    FILE_TRUNCATE_EXISTING` for an existing file (and the
+//    `create(true).truncate(true)` combo resolves to
+//    `CREATE_ALWAYS` for a new file). WinFSP routes `CREATE_ALWAYS`
+//    to the `overwrite` callback but routes
+//    `OPEN_ALWAYS + FILE_TRUNCATE_EXISTING` to the `open`
+//    callback — the truncate happens in the `open` impl, not in
+//    `overwrite`. So we can't reliably dispatch `overwrite` from
+//    std fs ops without raw FFI.
+//  * Direct trait calls bypass the writeback cache, so we can
+//    verify the data is preserved in the backend without racing
+//    the cache-flush timer.
+//  * The fix lives entirely in `WinFspAdapter::overwrite`; a
+//    unit test on that method is the most precise contract we
+//    can pin.
+///
+/// Pre-fix the trait default returned STATUS_INVALID_DEVICE_REQUEST
+/// (winfsp-0.13.0/src/filesystem/context.rs:150-161), which surfaced
+/// in .NET `WriteAllBytes` as "Incorrect function" and cascaded
+/// into Copy-Item / Move-Item / Remove-Item failures on the same
+/// files (each re-opens the freshly-written file with a disposition
+/// that WinFSP routes to `overwrite`).
+///
+/// Build a `WinFspHandle` for the named file under the
+/// memory-backed `MntrsFs`. Looks up via the `CoreFilesystem`
+/// trait and opens with O_RDWR so the resulting `fh` is valid
+/// for write/read IRPs.
+fn open_handle_for<F: CoreFilesystem>(fs: &F, name: &str) -> WinFspHandle {
+    let attr = fs.lookup(1, name).expect("lookup for fixture file");
+    let fh = fs
+        .open(attr.ino, 2 /* O_RDWR */)
+        .expect("open fixture file");
+    WinFspHandle {
+        ino: attr.ino,
+        fh,
+        is_dir: false,
+        dir_fh: 0,
+    }
+}
 
-/// Issue #612: WinFSP routes the second open on a freshly
-/// created file to our `overwrite` callback (visible in
-/// mntrs-bench.stdout.log: `create → write → cleanup →
-/// close → open → overwrite` for [IO.File]::WriteAllBytes).
-/// Pre-fix the callback was a stub returning
-/// STATUS_INVALID_DEVICE_REQUEST, which surfaced in .NET as
-/// "Incorrect function" and cascaded into Copy-Item / Move-Item
-/// / Remove-Item failures on the same files.
-///
-/// The fix (this PR) makes `overwrite` a no-op that refreshes
-/// `file_info` from the inode — see the doc-comment on
-/// `WinFspAdapter::overwrite` for the truncate-vs-preserve
-/// trade-off rationale.
-///
-/// The test reproduces the bench WriteNew pattern via
-/// `std::fs::OpenOptions::new().create(true).truncate(true)`,
-/// which on Win32 is `CREATE_ALWAYS` and triggers the same
-/// overwrite dispatch the bench sees for `.NET WriteAllBytes`.
-/// Two writes to the same path exercise the second open
-/// (overwrite callback). After each write, read back through
-/// the mount and assert the bytes are intact — a buggy
-/// overwrite that truncates to 0 would surface here as an
-/// empty file or read error.
 #[test]
 fn winfsp_overwrite_preserves_written_data() {
     let fs = Arc::new(make_memory_fs());
-    let guard = mntrs::core_fs::test_helpers::mount_winfsp(fs.clone()).unwrap();
-    let mp = &guard.mount_path;
-    settle();
+    let adapter = WinFspAdapter::new(fs.clone());
 
-    // First write — CreateFile(CREATE_ALWAYS) → create + write
-    // + close, then WinFSP's internal re-open triggers overwrite.
-    // Pre-fix overwrite returns STATUS_INVALID_DEVICE_REQUEST
-    // and the first `write` here would already fail.
-    let first = b"hello overwrite #612";
-    std::fs::write(format!("{mp}_ovw.bin"), first).expect("first write");
-    let read_first = std::fs::read(format!("{mp}_ovw.bin")).expect("read after first write");
+    // Seed a file via write_remote (bypasses WinFSP, lands
+    // straight in the opendal memory backend).
+    let payload = b"data we expect to survive overwrite";
+    write_remote(&fs, "_ovw.bin", payload);
+
+    let ctx = open_handle_for(&*fs, "_ovw.bin");
+
+    // Call `overwrite` with allocation_size=0 — the same
+    // shape WinFSP sends for the failing bench WriteNew case
+    // (visible in mntrs-bench.stdout.log).
+    let mut file_info = FileInfo::default();
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::overwrite(
+        &adapter,
+        &ctx,
+        0,     // file_attributes
+        false, // replace_file_attributes
+        0,     // allocation_size
+        None,  // extra_buffer
+        &mut file_info,
+    )
+    .expect("overwrite must succeed (issue #612 fix)");
+
+    // 1) Data must still be in the backend — a buggy overwrite
+    //    that honoured WinFSP's "truncate to allocation_size"
+    //    semantic would shrink the file to 0.
+    let backend = rt_block_on(async { fs.op.read("_ovw.bin").await.unwrap_or_default().to_vec() });
     assert_eq!(
-        read_first, first,
-        "first WriteAllBytes must round-trip through the mount"
+        backend, payload,
+        "overwrite must NOT truncate the backend payload (issue #612)"
     );
 
-    // Second write — same file, same CREATE_ALWAYS path. This
-    // is the pattern Copy-Item / Move-Item also follow.
-    let second = b"second payload, longer than the first one";
-    std::fs::write(format!("{mp}_ovw.bin"), second).expect("second write");
-    let read_second = std::fs::read(format!("{mp}_ovw.bin")).expect("read after second write");
+    // 2) file_info must reflect the current size so the kernel's
+    //    FCB stays in sync (post-#612 refresh).
     assert_eq!(
-        read_second, second,
-        "second WriteAllBytes must round-trip and replace contents"
+        file_info.file_size,
+        payload.len() as u64,
+        "file_info.file_size must match current inode size"
     );
 
-    // Cleanup: confirm backend (opendal memory) also reflects
-    // the second payload. A regression where overwrite
-    // truncates the WinFSP view but leaves the backend at the
-    // first payload would still leak state.
-    let op = fs.op.clone();
-    let backend = rt_block_on(async move { op.read("_ovw.bin").await.unwrap_or_default() });
-    assert_eq!(
-        backend.to_vec(),
-        second.to_vec(),
-        "backend must reflect the second payload, not the first"
-    );
-
-    drop(guard);
+    // Clean up the fh so the in-memory backend sees a tidy
+    // close (release() drops the write buffer).
+    fs.release(ctx.ino, ctx.fh).expect("release");
 }
 
-/// Issue #612: explicit-truncate path (TRUNCATE_EXISTING on
-/// Win32, i.e. `OpenOptions::truncate(true)` on an existing
-/// file). The kernel dispatches `open` then `overwrite` to
-/// signal "shrink to 0"; our overwrite preserves any data
-/// already written via `write` but the subsequent
-/// `set_file_size` (called by std::fs::File::set_len / etc.)
-/// would normally truncate. Without the `set_file_size` call,
-/// we don't truncate — which matches .NET's WriteAllBytes
-/// pattern (no explicit truncation call).
-///
-/// This test pins the current semantics: opening with
-/// truncate + closing without an explicit size change is a
-/// no-op on our adapter. If a future PR decides to honor the
-/// WinFSP overwrite spec strictly, this test will fail and
-/// signal the change to the operator.
 #[test]
-fn winfsp_overwrite_no_set_size_is_noop() {
+fn winfsp_overwrite_refreshes_file_info() {
     let fs = Arc::new(make_memory_fs());
-    let guard = mntrs::core_fs::test_helpers::mount_winfsp(fs.clone()).unwrap();
-    let mp = &guard.mount_path;
-    settle();
+    let adapter = WinFspAdapter::new(fs.clone());
 
-    let payload = b"data we expect to survive overwrite-without-set-size";
-    std::fs::write(format!("{mp}_ovw_noop.bin"), payload).expect("write");
+    // Seed two files of different sizes so we can prove
+    // file_info reflects the *current* inode, not some cached
+    // value.
+    let payload_a = vec![0xAAu8; 17];
+    let payload_b = vec![0xBBu8; 4099];
+    write_remote(&fs, "_ovw_a.bin", &payload_a);
+    write_remote(&fs, "_ovw_b.bin", &payload_b);
 
-    // Open with truncate(true), then close without writing.
-    use std::fs::OpenOptions;
-    let _f = OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(format!("{mp}_ovw_noop.bin"))
-        .expect("open with truncate");
-    drop(_f);
+    let ctx_a = open_handle_for(&*fs, "_ovw_a.bin");
+    let ctx_b = open_handle_for(&*fs, "_ovw_b.bin");
 
-    let read = std::fs::read(format!("{mp}_ovw_noop.bin")).expect("read");
+    let mut fi_a = FileInfo::default();
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::overwrite(
+        &adapter, &ctx_a, 0, false, 0, None, &mut fi_a,
+    )
+    .expect("overwrite a");
     assert_eq!(
-        read, payload,
-        "overwrite-without-set_file_size must preserve data (issue #612 design)"
+        fi_a.file_size,
+        payload_a.len() as u64,
+        "file_info for _ovw_a.bin must reflect its actual size"
     );
 
-    drop(guard);
+    let mut fi_b = FileInfo::default();
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::overwrite(
+        &adapter, &ctx_b, 0, false, 0, None, &mut fi_b,
+    )
+    .expect("overwrite b");
+    assert_eq!(
+        fi_b.file_size,
+        payload_b.len() as u64,
+        "file_info for _ovw_b.bin must reflect its actual size"
+    );
+
+    fs.release(ctx_a.ino, ctx_a.fh).expect("release a");
+    fs.release(ctx_b.ino, ctx_b.fh).expect("release b");
+}
+
+/// Pin the "no set_file_size → no truncate" design choice
+/// (see doc-comment on `WinFspAdapter::overwrite`). We can
+/// only test this at the trait level — issuing Win32
+/// `TRUNCATE_EXISTING` through std fs routes through the
+/// `open` callback, not `overwrite`, so the file is truncated
+/// before `overwrite` is ever called. At the trait level
+/// `overwrite(allocation_size=0)` is a no-op + file_info
+/// refresh, which matches our bench-observed dispatch.
+#[test]
+fn winfsp_overwrite_zero_allocation_is_noop_on_data() {
+    let fs = Arc::new(make_memory_fs());
+    let adapter = WinFspAdapter::new(fs.clone());
+
+    let payload = b"data that must survive overwrite(allocation_size=0)";
+    write_remote(&fs, "_ovw_noop.bin", payload);
+
+    let ctx = open_handle_for(&*fs, "_ovw_noop.bin");
+    let mut file_info = FileInfo::default();
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::overwrite(
+        &adapter,
+        &ctx,
+        0,
+        false,
+        0,
+        None,
+        &mut file_info,
+    )
+    .expect("overwrite");
+
+    let backend = rt_block_on(async {
+        fs.op
+            .read("_ovw_noop.bin")
+            .await
+            .unwrap_or_default()
+            .to_vec()
+    });
+    assert_eq!(
+        backend, payload,
+        "overwrite(allocation_size=0) must preserve existing data"
+    );
+    assert_eq!(
+        file_info.file_size,
+        payload.len() as u64,
+        "file_info.file_size must match pre-overwrite inode size"
+    );
+
+    fs.release(ctx.ino, ctx.fh).expect("release");
 }
 
 // ============================================================
