@@ -1772,19 +1772,50 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
         // successful `rename`. The kernel dispatches that
         // cleanup with the destination's name (the source
         // FH's path was updated by the rename), so a
-        // backend unlink would target the wrong file. We
-        // recorded the ino in `rename`; consume the entry
-        // here (regardless of the DELETE flag — this keeps
-        // the set bounded even if the kernel drops the
-        // dispatch) and, when DELETE is also set, suppress
-        // the backend unlink.
-        let recently_renamed = {
+        // backend unlink would target the wrong file.
+        //
+        // Tracking happens in two places:
+        //   * `rename` callback (v1) — kernel invoked us
+        //     via the user-mode path. The subsequent
+        //     cleanup-with-DELETE then drains + early-
+        //     returns.
+        //   * `set_basic_info` callback (v2) — kernel-
+        //     internal rename IRP that bypasses our
+        //     `rename` callback. The visible signal is
+        //     `(file_attributes != u32::MAX,
+        //     last_write_time == 0)`. The subsequent
+        //     cleanup-with-DELETE then drains + early-
+        //     returns.
+        //
+        // In both flows the kernel dispatches a
+        // cleanup-with-DELETE LAST, but it may dispatch
+        // an intermediate cleanup-without-DELETE first
+        // (closing the pre-rename handle before opening
+        // the post-rename handle). v3 fix: drain only
+        // when the DELETE flag is set; for non-DELETE
+        // cleanups, peek without removing. The previous
+        // "drain on every cleanup" logic was racing with
+        // the second (DELETE) cleanup, leaving the set
+        // empty when the post-rename DELETE cleanup ran.
+        //
+        // The leak risk is small: an entry persists only
+        // if `rename` (or the v2 heuristic) inserted but
+        // the kernel then drops the DELETE-cleanup
+        // dispatch — bench (run 33073543760) shows the
+        // DELETE cleanup always follows the non-DELETE
+        // one, so the set stays bounded in practice.
+        let recently_renamed = if FspCleanupFlags::FspCleanupDelete.is_flagged(flags) {
             let mut renamed = self.renamed_inos.lock_or_recover();
             renamed.remove(&context.ino)
+        } else {
+            let renamed = self.renamed_inos.lock_or_recover();
+            renamed.contains(&context.ino)
         };
         if recently_renamed {
             tracing::trace!(
                 ino = context.ino,
+                is_dir = context.is_dir,
+                flags = %format_cleanup_flags(flags),
                 "winfsp::cleanup: clearing renamed-tracking for ino"
             );
             if FspCleanupFlags::FspCleanupDelete.is_flagged(flags) {
