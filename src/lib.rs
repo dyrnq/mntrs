@@ -12,6 +12,7 @@ pub mod disk_write_pool;
 pub mod error_log;
 pub mod fuse_error;
 pub mod http_client;
+pub(crate) mod io;
 pub mod mem_limiter;
 pub mod metrics;
 pub(crate) mod multi_level_cache;

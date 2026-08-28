@@ -448,14 +448,30 @@ pub(crate) fn spawn(
     // stage 1 was retired: there is no global accumulator
     // anymore — every push goes straight to a deleter via the
     // `notify` primitive.
+    //
+    // **io::sync migration (2026-08-28):** N concurrent single-DELETE
+    // workers DO need N OS threads to actually parallelize. The
+    // original code spawned all N onto `crate::rt()` which has
+    // `worker_threads(1)` (Issue #30 design) — so the 8 workers
+    // serialized on a single OS thread, explaining the 10s wall-clock
+    // for rm-rf 10000. The `io::sync` runtime has 8 workers and is
+    // physically separate from `rt()` (which remains pinned at 1
+    // worker for the FUSE metadata-op hot path). All deleter + drain
+    // tasks now spawn on `io_sync.handle()`. If io::sync was not
+    // initialized (test / legacy), fall back to `rt()` so the
+    // existing behavior is preserved — the rm-rf 10000 regression
+    // will still be present in that mode, but no worse than today.
     let worker_count = config.worker_count.max(1);
+    let spawn_handle = crate::io::sync::IoSync::get()
+        .map(|s| s.handle())
+        .unwrap_or_else(|| crate::rt().handle().clone());
     let mut deleter_handles = Vec::with_capacity(worker_count);
     for deleter_id in 0..worker_count {
         let cfg = config.clone();
         let sh = shared.clone();
-        deleter_handles.push(crate::rt().spawn(deleter_loop(deleter_id, cfg, sh)));
+        deleter_handles.push(spawn_handle.spawn(deleter_loop(deleter_id, cfg, sh)));
     }
-    let drain_handle = crate::rt().spawn(drain_worker_loop(config, shared.clone(), rx));
+    let drain_handle = spawn_handle.spawn(drain_worker_loop(config, shared.clone(), rx));
     Ok((
         deleter,
         WorkerHandles {

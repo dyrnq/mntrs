@@ -1154,6 +1154,23 @@ pub fn mount(
     // (closes the Integration Tests "memory mount
     // not ready after 60s" failure on commit 977854d).
     crate::set_opendal_sync_op(op.clone());
+    // Initialize the io::sync runtime — independent tokio
+    // multi_thread runtime (worker_threads=8) that hosts all
+    // background opendal network IO (concurrent_delete workers,
+    // writeback uploads, prefetch downloads). Without this, N
+    // concurrent deleter workers spawned on `crate::rt()` (which
+    // has worker_threads=1, Issue #30 design) serialize on a
+    // single OS thread — explaining the rm -rf 10000 wall-clock
+    // regression vs rclone. See `src/io/sync.rs` module docs.
+    //
+    // Safe to call multiple times: `IoSync::set_global` is
+    // idempotent (logs a warn if a different instance was
+    // already set). Box::leak'd for process-static lifetime
+    // (matches `disk_write_pool`).
+    let io_sync = crate::io::sync::IoSync::init(op.clone(), None);
+    if let Err(_existing) = crate::io::sync::IoSync::set_global(io_sync) {
+        tracing::debug!("io::sync: a different instance was already set; using it");
+    }
     // Initialize the disk-IO thread pool. Without
     // it, `submit_disk_write` falls back to running
     // the I/O job synchronously on the FUSE worker
