@@ -29,14 +29,18 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-// Plan #64 (step 6): build result carries the per-mount
-// `reqwest::Client` plus, for S3, the inputs the batched
-// deleter needs (endpoint/bucket/prefix/region/credentials).
-// Non-S3 schemes get `s3_delete_config = None`. `http` is
-// always populated because cloning `reqwest::Client` is Arc-cheap
-// and keeps the `Mount` entry point free of an `Option`.
+// Plan #64 (step 6): build result carries, for S3, the inputs
+// the batched deleter needs (endpoint/bucket/prefix/region/credentials).
+// Non-S3 schemes get `s3_delete_config = None`. The `http` field
+// used to carry a per-mount `reqwest::Client` that the legacy
+// `concurrent_delete::from_s3` consumed; since stage 7 the deleter
+// uses opendal's own reqwest pool (via `Arc<S3Core>`), so the
+// field is kept for API stability but unused. The `#[allow]` is
+// scoped to this field — when the cleanup PR drops it, the allow
+// goes with it.
 pub(crate) struct BuiltOperator {
     pub operator: Operator,
+    #[allow(dead_code)]
     pub http: reqwest::Client,
     pub s3_delete_config: Option<S3DeleteMountConfig>,
 }
@@ -1102,18 +1106,13 @@ pub fn mount(
         resolve_unlink_batch(unlink_batch, user_set_env, built.s3_delete_config.is_some());
     let concurrent_delete_config = match built.s3_delete_config {
         Some(cfg) if enable_batch => {
-            // Plan #64 stage B: build the WorkerConfig first so the
-            // startup log line reflects the env-var-overridden
-            // batch_size + flush_delay rather than the defaults.
-            let wc = crate::concurrent_delete::WorkerConfig::from_s3(
-                cfg.endpoint.clone(),
-                cfg.bucket.clone(),
-                cfg.prefix.clone(),
-                cfg.region.clone(),
-                cfg.access_key_id.clone(),
-                cfg.secret_access_key.clone(),
-                built.http.clone(),
-            );
+            // Plan #64 stage 7: build the WorkerConfig from the
+            // live opendal Operator (opendal owns the SigV4 signer
+            // + reqwest pool via Arc<S3Core>). The S3DeleteMountConfig
+            // fields (endpoint/bucket/prefix/region/credentials)
+            // are all reachable via op.info() — the deleter pump
+            // reads them through op, not through legacy fields.
+            let wc = crate::concurrent_delete::WorkerConfig::from_operator(Arc::new(op.clone()));
             tracing::info!(
                 target: "mntrs::concurrent_delete",
                 bucket = %cfg.bucket,
