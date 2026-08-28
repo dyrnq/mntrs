@@ -1722,6 +1722,113 @@ fn winfsp_v5_rename_overwrites_existing_dst() {
     );
 }
 
+/// Issue #614 v6: when `op.read(src)` returns NotFound but
+/// the local write-back cache file exists, the rename
+/// fallback must read bytes from the cache file. This is
+/// the post-#78 fix hybrid: opendal-only files (no cache
+/// file) still surface NotFound (#78 preserved), but a
+/// recent local write that hasn't been uploaded yet still
+/// works (the #78 bug reintroduced).
+///
+/// Pre-fix this returned STATUS_OBJECT_NAME_NOT_FOUND on
+/// the second Move-Item kernel retry after iteration 1's
+/// rename deleted src from the backend but left the cache
+/// file at src orphaned (do_rename migrates src→dst on
+/// success, but a subsequent kernel retry of the same
+/// MoveFileEx against the orphan at src was failing with
+/// NotFound before the cache-file fallback).
+#[test]
+fn winfsp_v6_rename_falls_back_to_cache_file_on_backend_notfound() {
+    let fs = Arc::new(make_memory_fs());
+    let adapter = WinFspAdapter::new(fs.clone());
+
+    // Step 1: seed src in the backend via the direct
+    // write path so the rename fallback's `op.read(src)`
+    // would normally succeed. We'll then DELETE src from
+    // the backend AND plant a cache file at src to
+    // simulate the orphan-after-rename race.
+    let payload = b"v6: payload from cache-file fallback path";
+    write_remote(&fs, "_mv8_src.bin", payload);
+
+    // Delete src from the backend to simulate the
+    // post-rename-iteration-1 state (where do_rename has
+    // already deleted src and migrated the cache file).
+    rt_block_on(async { fs.op.delete("_mv8_src.bin").await }).unwrap();
+
+    // Plant a cache file at src with the original payload.
+    // do_rename's fallback will read this when op.read
+    // returns NotFound.
+    let cpath_src = mntrs::write_buffer_path(&fs.cache_dir, "_mv8_src.bin");
+    if let Some(parent) = cpath_src.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&cpath_src, payload).unwrap();
+
+    // Open a handle for the inode that the previous
+    // backend seed created. The cache-file fallback in
+    // do_rename fires regardless of the open handle — it's
+    // a function of op.read(src_clone) returning NotFound.
+    let ctx = open_handle_for(&*fs, "_mv8_src.bin");
+
+    // Direct rename via the trait. Pre-v6 this would
+    // return Err(NotFound) because op.read returns
+    // NotFound and there's no fallback to the cache file.
+    rename_path(&adapter, &ctx, "_mv8_src.bin", "_mv8_dst.bin");
+
+    // dst must contain the bytes from the cache file
+    // (NOT be empty — that was the v5-pre-v6 symptom).
+    let dst_after = rt_block_on(async {
+        fs.op
+            .read("_mv8_dst.bin")
+            .await
+            .unwrap_or_default()
+            .to_vec()
+    });
+    assert_eq!(
+        dst_after, payload,
+        "v6: rename must read bytes from cache file when op.read returns NotFound \
+         (issue #614 v6). Pre-fix the kernel saw STATUS_OBJECT_NAME_NOT_FOUND."
+    );
+
+    // The orphan cache file at src should be removed by
+    // the post-rename cache-file migration
+    // (write_buffer_path src → dst).
+    assert!(
+        !cpath_src.exists(),
+        "v6: post-rename cache-file migration must remove src cache file"
+    );
+}
+
+/// Issue #614 v6 (negative): when op.read returns
+/// NotFound AND there's no cache file either, the rename
+/// must surface NotFound (preserves the #78 opendal-only
+/// protection that #78 added; this test prevents a
+/// future regression from re-introducing the pre-#78
+/// silent-no-op behavior for opendal-only files).
+#[test]
+fn winfsp_v6_rename_returns_notfound_when_neither_backend_nor_cache_has_src() {
+    let fs = make_memory_fs();
+
+    // Do NOT seed anything — no backend entry, no cache
+    // file. We're calling rename on a path that does not
+    // exist anywhere. rename_paths is the lower-half
+    // rename that the WinFSP `rename` callback dispatches
+    // to (see lib.rs::rename_paths and lib.rs::do_rename).
+    // With neither backend nor cache-file containing src,
+    // do_rename stage 2 falls through both branches and
+    // returns Err(NotFound) at the v6 `cache-file missing`
+    // path.
+    let result = fs.rename_paths("/_mv9_does_not_exist.bin", "/_mv9_dst.bin");
+    let kind = result.as_ref().err().map(|e| e.kind());
+    assert_eq!(
+        kind,
+        Some(std::io::ErrorKind::NotFound),
+        "v6: rename of a non-existent src with no cache file must return NotFound \
+         (preserves #78 opendal-only protection). Got: {:?}",
+        kind
+    );
+}
+
 // ============================================================
 // Issue #306 regression tests: readdir_with_attrs (N+1 RTT + marker paging)
 // ============================================================
