@@ -54,6 +54,13 @@ use reqsign_core::{Context, ProvideCredentialChain, Signer};
 use reqsign_file_read_tokio::TokioFileRead;
 use tokio::sync::{mpsc, oneshot};
 
+// Note: `Arc<opendal::Operator>` is stashed on `WorkerConfig`
+// (Step 1 of plan #64 stage 7). Step 2 will start consuming it
+// (`op.deleter().await` per slot) — opendal owns the SigV4 signer
+// and reqwest connection pool via the inner `Arc<S3Core>`. The
+// field is initialised in `from_s3` from a stub memory operator
+// (unused until Step 2 rewrites the consumer side).
+
 // ===== Constants =====
 
 // Plan #64 stage B: retry knobs (kept). Per-mount tuning knobs
@@ -63,10 +70,12 @@ use tokio::sync::{mpsc, oneshot};
 // Calibrator / BurstObserver subsystem in issue #568 stage 6.
 // Issue #570 follow-up: the DeleteObjects XML batch path
 // (and its `DEFAULT_BATCH_SIZE` / `DEFAULT_FLUSH_DELAY` /
-// `HARD_MAX_KEYS_PER_REQUEST` constants) was also removed —
-// single path = N concurrent single-DELETE. There is no
-// opt-in knob; if a workload ever needs batch XML again,
-// resurrect the helpers from git history (commit 6eaac39).
+// `HARD_MAX_KEYS_PER_REQUEST` constants) was also removed.
+// Plan #64 stage 7 (Step 1): replaced N concurrent single-DELETE
+// with opendal `BatchDeleter<S3Deleter>::buffer` (see §2 of the
+// plan). Stage 6/7's retry knobs now wrap `Deleter::close()`
+// (the BatchDeleter flush call) instead of the old
+// `send_chunk_with_retry`.
 pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const DEFAULT_MAX_RETRIES: u32 = 3;
 pub(crate) const DEFAULT_RETRY_FACTOR: f64 = 2.0;
@@ -289,6 +298,15 @@ pub(crate) struct WorkerConfig {
     /// Shared reqwest client — same TLS settings + connection pool
     /// as opendal uses (see `cmd/mount.rs::build_mount_http_client`).
     pub http: reqwest::Client,
+    /// **Plan #64 stage 7 (Step 1, additive):** opendal operator.
+    /// The future deleter pump creates one `op.deleter().await`
+    /// per slot; the inner `Arc<S3Core>` (and thus the reqwest
+    /// connection pool) is shared across slots. **Unused in this
+    /// commit** — Step 2 swaps the per-DELETE signer/reqwest path
+    /// for `Deleter::delete` + `Deleter::close`, at which point
+    /// this becomes the only state the workers need (the six
+    /// legacy fields above are dropped).
+    pub op: Arc<opendal::Operator>,
     /// Issue #562 stage 1 (renamed in issue #568 stage 6):
     /// number of concurrent deleter loops that share
     /// `Shared::pending`. Each deleter pops one job at a time
@@ -308,6 +326,11 @@ pub(crate) struct WorkerConfig {
 impl WorkerConfig {
     /// Build the production config from S3 mount-time inputs.
     /// `prefix` should be the opendal root (e.g. `/some/dir/`).
+    /// The `op` field is initialised from a separately-constructed
+    /// opendal Operator (the same one `cmd/mount.rs::build_s3`
+    /// returns as `built.operator`); Step 2 collapses this into a
+    /// single `from_operator(op)` call that drops the legacy
+    /// fields entirely.
     pub(crate) fn from_s3(
         endpoint: url::Url,
         bucket: String,
@@ -338,6 +361,15 @@ impl WorkerConfig {
             access_key_id,
             secret_access_key,
             http,
+            // Step 1 stub: the live opendal Operator isn't threaded
+            // through `from_s3` yet, so we default to an unrooted
+            // memory operator that nothing in this commit touches.
+            // Step 2 replaces the `from_s3` call site with
+            // `from_operator(Arc::new(built.operator.clone()))` and
+            // this stub disappears.
+            op: Arc::new(opendal::Operator::new(
+                opendal::services::Memory::default(),
+            ).expect("concurrent_delete::WorkerConfig::from_s3: stub memory operator")),
             worker_count,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_retries: DEFAULT_MAX_RETRIES,

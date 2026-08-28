@@ -1119,7 +1119,7 @@ pub fn mount(
                 bucket = %cfg.bucket,
                 prefix = %cfg.prefix,
                 worker_count = wc.worker_count,
-                delete_mode = "concurrent-single",
+                delete_mode = "batched-deleteobjects",
                 credential_source = if cfg.access_key_id.is_some() { "explicit" } else { "default-chain" },
                 unlink_batch_flag = %unlink_batch,
                 user_set_env = user_set_env,
