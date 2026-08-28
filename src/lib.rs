@@ -7163,8 +7163,14 @@ impl CoreFilesystem for MntrsFs {
             );
             return Ok(());
         }
-        // #89 debug: log unlink calls
-        tracing::warn!(
+        // Issue #89: log unlink calls. Was `tracing::warn!` —
+        // bench/run_all.sh runs with RUST_LOG=info so warn fires
+        // every callback and the fmt-subscriber file write
+        // costs ~30-50µs/cb (300-500ms / 10000 unlinks).
+        // demoted to `debug!`; production mounts can re-enable
+        // with RUST_LOG=mntrs=debug to investigate unlink
+        // regressions like #89.
+        tracing::debug!(
             parent = %parent_path,
             name = %name,
             full_path = %full_path,
