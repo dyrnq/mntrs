@@ -3,16 +3,16 @@
 # Plan #64 step 11: end-to-end test for the S3 batched-delete
 # write-behind path. Verifies that:
 #   1. MNTRS_UNLINK_BATCH=1 enables the batcher (info log line
-#      at mount start; flush lines while unlink is running).
+#      at mount start; close() lines while unlink is running).
 #   2. The user's `rm` returns successfully while the batched
 #      deleter is still in flight.
 #   3. The S3 backend ends up empty after the unlink burst
 #      (verified via `aws s3api list-objects-v2`, not just the
 #      FUSE view — tombstones only mask the in-memory state).
 #   4. The daemon log shows at least one multi-key
-#      `batched_delete: flush` event with batch_size > 1
-#      (proves the batching actually happened, not just that
-#      deletes succeed serially).
+#      `concurrent_delete: pump started` event AND at least one
+#      Deleter::close call (proves the batching actually
+#      happened, not just that deletes succeed serially).
 #
 # Prereqs (host side, set in CI):
 #   - MinIO running on localhost:9000
@@ -115,7 +115,7 @@ trap cleanup EXIT
 # 2. Mount with batched delete enabled.
 echo "--- mount (MNTRS_UNLINK_BATCH=1) ---"
 MNTRS_UNLINK_BATCH=1 \
-RUST_LOG="mntrs::batched_delete=info,mntrs=warn" \
+RUST_LOG="mntrs::concurrent_delete=info,mntrs=warn" \
 "$BIN" mount \
     --opt endpoint="$ENDPOINT" \
     --opt access-key="$AK" \
@@ -139,12 +139,17 @@ fi
 echo "  mounted (pid $MOUNT_PID)"
 
 # Confirm the info log line landed.
-if ! grep -q "batched_delete: enabled (MNTRS_UNLINK_BATCH=1)" "$LOG"; then
-    echo "FAIL: batched_delete not enabled in daemon log"
+if ! grep -q "concurrent_delete: enabled" "$LOG"; then
+    echo "FAIL: concurrent_delete not enabled in daemon log"
     tail -30 "$LOG"
     exit 1
 fi
-echo "  batched_delete enabled (info log)"
+if ! grep -q "delete_mode=batched-deleteobjects" "$LOG"; then
+    echo "FAIL: delete_mode log line missing (Step 2 plan #64)"
+    tail -30 "$LOG"
+    exit 1
+fi
+echo "  concurrent_delete enabled (info log)"
 
 # 3. Create N files, then rm -rf them. The user's `rm` should
 #    return before all S3 deletes have been requested — that's
@@ -209,23 +214,28 @@ fi
 echo "  s3 list-objects count: $N (expected 0)"
 
 # 6. Verify the daemon log shows at least one multi-key flush.
-echo "--- verify batched_deleter flush log ---"
-FLUSH_LINES=$(grep -c "batched_delete: flush" "$LOG" || true)
-MULTI_KEY=$(grep "batched_delete: flush" "$LOG" | grep -c "batch_size=[2-9]" || true)
-echo "  flush lines: $FLUSH_LINES"
-echo "  multi-key (>1) flush lines: $MULTI_KEY"
+# Step 2 of plan #64: the per-key `Deleter::delete` is silent;
+# the visibility is the `pump started` line (once per slot at
+# mount) and the per-batch `Deleter::close` in flush_with_retry
+# on the rmdir barrier. We assert the pump started AND at least
+# one Deleter::close call.
+echo "--- verify concurrent_delete pump + close log ---"
+PUMP_LINES=$(grep -c "concurrent_delete: pump started" "$LOG" || true)
+CLOSE_LINES=$(grep -c "Deleter::close" "$LOG" || true)
+echo "  pump started lines: $PUMP_LINES"
+echo "  Deleter::close lines: $CLOSE_LINES"
 
 # 7. Pass/fail.
 if [ "$N" -ne 0 ]; then
     echo "FAIL: backend has $N objects remaining"
     exit 1
 fi
-if [ "$MULTI_KEY" -lt 1 ]; then
-    echo "FAIL: no multi-key batched_delete flush observed (write-behind not engaging)"
+if [ "$PUMP_LINES" -lt 1 ]; then
+    echo "FAIL: no pump started observed (concurrent_delete not engaging)"
     tail -30 "$LOG"
     exit 1
 fi
 
 echo
-echo "PASS: $N_FILES unlinks → 0 backend objects, $MULTI_KEY multi-key flush lines"
+echo "PASS: $N_FILES unlinks → 0 backend objects, $PUMP_LINES pump-started, $CLOSE_LINES Deleter::close"
 exit 0
