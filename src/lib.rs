@@ -1929,6 +1929,14 @@ impl MntrsFs {
         let op = self.op.clone();
         let delay = self.write_back_delay;
         let inodes = Arc::new(self.inodes.clone());
+        // io::sync migration (PR #616 + this PR): writeback
+        // worker runs on io::sync (multi_thread, 8 workers)
+        // instead of `crate::rt()` (1 worker). 200 MiB+ multipart
+        // uploads no longer block fuser-0. Falls back to
+        // `crate::rt()` for tests / pre-init.
+        let wb_handle = crate::io::sync::IoSync::get()
+            .map(|s| s.handle())
+            .unwrap_or_else(|| crate::rt().handle().clone());
         let (tx, _handle) = crate::writeback::spawn(
             op,
             inodes,
@@ -1936,6 +1944,7 @@ impl MntrsFs {
             self.cache_dir.clone(),
             self.writeback_pending.clone(),
             delay,
+            wb_handle,
         );
         self.writeback_sender.set(tx).ok();
 
