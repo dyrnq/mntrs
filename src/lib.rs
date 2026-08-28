@@ -12,6 +12,7 @@ pub mod disk_write_pool;
 pub mod error_log;
 pub mod fuse_error;
 pub mod http_client;
+pub(crate) mod io;
 pub mod mem_limiter;
 pub mod metrics;
 pub(crate) mod multi_level_cache;
@@ -464,97 +465,6 @@ impl FileHandleState {
     }
 }
 
-/// Issue #530: caller-side burst-gating defaults. The window
-/// (100 ms) and threshold (32) were chosen empirically when the
-/// S3 deleter still had a Profile subsystem (issue #530
-/// / #562). After issue #568 stage 6 the threshold gates no
-/// longer drive a fast-flush decision (the deleter is now N
-/// concurrent single-DELETE), but the constants remain so the
-/// `UnlinkBurstState` fallback policy is unchanged for callers
-/// that don't set `MNTRS_BURST_WINDOW_MS` /
-/// `MNTRS_BURST_THRESHOLD` in the environment.
-const DEFAULT_UNLINK_BURST_WINDOW_MS: u64 = 100;
-/// Renamed from `concurrent_delete::DEFAULT_BATCH_THRESHOLD`
-/// in issue #572: the constant lives here (with the policy
-/// that consumes it) rather than in the concurrent_delete
-/// module where it no longer has any meaning.
-pub(crate) const DEFAULT_UNLINK_BURST_THRESHOLD: u32 = 32;
-
-/// Issue #530: caller-side burst detection state for
-/// `enqueue_backend_delete`. See the doc-comment on
-/// `MntrsFs::unlink_burst_state` for the rationale. Two
-/// parameters govern the gating policy:
-///   * `burst_window` — how long after a previous unlink we
-///     still consider ourselves "in a burst". Default 100 ms
-///     (matches the original 50 ms flush_delay × 2, so an
-///     `rm -rf` where unlinks arrive faster than the
-///     concurrent deleter can drain them stays in burst mode).
-///   * `burst_threshold` — how many unlinks within
-///     `burst_window` are required before we route the next
-///     delete through the concurrent deleter. Below this we
-///     fall through to `delete_backend_strict`. Default 32
-///     (bench crossover from the issue #530 days when 1 batched
-///     `DeleteObjects` beat 32 serial `op.delete()` calls; the
-///     constant is retained for callers that opt into the
-///     strict path via `MNTRS_BURST_THRESHOLD=0`).
-struct UnlinkBurstState {
-    /// `Instant` of the last unlink that updated this state.
-    /// Compared against `Instant::now()` under the mutex.
-    last_unlink_at: std::time::Instant,
-    /// Count of unlinks within the current `burst_window`.
-    /// Reset to 1 whenever the gap from the previous unlink
-    /// exceeds the window; otherwise incremented.
-    count_in_window: u32,
-    /// How wide a window we treat as "still bursting".
-    burst_window: std::time::Duration,
-    /// How many unlinks within the window before we route
-    /// to the concurrent deleter.
-    burst_threshold: u32,
-}
-
-impl UnlinkBurstState {
-    /// Read env vars `MNTRS_BURST_WINDOW_MS` and
-    /// `MNTRS_BURST_THRESHOLD` to allow per-mount tuning.
-    /// Falls back to the hard-coded policy (100 ms / 32
-    /// unlinks) when env vars are unset or fail to parse —
-    /// runtime behaviour is unchanged for callers that do not
-    /// opt in via env. Bench harness overrides these to enable
-    /// the concurrent_delete fast path on small rm -rf workloads
-    /// (issue #536 follow-up).
-    fn from_env() -> Self {
-        let window_ms = std::env::var("MNTRS_BURST_WINDOW_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_UNLINK_BURST_WINDOW_MS);
-        let threshold = std::env::var("MNTRS_BURST_THRESHOLD")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(DEFAULT_UNLINK_BURST_THRESHOLD);
-        Self::with_policy(
-            std::time::Duration::from_millis(window_ms.clamp(1, 10_000)),
-            threshold,
-        )
-    }
-
-    /// Explicit policy for tests that need deterministic gating
-    /// without depending on the host environment.
-    fn with_policy(burst_window: std::time::Duration, burst_threshold: u32) -> Self {
-        Self {
-            // Initialise to "epoch" so the first unlink's gap
-            // is larger than any window — the first unlink is
-            // always classified as "not yet in a burst" and
-            // routes through the strict path. Subsequent
-            // unlinks within the window accumulate count.
-            last_unlink_at: std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_secs(3600))
-                .unwrap_or_else(std::time::Instant::now),
-            count_in_window: 0,
-            burst_window,
-            burst_threshold,
-        }
-    }
-}
-
 #[allow(clippy::type_complexity)]
 #[allow(dead_code)]
 pub struct MntrsFs {
@@ -906,21 +816,6 @@ pub struct MntrsFs {
     /// stage C).
     #[allow(dead_code)]
     delete_tombstones: std::sync::Arc<dashmap::DashSet<String>>,
-
-    /// Issue #530: caller-side burst detection for
-    /// `enqueue_backend_delete`. Tracks the timing of recent
-    /// unlinks so we can decide whether the next delete
-    /// should go through the concurrent deleter (sustained
-    /// burst) or fall back to a direct `delete_backend_strict`
-    /// (single / scattered unlinks). After issue #568 stage 6
-    /// the concurrent deleter has no flush-coalescing window —
-    /// every enqueue fires a single DELETE on the next available
-    /// worker — so the gating here only routes traffic away from
-    /// the deleter for tiny non-burst workloads where the
-    /// strict path skips the enqueue+oneshot overhead. Updated
-    /// under `unlink_burst_mu`; the lock is held only long
-    /// enough to read+write a few atomics-worth of state.
-    unlink_burst_state: std::sync::Mutex<UnlinkBurstState>,
 
     /// Issue #325: in-memory symlink target table.
     /// Maps the canonical `path → target` for every symlink
@@ -1928,6 +1823,14 @@ impl MntrsFs {
         let op = self.op.clone();
         let delay = self.write_back_delay;
         let inodes = Arc::new(self.inodes.clone());
+        // io::sync migration (PR #616 + this PR): writeback
+        // worker runs on io::sync (multi_thread, 8 workers)
+        // instead of `crate::rt()` (1 worker). 200 MiB+ multipart
+        // uploads no longer block fuser-0. Falls back to
+        // `crate::rt()` for tests / pre-init.
+        let wb_handle = crate::io::sync::IoSync::get()
+            .map(|s| s.handle())
+            .unwrap_or_else(|| crate::rt().handle().clone());
         let (tx, _handle) = crate::writeback::spawn(
             op,
             inodes,
@@ -1935,6 +1838,7 @@ impl MntrsFs {
             self.cache_dir.clone(),
             self.writeback_pending.clone(),
             delay,
+            wb_handle,
         );
         self.writeback_sender.set(tx).ok();
 
@@ -2068,59 +1972,33 @@ impl MntrsFs {
         op_label: &'static str,
     ) -> std::io::Result<()> {
         if let Some(deleter) = self.concurrent_deleter.get() {
-            // Strict path: enqueue + await. Workers are
-            // single-flight per chunk but the wait is bounded by
-            // batch size and request timeout. The wait has the
-            // same semantic as the old `op.delete().await` —
-            // it's just batched behind the scenes.
+            // Strict path: enqueue + flush barrier = wait for S3
+            // ack. The pre-Step-2 contract for callers that needed
+            // real ack was `op.delete().await`; with BatchDeleter
+            // we preserve the same strictness via the flush barrier
+            // (opendal buffers keys in its HashSet and one close()
+            // drains the buffer via a single POST /?delete). The
+            // pump fires every queued oneshot::Receiver before
+            // bumping `barrier_ack`, so a successful `flush().await`
+            // here implies the S3 batched-delete request has
+            // returned.
             //
-            // Issue #530: when the batched deleter's own
-            // `batch_threshold` gating (set from
-            // `MNTRS_BATCH_THRESHOLD`, default 32) returns
-            // `None` because the current pending queue is
-            // below threshold, fall through to a direct
-            // `op.delete()` instead of failing the unlink.
-            // The caller-side `UnlinkBurstState` may have
-            // routed us here precisely to *avoid* the
-            // batched path for a small burst; refusing the
-            // delete would be a regression vs. pre-#530
-            // where `op.delete()` was always the fallback.
-            // The pre-#530 fallback branch is preserved
-            // verbatim below for the case where
-            // `concurrent_deleter` itself is unavailable
-            // (non-S3, disabled, spawn failure).
-            // Issue #530: pass the `Option<Receiver>` through
-            // directly so a `None` from the deleter's own
-            // `batch_threshold` gating can fall through to
-            // `op.delete()`. The caller-side `UnlinkBurstState`
-            // may have routed us here precisely to *avoid* the
-            // batched path for a small burst; refusing the
-            // delete would be a regression vs. pre-#530 where
-            // `op.delete()` was always the fallback.
-            let rx = deleter.enqueue(path.to_string());
-            match rx {
-                Some(rx) => match rx.await {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Ok(Err(e)) => Err(e),
-                    Err(_) => Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "concurrent_deleter: worker dropped result sender",
-                    )),
-                },
-                None => {
-                    // Fallback path: same opendal call as the
-                    // outer `else` branch below. The two are
-                    // structurally identical so any future
-                    // error-kind mapping in `opendal_to_io_error`
-                    // applies uniformly.
-                    match self.op.delete(path).await {
-                        Ok(()) => Ok(()),
-                        Err(e) if matches!(e.kind(), opendal::ErrorKind::NotFound) => Ok(()),
-                        Err(e) => Err(opendal_to_io_error(&e, op_label)),
-                    }
-                }
-            }
+            // Critical: do NOT `rx.await` here. With BatchDeleter
+            // the per-key receiver only fires on the next
+            // `barrier_epoch` advance — for callers that never
+            // invoke `flush()` (none in this codebase anymore, but
+            // a regression risk), `rx.await` would block forever.
+            // The flush barrier replaces the per-key wait and
+            // preserves the "return only after S3 confirms" contract.
+            //
+            // Tombstone insertion is the caller's responsibility
+            // (unlink inserts at lib.rs:7372; rename_fallback /
+            // symlink_cleanup / rmdir do not use the tombstone
+            // table because their deletion target is the source
+            // path which the kernel is already about to forget).
+            let _rx = deleter.enqueue(path.to_string());
+            deleter.flush().await?;
+            Ok(())
         } else {
             // Fallback: opendal path (non-S3, or batched delete
             // disabled / failed to spawn).
@@ -2137,66 +2015,32 @@ impl MntrsFs {
     /// callers drop it, treating the FUSE callback success as
     /// the user-visible outcome. Per-key S3 failures are logged
     /// but not propagated.
-    ///
-    /// Issue #530: caller-side burst gating. The batched
-    /// deleter is not always the right tool — every enqueue
-    /// pays a `flush_delay` (50 ms) latency floor before the
-    /// S3 DELETE is requested, which is wasted for a single
-    /// `rm file.txt` or a 10-file `rm -rf dir/`. We consult
-    /// `unlink_burst_state` and return `None` (caller falls
-    /// through to `delete_backend_strict`) when the recent
-    /// unlink history doesn't show a sustained burst. This
-    /// means the first ~`burst_threshold` unlinks in a burst
-    /// still go through the strict path, but every unlink
-    /// after that rides the batched deleter's `DeleteObjects`
-    /// batches. The lock is held only for the duration of a
-    /// few atomic reads/writes; no I/O happens inside.
     pub(crate) fn enqueue_backend_delete(
         &self,
         path: &str,
     ) -> Option<tokio::sync::oneshot::Receiver<std::io::Result<()>>> {
+        // BatchDeleter pumps keys via opendal's HashSet (auto-flush
+        // at 1000 keys via `POST /?delete`). The pump only fires
+        // `oneshot::Receiver` on `flush()` barrier — never per-key.
+        // Callers that fall through to `delete_backend_strict`
+        // when this returns `None` would await the receiver forever
+        // (the rx has no completion path until the next barrier or
+        // shutdown). To preserve the pre-Step-2 write-behind
+        // contract (unlink returns immediately, batched POSTs
+        // happen in the background), we always return Some when
+        // BatchDeleter is available and let the caller drop the rx.
+        //
+        // The previous caller-side burst_threshold gating (issue
+        // #530) optimized the *old* N-concurrent-single-DELETE
+        // pump where each `Some(rx)` blocked fuser-0 for one HTTP
+        // RTT. With BatchDeleter that gating is obsolete — opendal
+        // batches single-key close() into one POST as easily as a
+        // 1000-key close, so we drop the gate.
+        //
+        // Callers that need strict ordering (rmdir's flush barrier
+        // at lib.rs:7566-7568) call `flush()` themselves after the
+        // enqueue + tombstone insert.
         let deleter = self.concurrent_deleter.get()?;
-
-        // Issue #530: caller-side burst gating. The `Mutex`
-        // here is uncontended on the steady-state burst path
-        // (one unlink at a time per FUSE thread) and held for
-        // a few ns of state update + decision. If contention
-        // shows up in a profile we can promote this to
-        // thread-local state later — the burst window is
-        // per-mount rather than per-process anyway.
-        let should_batch = {
-            let mut state = self
-                .unlink_burst_state
-                .lock()
-                .expect("unlink_burst_state mutex poisoned");
-            let now = std::time::Instant::now();
-            let gap = now.saturating_duration_since(state.last_unlink_at);
-            if gap <= state.burst_window {
-                state.count_in_window = state.count_in_window.saturating_add(1);
-            } else {
-                // Window expired — start a new window. The
-                // first unlink of a new window is always
-                // strict, by construction (count goes 0 → 1
-                // and we compare against `burst_threshold`
-                // below).
-                state.count_in_window = 1;
-            }
-            state.last_unlink_at = now;
-            state.count_in_window >= state.burst_threshold
-        };
-
-        if !should_batch {
-            // Below threshold (or new window) — bypass
-            // batching, return None so caller falls through
-            // to `delete_backend_strict`. The batched
-            // deleter's own internal `batch_threshold` is
-            // also a backstop (defaults to 32, matching our
-            // caller-side `burst_threshold` default) so a
-            // future caller that forgets to update this
-            // state still gets sensible behaviour.
-            return None;
-        }
-
         deleter.enqueue(path.to_string())
     }
 
@@ -9297,16 +9141,6 @@ pub fn new_test_fs_with_mode(
         // Plan #64 step 10: empty tombstone set in tests; tests
         // don't exercise the write-behind path (S3-only).
         delete_tombstones: Arc::new(dashmap::DashSet::new()),
-        // Issue #530: caller-side burst detection for
-        // enqueue_backend_delete. Tests use the default
-        // policy (100 ms window, 32-unlink threshold) so
-        // anything short of a sustained `rm -rf` of 32+
-        // files in <100 ms goes through the strict path.
-        //
-        // Bench harness overrides these via MNTRS_BURST_WINDOW_MS
-        // and MNTRS_BURST_THRESHOLD (issue #536 follow-up). The
-        // production default is unchanged.
-        unlink_burst_state: std::sync::Mutex::new(UnlinkBurstState::from_env()),
         // Issue #325: in-memory symlink target table. Empty in
         // tests; populated only by tests that exercise the
         // symlink code paths.

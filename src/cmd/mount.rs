@@ -29,14 +29,18 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-// Plan #64 (step 6): build result carries the per-mount
-// `reqwest::Client` plus, for S3, the inputs the batched
-// deleter needs (endpoint/bucket/prefix/region/credentials).
-// Non-S3 schemes get `s3_delete_config = None`. `http` is
-// always populated because cloning `reqwest::Client` is Arc-cheap
-// and keeps the `Mount` entry point free of an `Option`.
+// Plan #64 (step 6): build result carries, for S3, the inputs
+// the batched deleter needs (endpoint/bucket/prefix/region/credentials).
+// Non-S3 schemes get `s3_delete_config = None`. The `http` field
+// used to carry a per-mount `reqwest::Client` that the legacy
+// `concurrent_delete::from_s3` consumed; since stage 7 the deleter
+// uses opendal's own reqwest pool (via `Arc<S3Core>`), so the
+// field is kept for API stability but unused. The `#[allow]` is
+// scoped to this field — when the cleanup PR drops it, the allow
+// goes with it.
 pub(crate) struct BuiltOperator {
     pub operator: Operator,
+    #[allow(dead_code)]
     pub http: reqwest::Client,
     pub s3_delete_config: Option<S3DeleteMountConfig>,
 }
@@ -1102,24 +1106,19 @@ pub fn mount(
         resolve_unlink_batch(unlink_batch, user_set_env, built.s3_delete_config.is_some());
     let concurrent_delete_config = match built.s3_delete_config {
         Some(cfg) if enable_batch => {
-            // Plan #64 stage B: build the WorkerConfig first so the
-            // startup log line reflects the env-var-overridden
-            // batch_size + flush_delay rather than the defaults.
-            let wc = crate::concurrent_delete::WorkerConfig::from_s3(
-                cfg.endpoint.clone(),
-                cfg.bucket.clone(),
-                cfg.prefix.clone(),
-                cfg.region.clone(),
-                cfg.access_key_id.clone(),
-                cfg.secret_access_key.clone(),
-                built.http.clone(),
-            );
+            // Plan #64 stage 7: build the WorkerConfig from the
+            // live opendal Operator (opendal owns the SigV4 signer
+            // + reqwest pool via Arc<S3Core>). The S3DeleteMountConfig
+            // fields (endpoint/bucket/prefix/region/credentials)
+            // are all reachable via op.info() — the deleter pump
+            // reads them through op, not through legacy fields.
+            let wc = crate::concurrent_delete::WorkerConfig::from_operator(Arc::new(op.clone()));
             tracing::info!(
                 target: "mntrs::concurrent_delete",
                 bucket = %cfg.bucket,
                 prefix = %cfg.prefix,
                 worker_count = wc.worker_count,
-                delete_mode = "concurrent-single",
+                delete_mode = "batched-deleteobjects",
                 credential_source = if cfg.access_key_id.is_some() { "explicit" } else { "default-chain" },
                 unlink_batch_flag = %unlink_batch,
                 user_set_env = user_set_env,
@@ -1154,6 +1153,23 @@ pub fn mount(
     // (closes the Integration Tests "memory mount
     // not ready after 60s" failure on commit 977854d).
     crate::set_opendal_sync_op(op.clone());
+    // Initialize the io::sync runtime — independent tokio
+    // multi_thread runtime (worker_threads=8) that hosts all
+    // background opendal network IO (concurrent_delete workers,
+    // writeback uploads, prefetch downloads). Without this, N
+    // concurrent deleter workers spawned on `crate::rt()` (which
+    // has worker_threads=1, Issue #30 design) serialize on a
+    // single OS thread — explaining the rm -rf 10000 wall-clock
+    // regression vs rclone. See `src/io/sync.rs` module docs.
+    //
+    // Safe to call multiple times: `IoSync::set_global` is
+    // idempotent (logs a warn if a different instance was
+    // already set). Box::leak'd for process-static lifetime
+    // (matches `disk_write_pool`).
+    let io_sync = crate::io::sync::IoSync::init(op.clone(), None);
+    if let Err(_existing) = crate::io::sync::IoSync::set_global(io_sync) {
+        tracing::debug!("io::sync: a different instance was already set; using it");
+    }
     // Initialize the disk-IO thread pool. Without
     // it, `submit_disk_write` falls back to running
     // the I/O job synchronously on the FUSE worker
@@ -1287,13 +1303,6 @@ pub fn mount(
         // Plan #64 step 10: tombstones for write-behind deletes.
         // Always populated; remains empty in non-write-behind mode.
         delete_tombstones: std::sync::Arc::new(dashmap::DashSet::new()),
-        // Issue #530: caller-side burst detection for
-        // enqueue_backend_delete. Default policy (100 ms
-        // window, 32-unlink threshold); can be overridden via
-        // env vars `MNTRS_BURST_WINDOW_MS` and
-        // `MNTRS_BURST_THRESHOLD` (see
-        // UnlinkBurstState::from_env).
-        unlink_burst_state: std::sync::Mutex::new(crate::UnlinkBurstState::from_env()),
         // Issue #325: in-memory symlink target table. Empty at
         // mount start; populated by `MntrsFs::symlink` when
         // user-mode code creates a symbolic link (Win32

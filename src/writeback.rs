@@ -377,6 +377,16 @@ pub fn spawn(
     // skipped.
     writeback_pending: Arc<dashmap::DashSet<String>>,
     delay: Duration,
+    // io::sync migration (2026-08-28): the worker
+    // runs on the dedicated io::sync multi_thread
+    // runtime (worker_threads=8) instead of
+    // `crate::rt()` (1 worker). 200 MiB+ multipart
+    // uploads no longer block fuser-0's single
+    // event loop. Caller passes the io::sync handle;
+    // falls back to `crate::rt()` if io::sync was
+    // not initialized (test paths). See
+    // `src/io/sync.rs` and PR #616.
+    handle: tokio::runtime::Handle,
 ) -> (Sender, tokio::task::JoinHandle<()>) {
     // Note (issue #595): upload chunk size is **not** stored
     // here. Every `WritebackTask` carries its own `buffer_size`
@@ -393,7 +403,8 @@ pub fn spawn(
     // value.
     let tx_for_worker = tx.clone();
 
-    let handle = crate::rt().spawn(async move {
+    let tick_handle = handle.clone();
+    let handle = handle.spawn(async move {
         let mut queue: DelayQueue<WritebackTask> = DelayQueue::new();
 
         // Issue #268.1 O3: separate task for the 30-second
@@ -402,8 +413,11 @@ pub fn spawn(
         // the only "is the daemon alive?" probe is `ps`,
         // which can't see queue length. Independent task
         // because `queue.len()` needs `&mut queue` which
-        // the worker already owns.
-        tokio::spawn(async move {
+        // the worker already owns. Uses the outer
+        // `handle` (io::sync) so the tick task shares the
+        // same multi-thread pool as the upload worker
+        // itself — never falls back to rt()'s 1 worker.
+        tick_handle.spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 tracing::info!(

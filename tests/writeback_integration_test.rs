@@ -88,6 +88,7 @@ impl Harness {
                 cache_dir.clone(),
                 writeback_pending.clone(),
                 Duration::from_millis(100),
+                tokio::runtime::Handle::current(),
             )
         });
 
@@ -551,6 +552,7 @@ fn dirty_sidecar_lingers_with_no_surface_on_upload_failure() {
             cache_dir.clone(),
             writeback_pending.clone(),
             Duration::from_millis(100),
+            tokio::runtime::Handle::current(),
         )
     });
 

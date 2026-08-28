@@ -535,7 +535,20 @@ fn read_and_push(
     record_fetched: bool,
 ) -> ReadAndPushOutcome {
     let t0 = Instant::now();
-    let result = crate::rt().block_on(async { op.read_with(path).range(offset..end).await });
+    // io::sync migration (PR #616 + this PR): the read
+    // goes through the io::sync multi_thread runtime
+    // (worker_threads=8) instead of `crate::rt()` (1
+    // worker). Prefetch downloads no longer block
+    // fuser-0's single-thread event loop. Falls back
+    // to `crate::rt()` for tests / pre-init. See
+    // `src/io/sync.rs`.
+    let result = if let Some(io_sync) = crate::io::sync::IoSync::get() {
+        io_sync
+            .handle()
+            .block_on(async { op.read_with(path).range(offset..end).await })
+    } else {
+        crate::rt().block_on(async { op.read_with(path).range(offset..end).await })
+    };
     let elapsed = t0.elapsed();
     let buf = match result {
         Ok(b) => b,
