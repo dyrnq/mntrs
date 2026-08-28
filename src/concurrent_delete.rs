@@ -163,8 +163,9 @@ struct Shared {
     slots: Arc<Vec<DeleterSlot>>,
     /// Monotonically increasing flush-barrier epoch. `flush()`
     /// increments and waits for `slots[*].barrier_ack >= epoch` on
-    /// every slot before returning. `pump_loop` checks the epoch
-    /// after each drain and acks if it advanced.
+    /// every slot before returning. `pump_loop` advances each
+    /// slot's `barrier_ack` to the highest epoch it has observed
+    /// (so the per-slot ack is a "high-water mark", not a counter).
     barrier_epoch: AtomicU64,
 }
 
@@ -179,10 +180,11 @@ struct DeleterSlot {
     /// Per-slot retry knobs (kept on the slot for `flush_with_retry`).
     config: WorkerConfig,
     worker_id: usize,
-    /// `barrier_ack` counter incremented by the pump after each
-    /// successful barrier flush. Read by `flush()` to know when all
-    /// slots have caught up to a given epoch. `Arc`-wrapped so the
-    /// pump task can hold its own clone (no raw pointer).
+    /// Highest flush-barrier epoch this slot has observed. The pump
+    /// stores `max(prev_ack, current_epoch)` at the end of each
+    /// iteration; `flush()` waits for `barrier_ack >= epoch` on
+    /// every slot. `Arc`-wrapped so the pump task can hold its
+    /// own clone (no raw pointer).
     barrier_ack: Arc<AtomicU64>,
     /// Size of the last `close()`'s drained batch (for `flush()`'s
     /// return value sum). `Arc`-wrapped so the pump task can hold
@@ -568,8 +570,6 @@ async fn pump_loop(slot: DeleterSlotRef, shared: Arc<Shared>) {
     );
 
     loop {
-        let barrier_epoch = shared.barrier_epoch.load(Ordering::Acquire);
-
         // Drain everything currently in the shared pending queue.
         loop {
             let job = {
@@ -606,11 +606,42 @@ async fn pump_loop(slot: DeleterSlotRef, shared: Arc<Shared>) {
             drop(deleter);
         }
 
-        // Barrier check: a flush() or shutdown() raised the epoch.
-        // Force a `close()` so the caller observes a quiescent state.
-        if shared.barrier_epoch.load(Ordering::Acquire) != barrier_epoch {
+        // Barrier ack: advance `barrier_ack` to the highest epoch we
+        // have observed (semantics: "highest acked epoch", not a
+        // counter). Every flush() call bumps `barrier_epoch` and
+        // waits for `barrier_ack >= that_epoch` on every slot.
+        //
+        // Why store max instead of fetch_add(1):
+        //   (a) Epoch changed DURING this iter (e.g. a flush()
+        //       bumped it while we were draining pending). Max
+        //       picks up the new value. ✓
+        //   (b) Epoch changed BEFORE this iter (e.g. rmdir enqueued
+        //       + bumped, pump was asleep at notified.await, woke
+        //       from notify_one permit, enters iter with epoch
+        //       already at NEW). The old `!= barrier_epoch` check
+        //       was false → no ack → flush() hangs 30 s. Max
+        //       picks up the value we loaded at iter start. ✓
+        //   (c) Epoch bumped with no work in flight (e.g.
+        //       shutdown(drain=true) on an idle pump). Old code
+        //       had no flush to do and no ack bump; flush()
+        //       blocked 30 s. Max picks up the bump even with
+        //       empty ledger. ✓
+        //
+        // The previous `ledger_has_work` check (only acks when
+        // ledger non-empty) caught (b) but missed (c). The max
+        // approach handles all three.
+        //
+        // Flush-with-retry only runs when there's actual ledger
+        // work — flushing an empty deleter is a no-op close() and
+        // would just round-trip to S3 for nothing. The ack
+        // advance is independent of whether we flushed.
+        if !slot.ledger.lock().unwrap().is_empty() {
             let _ = flush_with_retry(&slot, &shared).await;
-            slot.barrier_ack.fetch_add(1, Ordering::AcqRel);
+        }
+        let current_epoch = shared.barrier_epoch.load(Ordering::Acquire);
+        let prev_ack = slot.barrier_ack.load(Ordering::Acquire);
+        if current_epoch > prev_ack {
+            slot.barrier_ack.store(current_epoch, Ordering::Release);
         }
 
         // Sleep until next enqueue or barrier. `notified()` is
@@ -1035,6 +1066,92 @@ mod tests {
         deleter.shutdown(false).await;
         let r = clone.enqueue("a".into());
         assert!(r.is_none(), "post-shutdown enqueue must reject");
+    }
+
+    // ===== Regression: rmdir flush-barrier race =====
+    //
+    // Pin the rmdir-style pattern: enqueue + flush() in tight
+    // sequence. Before the fix this hung the flush() barrier for
+    // 30 s and timed out — pump's barrier check only fired when
+    // epoch changed DURING the iteration, so when rmdir's enqueue
+    // woke the pump from a notify_one permit and then flush()
+    // bumped the epoch, the pump entered its iter with epoch
+    // already at NEW and never acked. flush() polled `ack >= epoch`
+    // forever.
+    //
+    // With "highest acked epoch" semantics (pump stores
+    // max(ack, current_epoch) at end of every iter), flush() now
+    // returns promptly.
+    //
+    // Uses the Memory backend (no HTTP) so the test is hermetic
+    // and runs in <100 ms.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn enqueue_then_flush_does_not_hang_on_warm_pump() {
+        let op = Arc::new(Operator::new(opendal::services::Memory::default()).unwrap());
+        op.write("warm/a", "x".to_string()).await.unwrap();
+
+        let cfg = WorkerConfig {
+            op: op.clone(),
+            worker_count: 1,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            max_retries: DEFAULT_MAX_RETRIES,
+            retry_factor: DEFAULT_RETRY_FACTOR,
+            retry_initial_backoff: DEFAULT_RETRY_INITIAL_BACKOFF,
+        };
+        let (deleter, _h) = spawn(cfg, Arc::new(dashmap::DashSet::new())).unwrap();
+
+        // Warm-up: enqueue + flush so the pump reaches steady
+        // state. Without this warm-up, the first enqueue/flush
+        // pair races against pump spawn (notify_one fired before
+        // pump entered its sleep). With the warm-up, the second
+        // enqueue/flush pair is the rmdir-style race: pump is
+        // sleeping at notified.await when enqueue's notify_one
+        // fires, then flush() bumps the epoch, then pump enters
+        // its iter with epoch already at NEW.
+        deleter.enqueue("warm/a".into()).expect("warm enqueue");
+        deleter.flush().await.expect("warm flush");
+
+        // Race: enqueue + flush. Wrap in tokio::time::timeout
+        // so a regression to the pre-fix behavior fails the test
+        // fast (instead of hanging the suite for 30 s).
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            deleter.enqueue("warm/b".into()).expect("enqueue");
+            deleter.flush().await
+        })
+        .await;
+
+        // Drain any leftover so the pump doesn't see a future
+        // shenanigan.
+        deleter.shutdown(true).await;
+
+        let flush_result =
+            result.expect("flush() must not hang past 5 s (rmdir-barrier regression)");
+        assert!(
+            flush_result.is_ok(),
+            "flush() returned Err: {flush_result:?}"
+        );
+    }
+
+    // Regression: shutdown(drain=true) on an idle pump must
+    // return promptly, not hang 30 s on the barrier. The fix's
+    // "highest acked epoch" ack advance handles this — pump's
+    // iter advances ack to current_epoch even when ledger is
+    // empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_drain_on_idle_pump_returns_promptly() {
+        let cfg = WorkerConfig {
+            op: Arc::new(Operator::new(opendal::services::Memory::default()).unwrap()),
+            worker_count: 1,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            max_retries: DEFAULT_MAX_RETRIES,
+            retry_factor: DEFAULT_RETRY_FACTOR,
+            retry_initial_backoff: DEFAULT_RETRY_INITIAL_BACKOFF,
+        };
+        let (deleter, _h) = spawn(cfg, Arc::new(dashmap::DashSet::new())).unwrap();
+
+        // No enqueues — pump is idle at notified.await.
+        let result = tokio::time::timeout(Duration::from_secs(5), deleter.shutdown(true)).await;
+        result.expect("shutdown(drain=true) on idle pump must not hang past 5 s");
     }
 
     #[tokio::test]
