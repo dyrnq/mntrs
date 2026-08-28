@@ -1635,39 +1635,6 @@ pub fn mount(
     let mount_path = Path::new(mountpoint);
     #[cfg(not(windows))]
     let mut cfg: fuser::Config = Default::default();
-    // Multi-threaded FUSE worker pool (Linux 4.5+; fuser 0.18
-    // session.rs:259 hard-errors on `n_threads != 1` for non-Linux).
-    //
-    // Without this, all FUSE callbacks serialize on a single user-space
-    // thread (the "Issue #30 design"), capping throughput at ~1400 ops/sec
-    // on `rm -rf 10000` regardless of backend speed (bench scaling curve
-    // is constant 1000/5000/10000 ≈ 1400 ops/sec — proves the ceiling is
-    // per-FUSE-callback, not HTTP). rclone's go-fuse defaults to NumCPU
-    // worker goroutines; we go to `NumCPU * 2` so kernel-side read-ahead
-    // (which fills the FUSE device fd buffer ahead of the user-space
-    // thread) doesn't stall waiting for a worker. Capped at 32 to bound
-    // memory + fd pressure on very large boxes.
-    //
-    // `clone_fd` uses `FUSE_DEV_IOC_CLONE` so each worker holds its own
-    // `/dev/fuse` fd, avoiding fd-lock contention on concurrent
-    // read/write.
-    //
-    // Risk: per-handle `cache_fd` write buffer
-    // (see [[mntrs-write-buffer-architecture]]) and tombstone DashSet
-    // were originally written under a single-threaded assumption. If
-    // tests under `tests/platform/linux/fuse_integration_test.rs` start
-    // hanging under multi-threaded load, fall back via
-    // `MNTRS_FUSE_THREADS=1`.
-    #[cfg(target_os = "linux")]
-    {
-        let cpus = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .saturating_mul(2)
-            .min(32);
-        cfg.n_threads = Some(cpus);
-        cfg.clone_fd = true;
-    }
     if debug_fuse {
         #[cfg(target_os = "linux")]
         unsafe {
