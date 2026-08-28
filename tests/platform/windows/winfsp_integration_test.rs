@@ -1171,6 +1171,665 @@ fn winfsp_overwrite_zero_allocation_is_noop_on_data() {
 }
 
 // ============================================================
+// Issue #614 regression tests: cleanup-after-rename must NOT unlink
+// ============================================================
+//
+// WinFSP 2.1's `MoveFileEx` dispatches as
+// `rename(src_fh, dst_path)` followed by a `cleanup(src_fh, DELETE)`
+// (the "delete the source alias" step of the Win32 move semantics).
+// Pre-fix, the post-rename cleanup unconditionally called
+// `self.inner.unlink(parent_ino, file_name)`, where `file_name` had
+// already been updated to the **destination** path by the prior
+// `rename`. The unlink therefore deleted the just-renamed backend
+// file, leaving both the source and destination missing and the
+// user seeing `ERROR_FILE_NOT_FOUND` from `Move-Item` /
+// `Remove-Item`.
+//
+// Tests below exercise the trait methods directly (no Win32
+// `MoveFileEx` needed) so the rename + cleanup-DELETE sequence
+// runs deterministically without relying on kernel dispatch.
+
+// Helper: build a `U16CString` (owned) from a `&str` for direct
+// trait invocations. `winfsp::U16CStr` derefs from
+// `widestring::U16CString`, which has `from_str(&str)` returning
+// `Result<U16CString, _>`. We then pass `&str_to_ucstr(s)` (i.e.
+// `&U16CString` coerces to `&U16CStr`) to the trait methods.
+fn str_to_ucstr(s: &str) -> widestring::U16CString {
+    widestring::U16CString::from_str(s).expect("u16cstring")
+}
+
+// Helper: invoke the trait's `rename` with a UTF-8 path (the trait
+// takes `&U16CStr`; we build one from a `String`).
+fn rename_path(
+    adapter: &WinFspAdapter<MntrsFs>,
+    ctx: &WinFspHandle,
+    src_path: &str,
+    dst_path: &str,
+) {
+    let src = str_to_ucstr(src_path);
+    let dst = str_to_ucstr(dst_path);
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::rename(adapter, ctx, &src, &dst, true)
+        .expect("trait rename");
+}
+
+#[test]
+fn winfsp_cleanup_after_rename_preserves_destination() {
+    let fs = Arc::new(make_memory_fs());
+    let adapter = WinFspAdapter::new(fs.clone());
+
+    // Seed a file via write_remote (lands in opendal memory
+    // backend, inodes entry created via mount lookup).
+    let payload = b"data that must survive post-rename cleanup";
+    write_remote(&fs, "_mv_src.bin", payload);
+
+    let ctx = open_handle_for(&*fs, "_mv_src.bin");
+
+    // Step 1: rename src -> dst via the trait. This is
+    // WinFSP's `MoveFileEx` step 1. The path shape
+    // (`\_mv_src.bin`) matches the kernel dispatch for a
+    // root-level file (file was created at opendal key
+    // `_mv_src.bin`, so the ino lives at root; the kernel
+    // passes `\name` for that — backslash converts to
+    // slash + lowercase yields the lookup path).
+    rename_path(&adapter, &ctx, "\\_mv_src.bin", "\\_mv_dst.bin");
+
+    // After rename: src gone, dst present.
+    let backend =
+        rt_block_on(async { fs.op.read("_mv_src.bin").await.unwrap_or_default().to_vec() });
+    assert!(
+        backend.is_empty(),
+        "rename should have removed _mv_src.bin from backend"
+    );
+    let dst_payload =
+        rt_block_on(async { fs.op.read("_mv_dst.bin").await.unwrap_or_default().to_vec() });
+    assert_eq!(
+        dst_payload, payload,
+        "rename should have moved the payload to _mv_dst.bin"
+    );
+
+    // Step 2: cleanup(src_ino, DELETE) — the kernel's
+    // "delete the source alias" call after MoveFileEx.
+    // Pre-fix this unlinks _mv_dst.bin (the post-rename
+    // file_name) and the test fails at the dst-presence
+    // check below. Post-fix the cleanup is recognised as
+    // the post-rename no-op and leaves _mv_dst.bin alone.
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::cleanup(
+        &adapter,
+        &ctx,
+        // The file_name the kernel passes after a
+        // MoveFileEx points at the **destination** path
+        // (the source FH's kernel-level path was
+        // updated by the prior `rename` call). Encoding
+        // the dst path here matches the dispatch we
+        // see in mntrs-bench.stdout.log (run
+        // 33059193417, line ~1599) for the bench
+        // Move-Item FAIL.
+        Some(&*str_to_ucstr("\\_mv_dst.bin")),
+        0x01,
+    );
+
+    let dst_after =
+        rt_block_on(async { fs.op.read("_mv_dst.bin").await.unwrap_or_default().to_vec() });
+    assert_eq!(
+        dst_after, payload,
+        "post-rename cleanup-with-DELETE must NOT unlink the \
+         destination (issue #614). The Win32 'delete the \
+         source alias' step is a no-op when `rename` \
+         already moved the file."
+    );
+}
+
+#[test]
+fn winfsp_cleanup_without_rename_still_unlinks() {
+    // Counter-test: prove the #614 fix does NOT
+    // accidentally suppress legitimate unlinks. A
+    // cleanup-with-DELETE on an ino that was NOT just
+    // renamed must still drop the backend file.
+    let fs = Arc::new(make_memory_fs());
+    let adapter = WinFspAdapter::new(fs.clone());
+
+    let payload = b"data that should be deleted on cleanup";
+    write_remote(&fs, "_del.bin", payload);
+
+    let ctx = open_handle_for(&*fs, "_del.bin");
+
+    // No rename — go straight to cleanup-with-DELETE.
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::cleanup(
+        &adapter,
+        &ctx,
+        Some(&*str_to_ucstr("\\_del.bin")),
+        0x01,
+    );
+
+    let backend = rt_block_on(async { fs.op.read("_del.bin").await.unwrap_or_default().to_vec() });
+    assert!(
+        backend.is_empty(),
+        "cleanup-with-DELETE on a non-renamed ino must \
+         still unlink (issue #614 false-positive guard)"
+    );
+}
+
+#[test]
+fn winfsp_cleanup_after_rename_then_real_delete() {
+    // Sequence: rename, then real Remove-Item on the
+    // destination. The first cleanup-with-DELETE
+    // (post-rename) is a no-op; the second cleanup
+    // (after Remove-Item) actually unlinks.
+    let fs = Arc::new(make_memory_fs());
+    let adapter = WinFspAdapter::new(fs.clone());
+
+    let payload = b"data that moves and then gets deleted";
+    write_remote(&fs, "_mv2_src.bin", payload);
+
+    let ctx = open_handle_for(&*fs, "_mv2_src.bin");
+
+    // 1. Rename src -> dst
+    rename_path(&adapter, &ctx, "\\_mv2_src.bin", "\\_mv2_dst.bin");
+
+    // 2. Post-rename cleanup-with-DELETE (Win32 move's
+    //    "delete the source alias") — no-op.
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::cleanup(
+        &adapter,
+        &ctx,
+        Some(&*str_to_ucstr("\\_mv2_dst.bin")),
+        0x01,
+    );
+    let after_first = rt_block_on(async {
+        fs.op
+            .read("_mv2_dst.bin")
+            .await
+            .unwrap_or_default()
+            .to_vec()
+    });
+    assert_eq!(
+        after_first, payload,
+        "post-rename cleanup must leave dst intact"
+    );
+
+    // 3. Real Remove-Item on the dst path. This is a
+    //    fresh fh on the same ino (the renamed file
+    //    now lives at _mv2_dst.bin, same ino).
+    //    Cleanup-with-DELETE on this fh must actually
+    //    unlink.
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::cleanup(
+        &adapter,
+        &ctx,
+        Some(&*str_to_ucstr("\\_mv2_dst.bin")),
+        0x01,
+    );
+    let after_second = rt_block_on(async {
+        fs.op
+            .read("_mv2_dst.bin")
+            .await
+            .unwrap_or_default()
+            .to_vec()
+    });
+    assert!(
+        after_second.is_empty(),
+        "second cleanup-with-DELETE (post-Remove-Item) \
+         must unlink — proves the renamed-tracking flag \
+         clears after the first post-rename cleanup"
+    );
+}
+
+// Issue #614 v2 regression: WinFSP 2.1's open-handle rename
+// (PowerShell `Move-Item`, Win32 `MoveFile` on an open
+// handle) is dispatched through the FSD internally — the
+// `rename` callback is NOT invoked. The visible side
+// effect is a `set_basic_info` with the current real
+// `file_attributes` (not the 0xFFFFFFFF "no-change"
+// sentinel) and `last_write_time=0` (no time update).
+// The kernel then dispatches `cleanup(FspCleanupDelete)`
+// on the same ino with the post-rename `file_name`. The
+// v1 fix (which only tracked inos in the `rename`
+// callback) doesn't cover this — `move` and `del` still
+// fail on the bench. The v2 fix detects the rename
+// signature in `set_basic_info` and inserts the ino into
+// the same `renamed_inos` set, so the subsequent
+// cleanup-with-DELETE early-returns as a no-op.
+#[test]
+fn winfsp_set_basic_info_rename_signal_skips_post_rename_cleanup() {
+    let fs = Arc::new(make_memory_fs());
+    let adapter = WinFspAdapter::new(fs.clone());
+
+    let payload = b"data that moves via set_basic_info IRP";
+    write_remote(&fs, "_mv3_src.bin", payload);
+
+    let ctx = open_handle_for(&*fs, "_mv3_src.bin");
+
+    // Step 1: set_basic_info with the kernel-internal
+    // rename signature — real attrs (FILE_ATTRIBUTE_ARCHIVE
+    // = 0x20) and last_write_time = 0. This is what
+    // WinFSP 2.1 dispatches for open-handle MoveFile on
+    // the bench trace (run 33071512354, line 3786:
+    // `winfsp::set_basic_info: entered ino=526
+    // file_attributes=32 last_write_time=0`).
+    let mut fi = FileInfo::default();
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::set_basic_info(
+        &adapter, &ctx, // file_attributes = real value (FILE_ATTRIBUTE_ARCHIVE)
+        0x20,
+        // creation_time, last_access_time, last_write_time,
+        // change_time: all 0 (the rename IRP doesn't carry
+        // timestamps). In particular last_write_time = 0
+        // is the discriminator vs. a legitimate
+        // attribute-only setattr (which would carry a real
+        // mtime).
+        0, 0, 0, 0, &mut fi,
+    )
+    .expect("trait set_basic_info");
+
+    // Step 2: cleanup-with-DELETE on the same ino, with
+    // the post-rename file_name. The kernel has already
+    // renamed the FCB to _mv3_dst.bin; our adapter
+    // receives the new name. Pre-v2 fix the unlink
+    // targets the backend path `data/_mv3_dst.bin` (which
+    // doesn't exist there — the rename was never
+    // performed in our adapter) and the test fails.
+    // Post-v2 the set_basic_info heuristic tracked the
+    // ino in renamed_inos, so cleanup early-returns.
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::cleanup(
+        &adapter,
+        &ctx,
+        Some(&*str_to_ucstr("\\_mv3_dst.bin")),
+        0x01,
+    );
+
+    let backend = rt_block_on(async {
+        fs.op
+            .read("_mv3_src.bin")
+            .await
+            .unwrap_or_default()
+            .to_vec()
+    });
+    assert_eq!(
+        backend, payload,
+        "set_basic_info-rename signal must register the ino for \
+         post-rename cleanup no-op (issue #614 v2). The backend \
+         file at the original path must survive; the kernel's \
+         delete-source-alias dispatch must not target the new \
+         (post-rename) name."
+    );
+}
+
+// Counter-test for the v2 heuristic: a legitimate
+// set_basic_info (with a real last_write_time) must NOT
+// trigger the renamed-tracking. Otherwise a user who sets
+// mtime via PowerShell and then deletes the file would
+// see the delete silently suppressed.
+#[test]
+fn winfsp_set_basic_info_with_real_mtime_does_not_block_later_cleanup() {
+    let fs = Arc::new(make_memory_fs());
+    let adapter = WinFspAdapter::new(fs.clone());
+
+    let payload = b"data that gets a real mtime then deleted";
+    write_remote(&fs, "_mv4.bin", payload);
+
+    let ctx = open_handle_for(&*fs, "_mv4.bin");
+
+    // set_basic_info with real attrs AND real mtime — this
+    // is a legitimate attribute/time set, NOT a rename
+    // IRP. The v2 heuristic must not register the ino.
+    let mut fi = FileInfo::default();
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::set_basic_info(
+        &adapter,
+        &ctx,
+        0x20, // file_attributes = ARCHIVE (real value)
+        0,
+        0,
+        // last_write_time = a real Win32 FILETIME (some
+        // arbitrary recent timestamp; the exact value is
+        // irrelevant — the point is it must be != 0).
+        134_323_072_067_238_517,
+        0,
+        &mut fi,
+    )
+    .expect("trait set_basic_info");
+
+    // Now cleanup-with-DELETE — must unlink normally
+    // because the v2 heuristic did NOT register the ino
+    // (real mtime was present).
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::cleanup(
+        &adapter,
+        &ctx,
+        Some(&*str_to_ucstr("\\_mv4.bin")),
+        0x01,
+    );
+
+    let backend = rt_block_on(async { fs.op.read("_mv4.bin").await.unwrap_or_default().to_vec() });
+    assert!(
+        backend.is_empty(),
+        "set_basic_info with real mtime must NOT trigger the \
+         rename-tracking heuristic — legitimate cleanup-with-DELETE \
+         after a real attr-set must still unlink (issue #614 v2 \
+         false-positive guard)"
+    );
+}
+
+// v3 regression test (issue #614 bench trace, run
+// 33073543760 lines 3788–3794): kernel dispatches the
+// kernel-internal rename IRP across THREE callbacks:
+//
+//   1. set_basic_info(attrs=0x20, time=0,0,0,0) — the v2
+//      rename-IRP signature; v2 inserts the ino into
+//      `renamed_inos`.
+//   2. cleanup(flags = SET_ATIME|SET_CTIME) — the
+//      "ordinary close" cleanup of the pre-rename
+//      handle. The kernel fires this BETWEEN set_basic_info
+//      and the post-rename DELETE cleanup (this is the
+//      step the v2 fix missed: v2 drained the entry on
+//      every cleanup, leaving the set empty when step 3
+//      fired).
+//   3. cleanup(flags = DELETE|SET_ATIME) — the
+//      "delete-source-alias" cleanup, which v1 + v3
+//      recognise and early-return.
+//
+// Pre-v3 the entry was drained in step 2; step 3 saw an
+// empty set and called `inner.unlink(parent, basename)`
+// with the POST-RENAME file_name, deleting the
+// just-renamed backend file. PowerShell saw "Unable to
+// find the specified file." Post-v3 step 2 peeks (no
+// drain); step 3 drains + early-returns, so the backend
+// file at the original path survives.
+#[test]
+fn winfsp_v3_set_basic_info_then_non_delete_cleanup_then_delete_cleanup() {
+    let fs = Arc::new(make_memory_fs());
+    let adapter = WinFspAdapter::new(fs.clone());
+
+    let payload = b"v3: set_basic_info + cleanup(no delete) + cleanup(delete)";
+    write_remote(&fs, "_mv5_src.bin", payload);
+
+    let ctx = open_handle_for(&*fs, "_mv5_src.bin");
+
+    // Step 1: kernel-internal rename IRP — v2 heuristic
+    // fires and inserts ino into renamed_inos.
+    let mut fi = FileInfo::default();
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::set_basic_info(
+        &adapter, &ctx, 0x20, // file_attributes = FILE_ATTRIBUTE_ARCHIVE
+        0, 0, 0, 0, // all four timestamps = 0
+        &mut fi,
+    )
+    .expect("trait set_basic_info");
+
+    // Step 2: cleanup WITHOUT DELETE flag — v3 must
+    // PEEK without removing the entry. Pre-v3 this
+    // drained the entry and the bench failed.
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::cleanup(
+        &adapter,
+        &ctx,
+        Some(&*str_to_ucstr("\\_mv5_src.bin")),
+        // SET_ATIME | SET_CTIME = 0xa0, NO DELETE.
+        0xa0,
+    );
+
+    // Step 3: cleanup WITH DELETE flag — v3 must drain
+    // and early-return (this is the post-rename
+    // delete-source-alias step). Pre-v3 this saw an
+    // empty set and called inner.unlink against the
+    // post-rename file_name, deleting the dst file.
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::cleanup(
+        &adapter,
+        &ctx,
+        Some(&*str_to_ucstr("\\_mv5_dst.bin")),
+        // DELETE | SET_ATIME = 0x21
+        0x21,
+    );
+
+    // Backend file at the ORIGINAL path must survive.
+    let backend = rt_block_on(async {
+        fs.op
+            .read("_mv5_src.bin")
+            .await
+            .unwrap_or_default()
+            .to_vec()
+    });
+    assert_eq!(
+        backend, payload,
+        "v3: set_basic_info + cleanup(no DELETE) must NOT drain the \
+         renamed-tracking entry; the subsequent cleanup(DELETE) must \
+         recognise it and early-return (issue #614 v3 bench trace). \
+         Pre-v3 the non-DELETE cleanup drained the entry, the DELETE \
+         cleanup proceeded to unlink with the post-rename file_name, \
+         and Move-Item / Remove-Item failed with \
+         'Unable to find the specified file.'"
+    );
+}
+
+// v3 counter-test (rename-callback path still works):
+// the user-mode `rename` callback inserts the ino into
+// `renamed_inos`; the subsequent cleanup-with-DELETE
+// drains + early-returns. The intermediate
+// cleanup-without-DELETE in between (if any) must peek
+// without removing — verified separately above. This
+// test pins the v1 + v3 invariant that the rename
+// callback still suppresses the post-rename cleanup
+// when the kernel invokes the rename callback directly
+// (e.g. `Move-Item` via `SetFileInformationByHandle`
+// with FILE_RENAME_INFO_EX bypass copy).
+#[test]
+fn winfsp_v3_rename_callback_then_delete_cleanup_still_suppressed() {
+    let fs = Arc::new(make_memory_fs());
+    let adapter = WinFspAdapter::new(fs.clone());
+
+    let payload = b"v3: rename callback path still suppresses post-rename cleanup";
+    write_remote(&fs, "_mv6_src.bin", payload);
+
+    let ctx = open_handle_for(&*fs, "_mv6_src.bin");
+
+    // Direct rename via the trait (the kernel-internal
+    // path bypasses this for open-handle MoveFile; the
+    // user-mode path still hits it for plain file renames
+    // and for the `rename` syscall).
+    rename_path(&adapter, &ctx, "_mv6_src.bin", "_mv6_dst.bin");
+
+    // cleanup(DELETE) — must early-return (v1 + v3).
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::cleanup(
+        &adapter,
+        &ctx,
+        Some(&*str_to_ucstr("\\_mv6_dst.bin")),
+        0x01,
+    );
+
+    // The rename callback already moved the backend
+    // file. cleanup-with-DELETE in the post-rename world
+    // would target the dst (the post-rename name); v1 +
+    // v3 must early-return so the dst survives.
+    let backend_dst = rt_block_on(async {
+        fs.op
+            .read("_mv6_dst.bin")
+            .await
+            .unwrap_or_default()
+            .to_vec()
+    });
+    assert_eq!(
+        backend_dst, payload,
+        "v3: rename-callback path must still suppress post-rename \
+         cleanup-with-DELETE (issue #614 v1 + v3 invariant)."
+    );
+}
+
+// Issue #614 v5: PowerShell `Move-Item -Force` and Win32
+// `MoveFileEx(MOVEFILE_REPLACE_EXISTING)` expect the rename
+// to overwrite an existing dst file. The memory backend's
+// `op.write` is create-only, so the do_rename fallback
+// (op.read + op.write + op.delete) returned AlreadyExists
+// on the dst write and surfaced as
+// STATUS_OBJECT_NAME_COLLISION, which the kernel treats as
+// "rename refused" and the user sees as "Unable to find
+// the specified file." (PowerShell's Move-Item messages).
+//
+// Pre-fix: the bench's warmup + iteration pattern (which
+// re-uses the same dst path across iterations) showed the
+// second-and-later Move-Item FAIL even though the first
+// iteration succeeded. Post-fix the do_rename fallback
+// detects AlreadyExists on the dst write, deletes the
+// existing dst, and retries the write — making the rename
+// succeed end-to-end.
+//
+// Test seeds BOTH src and dst in the backend, then runs
+// the rename. Post-fix the dst ends up with the src's
+// content (overwrite), src is gone. Pre-fix the trait
+// rename fails with AlreadyExists (kernel-visible as
+// STATUS_OBJECT_NAME_COLLISION) and the test fails at the
+// src-gone assertion.
+#[test]
+fn winfsp_v5_rename_overwrites_existing_dst() {
+    let fs = Arc::new(make_memory_fs());
+    let adapter = WinFspAdapter::new(fs.clone());
+
+    // Seed BOTH src and dst so the rename is a real
+    // overwrite, not a fresh dst.
+    let src_payload = b"v5: src payload that overwrites existing dst";
+    let old_dst_payload = b"v5: old dst payload that must be replaced";
+    write_remote(&fs, "_mv7_src.bin", src_payload);
+    write_remote(&fs, "_mv7_dst.bin", old_dst_payload);
+
+    let ctx = open_handle_for(&*fs, "_mv7_src.bin");
+
+    // Direct rename via the trait — should now succeed
+    // even though dst exists (issue #614 v5).
+    rename_path(&adapter, &ctx, "_mv7_src.bin", "_mv7_dst.bin");
+
+    // The user-mode `rename` callback updates the inodes
+    // map (see lib.rs::do_rename post-migrate) and the
+    // cache file move. Verify the backend state.
+    let dst_after = rt_block_on(async {
+        fs.op
+            .read("_mv7_dst.bin")
+            .await
+            .unwrap_or_default()
+            .to_vec()
+    });
+    assert_eq!(
+        dst_after, src_payload,
+        "v5: rename must overwrite existing dst with src content \
+         (issue #614 v5). Pre-fix the do_rename fallback returned \
+         AlreadyExists on dst write and PowerShell saw \
+         'Unable to find the specified file.'"
+    );
+
+    // Source must be gone (the rename is a move, not a
+    // copy).
+    let src_after = rt_block_on(async {
+        fs.op
+            .read("_mv7_src.bin")
+            .await
+            .unwrap_or_default()
+            .to_vec()
+    });
+    assert!(
+        src_after.is_empty(),
+        "v5: rename must delete src from backend after overwriting dst"
+    );
+}
+
+/// Issue #614 v6: when `op.read(src)` returns NotFound but
+/// the local write-back cache file exists, the rename
+/// fallback must read bytes from the cache file. This is
+/// the post-#78 fix hybrid: opendal-only files (no cache
+/// file) still surface NotFound (#78 preserved), but a
+/// recent local write that hasn't been uploaded yet still
+/// works (the #78 bug reintroduced).
+///
+/// Pre-fix this returned STATUS_OBJECT_NAME_NOT_FOUND on
+/// the second Move-Item kernel retry after iteration 1's
+/// rename deleted src from the backend but left the cache
+/// file at src orphaned (do_rename migrates src→dst on
+/// success, but a subsequent kernel retry of the same
+/// MoveFileEx against the orphan at src was failing with
+/// NotFound before the cache-file fallback).
+#[test]
+fn winfsp_v6_rename_falls_back_to_cache_file_on_backend_notfound() {
+    let fs = Arc::new(make_memory_fs());
+    let adapter = WinFspAdapter::new(fs.clone());
+
+    // Step 1: seed src in the backend via the direct
+    // write path so the rename fallback's `op.read(src)`
+    // would normally succeed. We'll then DELETE src from
+    // the backend AND plant a cache file at src to
+    // simulate the orphan-after-rename race.
+    let payload = b"v6: payload from cache-file fallback path";
+    write_remote(&fs, "_mv8_src.bin", payload);
+
+    // Delete src from the backend to simulate the
+    // post-rename-iteration-1 state (where do_rename has
+    // already deleted src and migrated the cache file).
+    rt_block_on(async { fs.op.delete("_mv8_src.bin").await }).unwrap();
+
+    // Plant a cache file at src with the original payload.
+    // do_rename's fallback will read this when op.read
+    // returns NotFound.
+    let cpath_src = mntrs::write_buffer_path(&fs.cache_dir, "_mv8_src.bin");
+    if let Some(parent) = cpath_src.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&cpath_src, payload).unwrap();
+
+    // Open a handle for the inode that the previous
+    // backend seed created. The cache-file fallback in
+    // do_rename fires regardless of the open handle — it's
+    // a function of op.read(src_clone) returning NotFound.
+    let ctx = open_handle_for(&*fs, "_mv8_src.bin");
+
+    // Direct rename via the trait. Pre-v6 this would
+    // return Err(NotFound) because op.read returns
+    // NotFound and there's no fallback to the cache file.
+    rename_path(&adapter, &ctx, "_mv8_src.bin", "_mv8_dst.bin");
+
+    // dst must contain the bytes from the cache file
+    // (NOT be empty — that was the v5-pre-v6 symptom).
+    let dst_after = rt_block_on(async {
+        fs.op
+            .read("_mv8_dst.bin")
+            .await
+            .unwrap_or_default()
+            .to_vec()
+    });
+    assert_eq!(
+        dst_after, payload,
+        "v6: rename must read bytes from cache file when op.read returns NotFound \
+         (issue #614 v6). Pre-fix the kernel saw STATUS_OBJECT_NAME_NOT_FOUND."
+    );
+
+    // The orphan cache file at src should be removed by
+    // the post-rename cache-file migration
+    // (write_buffer_path src → dst).
+    assert!(
+        !cpath_src.exists(),
+        "v6: post-rename cache-file migration must remove src cache file"
+    );
+}
+
+/// Issue #614 v6 (negative): when op.read returns
+/// NotFound AND there's no cache file either, the rename
+/// must surface NotFound (preserves the #78 opendal-only
+/// protection that #78 added; this test prevents a
+/// future regression from re-introducing the pre-#78
+/// silent-no-op behavior for opendal-only files).
+#[test]
+fn winfsp_v6_rename_returns_notfound_when_neither_backend_nor_cache_has_src() {
+    let fs = make_memory_fs();
+
+    // Do NOT seed anything — no backend entry, no cache
+    // file. We're calling rename on a path that does not
+    // exist anywhere. rename_paths is the lower-half
+    // rename that the WinFSP `rename` callback dispatches
+    // to (see lib.rs::rename_paths and lib.rs::do_rename).
+    // With neither backend nor cache-file containing src,
+    // do_rename stage 2 falls through both branches and
+    // returns Err(NotFound) at the v6 `cache-file missing`
+    // path.
+    let result = fs.rename_paths("/_mv9_does_not_exist.bin", "/_mv9_dst.bin");
+    let kind = result.as_ref().err().map(|e| e.kind());
+    assert_eq!(
+        kind,
+        Some(std::io::ErrorKind::NotFound),
+        "v6: rename of a non-existent src with no cache file must return NotFound \
+         (preserves #78 opendal-only protection). Got: {:?}",
+        kind
+    );
+}
+
+// ============================================================
 // Issue #306 regression tests: readdir_with_attrs (N+1 RTT + marker paging)
 // ============================================================
 

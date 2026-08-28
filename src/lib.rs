@@ -8732,21 +8732,139 @@ impl MntrsFs {
                                 src = %src_clone, dst = %dst_clone,
                                 "op.copy unsupported too; falling back to op.read + op.write"
                             );
+                            // Issue #614 v6: read src bytes from
+                            // the backend first (the #78 fix's
+                            // preferred path — works for files
+                            // created directly via opendal, which
+                            // have no local cache file). If the
+                            // backend says NotFound but a local
+                            // cache file exists for src, fall back
+                            // to reading the cache file. This
+                            // covers two distinct races:
+                            //
+                            // (a) Writeback-not-flushed: the user
+                            //     wrote to src via the mount, the
+                            //     5s writeback queue hasn't drained
+                            //     yet, and `op.read` returns
+                            //     NotFound because the backend
+                            //     hasn't seen the data. Pre-#78
+                            //     behavior was to read the cache
+                            //     file unconditionally; #78 changed
+                            //     it to op.read only because
+                            //     opendal-only files (no cache
+                            //     file) had silently turned the
+                            //     rename into a no-op. The
+                            //     cache-file fallback below only
+                            //     fires when op.read fails AND a
+                            //     cache file exists, so #78's
+                            //     opendal-only protection is
+                            //     preserved.
+                            //
+                            // (b) Post-rename orphan (issue #614
+                            //     bench repro): PowerShell's
+                            //     `Move-Item -Force` → MoveFileEx
+                            //     dispatches a successful rename
+                            //     (do_rename deletes src from the
+                            //     backend and migrates the cache
+                            //     file src → dst). The kernel
+                            //     then retries the rename against
+                            //     a freshly-allocated ino for src
+                            //     (our `lookup` returns Ok via the
+                            //     orphan cache file at line
+                            //     3988-4000). On retry, `op.read`
+                            //     returns NotFound (src is gone
+                            //     from the backend). For the
+                            //     cache-file-missing path, the
+                            //     source has no payload to copy
+                            //     and we surface NotFound (the
+                            //     dst file from the prior
+                            //     successful rename is the
+                            //     authoritative version on the
+                            //     backend; the kernel retry just
+                            //     sees STATUS_OBJECT_NAME_NOT_FOUND
+                            //     and PowerShell's MoveFileEx
+                            //     ignores it after the first
+                            //     rename succeeded).
+                            //
+                            // Returns Ok(true) when the cache-file
+                            // fallback provides bytes — the rename
+                            // payload is real and the rename
+                            // proceeds normally. This is the
+                            // common case for both (a) and (b)
+                            // when a cache file is present.
                             let bytes = match op.read(&src_clone).await {
                                 Ok(b) => b.to_vec(),
                                 Err(read_err)
                                     if read_err.kind()
                                         == opendal::ErrorKind::NotFound =>
                                 {
-                                    // Issue #197: source is missing.
-                                    // POSIX rename(non-existent, dst)
-                                    // requires ENOENT. Return Err so
-                                    // fn rename propagates to FUSE
-                                    // instead of silently succeeding.
-                                    return Err(std::io::Error::new(
-                                        std::io::ErrorKind::NotFound,
-                                        format!("rename source not found: {}", src_clone),
-                                    ));
+                                    // Issue #614 v6: source is
+                                    // missing from the backend.
+                                    // Check for a local cache
+                                    // file (writeback-not-flushed
+                                    // race). If present, use it
+                                    // as the rename payload. If
+                                    // absent, the source really
+                                    // doesn't exist (POSIX
+                                    // rename(non-existent, dst) →
+                                    // ENOENT) — but on WinFSP
+                                    // returning STATUS_OBJECT_NAME_NOT_FOUND
+                                    // here causes PowerShell
+                                    // MoveFileEx to fail the
+                                    // whole Move-Item. The v6
+                                    // behaviour for the
+                                    // genuinely-missing case
+                                    // matches #197: return
+                                    // NotFound and let the
+                                    // kernel surface it.
+                                    let cpath_src = crate::write_buffer_path(&self.cache_dir, &src_clone);
+                                    match std::fs::read(&cpath_src) {
+                                        Ok(cached) => {
+                                            tracing::warn!(
+                                                src = %src_clone,
+                                                cache_bytes = cached.len(),
+                                                "rename fallback stage-2: op.read returned NotFound; \
+                                                 falling back to local cache file (issue #614 v6; \
+                                                 writeback not yet flushed)"
+                                            );
+                                            cached
+                                        }
+                                        Err(fs_err) if fs_err.kind() == std::io::ErrorKind::NotFound => {
+                                            // No cache file either
+                                            // — source genuinely
+                                            // doesn't exist. POSIX
+                                            // rename(non-existent,
+                                            // dst) requires ENOENT.
+                                            // #197: return Err so
+                                            // fn rename propagates
+                                            // to FUSE instead of
+                                            // silently succeeding.
+                                            // The kernel will
+                                            // surface
+                                            // STATUS_OBJECT_NAME_NOT_FOUND
+                                            // for this rename
+                                            // retry; PowerShell's
+                                            // MoveFileEx ignores
+                                            // the retry failure
+                                            // once the original
+                                            // rename succeeded,
+                                            // so this is a benign
+                                            // error code for the
+                                            // Move-Item-1M case.
+                                            return Err(std::io::Error::new(
+                                                std::io::ErrorKind::NotFound,
+                                                format!("rename source not found: {}", src_clone),
+                                            ));
+                                        }
+                                        Err(fs_err) => {
+                                            tracing::error!(
+                                                src = %src_clone, error = %fs_err,
+                                                "rename fallback stage-2: cache-file read failed, \
+                                                 keeping source intact (issue #614 v6)"
+                                            );
+                                            return Ok(false);
+                                        }
+                                    }
                                 }
                                 Err(read_err) => {
                                     tracing::error!(
@@ -8756,10 +8874,87 @@ impl MntrsFs {
                                     return Ok(false);
                                 }
                             };
+                            // Issue #614 v5: keep an extra
+                            // copy so the AlreadyExists-retry
+                            // path below can re-write the
+                            // payload after deleting the
+                            // existing dst key. Cloning is
+                            // acceptable here — `rename` is
+                            // not a hot path and the
+                            // `Move-Item -Force` semantics
+                            // the kernel expects require
+                            // overwrite behaviour.
+                            let bytes_for_retry = bytes.clone();
                             match op.write(&dst_clone, bytes).await {
                                 Ok(_meta) => {
                                     tracing::debug!(src = %src_clone, dst = %dst_clone, "rename fallback stage-2: op.write ok");
                                     Ok(true)
+                                }
+                                Err(write_err)
+                                    if write_err.kind()
+                                        == opendal::ErrorKind::AlreadyExists =>
+                                {
+                                    // Issue #614 v5: on
+                                    // backends where op.write is
+                                    // create-only (memory://,
+                                    // some WebHDFS deployments)
+                                    // the first write to an
+                                    // existing dst key returns
+                                    // AlreadyExists. PowerShell
+                                    // `Move-Item -Force` /
+                                    // Win32 `MoveFileEx(
+                                    // MOVEFILE_REPLACE_EXISTING)`
+                                    // expect overwrite semantics;
+                                    // pre-fix this made the
+                                    // second-and-later bench
+                                    // iteration FAIL with
+                                    // STATUS_OBJECT_NAME_COLLISION
+                                    // because the dst from the
+                                    // prior iteration was still
+                                    // in the backend. We delete
+                                    // the existing dst and retry
+                                    // the write once. If the
+                                    // retry succeeds the rename
+                                    // proceeds normally; if it
+                                    // fails we keep the source
+                                    // intact (matching the
+                                    // data-loss-avoidance
+                                    // contract below).
+                                    tracing::warn!(
+                                        src = %src_clone, dst = %dst_clone,
+                                        "rename fallback stage-2: op.write returned AlreadyExists; \
+                                         deleting existing dst and retrying (issue #614 v5)"
+                                    );
+                                    match op.delete(&dst_clone).await {
+                                        Ok(()) => {}
+                                        Err(del_err) => {
+                                            tracing::error!(
+                                                src = %src_clone, dst = %dst_clone, error = %del_err,
+                                                "rename fallback stage-2: dst pre-delete for AlreadyExists-retry failed; \
+                                                 keeping source intact"
+                                            );
+                                            return Ok(false);
+                                        }
+                                    }
+                                    match op.write(&dst_clone, bytes_for_retry).await {
+                                        Ok(_meta) => {
+                                            tracing::debug!(
+                                                src = %src_clone, dst = %dst_clone,
+                                                "rename fallback stage-2: op.write ok (after AlreadyExists retry)"
+                                            );
+                                            Ok(true)
+                                        }
+                                        Err(retry_err) => {
+                                            tracing::error!(
+                                                src = %src_clone, dst = %dst_clone, error = %retry_err,
+                                                "rename fallback stage-2: op.write retry failed after dst delete; \
+                                                 keeping source intact (dst is now gone from the backend — \
+                                                 same shape as a successful MoveFileEx but the data didn't \
+                                                 land; subsequent ops will surface NotFound)"
+                                            );
+                                            Ok(false)
+                                        }
+                                    }
                                 }
                                 Err(write_err) => {
                                     tracing::error!(
