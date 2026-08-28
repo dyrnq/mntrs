@@ -1647,6 +1647,81 @@ fn winfsp_v3_rename_callback_then_delete_cleanup_still_suppressed() {
     );
 }
 
+// Issue #614 v5: PowerShell `Move-Item -Force` and Win32
+// `MoveFileEx(MOVEFILE_REPLACE_EXISTING)` expect the rename
+// to overwrite an existing dst file. The memory backend's
+// `op.write` is create-only, so the do_rename fallback
+// (op.read + op.write + op.delete) returned AlreadyExists
+// on the dst write and surfaced as
+// STATUS_OBJECT_NAME_COLLISION, which the kernel treats as
+// "rename refused" and the user sees as "Unable to find
+// the specified file." (PowerShell's Move-Item messages).
+//
+// Pre-fix: the bench's warmup + iteration pattern (which
+// re-uses the same dst path across iterations) showed the
+// second-and-later Move-Item FAIL even though the first
+// iteration succeeded. Post-fix the do_rename fallback
+// detects AlreadyExists on the dst write, deletes the
+// existing dst, and retries the write — making the rename
+// succeed end-to-end.
+//
+// Test seeds BOTH src and dst in the backend, then runs
+// the rename. Post-fix the dst ends up with the src's
+// content (overwrite), src is gone. Pre-fix the trait
+// rename fails with AlreadyExists (kernel-visible as
+// STATUS_OBJECT_NAME_COLLISION) and the test fails at the
+// src-gone assertion.
+#[test]
+fn winfsp_v5_rename_overwrites_existing_dst() {
+    let fs = Arc::new(make_memory_fs());
+    let adapter = WinFspAdapter::new(fs.clone());
+
+    // Seed BOTH src and dst so the rename is a real
+    // overwrite, not a fresh dst.
+    let src_payload = b"v5: src payload that overwrites existing dst";
+    let old_dst_payload = b"v5: old dst payload that must be replaced";
+    write_remote(&fs, "_mv7_src.bin", src_payload);
+    write_remote(&fs, "_mv7_dst.bin", old_dst_payload);
+
+    let ctx = open_handle_for(&*fs, "_mv7_src.bin");
+
+    // Direct rename via the trait — should now succeed
+    // even though dst exists (issue #614 v5).
+    rename_path(&adapter, &ctx, "_mv7_src.bin", "_mv7_dst.bin");
+
+    // The user-mode `rename` callback updates the inodes
+    // map (see lib.rs::do_rename post-migrate) and the
+    // cache file move. Verify the backend state.
+    let dst_after = rt_block_on(async {
+        fs.op
+            .read("_mv7_dst.bin")
+            .await
+            .unwrap_or_default()
+            .to_vec()
+    });
+    assert_eq!(
+        dst_after, src_payload,
+        "v5: rename must overwrite existing dst with src content \
+         (issue #614 v5). Pre-fix the do_rename fallback returned \
+         AlreadyExists on dst write and PowerShell saw \
+         'Unable to find the specified file.'"
+    );
+
+    // Source must be gone (the rename is a move, not a
+    // copy).
+    let src_after = rt_block_on(async {
+        fs.op
+            .read("_mv7_src.bin")
+            .await
+            .unwrap_or_default()
+            .to_vec()
+    });
+    assert!(
+        src_after.is_empty(),
+        "v5: rename must delete src from backend after overwriting dst"
+    );
+}
+
 // ============================================================
 // Issue #306 regression tests: readdir_with_attrs (N+1 RTT + marker paging)
 // ============================================================

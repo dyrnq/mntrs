@@ -8756,10 +8756,87 @@ impl MntrsFs {
                                     return Ok(false);
                                 }
                             };
+                            // Issue #614 v5: keep an extra
+                            // copy so the AlreadyExists-retry
+                            // path below can re-write the
+                            // payload after deleting the
+                            // existing dst key. Cloning is
+                            // acceptable here — `rename` is
+                            // not a hot path and the
+                            // `Move-Item -Force` semantics
+                            // the kernel expects require
+                            // overwrite behaviour.
+                            let bytes_for_retry = bytes.clone();
                             match op.write(&dst_clone, bytes).await {
                                 Ok(_meta) => {
                                     tracing::debug!(src = %src_clone, dst = %dst_clone, "rename fallback stage-2: op.write ok");
                                     Ok(true)
+                                }
+                                Err(write_err)
+                                    if write_err.kind()
+                                        == opendal::ErrorKind::AlreadyExists =>
+                                {
+                                    // Issue #614 v5: on
+                                    // backends where op.write is
+                                    // create-only (memory://,
+                                    // some WebHDFS deployments)
+                                    // the first write to an
+                                    // existing dst key returns
+                                    // AlreadyExists. PowerShell
+                                    // `Move-Item -Force` /
+                                    // Win32 `MoveFileEx(
+                                    // MOVEFILE_REPLACE_EXISTING)`
+                                    // expect overwrite semantics;
+                                    // pre-fix this made the
+                                    // second-and-later bench
+                                    // iteration FAIL with
+                                    // STATUS_OBJECT_NAME_COLLISION
+                                    // because the dst from the
+                                    // prior iteration was still
+                                    // in the backend. We delete
+                                    // the existing dst and retry
+                                    // the write once. If the
+                                    // retry succeeds the rename
+                                    // proceeds normally; if it
+                                    // fails we keep the source
+                                    // intact (matching the
+                                    // data-loss-avoidance
+                                    // contract below).
+                                    tracing::warn!(
+                                        src = %src_clone, dst = %dst_clone,
+                                        "rename fallback stage-2: op.write returned AlreadyExists; \
+                                         deleting existing dst and retrying (issue #614 v5)"
+                                    );
+                                    match op.delete(&dst_clone).await {
+                                        Ok(()) => {}
+                                        Err(del_err) => {
+                                            tracing::error!(
+                                                src = %src_clone, dst = %dst_clone, error = %del_err,
+                                                "rename fallback stage-2: dst pre-delete for AlreadyExists-retry failed; \
+                                                 keeping source intact"
+                                            );
+                                            return Ok(false);
+                                        }
+                                    }
+                                    match op.write(&dst_clone, bytes_for_retry).await {
+                                        Ok(_meta) => {
+                                            tracing::debug!(
+                                                src = %src_clone, dst = %dst_clone,
+                                                "rename fallback stage-2: op.write ok (after AlreadyExists retry)"
+                                            );
+                                            Ok(true)
+                                        }
+                                        Err(retry_err) => {
+                                            tracing::error!(
+                                                src = %src_clone, dst = %dst_clone, error = %retry_err,
+                                                "rename fallback stage-2: op.write retry failed after dst delete; \
+                                                 keeping source intact (dst is now gone from the backend — \
+                                                 same shape as a successful MoveFileEx but the data didn't \
+                                                 land; subsequent ops will surface NotFound)"
+                                            );
+                                            Ok(false)
+                                        }
+                                    }
                                 }
                                 Err(write_err) => {
                                     tracing::error!(
