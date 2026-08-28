@@ -57,22 +57,61 @@ PEAK_FD_MAX=0
 # above ~10 means a real leak (e.g. an orphaned fusermount3 child
 # the watch thread spawned, or a held /dev/fuse handle).
 #
-# Threshold of 20 was chosen empirically against the s3 mount path.
-# Steady state per backend:
-#   memory://  : ~10 FDs (3 stdio + 3 tokio eventpoll/eventfd
-#                + 1 /dev/fuse + 2-3 tokio sockets)
-#   s3://      : ~12-15 FDs (memory set + reqwest keep-alive TCP
-#                to the S3 endpoint; pool_max_idle_per_host=16
-#                in http_client.rs means up to 16 sockets per
-#                host could be warm)
-# Iterations with a busy cache dir (many .dirty sidecars from
-# prior runs) can transiently hold an extra 2-5 FDs while the
-# writeback worker recovers sidecars and the recovery scan opens
-# files in quick succession. 20 is a tolerance band wide enough
-# to absorb the s3 case + a transient burst, tight enough to
-# catch a real regression (e.g. an unbounded socket or pipe per
-# cycle).
-PEAK_FD_THRESHOLD=20
+# Threshold of 32 was recalibrated after PR #616 introduced
+# io::sync (src/io/sync.rs), an isolated multi_thread tokio
+# runtime that hosts concurrent_delete + writeback workers.
+#
+# PR #616 was reviewed and merged without realizing that the
+# new runtime adds a non-trivial fixed FD cost to the daemon
+# snapshot — s3-lifecycle-stress (which calls `echo > probe.txt`,
+# triggering the writeback path which initializes io::sync)
+# started failing the FD-leak detector at threshold=20.
+#
+# Empirical post-#616 measurements (local 8-core + GHA
+# ubuntu-latest 2-core give the same daemon post-mount peak):
+#
+#   memory backend, 30 iter: max=14 FDs (PASSED at threshold 20,
+#       passes at 32 with headroom)
+#   s3 backend, 3 iter:      max=20 FDs (legitimate baseline,
+#       not a leak — reqwest keep-alive pool warm)
+#
+# Steady state per backend AFTER PR #616:
+#   memory://  : ~16 FDs base
+#                (3 stdio + 2 tokio eventpoll/eventfd on
+#                crate::rt() + 1 /dev/fuse + 1-2 tokio sockets
+#                + ~6 from io::sync: 1 shared epoll + 1 eventfd
+#                on the multi_thread runtime + bridge std::thread +
+#                wakeup pipe + internal notify)
+#   s3://      : ~20 FDs base
+#                (+ ~4 from reqwest keep-alive TCP to the S3
+#                endpoint; pool_max_idle_per_host=16 in
+#                http_client.rs means up to 16 sockets per host
+#                COULD be warm, but empirical ~3-4 are warm in
+#                a 30-iter test)
+#   +4-8 transient: busy cache dir (.dirty sidecar recovery
+#                opens files in quick succession)
+#
+# 32 = 20 (s3 base) + 8 (transient burst) + 4 (defensive headroom
+# for reqwest pool expansion during the first WRITE path).
+# Still tight enough to catch an unbounded regression: a per-iter
+# FD that doesn't drop trends 32+ as iterations accumulate and
+# the avgs/maxes diverge.
+#
+# Why not "lazy init io::sync on first delete/write/prefetch" to
+# avoid the cost entirely? Because the lifecycle_stress test
+# itself invokes writes (`echo > probe.txt`), which triggers
+# writeback → io::sync init. The init happens during the first
+# iteration regardless of laziness. The only way to avoid the
+# cost in this test is the threshold recalibration above.
+# Read-only production mounts (--read-only flag, no writes) DO
+# benefit from a future lazy-init follow-up — see plan note.
+#
+# RULE: do not silently raise this further. If a future PR
+# legitimately needs more FDs, the right answer is to MOVE the
+# new FDs to a separate process / subprocess / off-thread runtime
+# so the daemon's post-unmount snapshot stays bounded. Raising
+# the threshold indefinitely defeats the detector.
+PEAK_FD_THRESHOLD=32
 
 cleanup() {
     fusermount3 -u "$MP" 2>/dev/null || fusermount -u "$MP" 2>/dev/null || true
