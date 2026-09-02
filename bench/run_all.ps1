@@ -201,7 +201,17 @@ function Mount-WinFsp {
     # to ERROR and the dispatch evidence never lands in
     # mntrs-bench.stdout.log — making the bench artifact useless
     # for the issue #612 root-cause investigation.
-    $env:RUST_LOG = "warn"
+    #
+    # Issue #614 v8 investigation (2026-09-02): temporary bump to
+    # `trace` to surface set_delete / get_file_info / lookup / read
+    # dispatch on the failing Remove-Item 1M warmup. v7's
+    # bench-result.txt showed the failure but the dispatch trace
+    # was empty for the post-Copy dispatch chain — the bug is
+    # somewhere between the Copy's verification cycles and the
+    # cleanup-with-DELETE we expect but never see. TRACE-level
+    # for one rerun will reveal the missing path; revert to `warn`
+    # once v8 lands.
+    $env:RUST_LOG = "trace"
     $script:MntrsProc = Start-Process -FilePath $MNTRS_BIN `
         -ArgumentList @("mount", $BACKEND, $MNTRS_BNT) `
         -RedirectStandardOutput "mntrs-bench.stdout.log" `
