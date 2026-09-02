@@ -1969,6 +1969,115 @@ fn winfsp_v7_rename_does_not_idempotently_succeed_when_dst_never_existed() {
 }
 
 // ============================================================
+// Issue #614 v8 regression test: PowerShell `Remove-Item -Force`
+// sends `SetFileAttributes(file, FILE_ATTRIBUTE_ARCHIVE)` before
+// `DeleteFile`; the kernel translates that into a
+// `set_basic_info` callback with all four FILETIME fields at 0
+// (the "leave unchanged" sentinel). Pre-v8 the rename-IRP
+// heuristic matched that pattern and inserted the ino into
+// `renamed_inos`, so the subsequent `cleanup(FspCleanupDelete)`
+// early-returned as a post-rename "delete-source-alias" no-op —
+// the file stayed on the backend and `Remove-Item` returned
+// "The system cannot find the file specified."
+//
+// v8 fix: tighten the heuristic with
+// `(creation_time != 0 || change_time != 0)`. A genuine
+// WinFSP kernel-internal rename IRP passes the file's real
+// creation_time / change_time (rename doesn't touch them);
+// PowerShell's archive-set leaves them at 0, so the clause
+// excludes the false-positive without excluding a real rename.
+//
+// This test is the **inverse** of `winfsp_v3_set_basic_info_then
+// _non_delete_cleanup_then_delete_cleanup` above: same
+// `set_basic_info` shape (attrs=0x20 ARCHIVE, all four times = 0),
+// no preceding rename, then a single `cleanup(FspCleanupDelete)`
+// — pre-v8 the backend file would survive, post-v8 it must be
+// unlinked.
+// ============================================================
+#[test]
+fn winfsp_v8_archive_set_before_delete_does_not_suppress_unlink() {
+    let fs = Arc::new(make_memory_fs());
+    let adapter = WinFspAdapter::new(fs.clone());
+
+    // Lowercase name to match the case-normalised basename
+    // the kernel hands to `cleanup` — see winfsp::cleanup
+    // at src/core_fs/winfsp.rs:1900 (NFC + lowercase).
+    // Opendal memory is case-sensitive, so writing
+    // `_rm1M_v8.bin` (mixed case) and asserting on
+    // `_rm1m_v8.bin` (lowercase) would hit two different
+    // keys; use lowercase end-to-end.
+    let name = "_rm1m_v8.bin";
+    let payload = b"payload that PowerShell Remove-Item -Force must actually delete";
+    write_remote(&fs, name, payload);
+
+    let ctx = open_handle_for(&*fs, name);
+
+    // Step 1: PowerShell Remove-Item -Force signature.
+    // The kernel translates
+    //   SetFileAttributes(file, FILE_ATTRIBUTE_ARCHIVE)
+    // into
+    //   set_basic_info(
+    //       file_attributes = FILE_ATTRIBUTE_ARCHIVE = 0x20,
+    //       creation_time   = 0,   // leave unchanged
+    //       last_access_time= 0,   // leave unchanged
+    //       last_write_time = 0,   // leave unchanged
+    //       change_time     = 0)   // leave unchanged
+    // Every time field is the 0 "leave unchanged" FILETIME
+    // sentinel. Pre-v8 the rename-IRP heuristic was
+    //   (file_attributes != 0xFFFFFFFF && last_write_time == 0)
+    // which matched this and wrongly inserted the ino into
+    // `renamed_inos` — so the subsequent cleanup-with-DELETE
+    // saw the entry, drained it, and early-returned without
+    // unlinking the backend file.
+    let mut fi = FileInfo::default();
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::set_basic_info(
+        &adapter, &ctx, 0x20, // FILE_ATTRIBUTE_ARCHIVE
+        0,    // creation_time    (leave unchanged)
+        0,    // last_access_time (leave unchanged)
+        0,    // last_write_time  (leave unchanged)
+        0,    // change_time      (leave unchanged)
+        &mut fi,
+    )
+    .expect("trait set_basic_info");
+
+    // Step 2: the actual delete cleanup. v8 must NOT have
+    // registered the ino (creation_time==0 and change_time==0),
+    // so this cleanup dispatches the backend unlink normally.
+    // FspCleanupDelete = 0x01 (winfsp constants); SET_ATIME =
+    // FspCleanupSetLastAccessTime = 0x20. Without DELETE the
+    // cleanup callback would just close the handle and never
+    // reach the unlink (see winfsp::cleanup at
+    // src/core_fs/winfsp.rs:1879).
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::cleanup(
+        &adapter,
+        &ctx,
+        Some(&*str_to_ucstr("\\_rm1m_v8.bin")),
+        0x21, // DELETE | SET_LAST_ACCESS_TIME
+    );
+
+    // The backend file MUST be gone. Pre-v8 the v7
+    // false-positive in set_basic_info suppressed this
+    // unlink and the file stayed — which is exactly the
+    // bench Remove-Item 1M FAIL we were investigating.
+    let backend_after = rt_block_on(async {
+        fs.op
+            .read("_rm1m_v8.bin")
+            .await
+            .unwrap_or_default()
+            .to_vec()
+    });
+    assert!(
+        backend_after.is_empty(),
+        "v8: PowerShell Remove-Item's set_basic_info(all-zeros \
+         ARCHIVE) must NOT register the ino as renamed, so the \
+         subsequent cleanup(FspCleanupDelete) must actually \
+         unlink — post-v8 the backend must be empty for \
+         _rm1M_v8.bin. Pre-v8 the rename-IRP heuristic wrongly \
+         suppressed the unlink (issue #614 v7 false-positive)."
+    );
+}
+
+// ============================================================
 // Issue #306 regression tests: readdir_with_attrs (N+1 RTT + marker paging)
 // ============================================================
 
