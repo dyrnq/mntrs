@@ -1829,6 +1829,145 @@ fn winfsp_v6_rename_returns_notfound_when_neither_backend_nor_cache_has_src() {
     );
 }
 
+/// Issue #614 v7: post-rename orphan idempotency.
+///
+/// PowerShell `Move-Item -Force` invokes
+/// `MoveFileEx(MOVEFILE_REPLACE_EXISTING)`, which opens
+/// multiple FHs on the source and dispatches the rename IRP
+/// once per FH. After iter 1's do_rename migrates the cache
+/// file src→dst and deletes src from the backend, iter 2's
+/// rename IRP arrives with:
+///
+///   * op.read(src) → NotFound (backend src is gone)
+///   * cpath_src → NotFound (cache file was migrated to dst)
+///   * cpath_dst → present (the migrated payload)
+///
+/// Pre-v7: do_rename returns Err(NotFound). PowerShell's
+/// MoveFileEx propagates this and Move-Item fails with
+/// "Unable to find the specified file" even though iter 1
+/// already moved the data.
+///
+/// Post-v7: the orphan fast-path at the top of do_rename
+/// detects `cpath_src missing + cpath_dst present` and
+/// returns Ok(true) idempotently. The post-do_rename block
+/// runs (no-op for cache migration since cpath_dst exists,
+/// no-op for inodes since path_to_ino[src] is gone — the
+/// orphan ino leaks; the kernel's forget path GC's it).
+///
+/// This test reproduces the exact bench scenario at the
+/// trait level:
+///   1. Stage a 1MB file via the trait's create path
+///      (matches the bench's Set-Content pattern).
+///   2. Run iter 1 of rename via the trait — succeeds.
+///   3. Verify the post-iter-1 state: cpath_src is gone,
+///      cpath_dst has the migrated bytes, backend has dst.
+///   4. Run iter 2 of rename via the trait — pre-v7 this
+///      returns Err(NotFound); post-v7 it returns Ok.
+///   5. Assert iter 2 succeeded and dst still has the data.
+#[test]
+fn winfsp_v7_rename_idempotent_on_post_rename_orphan() {
+    let fs = Arc::new(make_memory_fs());
+    let adapter = WinFspAdapter::new(fs.clone());
+
+    let src = "_mv10_src.bin";
+    let dst = "_mv10_dst.bin";
+    let payload = vec![0xABu8; 1024 * 1024]; // 1 MB — matches bench Move-Item 1M
+
+    // Step 1: stage src via the direct opendal write path so
+    // the post-rename state has `cpath_src` populated (the
+    // bench's Set-Content writes go through the WinFSP mount
+    // which creates the cache file; here we simulate the
+    // post-flush state by writing to backend AND planting a
+    // matching cache file at src).
+    write_remote(&fs, src, &payload);
+    let cpath_src = mntrs::write_buffer_path(&fs.cache_dir, src);
+    let cpath_dst = mntrs::write_buffer_path(&fs.cache_dir, dst);
+    if let Some(parent) = cpath_src.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&cpath_src, &payload).unwrap();
+
+    // Step 2: iter 1 — rename src → dst. Should succeed.
+    {
+        let ctx = open_handle_for(&*fs, src);
+        rename_path(&adapter, &ctx, src, dst);
+    }
+
+    // Step 3: verify the post-iter-1 state matches the
+    // bench's iter-1 ending state.
+    assert!(
+        !cpath_src.exists(),
+        "v7: post-iter-1 cpath_src must be gone (migrated to dst)"
+    );
+    assert!(
+        cpath_dst.exists(),
+        "v7: post-iter-1 cpath_dst must exist (the migrated payload)"
+    );
+    let dst_after_iter1 = rt_block_on(async { fs.op.read(dst).await.unwrap_or_default().to_vec() });
+    assert_eq!(
+        dst_after_iter1, payload,
+        "v7: post-iter-1 dst must have the migrated bytes"
+    );
+
+    // Step 4: iter 2 — rename src → dst again. This is the
+    // exact bench scenario. Pre-v7 returns Err(NotFound)
+    // because op.read src is NotFound AND cpath_src is
+    // missing (migrated). Post-v7 the orphan fast-path
+    // detects the state and returns Ok idempotently.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // We can't open a fresh ino for src (the lookup
+        // orphan-cache-file fallback at line 3988 would
+        // return Err since cpath_src is missing). But the
+        // do_rename fast-path doesn't need an ino — it
+        // runs before any ino-dependent code. So we call
+        // rename_paths directly through the trait, which
+        // is what the WinFSP rename callback dispatches to
+        // in production (lib.rs::rename_paths → do_rename).
+        fs.rename_paths(&format!("/{}", src), &format!("/{}", dst))
+    }));
+
+    // Step 5: iter 2 must succeed (pre-v7 returned Err).
+    let result = result.expect("rename_paths must not panic");
+    assert!(
+        result.is_ok(),
+        "v7: iter-2 rename (post-rename orphan) must succeed \
+         (treat as idempotent because dst already has the data). \
+         Pre-v7 this returned Err(NotFound). Got: {:?}",
+        result.as_ref().err().map(|e| (e.kind(), e.to_string()))
+    );
+
+    // dst must still have the data — iter 2 is a no-op
+    // (the fast-path skips backend ops entirely).
+    let dst_after_iter2 = rt_block_on(async { fs.op.read(dst).await.unwrap_or_default().to_vec() });
+    assert_eq!(
+        dst_after_iter2, payload,
+        "v7: post-iter-2 dst must still have the original data \
+         (fast-path is idempotent — no backend ops, no cache ops)"
+    );
+}
+
+/// Issue #614 v7 (negative): when neither backend nor
+/// cache file at dst has any payload (genuine first-time
+/// rename of a non-existent file), the orphan fast-path
+/// MUST NOT fire. The guard is `cpath_dst.exists()` —
+/// without it, we'd silently no-op writes against a never-
+/// written dst. This test prevents a future regression
+/// from making the guard too loose.
+#[test]
+fn winfsp_v7_rename_does_not_idempotently_succeed_when_dst_never_existed() {
+    let fs = make_memory_fs();
+    let result = fs.rename_paths("/_mv11_does_not_exist.bin", "/_mv11_dst_never_existed.bin");
+    let kind = result.as_ref().err().map(|e| e.kind());
+    assert_eq!(
+        kind,
+        Some(std::io::ErrorKind::NotFound),
+        "v7: rename with neither backend nor cache file (anywhere) \
+         must return NotFound — the fast-path guard `cpath_dst.exists()` \
+         prevents silent no-op on never-written dst. Got: {:?}",
+        kind
+    );
+}
+
 // ============================================================
 // Issue #306 regression tests: readdir_with_attrs (N+1 RTT + marker paging)
 // ============================================================
