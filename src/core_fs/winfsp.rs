@@ -1100,6 +1100,53 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 let is_dir = attr.kind == CoreFileType::Directory;
                 let ino = attr.ino;
                 tracing::info!(name = %name, ino, is_dir, kind = ?attr.kind, "winfsp::open: lookup ok");
+                // Issue #614 v9: WinFSP can route a
+                // file-create request through `open` rather
+                // than `create` (e.g. `[IO.File]::OpenWrite`
+                // on a fresh path, which the kernel serves
+                // via get_security_by_name → open with
+                // FILE_OPEN_IF disposition). The create
+                // path calls `cache_add_entry` for the
+                // parent dir_cache, but the open path
+                // never did — so a subsequent `Remove-Item`
+                // or `Copy-Item` readdir would HIT the
+                // stale parent listing (the just-written
+                // file is invisible), causing #614's
+                // Remove-Item 1M FAIL.
+                //
+                // Detect the "file freshly allocated by
+                // this open" signal: lookup succeeded
+                // (returning `attr`) but the name is not
+                // in the parent's dir_cache snapshot —
+                // which only happens when the file landed
+                // on the backend without going through our
+                // `cache_add_entry` hook (i.e. via the
+                // open path or via an out-of-band backend
+                // write). For directory opens we leave the
+                // cache alone; the underlying opendir()
+                // already populates dir_cache via
+                // list_op on the next readdir.
+                //
+                // Cost: one DashMap probe per file open,
+                // which is dominated by the lookup
+                // round-trip itself. Read-side opens
+                // (already-present files) are no-ops
+                // because the name IS in the cache.
+                if !is_dir
+                    && let Some((parent_path, basename)) = path.rsplit_once('/')
+                    && !basename.is_empty()
+                {
+                    let invalidated = self
+                        .inner
+                        .dir_cache_invalidate_if_stale(parent_path, basename);
+                    if invalidated {
+                        tracing::debug!(
+                            parent = %parent_path,
+                            name = %basename,
+                            "winfsp::open: invalidating stale parent dir_cache (issue #614 v9)"
+                        );
+                    }
+                }
                 // Bug 11: actually call CoreFilesystem::open so
                 // the per-handle FileHandleState (write_buffer_fd for
                 // writes, prefetcher for reads) gets populated.
