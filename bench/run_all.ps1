@@ -201,6 +201,19 @@ function Mount-WinFsp {
     # to ERROR and the dispatch evidence never lands in
     # mntrs-bench.stdout.log — making the bench artifact useless
     # for the issue #612 root-cause investigation.
+    #
+    # Issue #614 v8 investigation (2026-09-02): bumped to
+    # `trace` to surface set_delete / get_file_info / lookup /
+    # read dispatch on the failing Remove-Item 1M warmup. Root
+    # cause was a v7 false-positive in the set_basic_info rename
+    # heuristic — PowerShell's archive-bit-set before delete
+    # matched the rename signature, so the cleanup-with-DELETE
+    # was no-op'd and the file stayed on the backend. v8 fix
+    # (winfsp.rs set_basic_info) tightens the heuristic to
+    # require a non-zero creation_time / change_time, which
+    # Remove-Item's all-zeros time fields do not satisfy.
+    # Reverted to `warn` now that the dispatch question is
+    # answered.
     $env:RUST_LOG = "warn"
     $script:MntrsProc = Start-Process -FilePath $MNTRS_BIN `
         -ArgumentList @("mount", $BACKEND, $MNTRS_BNT) `

@@ -1829,6 +1829,254 @@ fn winfsp_v6_rename_returns_notfound_when_neither_backend_nor_cache_has_src() {
     );
 }
 
+/// Issue #614 v7: post-rename orphan idempotency.
+///
+/// PowerShell `Move-Item -Force` invokes
+/// `MoveFileEx(MOVEFILE_REPLACE_EXISTING)`, which opens
+/// multiple FHs on the source and dispatches the rename IRP
+/// once per FH. After iter 1's do_rename migrates the cache
+/// file src→dst and deletes src from the backend, iter 2's
+/// rename IRP arrives with:
+///
+///   * op.read(src) → NotFound (backend src is gone)
+///   * cpath_src → NotFound (cache file was migrated to dst)
+///   * cpath_dst → present (the migrated payload)
+///
+/// Pre-v7: do_rename returns Err(NotFound). PowerShell's
+/// MoveFileEx propagates this and Move-Item fails with
+/// "Unable to find the specified file" even though iter 1
+/// already moved the data.
+///
+/// Post-v7: the orphan fast-path at the top of do_rename
+/// detects `cpath_src missing + cpath_dst present` and
+/// returns Ok(true) idempotently. The post-do_rename block
+/// runs (no-op for cache migration since cpath_dst exists,
+/// no-op for inodes since path_to_ino[src] is gone — the
+/// orphan ino leaks; the kernel's forget path GC's it).
+///
+/// This test reproduces the exact bench scenario at the
+/// trait level:
+///   1. Stage a 1MB file via the trait's create path
+///      (matches the bench's Set-Content pattern).
+///   2. Run iter 1 of rename via the trait — succeeds.
+///   3. Verify the post-iter-1 state: cpath_src is gone,
+///      cpath_dst has the migrated bytes, backend has dst.
+///   4. Run iter 2 of rename via the trait — pre-v7 this
+///      returns Err(NotFound); post-v7 it returns Ok.
+///   5. Assert iter 2 succeeded and dst still has the data.
+#[test]
+fn winfsp_v7_rename_idempotent_on_post_rename_orphan() {
+    let fs = Arc::new(make_memory_fs());
+    let adapter = WinFspAdapter::new(fs.clone());
+
+    let src = "_mv10_src.bin";
+    let dst = "_mv10_dst.bin";
+    let payload = vec![0xABu8; 1024 * 1024]; // 1 MB — matches bench Move-Item 1M
+
+    // Step 1: stage src via the direct opendal write path so
+    // the post-rename state has `cpath_src` populated (the
+    // bench's Set-Content writes go through the WinFSP mount
+    // which creates the cache file; here we simulate the
+    // post-flush state by writing to backend AND planting a
+    // matching cache file at src).
+    write_remote(&fs, src, &payload);
+    let cpath_src = mntrs::write_buffer_path(&fs.cache_dir, src);
+    let cpath_dst = mntrs::write_buffer_path(&fs.cache_dir, dst);
+    if let Some(parent) = cpath_src.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&cpath_src, &payload).unwrap();
+
+    // Step 2: iter 1 — rename src → dst. Should succeed.
+    {
+        let ctx = open_handle_for(&*fs, src);
+        rename_path(&adapter, &ctx, src, dst);
+    }
+
+    // Step 3: verify the post-iter-1 state matches the
+    // bench's iter-1 ending state.
+    assert!(
+        !cpath_src.exists(),
+        "v7: post-iter-1 cpath_src must be gone (migrated to dst)"
+    );
+    assert!(
+        cpath_dst.exists(),
+        "v7: post-iter-1 cpath_dst must exist (the migrated payload)"
+    );
+    let dst_after_iter1 = rt_block_on(async { fs.op.read(dst).await.unwrap_or_default().to_vec() });
+    assert_eq!(
+        dst_after_iter1, payload,
+        "v7: post-iter-1 dst must have the migrated bytes"
+    );
+
+    // Step 4: iter 2 — rename src → dst again. This is the
+    // exact bench scenario. Pre-v7 returns Err(NotFound)
+    // because op.read src is NotFound AND cpath_src is
+    // missing (migrated). Post-v7 the orphan fast-path
+    // detects the state and returns Ok idempotently.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // We can't open a fresh ino for src (the lookup
+        // orphan-cache-file fallback at line 3988 would
+        // return Err since cpath_src is missing). But the
+        // do_rename fast-path doesn't need an ino — it
+        // runs before any ino-dependent code. So we call
+        // rename_paths directly through the trait, which
+        // is what the WinFSP rename callback dispatches to
+        // in production (lib.rs::rename_paths → do_rename).
+        fs.rename_paths(&format!("/{}", src), &format!("/{}", dst))
+    }));
+
+    // Step 5: iter 2 must succeed (pre-v7 returned Err).
+    let result = result.expect("rename_paths must not panic");
+    assert!(
+        result.is_ok(),
+        "v7: iter-2 rename (post-rename orphan) must succeed \
+         (treat as idempotent because dst already has the data). \
+         Pre-v7 this returned Err(NotFound). Got: {:?}",
+        result.as_ref().err().map(|e| (e.kind(), e.to_string()))
+    );
+
+    // dst must still have the data — iter 2 is a no-op
+    // (the fast-path skips backend ops entirely).
+    let dst_after_iter2 = rt_block_on(async { fs.op.read(dst).await.unwrap_or_default().to_vec() });
+    assert_eq!(
+        dst_after_iter2, payload,
+        "v7: post-iter-2 dst must still have the original data \
+         (fast-path is idempotent — no backend ops, no cache ops)"
+    );
+}
+
+/// Issue #614 v7 (negative): when neither backend nor
+/// cache file at dst has any payload (genuine first-time
+/// rename of a non-existent file), the orphan fast-path
+/// MUST NOT fire. The guard is `cpath_dst.exists()` —
+/// without it, we'd silently no-op writes against a never-
+/// written dst. This test prevents a future regression
+/// from making the guard too loose.
+#[test]
+fn winfsp_v7_rename_does_not_idempotently_succeed_when_dst_never_existed() {
+    let fs = make_memory_fs();
+    let result = fs.rename_paths("/_mv11_does_not_exist.bin", "/_mv11_dst_never_existed.bin");
+    let kind = result.as_ref().err().map(|e| e.kind());
+    assert_eq!(
+        kind,
+        Some(std::io::ErrorKind::NotFound),
+        "v7: rename with neither backend nor cache file (anywhere) \
+         must return NotFound — the fast-path guard `cpath_dst.exists()` \
+         prevents silent no-op on never-written dst. Got: {:?}",
+        kind
+    );
+}
+
+// ============================================================
+// Issue #614 v8 regression test: PowerShell `Remove-Item -Force`
+// sends `SetFileAttributes(file, FILE_ATTRIBUTE_ARCHIVE)` before
+// `DeleteFile`; the kernel translates that into a
+// `set_basic_info` callback with all four FILETIME fields at 0
+// (the "leave unchanged" sentinel). Pre-v8 the rename-IRP
+// heuristic matched that pattern and inserted the ino into
+// `renamed_inos`, so the subsequent `cleanup(FspCleanupDelete)`
+// early-returned as a post-rename "delete-source-alias" no-op —
+// the file stayed on the backend and `Remove-Item` returned
+// "The system cannot find the file specified."
+//
+// v8 fix: tighten the heuristic with
+// `(creation_time != 0 || change_time != 0)`. A genuine
+// WinFSP kernel-internal rename IRP passes the file's real
+// creation_time / change_time (rename doesn't touch them);
+// PowerShell's archive-set leaves them at 0, so the clause
+// excludes the false-positive without excluding a real rename.
+//
+// This test is the **inverse** of `winfsp_v3_set_basic_info_then
+// _non_delete_cleanup_then_delete_cleanup` above: same
+// `set_basic_info` shape (attrs=0x20 ARCHIVE, all four times = 0),
+// no preceding rename, then a single `cleanup(FspCleanupDelete)`
+// — pre-v8 the backend file would survive, post-v8 it must be
+// unlinked.
+// ============================================================
+#[test]
+fn winfsp_v8_archive_set_before_delete_does_not_suppress_unlink() {
+    let fs = Arc::new(make_memory_fs());
+    let adapter = WinFspAdapter::new(fs.clone());
+
+    // Lowercase name to match the case-normalised basename
+    // the kernel hands to `cleanup` — see winfsp::cleanup
+    // at src/core_fs/winfsp.rs:1900 (NFC + lowercase).
+    // Opendal memory is case-sensitive, so writing
+    // `_rm1M_v8.bin` (mixed case) and asserting on
+    // `_rm1m_v8.bin` (lowercase) would hit two different
+    // keys; use lowercase end-to-end.
+    let name = "_rm1m_v8.bin";
+    let payload = b"payload that PowerShell Remove-Item -Force must actually delete";
+    write_remote(&fs, name, payload);
+
+    let ctx = open_handle_for(&*fs, name);
+
+    // Step 1: PowerShell Remove-Item -Force signature.
+    // The kernel translates
+    //   SetFileAttributes(file, FILE_ATTRIBUTE_ARCHIVE)
+    // into
+    //   set_basic_info(
+    //       file_attributes = FILE_ATTRIBUTE_ARCHIVE = 0x20,
+    //       creation_time   = 0,   // leave unchanged
+    //       last_access_time= 0,   // leave unchanged
+    //       last_write_time = 0,   // leave unchanged
+    //       change_time     = 0)   // leave unchanged
+    // Every time field is the 0 "leave unchanged" FILETIME
+    // sentinel. Pre-v8 the rename-IRP heuristic was
+    //   (file_attributes != 0xFFFFFFFF && last_write_time == 0)
+    // which matched this and wrongly inserted the ino into
+    // `renamed_inos` — so the subsequent cleanup-with-DELETE
+    // saw the entry, drained it, and early-returned without
+    // unlinking the backend file.
+    let mut fi = FileInfo::default();
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::set_basic_info(
+        &adapter, &ctx, 0x20, // FILE_ATTRIBUTE_ARCHIVE
+        0,    // creation_time    (leave unchanged)
+        0,    // last_access_time (leave unchanged)
+        0,    // last_write_time  (leave unchanged)
+        0,    // change_time      (leave unchanged)
+        &mut fi,
+    )
+    .expect("trait set_basic_info");
+
+    // Step 2: the actual delete cleanup. v8 must NOT have
+    // registered the ino (creation_time==0 and change_time==0),
+    // so this cleanup dispatches the backend unlink normally.
+    // FspCleanupDelete = 0x01 (winfsp constants); SET_ATIME =
+    // FspCleanupSetLastAccessTime = 0x20. Without DELETE the
+    // cleanup callback would just close the handle and never
+    // reach the unlink (see winfsp::cleanup at
+    // src/core_fs/winfsp.rs:1879).
+    <WinFspAdapter<MntrsFs> as FileSystemContext>::cleanup(
+        &adapter,
+        &ctx,
+        Some(&*str_to_ucstr("\\_rm1m_v8.bin")),
+        0x21, // DELETE | SET_LAST_ACCESS_TIME
+    );
+
+    // The backend file MUST be gone. Pre-v8 the v7
+    // false-positive in set_basic_info suppressed this
+    // unlink and the file stayed — which is exactly the
+    // bench Remove-Item 1M FAIL we were investigating.
+    let backend_after = rt_block_on(async {
+        fs.op
+            .read("_rm1m_v8.bin")
+            .await
+            .unwrap_or_default()
+            .to_vec()
+    });
+    assert!(
+        backend_after.is_empty(),
+        "v8: PowerShell Remove-Item's set_basic_info(all-zeros \
+         ARCHIVE) must NOT register the ino as renamed, so the \
+         subsequent cleanup(FspCleanupDelete) must actually \
+         unlink — post-v8 the backend must be empty for \
+         _rm1M_v8.bin. Pre-v8 the rename-IRP heuristic wrongly \
+         suppressed the unlink (issue #614 v7 false-positive)."
+    );
+}
+
 // ============================================================
 // Issue #306 regression tests: readdir_with_attrs (N+1 RTT + marker paging)
 // ============================================================

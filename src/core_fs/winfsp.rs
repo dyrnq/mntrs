@@ -2784,19 +2784,26 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 // renamed_inos-aware branch then early-returns
                 // and the dst file is preserved.
                 //
-                // Heuristic rationale: the
-                // `(file_attributes != 0xFFFFFFFF,
-                // last_write_time == 0)` combination is rare
-                // outside of rename IRPs. A legitimate
-                // user-initiated `Set-ItemProperty -Attributes
-                // Archive` would carry a real mtime (or the
-                // sentinel 0xFFFFFFFF for the attrs), so this
-                // heuristic avoids the false-positive of
-                // "every set_basic_info marks as renamed". If
-                // a future WinFSP release changes the
-                // signature we can refine; for now this
-                // matches the bench trace exactly.
-                if file_attributes != u32::MAX && last_write_time == 0 {
+                // Heuristic rationale: a WinFSP-internal rename
+                // IRP (open-handle MoveFile) calls this callback
+                // with the file's current real
+                // `file_attributes`, `last_write_time = 0` (no
+                // mtime change), AND the real `creation_time` /
+                // `change_time` (rename doesn't touch those
+                // either). PowerShell `Remove-Item`, by contrast,
+                // clears the read-only bit before delete and the
+                // kernel sends `set_basic_info(attrs=ARCHIVE,
+                // creation_time=0, change_time=0, last_write_time=0)`
+                // — every time field is the 0 "leave unchanged"
+                // sentinel. Adding the `creation_time != 0 ||
+                // change_time != 0` clause excludes that
+                // false-positive so Remove-Item's DELETE cleanup
+                // isn't mistakenly suppressed (which would leave
+                // the file on the backend).
+                if file_attributes != u32::MAX
+                    && last_write_time == 0
+                    && (creation_time != 0 || change_time != 0)
+                {
                     let mut renamed = self.renamed_inos.lock_or_recover();
                     renamed.insert(context.ino);
                     tracing::info!(

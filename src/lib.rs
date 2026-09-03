@@ -8504,8 +8504,72 @@ impl MntrsFs {
         //                requires ENOENT, so propagate. Issue #192's fix
         //                (return Ok(())) was a POSIX violation; this
         //                restores the correct semantics.
-        let backend_result: Result<bool, std::io::Error> = rt().block_on(async move {
-            match op.rename(&src_clone, &dst_clone).await {
+        //
+        // Issue #614 v7: post-rename orphan fast-path.
+        // PowerShell `Move-Item -Force` invokes
+        // `MoveFileEx(MOVEFILE_REPLACE_EXISTING)`, which opens
+        // multiple FHs on the source and dispatches the rename
+        // IRP once per FH. After iter 1's do_rename successfully
+        // migrated cache src→dst and deleted src from the backend,
+        // iter 2's rename IRP arrives for a freshly-allocated ino
+        // for src. At the rename stage:
+        //
+        //   * op.read(src) → NotFound (backend src was deleted in
+        //     iter 1)
+        //   * cpath_src (cache file at src) → also missing
+        //     (migrated to cpath_dst in iter 1)
+        //   * cpath_dst (cache file at dst) → still present
+        //     (the migrated payload from iter 1)
+        //
+        // Pre-v7: the v6 `cache-file missing` arm returned
+        // `Err(NotFound)` to satisfy POSIX rename(non-existent,
+        // dst) → ENOENT. But PowerShell's MoveFileEx treats the
+        // retry's STATUS_OBJECT_NAME_NOT_FOUND as a fatal
+        // Move-Item failure ("Unable to find the specified
+        // file") even though iter 1 already moved the data. The
+        // v7 fast-path detects the orphan state (cpath_src
+        // missing + cpath_dst present) and returns `Ok(true)`
+        // idempotently: dst already has the right data, so the
+        // rename is a no-op as far as the user-visible state is
+        // concerned. The post-do_rename block below still runs
+        // (cache-file migration is a no-op since cpath_dst
+        // exists; inodes update is a no-op since path_to_ino
+        // doesn't have src anymore — that's fine; the
+        // per-iteration orphan ino just leaks and is GC'd by
+        // the kernel's forget path). The v1 renamed_inos
+        // suppression in the WinFspAdapter `rename` callback
+        // covers any subsequent DELETE cleanup of the orphan
+        // ino (the callback adds context.ino on Ok from
+        // rename_paths).
+        //
+        // Guards: we only fire the fast-path when cpath_dst
+        // exists (some prior iteration already migrated).
+        // Without that guard we'd silently no-op a rename
+        // against a never-written dst, breaking write-new.
+        let cpath_src_pre = crate::write_buffer_path(&self.cache_dir, &src);
+        let cpath_dst_pre = crate::write_buffer_path(&self.cache_dir, &dst);
+        let orphan_fast_path = !cpath_src_pre.exists() && cpath_dst_pre.exists();
+        if orphan_fast_path {
+            tracing::warn!(
+                src = %src,
+                dst = %dst,
+                cpath_dst_bytes = std::fs::metadata(&cpath_dst_pre).map(|m| m.len()).unwrap_or(0),
+                "rename: post-rename orphan detected (cpath_src missing, cpath_dst present); \
+                 treating as idempotent (issue #614 v7). PowerShell MoveFileEx issues one rename \
+                 IRP per open FH, so the kernel's retry sees the iter-1 state (backend src gone, \
+                 cache file already migrated) and would otherwise fail with NotFound."
+            );
+        }
+        let backend_result: Result<bool, std::io::Error> = if orphan_fast_path {
+            // Skip the backend block entirely. The post-do_rename
+            // block below will run (no-op for cache migration
+            // since cpath_dst already exists; no-op for inodes
+            // since path_to_ino doesn't have src). The orphan
+            // ino leaks; the kernel's forget path GC's it.
+            Ok(true)
+        } else {
+            rt().block_on(async move {
+                match op.rename(&src_clone, &dst_clone).await {
                 Ok(()) => Ok(true),
                 Err(e) if e.kind() == opendal::ErrorKind::Unsupported => {
                     tracing::debug!(
@@ -8857,7 +8921,8 @@ impl MntrsFs {
                     Ok(false)
                 }
             }
-        });
+        })
+        };
         match backend_result {
             Ok(true) => {}
             Ok(false) => return Ok(()),
