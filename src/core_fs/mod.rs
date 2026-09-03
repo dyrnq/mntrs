@@ -203,6 +203,30 @@ pub trait CoreFilesystem: Send + Sync {
         Ok(())
     }
 
+    /// Issue #614 v9: invalidate the parent's
+    /// `dir_cache` snapshot when an open observed a
+    /// name that the cache doesn't know about. Some
+    /// WinFSP dispatch paths (e.g. `[IO.File]::OpenWrite`
+    /// on a fresh path) create files via `open`
+    /// rather than `create`, so the `cache_add_entry`
+    /// hook the create path runs is never invoked.
+    /// Without this invalidation, a subsequent
+    /// readdir would HIT the stale parent listing
+    /// and miss the freshly-written file — exactly
+    /// what powers the Remove-Item 1M FAIL on
+    /// WinFSP mounts.
+    ///
+    /// Default: no-op. Implementations that maintain
+    /// a parent-dir cache (e.g. `MntrsFs`) override
+    /// to perform the actual invalidation.
+    ///
+    /// Returns `true` if the cache was stale and got
+    /// invalidated, `false` if the name was already
+    /// present (or no parent cache entry existed).
+    fn dir_cache_invalidate_if_stale(&self, _parent_path: &str, _name: &str) -> bool {
+        false
+    }
+
     /// Read directory entries with their attrs in one call.
     ///
     /// Issue #306: WinFSP's `read_directory` callback wants

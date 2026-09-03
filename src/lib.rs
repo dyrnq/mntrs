@@ -3899,6 +3899,53 @@ impl CoreFilesystem for MntrsFs {
         Ok(self.batch_lookup_from_dir_cache(parent, names))
     }
 
+    /// Issue #614 v9 override: companion helper for the
+    /// `winfsp::open` "create-via-open" path. WinFSP
+    /// sometimes routes file-create requests (e.g.
+    /// `[IO.File]::OpenWrite` on a fresh path) through
+    /// `open` rather than `create`, which means
+    /// `cache_add_entry` (called by `create`) is never
+    /// invoked. The file ends up on the backend but is
+    /// invisible to subsequent readdir calls because
+    /// the parent's dir_cache snapshot is stale.
+    ///
+    /// When the open succeeds for a name that isn't in
+    /// the parent's existing dir_cache snapshot, we
+    /// invalidate the parent so the next readdir
+    /// refetches via list_op. The cost is one DashMap
+    /// probe per file open (no-op when the name IS in
+    /// the cache, i.e. the read-side open case).
+    ///
+    /// Returns `true` if the parent cache was stale
+    /// and got invalidated; `false` if the name was
+    /// already present (or no parent cache entry
+    /// existed at all — the next readdir will refetch
+    /// via the cold path anyway, so no action needed).
+    fn dir_cache_invalidate_if_stale(&self, parent_path: &str, name: &str) -> bool {
+        let parent_canon = canonicalize_list_path(parent_path);
+        let stale = self
+            .dir_cache
+            .get(&parent_canon)
+            .map(|entry| !entry.value().1.contains_key(name))
+            .unwrap_or(false);
+        if stale {
+            tracing::debug!(
+                parent = %parent_canon,
+                name = %name,
+                "MntrsFs::dir_cache_invalidate_if_stale: invalidating parent dir_cache"
+            );
+            self.dir_cache.remove(&parent_canon);
+            true
+        } else {
+            tracing::trace!(
+                parent = %parent_canon,
+                name = %name,
+                "MntrsFs::dir_cache_invalidate_if_stale: parent dir_cache up-to-date (name present or no entry)"
+            );
+            false
+        }
+    }
+
     fn access(&self, _ino: u64, _mask: u32) -> std::io::Result<()> {
         // Issue #268.2 O11: trace-level entry log so
         // operators can correlate EACCES ("--default-permissions")
