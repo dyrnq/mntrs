@@ -149,18 +149,6 @@ jobs:
       - name: Run benchmark (WinFSP mount + PowerShell workload)
         shell: pwsh
         timeout-minutes: 10
-        env:
-          # Issue #621 debug: mntrs=trace surfaces v10's
-          # `lookup: populated cold parent dir_cache` and the
-          # warmup-race path inside lookup_async. Replace with
-          # `mntrs=info` (default) once #621 is fixed.
-          RUST_LOG: mntrs=trace,winfsp=info
-          # Issue #621 v12 debug: write notify-push/drain markers
-          # directly to stderr (bypasses tracing-subscriber's
-          # filter), so we can confirm whether the WinFSP timer
-          # thread is actually firing `should_notify`/`notify`.
-          # Remove once #621 is fixed.
-          MNTRS_NOTIFY_TRACE: '1'
         run: |
           & ./bench/run_all.ps1 *>&1 | Tee-Object -FilePath bench-result.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

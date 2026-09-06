@@ -1380,14 +1380,18 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                         queue_len = queue.len(),
                         "winfsp::create: queued FILE_ACTION_ADDED (issue #621 v13)"
                     );
-                    // Issue #621 v12 debug: also write directly to
-                    // stderr (bypasses tracing-subscriber's filter —
-                    // env-filter was missing until this PR so trace!
-                    // lines never reached the bench artifact). Gated
-                    // on MNTRS_NOTIFY_TRACE=1 to avoid spamming prod.
+                    // Issue #621 debug: also write directly to
+                    // stderr (bypasses tracing-subscriber's filter),
+                    // so we can confirm whether the push and the
+                    // WinFSP notifier thread are actually firing
+                    // should_notify/notify in production. Gated on
+                    // MNTRS_NOTIFY_TRACE=1 to avoid spamming prod.
+                    // Kept after v13 because FspFileSystemNotify's
+                    // per-volume dir-cache behavior is still under
+                    // investigation (see issue #621 thread).
                     if std::env::var("MNTRS_NOTIFY_TRACE").is_ok() {
                         eprintln!(
-                            "[v13] winfsp::create: queued FILE_ACTION_ADDED \
+                            "[notify-trace] winfsp::create: queued FILE_ACTION_ADDED \
                              basename={basename_upper:?} is_dir={is_dir} \
                              filter={filter} action={action} queue_len={}",
                             queue.len()
@@ -2158,11 +2162,11 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                         tracing::trace!(
                             basename = %basename_upper,
                             queue_len = queue.len(),
-                            "winfsp::cleanup: queued FILE_ACTION_REMOVED (issue #621 v13 uppercased)"
+                            "winfsp::cleanup: queued FILE_ACTION_REMOVED"
                         );
                         if std::env::var("MNTRS_NOTIFY_TRACE").is_ok() {
                             eprintln!(
-                                "[v13] winfsp::cleanup: queued FILE_ACTION_REMOVED \
+                                "[notify-trace] winfsp::cleanup: queued FILE_ACTION_REMOVED \
                                  basename={basename_upper:?} queue_len={}",
                                 queue.len()
                             );
@@ -3778,7 +3782,7 @@ impl<F: CoreFilesystem + 'static> NotifyingFileSystemContext<()> for WinFspAdapt
             // heartbeat so we can confirm the timer thread is alive
             // even when the queue is empty.
             eprintln!(
-                "[v12] winfsp::should_notify: queue.len()={} has={has}",
+                "[notify-trace] winfsp::should_notify: queue.len()={} has={has}",
                 queue.len()
             );
         }
@@ -3832,7 +3836,7 @@ impl<F: CoreFilesystem + 'static> NotifyingFileSystemContext<()> for WinFspAdapt
             notifier.notify(&info);
             if std::env::var("MNTRS_NOTIFY_TRACE").is_ok() {
                 eprintln!(
-                    "[v12] winfsp::notify: emitted basename={basename:?} \
+                    "[notify-trace] winfsp::notify: emitted basename={basename:?} \
                      filter={filter} action={action}"
                 );
             }
@@ -3843,7 +3847,7 @@ impl<F: CoreFilesystem + 'static> NotifyingFileSystemContext<()> for WinFspAdapt
                 "winfsp::notify: drained pending_notifications and emitted FILE_ACTION_REMOVED events"
             );
             if std::env::var("MNTRS_NOTIFY_TRACE").is_ok() {
-                eprintln!("[v12] winfsp::notify: drained {count} pending_notifications entries");
+                eprintln!("[notify-trace] winfsp::notify: drained {count} pending_notifications entries");
             }
         }
     }
