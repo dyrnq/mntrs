@@ -3589,6 +3589,20 @@ impl MntrsFs {
         } else {
             format!("{}/{}", parent_path, name)
         };
+        // Issue #621: lift `parent_dir_of_full`, `basename`, and the
+        // cold-populate flag to the function-top so the deferred
+        // populate (after the ino allocation, below) can reuse
+        // them. Same parent/basename split as the issue-#301 block;
+        // we just hoist them out of the stat-success branch.
+        let parent_dir_of_full = std::path::Path::new(&full_path)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let basename = std::path::Path::new(&full_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut cold_populate_pending = false;
         // Plan #64 step 10: tombstone filter — write-behind
         // deletes are visible to lookup as soon as the user
         // calls unlink (S3 DeleteObjects hasn't landed yet).
@@ -3737,26 +3751,23 @@ impl MntrsFs {
             // parent's cache here so the next readdir refetches the
             // full backend listing.
             //
-            // Cold-cache case (dir_cache has no entry for the
-            // parent) is left untouched: the lookup is the first
-            // thing to mention this name, so the cache is already
-            // "fresh enough" — there is nothing to invalidate. This
-            // matches the issue body's option 3 ("lookup should
-            // populate the dir_cache for parents as a side effect")
-            // adapted to the cheaper invalidate-on-miss variant.
+            // Issue #621 follow-up: a cold parent has no dir_cache
+            // entry to invalidate (`unwrap_or(false)` returns false).
+            // v9 (PR #620) handled the warm-parent case via
+            // `winfsp::open`'s `dir_cache_invalidate_if_stale`; the
+            // cold-parent case is what powers the bench warmup race
+            // — `stat_op_async` succeeds here (the backend HAS the
+            // file at this instant), so we populate the cold parent
+            // with a single-entry snapshot. Without this, the
+            // follow-up readdir re-runs `list_op` and may return
+            // pre-writeback state (5 s coalescing delay for files
+            // ≥ 1 MiB at lib.rs:1720) → "Cannot find the file
+            // specified" warmup FAIL.
             //
             // We use `full_path` (the canonical backend path) rather
             // than `name` (the per-adapter arg, which is a basename
             // from FUSE and a full path from WinFSP) so the
             // parent/basename split is uniform across adapters.
-            let parent_dir_of_full = std::path::Path::new(&full_path)
-                .parent()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let basename = std::path::Path::new(&full_path)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
             if !basename.is_empty() {
                 let parent_canon = canonicalize_list_path(&parent_dir_of_full);
                 let stale = self
@@ -3772,6 +3783,11 @@ impl MntrsFs {
                     );
                     self.dir_cache.remove(&parent_canon);
                 }
+                // Issue #621: remember to populate cold parent
+                // after the ino alloc runs below. We don't have the
+                // ino yet here, so the actual populate call is
+                // deferred to right before `Ok(...)` returns.
+                cold_populate_pending = self.dir_cache.get(&parent_canon).is_none();
             }
             (k, s.max(cache_size), m)
         } else {
@@ -3867,6 +3883,36 @@ impl MntrsFs {
                 mtime.unwrap_or_else(SystemTime::now),
             )
         });
+        // Issue #621: populate the cold parent's dir_cache now
+        // that we have the ino. The flag was set inside the
+        // stat_op_async success branch when the parent's cache
+        // had no entry at lookup time. `cache_add_entry` is
+        // idempotent on duplicate names (DashMap::insert
+        // overwrites) and constructs a single-entry snapshot
+        // when the parent has no existing cache entry. TTL
+        // (default 300 s) >> writeback coalescing delay (5 s),
+        // so the populated entry is alive when the follow-up
+        // readdir (Remove-Item / Copy-Item enumeration) arrives.
+        if cold_populate_pending && !basename.is_empty() {
+            let mode = match kind {
+                FileType::Directory => EntryMode::DIR,
+                _ => EntryMode::FILE,
+            };
+            self.cache_add_entry(
+                &parent_dir_of_full,
+                &basename,
+                mode,
+                size,
+                mtime.unwrap_or(SystemTime::UNIX_EPOCH),
+                ino,
+            );
+            tracing::trace!(
+                parent = %parent_dir_of_full,
+                name = %basename,
+                ino,
+                "lookup: populated cold parent dir_cache (issue #621)"
+            );
+        }
         // Bug 33: kernel will store this entry under
         // its own dentry cache and ref-count it; mirror
         // by bumping our per-ino lookup_count.
