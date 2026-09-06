@@ -1099,7 +1099,7 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 })?;
                 let is_dir = attr.kind == CoreFileType::Directory;
                 let ino = attr.ino;
-                tracing::info!(name = %name, ino, is_dir, kind = ?attr.kind, "winfsp::open: lookup ok");
+                tracing::warn!(name = %name, ino, is_dir, kind = ?attr.kind, "winfsp::open: lookup ok");
                 // Issue #614 v9: WinFSP can route a
                 // file-create request through `open` rather
                 // than `create` (e.g. `[IO.File]::OpenWrite`
