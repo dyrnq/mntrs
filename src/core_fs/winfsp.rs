@@ -1352,14 +1352,33 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                     .or_else(|| name.rsplit_once('/').map(|(_, b)| b))
                     .unwrap_or(&name)
                     .to_string();
+                // Issue #621 v13: FspFileSystemNotify REQUIRES a
+                // normalized basename. mntrs sets
+                // `case_sensitive_search(false)` +
+                // `case_preserved_names(true)` on the volume
+                // (mount.rs:2009-2010) but does NOT implement
+                // `FspFileSystemGetOpenFileInfo` for name
+                // normalization, so per WinFSP docs the
+                // normalized form is the UPPERCASE of the name
+                // used to open the file. Without uppercasing
+                // here, WinFSP's internal name match in
+                // FspFileSystemNotify fails and the
+                // notification is silently dropped — the
+                // kernel's per-volume dir cache (used by
+                // `get_security_by_name`) keeps its stale
+                // pre-create listing, and a follow-up
+                // Remove-Item / Move-Item / `Get-ChildItem`
+                // sees the file as absent even though it is
+                // on the backend.
+                let basename_upper = basename.to_uppercase();
                 {
                     let mut queue = self.pending_notifications.lock_or_recover();
-                    queue.push_back((basename.clone(), filter, action));
+                    queue.push_back((basename_upper.clone(), filter, action));
                     tracing::trace!(
-                        basename = %basename,
+                        basename = %basename_upper,
                         is_dir,
                         queue_len = queue.len(),
-                        "winfsp::create: queued FILE_ACTION_ADDED (issue #621 v11)"
+                        "winfsp::create: queued FILE_ACTION_ADDED (issue #621 v13)"
                     );
                     // Issue #621 v12 debug: also write directly to
                     // stderr (bypasses tracing-subscriber's filter —
@@ -1368,8 +1387,8 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                     // on MNTRS_NOTIFY_TRACE=1 to avoid spamming prod.
                     if std::env::var("MNTRS_NOTIFY_TRACE").is_ok() {
                         eprintln!(
-                            "[v12] winfsp::create: queued FILE_ACTION_ADDED \
-                             basename={basename:?} is_dir={is_dir} \
+                            "[v13] winfsp::create: queued FILE_ACTION_ADDED \
+                             basename={basename_upper:?} is_dir={is_dir} \
                              filter={filter} action={action} queue_len={}",
                             queue.len()
                         );
@@ -2119,18 +2138,35 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                         // filter to decide which watched
                         // handles get woken up; picking
                         // both is safe but wasteful).
+                        //
+                        // Issue #621 v13: the basename needs
+                        // to be UPPERCASE — same
+                        // normalization requirement as the
+                        // create path above. Without it,
+                        // FspFileSystemNotify silently
+                        // drops the notification and the
+                        // stale entry persists in the
+                        // kernel's per-volume dir cache.
                         let (filter, action) = if context.is_dir {
                             (FILE_NOTIFY_CHANGE_DIR_NAME, FILE_ACTION_REMOVED)
                         } else {
                             (FILE_NOTIFY_CHANGE_FILE_NAME, FILE_ACTION_REMOVED)
                         };
+                        let basename_upper = basename.to_uppercase();
                         let mut queue = self.pending_notifications.lock_or_recover();
-                        queue.push_back((basename.clone(), filter, action));
+                        queue.push_back((basename_upper.clone(), filter, action));
                         tracing::trace!(
-                            basename = %basename,
+                            basename = %basename_upper,
                             queue_len = queue.len(),
-                            "winfsp::cleanup: queued FILE_ACTION_REMOVED"
+                            "winfsp::cleanup: queued FILE_ACTION_REMOVED (issue #621 v13 uppercased)"
                         );
+                        if std::env::var("MNTRS_NOTIFY_TRACE").is_ok() {
+                            eprintln!(
+                                "[v13] winfsp::cleanup: queued FILE_ACTION_REMOVED \
+                                 basename={basename_upper:?} queue_len={}",
+                                queue.len()
+                            );
+                        }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         tracing::debug!(
