@@ -568,7 +568,12 @@ enum InstallAction {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    // Issue #621 debug: honor RUST_LOG (env-filter feature). Falls
+    // back to default INFO when RUST_LOG is unset or malformed, so
+    // existing behavior is preserved.
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
     mntrs::install_panic_logger();
     if let Some(limit) = mntrs::detect_cgroup_memory_limit() {
         tracing::info!(
