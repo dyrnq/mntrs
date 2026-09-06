@@ -74,6 +74,7 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 // for FILE_ACTION_* and
 //   https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-readdirectorychangesw
 // for FILE_NOTIFY_CHANGE_*.
+const FILE_ACTION_ADDED: u32 = 0x00000001;
 const FILE_ACTION_REMOVED: u32 = 0x00000002;
 const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x00000001;
 const FILE_NOTIFY_CHANGE_DIR_NAME: u32 = 0x00000002;
@@ -1324,6 +1325,43 @@ impl<F: CoreFilesystem + 'static> FileSystemContext for WinFspAdapter<F> {
                 } else {
                     0
                 };
+                // Issue #621 v11: push FILE_ACTION_ADDED so the
+                // kernel's per-volume directory cache reflects the
+                // freshly-created entry. Without this, the kernel
+                // caches the prior readdir listing (which doesn't
+                // include the new file), and a follow-up Remove-Item
+                // / Copy-Item / `Get-ChildItem` runs `read_directory`
+                // against the stale cache, gets STATUS_NO_SUCH_FILE /
+                // ERROR_PATH_NOT_FOUND for the new name, and reports
+                // "Cannot find the file specified" even though the
+                // file is on the backend and accessible via lookup.
+                // The mirror of the FILE_ACTION_REMOVED push in
+                // `cleanup` (line ~2076, issue #360). Filter is
+                // FILE_NOTIFY_CHANGE_FILE_NAME for files and
+                // FILE_NOTIFY_CHANGE_DIR_NAME for directories — the
+                // kernel uses the filter to decide which watched
+                // handles receive the notification.
+                let (filter, action) = if is_dir {
+                    (FILE_NOTIFY_CHANGE_DIR_NAME, FILE_ACTION_ADDED)
+                } else {
+                    (FILE_NOTIFY_CHANGE_FILE_NAME, FILE_ACTION_ADDED)
+                };
+                let basename = name
+                    .rsplit_once('\\')
+                    .map(|(_, b)| b)
+                    .or_else(|| name.rsplit_once('/').map(|(_, b)| b))
+                    .unwrap_or(&name)
+                    .to_string();
+                {
+                    let mut queue = self.pending_notifications.lock_or_recover();
+                    queue.push_back((basename.clone(), filter, action));
+                    tracing::trace!(
+                        basename = %basename,
+                        is_dir,
+                        queue_len = queue.len(),
+                        "winfsp::create: queued FILE_ACTION_ADDED (issue #621 v11)"
+                    );
+                }
                 tracing::debug!(name = %name, ino, fh, is_dir, dir_fh, "winfsp::create: ok");
                 Ok(WinFspHandle {
                     ino,
