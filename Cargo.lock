@@ -153,6 +153,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "asyncband"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e52766975a4f080528a898235c51e82e65df9db713419067b5368040eeb5659"
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -696,27 +702,27 @@ checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
 
 [[package]]
 name = "crossbeam-channel"
-version = "0.5.16"
+version = "0.5.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
+checksum = "98b0cc327b5bc766e7fda9c9260cc0fa81b43a8e240440422dff70788e3f9ef1"
 dependencies = [
  "crossbeam-utils",
 ]
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.20"
+version = "0.9.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
+checksum = "dc74980687109a3b14c72fd458107bf0baa1da1a1a805e178d15501ba9b86d9d"
 dependencies = [
  "crossbeam-utils",
 ]
 
 [[package]]
 name = "crossbeam-utils"
-version = "0.8.22"
+version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
+checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
 name = "crunchy"
@@ -969,7 +975,7 @@ version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fb83c3c24118a8c5ab0b0d7a2a357512dbe79449945affc62ad2499b57fe383"
 dependencies = [
- "asyncband",
+ "asyncband 0.6.7",
  "scopeguard",
 ]
 
@@ -1020,9 +1026,9 @@ dependencies = [
 
 [[package]]
 name = "foyer-common"
-version = "0.22.4"
+version = "0.22.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3634c6f3da978b6cae98d54367a2342041d3a4786b20c0384164cc7fce94787"
+checksum = "05cdcae6cedec72c28e97ada0b453e33b1df57fbc209708091107be2a283d577"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1045,12 +1051,12 @@ dependencies = [
 
 [[package]]
 name = "foyer-memory"
-version = "0.22.4"
+version = "0.22.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5349a61af676b3275bfef7a5fceceeadf6b0a7dd9ec14ba0edd78e1ff771d101"
+checksum = "8a51c8ce8e1e323a1e087ac45bf629d953676fc5e0037d14a799fadd272b42db"
 dependencies = [
  "anyhow",
- "asyncband",
+ "asyncband 0.7.1",
  "bitflags 2.13.1",
  "datasketches",
  "equivalent",
@@ -1070,9 +1076,9 @@ dependencies = [
 
 [[package]]
 name = "foyer-tokio"
-version = "0.22.4"
+version = "0.22.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b7315103199f3415a010befd6dd5a1c8e7082fbc49c0194931e65629995d9d1"
+checksum = "cbdbb9f39443cb348a069baa1a0ec73bcea848a4a383eb2da1a5ea7a0ca05941"
 dependencies = [
  "tokio",
 ]
@@ -1794,9 +1800,9 @@ dependencies = [
 
 [[package]]
 name = "ipnet"
-version = "2.12.1"
+version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
+checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 dependencies = [
  "serde",
 ]
@@ -2438,7 +2444,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48dbcef97d3eb7591db2c18d5cae95c836bcce07359b98d98dd6f4e861eb77b7"
 dependencies = [
  "anyhow",
- "asyncband",
+ "asyncband 0.6.7",
  "base64 0.23.1",
  "bytes",
  "futures",
@@ -2486,7 +2492,7 @@ version = "0.58.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03f9e144b5228d741c3763ade8711d9b72e5fb6d998e779f2d7a09da0b5a3eba"
 dependencies = [
- "asyncband",
+ "asyncband 0.6.7",
  "futures",
  "http",
  "opendal-core",
@@ -2529,7 +2535,7 @@ version = "0.58.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7c3e551e25d1c182be77a7c501eb3e0a9217fc409fca6f88125167083daa304"
 dependencies = [
- "asyncband",
+ "asyncband 0.6.7",
  "bytes",
  "http",
  "log",
@@ -2575,7 +2581,7 @@ version = "0.58.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d606353dd192c46db1a146d0085dadd4dba85a97d63a233851de0f5a4697ddb8"
 dependencies = [
- "asyncband",
+ "asyncband 0.6.7",
  "bytes",
  "http",
  "log",
@@ -2759,7 +2765,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fa9aec39b39efa0367020732991260373492ffb0273259591ec362b664f455f"
 dependencies = [
  "anyhow",
- "asyncband",
+ "asyncband 0.6.7",
  "bytes",
  "http",
  "log",
@@ -2775,7 +2781,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a0f7466fde4e0574935079401198c59980fe3dceb820c23a239e2fe513b1126"
 dependencies = [
  "anyhow",
- "asyncband",
+ "asyncband 0.6.7",
  "bytes",
  "http",
  "log",
@@ -3692,9 +3698,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "6725596c3f2c3a0aef021139e145d4eafe314a6623e4680ca83852b2c67ab2ba"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
