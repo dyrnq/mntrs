@@ -23,7 +23,7 @@ moka = { version = "0.12.15", features = ["sync"] }
 bytes = "1.12"
 unicode-normalization = "0.1.25"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "hickory-dns"] }
-opendal = { version = "0.58", features = ["services-s3", "services-gcs", "services-azblob", "services-hdfs-native", "services-webhdfs", "services-oss", "services-cos", "services-obs", "services-b2", "services-vercel-blob", "services-aliyun-drive", "services-fs", "services-memory", "services-webdav", "layers-capability-check"] }
+opendal = { version = "0.59", features = ["services-s3", "services-gcs", "services-azblob", "services-hdfs-native", "services-webhdfs", "services-oss", "services-cos", "services-obs", "services-b2", "services-vercel-blob", "services-aliyun-drive", "services-fs", "services-memory", "services-webdav", "layers-capability-check"] }
 # Reqwest-based HTTP transport for opendal 0.58.1+ (RFC #7740
 # provider model). `HttpClientLayer` was removed in 0.58; the
 # transport is now installed via
@@ -32,7 +32,7 @@ opendal = { version = "0.58", features = ["services-s3", "services-gcs", "servic
 # `http-transport-reqwest` feature, but doesn't `pub use` it; we
 # depend on it directly so we can name `ReqwestTransport` in code
 # without depending on opendal's internal type re-exports.
-opendal-http-transport-reqwest = "0.58"
+opendal-http-transport-reqwest = "0.59"
 # Direct S3 DeleteObjects signing for plan #64 (concurrent_delete).
 # Versions track reqsign 3.x line; PR #575 (#574) advanced the
 # lockfile to 3.2/3.3/3.0.5, PR #576 aligns the manifest. New

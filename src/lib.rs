@@ -7768,11 +7768,19 @@ impl CoreFilesystem for MntrsFs {
                 .stat(path.as_ref())
                 .await
                 .map_err(|e| std::io::Error::other(format!("stat failed: {e}")))?;
-            // 2. merge into the existing map. Cloned because
-            //    `Metadata::user_metadata()` returns an
-            //    `Option<&HashMap>` tied to `meta`'s lifetime;
-            //    we need an owned map to mutate.
-            let mut user_meta = meta.user_metadata().cloned().unwrap_or_default();
+            // 2. merge into the existing map. opendal 0.59 changed
+            //    `Metadata::user_metadata()` from `Option<&HashMap>`
+            //    to `Option<UserMetadata<'_>>` — a borrowed binary
+            //    view (`get`/`len`/`IntoIterator<(&str,&str)>`).
+            //    Reconstruct an owned map we can mutate.
+            let mut user_meta: std::collections::HashMap<String, String> = meta
+                .user_metadata()
+                .map(|um| {
+                    um.into_iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
             user_meta.insert(key, val.to_string());
             // 3. read existing content. Bytes are identical
             //    to what's already on the backend — opendal's
@@ -7844,7 +7852,19 @@ impl CoreFilesystem for MntrsFs {
             // surfaces ENODATA rather than silently succeeding.
             // We also early-return when the backend has no user
             // metadata at all (the key cannot be present).
-            let Some(existing) = meta.user_metadata() else {
+            // opendal 0.59: `user_metadata()` now returns
+            // `Option<UserMetadata<'_>>` (binary view, no HashMap
+            // methods). Convert to an owned HashMap so we can use
+            // `.contains_key()` / `.iter()` below.
+            let existing: std::collections::HashMap<String, String> = meta
+                .user_metadata()
+                .map(|um| {
+                    um.into_iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if existing.is_empty() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     format!("removexattr: {name:?} not present"),
@@ -8474,8 +8494,11 @@ fn xattr_names_for(meta: &opendal::Metadata) -> Vec<Vec<u8>> {
     // `content_length` is always present (u64, not Option); list
     // unconditionally.
     names.push(b"user.content_length".to_vec());
+    // opendal 0.59: `UserMetadata` is a binary view. Iterate
+    // via `IntoIterator` (yields `(&str, &str)` pairs) instead
+    // of the removed `HashMap::keys()`.
     if let Some(map) = meta.user_metadata() {
-        for key in map.keys() {
+        for (key, _) in map {
             names.push(format!("user.{key}").into_bytes());
         }
     }
