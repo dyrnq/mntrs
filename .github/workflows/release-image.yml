@@ -5,15 +5,21 @@ name: Release Image
 # registry.
 #
 # Required repo secrets (set at GitHub Settings → Secrets → Actions):
-#   * DOCKERHUB_USERNAME — your Docker Hub username. The login step
+#   * DOCKER_USERNAME — your Docker Hub username. The login step
 #     reads this; the image URL below hardcodes `dyrnq` and must
 #     match the GH org owner (edit both `dyrnq` literals if you ever
 #     change namespaces).
-#   * DOCKERHUB_TOKEN — a Docker Hub access token with Read+Write
-#     scope (NOT your docker hub password). Generate at
+#   * DOCKER_PASSWORD — your Docker Hub password OR an access token
+#     with Read+Write scope. Generate a token at
 #     hub.docker.com → Account Settings → Security → New Access
 #     Token. Missing secrets cause the second `docker login` step
 #     to fail with a clear error.
+#
+# History: PR #625 originally used DOCKERHUB_USERNAME / DOCKERHUB_TOKEN.
+# The repo already had DOCKER_USERNAME + DOCKER_PASSWORD configured from
+# a prior project — the mismatch caused run 35580834416 to fail with
+# "Username and password required". Use the DOCKER_* names; older Docker
+# Hub access-token names are not configured in this repo.
 #
 # Build pattern adapted from /data/work/docker-jenkins/buildx.sh:
 #   1. Build with `push=false` — verifies the Dockerfile / build context
@@ -21,7 +27,8 @@ name: Release Image
 #      (syntax error, missing dep, Rust compile failure inside the
 #      builder stage), we fail here and never touch either registry.
 #   2. Two `docker login` steps — ghcr.io (GITHUB_TOKEN, packages:write
-#      via permissions: block below) and docker.io (DOCKERHUB_* secrets).
+#      via permissions: block below) and docker.io (DOCKER_USERNAME +
+#      DOCKER_PASSWORD secrets).
 #      Fresh auth in between so a registry auth problem surfaces as a
 #      distinct step failure, not buried in a build error.
 #   3. Build again with `push=true` — publishes to both registries
@@ -97,16 +104,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # docker.io auth. The DOCKERHUB_USERNAME secret value is only
-      # used for authentication (never appears in image URLs). The
-      # `dyrnq` literal in the --tag list below is the image
+      # docker.io auth. The DOCKER_USERNAME / DOCKER_PASSWORD secrets
+      # are only used for authentication (never appears in image URLs).
+      # The `dyrnq` literal in the --tag list below is the image
       # namespace and must match the GH org owner; edit both `dyrnq`
       # literals in this file if you ever change namespaces.
+      #
+      # History: PR #625 originally used DOCKERHUB_USERNAME /
+      # DOCKERHUB_TOKEN (matching the Docker Hub access token setup
+      # docs at hub.docker.com). The repo already had DOCKER_USERNAME
+      # + DOCKER_PASSWORD set from a prior project — these are the
+      # standard Docker Hub credentials (username + password OR a PAT
+      # in DOCKER_PASSWORD). The mismatch caused release-image.yml
+      # run 35580834416 to fail with "Username and password required"
+      # even though the secrets were already configured.
       - name: docker login (docker.io)
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
 
       # ============================================================
       # Step 3: Real build + push. Same csi/Dockerfile, push=true.

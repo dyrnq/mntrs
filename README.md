@@ -77,12 +77,17 @@ mntrs unmount /mnt/s3
 # From source (Rust 1.91+, needs libfuse3-dev / fuse3 / pkg-config on Linux)
 cargo install --path .
 
-# Pre-built binary (Linux x86_64)
+# Pre-built binary (Linux x86_64 / macOS Apple Silicon / Windows MSVC)
+# Pick the asset matching your platform from the Assets table on
+# https://github.com/dyrnq/mntrs/releases/latest — each is named
+# `mntrs-<tag>-<target>` (`.exe` suffix on Windows), plus a
+# `sha256sums.txt`. The macOS Apple Silicon binary covers M1/M2/M3/M4.
+# Intel Mac users build from source (see `cargo install` above).
 curl -L https://github.com/dyrnq/mntrs/releases/latest/download/mntrs-$(uname -m | sed 's/x86_64/x86_64-unknown-linux-gnu/;s/aarch64/aarch64-unknown-linux-gnu/') \
   -o mntrs && chmod +x mntrs && sudo mv mntrs /usr/local/bin/
 
-# All 8 targets (Linux gnu/musl × x86_64/aarch64, armv7-musl,
-# macOS x86_64/aarch64, Windows MSVC): see the Assets table on
+# All 7 targets (Linux gnu/musl × x86_64/aarch64 + armv7-musl,
+# macOS aarch64, Windows MSVC): see the Assets table on
 # https://github.com/dyrnq/mntrs/releases/latest — each asset is
 # `mntrs-<tag>-<target>` (`.exe` suffix on Windows) plus a
 # sha256sums.txt.
@@ -776,7 +781,7 @@ cargo bench                         # micro-benchmarks
 |-----------|-------------|
 | Rust | 1.91+ (edition 2024) |
 | Linux | FUSE 3 (`libfuse3-dev fuse3`) |
-| macOS | macFUSE 4+ |
+| macOS | macFUSE 4+ (Apple Silicon only — prebuilt binary covers aarch64; Intel Mac users build from source, no `x86_64-apple-darwin` release asset yet, see #628 follow-up) |
 | Windows | WinFSP 2.1+ |
 | Kubernetes | 1.20+ (external-provisioner) |
 | HDFS-JNI | Java 11+, libhdfs3 |
