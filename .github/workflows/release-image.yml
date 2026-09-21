@@ -13,9 +13,14 @@ name: Release Image
 #      cache from step 1 means step 3 is a fast no-op rebuild unless
 #      something changed.
 #
-# The standard (non-kerberos) image variant is published. The kerberos
-# variant under docker/csi/Dockerfile is for e2e tests and is not part
-# of v0.0.1-alpha.x releases; it can become a tagged variant in v0.1.x.
+# Multi-arch: linux/amd64 + linux/arm64 via buildx + QEMU emulation.
+# arm64 is produced under QEMU user-mode emulation on the amd64 GHA
+# runner — no arm64 runner required. First-tag cold-cache cost is
+# ~60-70 min (opendal + 14 service crates compile under emulation
+# is ~5-10× slower than native amd64); subsequent tags share the
+# buildx layer cache and finish in ~5-15 min. The kerberos image
+# variant under docker/csi/Dockerfile stays linux/amd64 only — it
+# is e2e-only and not part of v0.0.1-alpha.x.
 
 on:
   push:
@@ -39,6 +44,14 @@ jobs:
       - name: Setup docker buildx
         uses: docker/setup-buildx-action@v3
 
+      # Enables QEMU user-mode emulation so buildx can target arm64
+      # from the amd64 GHA runner. `platforms` matches the buildx
+      # --platform lists below; trim both if you ever drop a target.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
       # ============================================================
       # Step 1: Pre-build with push=false.
       # Validates the entire csi/Dockerfile build pipeline end-to-end
@@ -49,7 +62,7 @@ jobs:
       - name: Pre-build (no-push, verify only)
         run: |
           docker buildx build \
-            --platform linux/amd64 \
+            --platform linux/amd64,linux/arm64 \
             --output "type=image,push=false" \
             --tag "ghcr.io/${{ github.repository_owner }}/mntrs-csi:${{ github.ref_name }}" \
             --file csi/Dockerfile \
@@ -70,13 +83,13 @@ jobs:
 
       # ============================================================
       # Step 3: Real build + push. Same csi/Dockerfile, push=true.
-      # Tags: exact version + :latest. Multi-arch manifest is a v0.1.x
-      # follow-up (linux/arm64 needs QEMU + cross-compile of csi).
+      # Tags: exact version + :latest. Multi-arch manifest list:
+      # linux/amd64 + linux/arm64 (see header comment + QEMU step).
       # ============================================================
       - name: Build + push (release)
         run: |
           docker buildx build \
-            --platform linux/amd64 \
+            --platform linux/amd64,linux/arm64 \
             --output "type=image,push=true" \
             --tag "ghcr.io/${{ github.repository_owner }}/mntrs-csi:${{ github.ref_name }}" \
             --tag "ghcr.io/${{ github.repository_owner }}/mntrs-csi:latest" \
@@ -90,7 +103,10 @@ jobs:
       # ============================================================
       - name: Verify push (manifest inspect)
         run: |
-          docker manifest inspect \
+          # imagetools inspect handles multi-arch manifest lists cleanly
+          # (docker manifest inspect works too but prints platform info
+          # less predictably across Docker versions).
+          docker buildx imagetools inspect \
             "ghcr.io/${{ github.repository_owner }}/mntrs-csi:${{ github.ref_name }}" \
             > /dev/null \
             || (echo "::error::manifest not found post-push" && exit 1)
