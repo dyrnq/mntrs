@@ -1,0 +1,148 @@
+name: Release Image
+
+# Pushes the mntrs-csi Docker image to BOTH ghcr.io AND docker.io on
+# tag push. Multi-arch linux/amd64 + linux/arm64 manifest list per
+# registry.
+#
+# Required repo secrets (set at GitHub Settings → Secrets → Actions):
+#   * DOCKERHUB_USERNAME — your Docker Hub username. The login step
+#     reads this; the image URL below hardcodes `dyrnq` and must
+#     match the GH org owner (edit both `dyrnq` literals if you ever
+#     change namespaces).
+#   * DOCKERHUB_TOKEN — a Docker Hub access token with Read+Write
+#     scope (NOT your docker hub password). Generate at
+#     hub.docker.com → Account Settings → Security → New Access
+#     Token. Missing secrets cause the second `docker login` step
+#     to fail with a clear error.
+#
+# Build pattern adapted from /data/work/docker-jenkins/buildx.sh:
+#   1. Build with `push=false` — verifies the Dockerfile / build context
+#      without consuming any registry API quota. If the build is broken
+#      (syntax error, missing dep, Rust compile failure inside the
+#      builder stage), we fail here and never touch either registry.
+#   2. Two `docker login` steps — ghcr.io (GITHUB_TOKEN, packages:write
+#      via permissions: block below) and docker.io (DOCKERHUB_* secrets).
+#      Fresh auth in between so a registry auth problem surfaces as a
+#      distinct step failure, not buried in a build error.
+#   3. Build again with `push=true` — publishes to both registries
+#      (one image, four tags: exact version + :latest per registry).
+#      The layer cache from step 1 means step 3 is a fast no-op
+#      rebuild unless something changed.
+#
+# Multi-arch: linux/amd64 + linux/arm64 via buildx + QEMU emulation.
+# arm64 is produced under QEMU user-mode emulation on the amd64 GHA
+# runner — no arm64 runner required. First-tag cold-cache cost is
+# ~60-70 min (opendal + 14 service crates compile under emulation
+# is ~5-10× slower than native amd64); subsequent tags share the
+# buildx layer cache and finish in ~5-15 min. The kerberos image
+# variant under docker/csi/Dockerfile stays linux/amd64 only — it
+# is e2e-only and not part of v0.0.1-alpha.x.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  csi-image:
+    name: Build + publish mntrs-csi image
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Setup docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Enables QEMU user-mode emulation so buildx can target arm64
+      # from the amd64 GHA runner. `platforms` matches the buildx
+      # --platform lists below; trim both if you ever drop a target.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      # ============================================================
+      # Step 1: Pre-build with push=false.
+      # Validates the entire csi/Dockerfile build pipeline end-to-end
+      # (rust:1.87-slim-bookworm builder → cargo build → debian runtime)
+      # without spending any ghcr.io push quota. This is the "verify"
+      # pass — any failure here aborts before the registry is touched.
+      # ============================================================
+      - name: Pre-build (no-push, verify only)
+        run: |
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --output "type=image,push=false" \
+            --tag "ghcr.io/${{ github.repository_owner }}/mntrs-csi:${{ github.ref_name }}" \
+            --file csi/Dockerfile \
+            .
+
+      # ============================================================
+      # Step 2: Fresh auth. Between the two builds so that a registry
+      # auth problem surfaces as a distinct step failure (not buried in
+      # a build error). GITHUB_TOKEN has packages:write scope via the
+      # permissions: block above.
+      # ============================================================
+      - name: docker login (ghcr.io)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # docker.io auth. The DOCKERHUB_USERNAME secret value is only
+      # used for authentication (never appears in image URLs). The
+      # `dyrnq` literal in the --tag list below is the image
+      # namespace and must match the GH org owner; edit both `dyrnq`
+      # literals in this file if you ever change namespaces.
+      - name: docker login (docker.io)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # ============================================================
+      # Step 3: Real build + push. Same csi/Dockerfile, push=true.
+      # Tags: exact version + :latest. Multi-arch manifest list:
+      # linux/amd64 + linux/arm64 (see header comment + QEMU step).
+      # ============================================================
+      - name: Build + push (release)
+        run: |
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --output "type=image,push=true" \
+            --tag "ghcr.io/${{ github.repository_owner }}/mntrs-csi:${{ github.ref_name }}" \
+            --tag "ghcr.io/${{ github.repository_owner }}/mntrs-csi:latest" \
+            --tag "docker.io/dyrnq/mntrs-csi:${{ github.ref_name }}" \
+            --tag "docker.io/dyrnq/mntrs-csi:latest" \
+            --file csi/Dockerfile \
+            .
+
+      # ============================================================
+      # Step 4: Verify the push actually landed. Catches the case where
+      # buildx silently reports success but the registry 4xx'd at the
+      # last layer (rare but seen with quota/auth flake).
+      # ============================================================
+      - name: Verify push (ghcr.io)
+        run: |
+          # imagetools inspect handles multi-arch manifest lists cleanly
+          # (docker manifest inspect works too but prints platform info
+          # less predictably across Docker versions).
+          docker buildx imagetools inspect \
+            "ghcr.io/${{ github.repository_owner }}/mntrs-csi:${{ github.ref_name }}" \
+            > /dev/null \
+            || (echo "::error::ghcr.io manifest not found post-push" && exit 1)
+
+      - name: Verify push (docker.io)
+        run: |
+          docker buildx imagetools inspect \
+            "docker.io/dyrnq/mntrs-csi:${{ github.ref_name }}" \
+            > /dev/null \
+            || (echo "::error::docker.io manifest not found post-push" && exit 1)
