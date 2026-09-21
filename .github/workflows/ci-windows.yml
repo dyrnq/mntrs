@@ -301,53 +301,73 @@ jobs:
         shell: pwsh
         timeout-minutes: 5
         run: |
-          # --- Start MinIO (inlined; see comment above) ----------
+          # --- Start silo + mcli (inlined; see comment above) ----------
+          # silo = community-maintained MinIO fork
+          # (https://github.com/pgsty/silo). Drop-in compatible: same
+          # S3 API on :9000, same /minio/health/live endpoint, same
+          # MINIO_ROOT_USER / MINIO_ROOT_PASSWORD env vars. Replaces
+          # the upstream minio.exe because dl.min.io now returns
+          # HTTP 410 Gone for the Windows binary (the open-source
+          # community distribution was archived).
+          # mcli = community-maintained MinIO Client fork
+          # (https://github.com/pgsty/mc); shipped as `mcli.exe` in
+          # the standalone archive but the command syntax is
+          # unchanged from upstream `mc`.
           $minioDir = Join-Path ${{ runner.temp }} "mntrs-minio"
           New-Item -ItemType Directory -Force -Path $minioDir | Out-Null
-          $minioBin = Join-Path $minioDir "minio.exe"
-          $mcBin    = Join-Path $minioDir "mc.exe"
-          $dataDir  = Join-Path $minioDir "data"
+          $siloBin = Join-Path $minioDir "silo.exe"
+          $mcliBin = Join-Path $minioDir "mcli.exe"
+          $dataDir = Join-Path $minioDir "data"
           New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
-          if (-not (Test-Path $minioBin)) {
-            Write-Host "Downloading minio.exe..."
-            Invoke-WebRequest -Uri "https://dl.min.io/server/minio/release/windows-amd64/minio.exe" -OutFile $minioBin -UseBasicParsing
+          $SILO_VERSION = "RELEASE.2026-09-16T00-00-00Z"
+          $MCLI_VERSION = "RELEASE.2026-09-16T00-00-00Z"
+          if (-not (Test-Path $siloBin)) {
+            Write-Host "Downloading silo.exe..."
+            $siloTar = Join-Path $minioDir "silo.tar.gz"
+            Invoke-WebRequest -Uri "https://github.com/pgsty/silo/releases/download/$SILO_VERSION/silo_20260916000000.0.0_windows_amd64.tar.gz" -OutFile $siloTar -UseBasicParsing
+            # PowerShell 7 ships `tar` (Windows binary) that handles .tar.gz
+            tar -xzf $siloTar -C $minioDir silo.exe
+            Remove-Item $siloTar
           }
-          if (-not (Test-Path $mcBin)) {
-            Write-Host "Downloading mc.exe..."
-            Invoke-WebRequest -Uri "https://dl.min.io/client/mc/release/windows-amd64/mc.exe" -OutFile $mcBin -UseBasicParsing
+          if (-not (Test-Path $mcliBin)) {
+            Write-Host "Downloading mcli.exe..."
+            $mcliTar = Join-Path $minioDir "mcli.tar.gz"
+            Invoke-WebRequest -Uri "https://github.com/pgsty/mc/releases/download/$MCLI_VERSION/mcli_20260916000000.0.0_windows_amd64.tar.gz" -OutFile $mcliTar -UseBasicParsing
+            tar -xzf $mcliTar -C $minioDir mcli.exe
+            Remove-Item $mcliTar
           }
           $env:MINIO_ROOT_USER     = "minioadmin"
           $env:MINIO_ROOT_PASSWORD = "minioadmin"
-          $minioLog = Join-Path $minioDir "minio.log"
-          $minioProc = Start-Process -FilePath $minioBin `
+          $siloLog = Join-Path $minioDir "silo.log"
+          $siloProc = Start-Process -FilePath $siloBin `
               -ArgumentList @('server', $dataDir, '--address', ':9000') `
-              -RedirectStandardOutput $minioLog `
-              -RedirectStandardError "$minioLog.err" `
+              -RedirectStandardOutput $siloLog `
+              -RedirectStandardError "$siloLog.err" `
               -WindowStyle Hidden `
               -PassThru
-          Write-Host "started minio pid=$($minioProc.Id)"
-          $minioReady = $false
+          Write-Host "started silo pid=$($siloProc.Id)"
+          $siloReady = $false
           for ($i = 1; $i -le 30; $i++) {
             try {
               $r = Invoke-WebRequest -Uri "http://localhost:9000/minio/health/live" -UseBasicParsing -TimeoutSec 2
-              if ($r.StatusCode -eq 200) { $minioReady = $true; break }
+              if ($r.StatusCode -eq 200) { $siloReady = $true; break }
             } catch { }
             Start-Sleep -Seconds 1
           }
-          if (-not $minioReady) {
-            Write-Host "::error::MinIO did not become ready in 30s"
-            if (Test-Path $minioLog) { Get-Content $minioLog -Tail 40 }
-            if (Test-Path "$minioLog.err") { Get-Content "$minioLog.err" -Tail 40 }
+          if (-not $siloReady) {
+            Write-Host "::error::silo did not become ready in 30s"
+            if (Test-Path $siloLog) { Get-Content $siloLog -Tail 40 }
+            if (Test-Path "$siloLog.err") { Get-Content "$siloLog.err" -Tail 40 }
             exit 1
           }
-          Write-Host "MinIO ready"
-          & $mcBin alias set ci http://localhost:9000 minioadmin minioadmin 2>&1 | Out-Null
-          & $mcBin mb ci/ci-bucket 2>&1 | Out-Null
+          Write-Host "silo ready"
+          & $mcliBin alias set ci http://localhost:9000 minioadmin minioadmin 2>&1 | Out-Null
+          & $mcliBin mb ci/ci-bucket 2>&1 | Out-Null
           $seedPath = Join-Path $minioDir "s3-test.txt"
           Set-Content -LiteralPath $seedPath -Value "hello s3`n" -NoNewline
-          & $mcBin cp $seedPath "ci/ci-bucket/s3-test.txt" 2>&1 | Out-Null
+          & $mcliBin cp $seedPath "ci/ci-bucket/s3-test.txt" 2>&1 | Out-Null
           Write-Host "seeded s3://ci-bucket/s3-test.txt"
-          # --- Run the s3 e2e (MinIO stays alive in this step) ---
+          # --- Run the s3 e2e (silo stays alive in this step) ---
           . tests/e2e/common/mount-test.ps1
           $s3Result = Mount-Test -Backend s3 `
                                 -Storage s3://ci-bucket `
@@ -359,14 +379,14 @@ jobs:
                                 -PreexistFile "s3-test.txt" `
                                 -ExpectedText "hello s3" `
                                 -SkipSubTests "3,4,5,6,7,8,9,11,12,14"
-          # --- Teardown: stop MinIO so the cleanup step's
-          # Get-Process minio is a no-op (or only catches the
+          # --- Teardown: stop silo so the cleanup step's
+          # Get-Process silo is a no-op (or only catches the
           # rare zombie). Don't `exit` here — let the
           # workflow's `if: always()` cleanup step run.
-          if ($null -ne $minioProc -and -not $minioProc.HasExited) {
-            try { Stop-Process -Id $minioProc.Id -Force -ErrorAction Stop } catch { }
+          if ($null -ne $siloProc -and -not $siloProc.HasExited) {
+            try { Stop-Process -Id $siloProc.Id -Force -ErrorAction Stop } catch { }
           }
-          Get-Process minio -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Get-Process silo -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           if ($s3Result -ne 0) { exit $s3Result }
 
       - name: Upload s3 mount log (failure)
@@ -380,7 +400,7 @@ jobs:
       # by Mount-Test, clears both V: and W: drives, removes the
       # ~/.local/share/mntrs/mounts.txt entries that record_mount()
       # wrote on the (now-dead) mount processes, and tears down the
-      # MinIO server started for the s3 e2e.
+      # silo server started for the s3 e2e.
       #
       # mounts.db note (Issue #311): the cross-process
       # `mntrs unmount X:` in this script is the R1 caveat
@@ -401,10 +421,11 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          # Stop the MinIO server first so its port 9000 is
+          # Stop the silo server first so its port 9000 is
           # released before any later step (e.g. integration
           # with csi-e2e in a follow-up) tries to rebind.
-          Get-Process minio -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          # Process name matches the binary: silo.exe → "silo".
+          Get-Process silo -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           # Kill the mount processes — releases the kernel-side
           # DOS device handle. Stop-Process -Force is SIGKILL-style
           # on Windows, so the in-process cleanup() (which would
@@ -454,7 +475,7 @@ jobs:
               Write-Host "::warning::mounts.txt cleanup failed: $($_.Exception.Message)"
             }
           }
-          # Remove the MinIO data dir + binaries so the next run
+          # Remove the silo data dir + binaries so the next run
           # starts from a clean state. Best-effort: ignore errors.
           $minioDir = Join-Path ${{ runner.temp }} "mntrs-minio"
           if (Test-Path $minioDir) {
