@@ -6,10 +6,17 @@ name: Release
 #   * Dropped x86_64-pc-windows-gnu from the matrix (mntrs's existing
 #     ci-windows.yml / bench-windows.yml only run MSVC; v0.0.1-alpha.x
 #     ships MSVC only, GNU can be a follow-up)
+#   * Dropped x86_64-apple-darwin from the matrix (GHA macos-14 runners
+#     are Apple Silicon; cross-compiling to x86_64 trips fuser 0.18's
+#     pkg-config step with no target sysroot. v0.0.1-alpha.x ships
+#     aarch64-apple-darwin only — covers ~99% of 2026 macOS install
+#     base; Intel Mac users build from source. Re-add with osxcross
+#     in v0.0.1-alpha.2 if requested, tracked separately)
 #   * Added Swatinem/rust-cache@v2 with shared-key=release (separate
 #     from ci's shared-key so they don't evict each other; opendal +
 #     14 service crates + hdfs-native have a ~5-10min cold compile)
-#   * Asset table drops the Windows GNU row
+#   * Asset table drops the Windows GNU + x86_64 macOS rows (7 targets
+#     shipped in v0.0.1-alpha.x, down from the 8 originally planned)
 #
 # Triggers on tag push (v*). workflow_dispatch is for ad-hoc rebuilds
 # of an existing tag — push is required to actually publish the release.
@@ -53,9 +60,15 @@ jobs:
             target: armv7-unknown-linux-musleabihf
             cross: true
           # macOS (native, no cross)
-          - os: macos-14
-            target: x86_64-apple-darwin
-            cross: false
+          # NOTE: only aarch64-apple-darwin — GHA `macos-14` runners are
+          # Apple Silicon, and `cargo build --target x86_64-apple-darwin`
+          # is cross-compilation. fuser 0.18's build.rs invokes
+          # pkg-config which has no target sysroot on the cross path
+          # ("pkg-config has not been configured to support
+          # cross-compilation", release run 35580834397).
+          # Apple Silicon covers ~99% of macOS install base in 2026;
+          # Intel Mac users build from source (Cargo.toml rust 1.91+).
+          # Re-add with osxcross in v0.0.1-alpha.2 if requested.
           - os: macos-14
             target: aarch64-apple-darwin
             cross: false
@@ -229,8 +242,7 @@ jobs:
             | Linux aarch64 (gnu) | `${{ env.BINARY_NAME }}-${{ github.ref_name }}-aarch64-unknown-linux-gnu` |
             | Linux aarch64 (musl) | `${{ env.BINARY_NAME }}-${{ github.ref_name }}-aarch64-unknown-linux-musl` |
             | Linux armv7 (static) | `${{ env.BINARY_NAME }}-${{ github.ref_name }}-armv7-unknown-linux-musleabihf` |
-            | macOS x86_64 | `${{ env.BINARY_NAME }}-${{ github.ref_name }}-x86_64-apple-darwin` |
-            | macOS aarch64 | `${{ env.BINARY_NAME }}-${{ github.ref_name }}-aarch64-apple-darwin` |
+            | macOS aarch64 (Apple Silicon) | `${{ env.BINARY_NAME }}-${{ github.ref_name }}-aarch64-apple-darwin` |
             | Windows x86_64 (MSVC) | `${{ env.BINARY_NAME }}-${{ github.ref_name }}-x86_64-pc-windows-msvc.exe` |
 
             ### Docker image
