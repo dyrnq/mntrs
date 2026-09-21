@@ -6,6 +6,10 @@
 >
 > [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](#license)
 > [![Rust 1.87+](https://img.shields.io/badge/rust-1.87%2B-orange.svg)](https://www.rust-lang.org)
+> [![crates.io](https://img.shields.io/crates/v/mntrs)](https://crates.io/crates/mntrs)
+> [![GitHub release](https://img.shields.io/github/v/release/dyrnq/mntrs)](https://github.com/dyrnq/mntrs/releases/latest)
+> ![Status: 0.0.1-alpha](https://img.shields.io/badge/status-0.0.1--alpha-orange)
+> [![Docker image](https://img.shields.io/badge/ghcr.io-mntrs--csi-blue)](https://ghcr.io/dyrnq/mntrs-csi)
 
 A high-performance FUSE mount for object storage and remote filesystems, written in Rust.
 Backed by [Apache OpenDAL](https://github.com/apache/opendal), supporting **13 storage backends**
@@ -63,14 +67,29 @@ mntrs unmount /mnt/s3
 
 ## Installation
 
+> **Alpha release** — see the [`0.0.1-alpha.1`](CHANGELOG.md#001-alpha1---2026-09-21)
+> CHANGELOG entry for known caveats before pinning to a production
+> workload. Versions before 1.0.0 may break compatibility between
+> alpha tags.
+
 ```bash
-# From source (Rust 1.87+)
+# From source (Rust 1.87+, needs libfuse3-dev / fuse3 / pkg-config on Linux)
 cargo install --path .
 
-# Pre-built binaries (GitHub Releases, all platforms)
-# https://github.com/your-org/mntrs/releases
+# Pre-built binary (Linux x86_64)
+curl -L https://github.com/dyrnq/mntrs/releases/latest/download/mntrs-$(uname -m | sed 's/x86_64/x86_64-unknown-linux-gnu/;s/aarch64/aarch64-unknown-linux-gnu/') \
+  -o mntrs && chmod +x mntrs && sudo mv mntrs /usr/local/bin/
 
-# Docker
+# All 8 targets (Linux gnu/musl × x86_64/aarch64, armv7-musl,
+# macOS x86_64/aarch64, Windows MSVC): see the Assets table on
+# https://github.com/dyrnq/mntrs/releases/latest — each asset is
+# `mntrs-<tag>-<target>` (`.exe` suffix on Windows) plus a
+# sha256sums.txt.
+
+# Docker (CSI driver image from GHCR)
+docker pull ghcr.io/dyrnq/mntrs-csi:latest
+
+# Docker (CSI driver, build from source)
 docker build -f csi/Dockerfile -t mntrs-csi .
 ```
 

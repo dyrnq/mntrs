@@ -2,11 +2,38 @@
 
 All notable changes to mntrs are documented in this file.
 
-The format is loosely based on [Keep a Changelog](https://keepachangelog.com/),
-and this project does **not** yet follow Semantic Versioning. Dates
-use the YYYY-MM-DD form.
+The format is based on [Keep a Changelog](https://keepachangelog.com/),
+and this project follows [Semantic Versioning](https://semver.org/).
+Versions before 1.0.0 (including this `0.0.1-alpha`) are **alpha /
+pre-release** — APIs may change without notice; do not rely on this
+build for production workloads. Dates use the YYYY-MM-DD form.
 
 ## Unreleased
+
+## [0.0.1-alpha.1] - 2026-09-21
+
+### Highlights
+
+This is the first public alpha release of mntrs (`v0.0.1-alpha.1`),
+marking entry into testing. Expect rough edges; APIs may change
+before 1.0.0. Major themes since project start:
+
+- **vfs-cache-mode is now a real selector** (#583). The previously
+  shadow-string default `writes` is now `off`; users relying on the
+  implicit crash safety must now pass `--vfs-cache-mode=writes`
+  explicitly.
+- **Windows rename correctness** (#614 v1-v9): idempotent `do_rename`,
+  skip post-rename cleanup DELETE on Windows, WinFspAdapter::overwrite
+  implemented, dir_cache invalidation on open name allocation.
+- **opendal 0.58 → 0.59** with 4 `Metadata::user_metadata()` migrations
+  (setxattr / removexattr / listxattr); hdfs-native 0.13 → 0.14 via
+  apache/opendal#7910 + Kimahriman/hdfs-native#303, dropping the
+  `[patch.crates-io]` fork.
+- **batched_delete** ships default-ON for S3 with N concurrent worker
+  loops, workload-adaptive profiles, single-key short-circuit,
+  threshold-based fast path.
+- **io::sync isolated runtime** for opendal network IO (#616) — fixes
+  BatchDeleter `rx.await` hangs on unlink / rmdir / rename / symlink.
 
 ### Breaking changes
 

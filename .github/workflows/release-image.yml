@@ -1,0 +1,96 @@
+name: Release Image
+
+# Pushes the mntrs-csi Docker image to GHCR on tag push.
+#
+# Build pattern adapted from /data/work/docker-jenkins/buildx.sh:
+#   1. Build with `push=false` — verifies the Dockerfile / build context
+#      without consuming any registry API quota. If the build is broken
+#      (syntax error, missing dep, Rust compile failure inside the
+#      builder stage), we fail here and never touch ghcr.io.
+#   2. `docker login` to ghcr.io — fresh auth, surfaces credential issues
+#      independently of the build outcome.
+#   3. Build again with `push=true` — actually publishes. The layer
+#      cache from step 1 means step 3 is a fast no-op rebuild unless
+#      something changed.
+#
+# The standard (non-kerberos) image variant is published. The kerberos
+# variant under docker/csi/Dockerfile is for e2e tests and is not part
+# of v0.0.1-alpha.x releases; it can become a tagged variant in v0.1.x.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  csi-image:
+    name: Build + publish mntrs-csi image
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Setup docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ============================================================
+      # Step 1: Pre-build with push=false.
+      # Validates the entire csi/Dockerfile build pipeline end-to-end
+      # (rust:1.87-slim-bookworm builder → cargo build → debian runtime)
+      # without spending any ghcr.io push quota. This is the "verify"
+      # pass — any failure here aborts before the registry is touched.
+      # ============================================================
+      - name: Pre-build (no-push, verify only)
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --output "type=image,push=false" \
+            --tag "ghcr.io/${{ github.repository_owner }}/mntrs-csi:${{ github.ref_name }}" \
+            --file csi/Dockerfile \
+            .
+
+      # ============================================================
+      # Step 2: Fresh auth. Between the two builds so that a registry
+      # auth problem surfaces as a distinct step failure (not buried in
+      # a build error). GITHUB_TOKEN has packages:write scope via the
+      # permissions: block above.
+      # ============================================================
+      - name: docker login (ghcr.io)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ============================================================
+      # Step 3: Real build + push. Same csi/Dockerfile, push=true.
+      # Tags: exact version + :latest. Multi-arch manifest is a v0.1.x
+      # follow-up (linux/arm64 needs QEMU + cross-compile of csi).
+      # ============================================================
+      - name: Build + push (release)
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --output "type=image,push=true" \
+            --tag "ghcr.io/${{ github.repository_owner }}/mntrs-csi:${{ github.ref_name }}" \
+            --tag "ghcr.io/${{ github.repository_owner }}/mntrs-csi:latest" \
+            --file csi/Dockerfile \
+            .
+
+      # ============================================================
+      # Step 4: Verify the push actually landed. Catches the case where
+      # buildx silently reports success but the registry 4xx'd at the
+      # last layer (rare but seen with quota/auth flake).
+      # ============================================================
+      - name: Verify push (manifest inspect)
+        run: |
+          docker manifest inspect \
+            "ghcr.io/${{ github.repository_owner }}/mntrs-csi:${{ github.ref_name }}" \
+            > /dev/null \
+            || (echo "::error::manifest not found post-push" && exit 1)

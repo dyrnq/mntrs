@@ -1,0 +1,228 @@
+name: Release
+
+# Adapted from /data/work/sc/.github/workflows/release.yml. Differences:
+#   * BINARY_NAME=mntrs (mntrs is a single-binary CLI; CSI lives in a
+#     separate ghcr.io image, published by release-image.yml)
+#   * Dropped x86_64-pc-windows-gnu from the matrix (mntrs's existing
+#     ci-windows.yml / bench-windows.yml only run MSVC; v0.0.1-alpha.x
+#     ships MSVC only, GNU can be a follow-up)
+#   * Added Swatinem/rust-cache@v2 with shared-key=release (separate
+#     from ci's shared-key so they don't evict each other; opendal +
+#     14 service crates + hdfs-native have a ~5-10min cold compile)
+#   * Asset table drops the Windows GNU row
+#
+# Triggers on tag push (v*). workflow_dispatch is for ad-hoc rebuilds
+# of an existing tag — push is required to actually publish the release.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: mntrs
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux native
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            cross: false
+          # Linux musl (native build with musl-tools)
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            cross: false
+          # Linux cross via cross-rs (Docker-backed)
+          - os: ubuntu-24.04
+            target: aarch64-unknown-linux-gnu
+            cross: true
+          - os: ubuntu-24.04
+            target: aarch64-unknown-linux-musl
+            cross: true
+          - os: ubuntu-24.04
+            target: armv7-unknown-linux-musleabihf
+            cross: true
+          # macOS (native, no cross)
+          - os: macos-14
+            target: x86_64-apple-darwin
+            cross: false
+          - os: macos-14
+            target: aarch64-apple-darwin
+            cross: false
+          # Windows MSVC only (per v0.0.1-alpha.x scope)
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+          # Save only on tag push so workflow_dispatch runs don't pollute
+          # the cache or interfere with cache invalidation.
+          save-if: ${{ github.ref_type == 'tag' }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get install -y musl-tools
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Set binary ext
+        id: ext
+        shell: bash
+        run: |
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
+            echo "ext=.exe" >> $GITHUB_OUTPUT
+          else
+            echo "ext=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Rename artifact
+        shell: bash
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          EXT=${{ steps.ext.outputs.ext }}
+          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}$EXT \
+             ${{ env.BINARY_NAME }}-${TAG}-${{ matrix.target }}$EXT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ matrix.target }}
+          path: ${{ env.BINARY_NAME }}-*
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history for changelog generation
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f -exec cp {} release-assets/ \;
+          cd release-assets
+          sha256sum * > sha256sums.txt
+          ls -la
+
+      - name: Generate changelog
+        id: changelog
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          PREV_TAG=$(git tag --sort=-creatordate 2>/dev/null | grep -v "$TAG" | head -1 || true)
+          if [ -z "$PREV_TAG" ]; then
+            # First tag — fall back to last 30 commits. CHANGELOG.md is
+            # the source of truth for what shipped; this auto-block is
+            # just for the GitHub Release page.
+            git log --oneline --no-decorate -30 > changelog.md
+          else
+            git log --oneline --no-decorate "${PREV_TAG}..HEAD" > changelog.md 2>/dev/null || git log --oneline --no-decorate -30 > changelog.md
+          fi
+          cat changelog.md
+          {
+            echo "changelog<<EOF"
+            cat changelog.md
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # Lets the same tag be re-pushed (e.g. fixed a CI flake after
+      # tagging) without tripping GitHub's "release already exists"
+      # guard. Same pattern as sc.
+      - name: Delete existing release (if any)
+        continue-on-error: true
+        shell: bash
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ github.ref_name }}")
+          if [ "$HTTP_CODE" = "200" ]; then
+            RELEASE_ID=$(curl -s \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ github.ref_name }}" \
+              | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+            curl -s -X DELETE \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID"
+            echo "Deleted release $RELEASE_ID for ${{ github.ref_name }}"
+          else
+            echo "No existing release for ${{ github.ref_name }}"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          name: ${{ github.ref_name }}
+          body: |
+            ## ${{ github.ref_name }}
+
+            Pre-release / alpha build. APIs may change before 1.0.0. See
+            [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md)
+            for the full per-version notes.
+
+            ### Assets
+            | Platform | File |
+            |---|---|
+            | Linux x86_64 (gnu) | `${{ env.BINARY_NAME }}-${{ github.ref_name }}-x86_64-unknown-linux-gnu` |
+            | Linux x86_64 (static) | `${{ env.BINARY_NAME }}-${{ github.ref_name }}-x86_64-unknown-linux-musl` |
+            | Linux aarch64 (gnu) | `${{ env.BINARY_NAME }}-${{ github.ref_name }}-aarch64-unknown-linux-gnu` |
+            | Linux aarch64 (musl) | `${{ env.BINARY_NAME }}-${{ github.ref_name }}-aarch64-unknown-linux-musl` |
+            | Linux armv7 (static) | `${{ env.BINARY_NAME }}-${{ github.ref_name }}-armv7-unknown-linux-musleabihf` |
+            | macOS x86_64 | `${{ env.BINARY_NAME }}-${{ github.ref_name }}-x86_64-apple-darwin` |
+            | macOS aarch64 | `${{ env.BINARY_NAME }}-${{ github.ref_name }}-aarch64-apple-darwin` |
+            | Windows x86_64 (MSVC) | `${{ env.BINARY_NAME }}-${{ github.ref_name }}-x86_64-pc-windows-msvc.exe` |
+
+            ### Docker image
+            ```
+            docker pull ghcr.io/${{ github.repository_owner }}/mntrs-csi:${{ github.ref_name }}
+            ```
+            See the CSI driver section of README.md for usage.
+
+            ### Checksums
+            See `sha256sums.txt` in the assets.
+
+            ${{ steps.changelog.outputs.changelog }}
+          files: release-assets/*
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
