@@ -87,6 +87,28 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get install -y musl-tools
 
+      # macOS runners ship brew but no FUSE / protobuf headers. Two
+      # distinct build deps:
+      #   * macfuse cask — pkg-config `fuse` (libfuse2-compatible) needed
+      #     by fuser 0.18's build.rs (release run 35576793109 failed both
+      #     macOS targets with "Package fuse was not found in the
+      #     pkg-config search path"). The kext itself won't load in the
+      #     headless GHA runner — same limitation ci-macos.yml calls out
+      #     at its mount-test skip step — but the headers are enough for
+      #     compile.
+      #   * protobuf (brew formula, NOT cask) — provides the
+      #     protoc binary + /usr/local/include/google/protobuf/*.proto.
+      #     mntrs-csi's build.rs invokes tonic-prost-build's
+      #     compile_protos("csi.proto") which imports
+      #     google/protobuf/{descriptor,timestamp,wrappers}.proto.
+      #     Linux builders get these via apt's libprotobuf-dev (explicit
+      #     Recommends of protobuf-compiler); macOS brew's `protobuf`
+      #     formula is the equivalent.
+      # Mirrors ci-macos.yml L58-60 verbatim.
+      - name: Install FUSE + protobuf (macOS)
+        if: runner.os == 'macOS'
+        run: brew install --cask macfuse && brew install protobuf
+
       - name: Build (native)
         if: ${{ !matrix.cross }}
         run: cargo build --release --target ${{ matrix.target }}
