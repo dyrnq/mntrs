@@ -9,7 +9,8 @@
 > [![crates.io](https://img.shields.io/crates/v/mntrs)](https://crates.io/crates/mntrs)
 > [![GitHub release](https://img.shields.io/github/v/release/dyrnq/mntrs)](https://github.com/dyrnq/mntrs/releases/latest)
 > ![Status: 0.0.1-alpha](https://img.shields.io/badge/status-0.0.1--alpha-orange)
-> [![Docker image](https://img.shields.io/badge/ghcr.io-mntrs--csi-blue)](https://ghcr.io/dyrnq/mntrs-csi)
+> [![Docker image](https://img.shields.io/badge/docker.io-mntrs--csi-blue)](https://hub.docker.com/r/dyrnq/mntrs-csi)
+> [![GHCR image](https://img.shields.io/badge/ghcr.io-mntrs--csi-lightgrey)](https://ghcr.io/dyrnq/mntrs-csi)
 
 A high-performance FUSE mount for object storage and remote filesystems, written in Rust.
 Backed by [Apache OpenDAL](https://github.com/apache/opendal), supporting **13 storage backends**
@@ -86,7 +87,11 @@ curl -L https://github.com/dyrnq/mntrs/releases/latest/download/mntrs-$(uname -m
 # `mntrs-<tag>-<target>` (`.exe` suffix on Windows) plus a
 # sha256sums.txt.
 
-# Docker (CSI driver image from GHCR)
+# Docker (CSI driver image — multi-arch linux/amd64 + linux/arm64)
+# Docker Hub (default registry; what most users reach for):
+docker pull dyrnq/mntrs-csi:latest
+
+# Or GHCR (GitHub Container Registry; same image, different URL):
 docker pull ghcr.io/dyrnq/mntrs-csi:latest
 
 # Docker (CSI driver, build from source)
