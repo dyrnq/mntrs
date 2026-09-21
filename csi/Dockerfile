@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.87-slim-bookworm AS builder
+FROM rust:1.91-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     protobuf-compiler libfuse3-dev fuse3 pkg-config && \
