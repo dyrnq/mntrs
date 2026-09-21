@@ -31,15 +31,24 @@ jobs:
     runs-on: ubuntu-latest
 
     services:
-      minio:
-        image: minio/minio:latest
+      # pgsty/silo (https://github.com/pgsty/silo) — community-maintained
+      # fork of open-source MinIO. Drop-in compatible: same
+      # MINIO_ROOT_USER/MINIO_ROOT_PASSWORD env vars, same S3 API on
+      # :9000, same /minio/* routes (incl. /minio/health/live), same
+      # .minio.sys data format. Used because upstream `minio/minio:latest`
+      # is no longer pullable from Docker Hub (the open-source
+      # community distribution was archived by MinIO, Inc. — see
+      # https://dl.min.io returning HTTP 410 Gone for the Windows binary
+      # and `pull access denied` for the Docker image).
+      silo:
+        image: pgsty/silo:latest
         command: server /data --address :9000
         env:
           MINIO_ROOT_USER: minioadmin
           MINIO_ROOT_PASSWORD: minioadmin
         ports:
           - 9000:9000
-        # MinIO needs /data to exist on the host; the service uses an
+        # silo needs /data to exist on the host; the service uses an
         # ephemeral container so /data goes away with the runner.
 
     env:

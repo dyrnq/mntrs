@@ -43,8 +43,10 @@ jobs:
             storage: hdfs://localhost:8020/
             endpoint: ""
     services:
-      minio:
-        image: minio/minio:latest
+      # pgsty/silo = community-maintained MinIO fork, drop-in compatible
+      # (see .github/workflows/csi-e2e.yml header comment for context).
+      silo:
+        image: pgsty/silo:latest
         command: server /data
         env:
           MINIO_ROOT_USER: minioadmin

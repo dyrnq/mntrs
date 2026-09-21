@@ -27,8 +27,11 @@ jobs:
             storage: hdfs://localhost:8020/
 
     services:
-      minio:
-        image: minio/minio:latest
+      # pgsty/silo = community-maintained MinIO fork, drop-in compatible
+      # (see .github/workflows/csi-e2e.yml header comment for context).
+      # Same port (9000), same env vars, same /minio/health/live endpoint.
+      silo:
+        image: pgsty/silo:latest
         command: server /data
         options: --health-cmd "curl -sf http://localhost:9000/minio/health/live || exit 1" --health-interval 5s
         env:
@@ -435,8 +438,11 @@ jobs:
   s3-lifecycle-stress:
     runs-on: ubuntu-latest
     services:
-      minio:
-        image: minio/minio:latest
+      # pgsty/silo = community-maintained MinIO fork, drop-in compatible
+      # (see .github/workflows/csi-e2e.yml header comment for context).
+      # Same port (9000), same env vars, same /minio/health/live endpoint.
+      silo:
+        image: pgsty/silo:latest
         command: server /data
         options: --health-cmd "curl -sf http://localhost:9000/minio/health/live || exit 1" --health-interval 5s
         env:
@@ -452,17 +458,37 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: integration
 
-      # Add $HOME/go/bin to GITHUB_PATH so the `go install github.com/minio/mc`
-      # below puts `mc` on PATH for the rest of the job. The original
+      # Add $HOME/go/bin to GITHUB_PATH so the `mc` binary extracted
+      # below is on PATH for the rest of the job. Original
       # install-linux-deps.sh had with_gopath=yes doing this; the
       # build-mntrs-release action doesn't touch GITHUB_PATH.
-      - name: Set GITHUB_PATH for go install
+      - name: Set GITHUB_PATH for mc binary
         run: echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
       - uses: ./.github/actions/build-mntrs-release
 
-      - name: Install mc (MinIO client)
-        run: go install github.com/minio/mc@latest
+      # Install `mc` (MinIO client). `pgsty/mc` is the community-maintained
+      # fork (`mcli` binary in the standalone archive, but command syntax
+      # is identical to upstream `mc`). We download the standalone archive,
+      # extract `mcli`, and copy it to `$HOME/go/bin/mc` so the
+      # subsequent `mc alias set` / `mc mb` / `mc cp` invocations work
+      # unchanged. Pin to a specific release tag (not `:latest`) for
+      # reproducibility.
+      #   pgsty/mc: https://github.com/pgsty/mc (forked from minio/mc,
+      #     upstream archived; the pgsty fork ships `mcli` standalone
+      #     and is the actively maintained line).
+      - name: Install mc (Silo client)
+        run: |
+          set -euo pipefail
+          MC_VERSION="RELEASE.2026-09-16T00-00-00Z"
+          MC_TARBALL="mcli_20260916000000.0.0_linux_amd64.tar.gz"
+          curl -fsSL \
+            "https://github.com/pgsty/mc/releases/download/${MC_VERSION}/${MC_TARBALL}" \
+            -o "/tmp/${MC_TARBALL}"
+          tar -xzf "/tmp/${MC_TARBALL}" -C /tmp mcli
+          mkdir -p "$HOME/go/bin"
+          install -m 0755 /tmp/mcli "$HOME/go/bin/mc"
+          mc --version
 
       - name: Create S3 bucket
         run: |

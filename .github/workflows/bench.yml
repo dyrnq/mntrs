@@ -31,8 +31,10 @@ jobs:
             mem_cache_impl: moka
 
     services:
-      minio:
-        image: minio/minio:latest
+      # pgsty/silo = community-maintained MinIO fork, drop-in compatible
+      # (see .github/workflows/csi-e2e.yml header comment for context).
+      silo:
+        image: pgsty/silo:latest
         command: server /data
         options: --health-cmd "curl -sf http://localhost:9000/minio/health/live || exit 1" --health-interval 5s
         env:

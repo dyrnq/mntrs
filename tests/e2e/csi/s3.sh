@@ -20,10 +20,15 @@
 #   REGISTRY_USER             Registry username (default: test)
 #   REGISTRY_PASS             Registry password (default: test)
 #   IMAGE_TAG                 Image tag (default: dev)
-#   MNIO_IMAGE                MinIO image (default: minio/minio:latest)
-#   MNIO_NAMESPACE            Namespace for MinIO (default: minio)
-#   MNIO_ROOT_USER            MinIO root user (default: minioadmin)
-#   MNIO_ROOT_PASSWORD        MinIO root password (default: minioadmin)
+#   MNIO_IMAGE                S3 storage image (default: pgsty/silo:latest)
+#                             Variable name kept as MNIO_IMAGE for backward
+#                             compat with callers that pass it explicitly.
+#                             Image is pgsty/silo — the community-maintained
+#                             MinIO fork (drop-in compatible). Upstream
+#                             minio/minio:latest is no longer pullable.
+#   MNIO_NAMESPACE            Namespace for the S3 storage (default: minio)
+#   MNIO_ROOT_USER            Root user (default: minioadmin)
+#   MNIO_ROOT_PASSWORD        Root password (default: minioadmin)
 #   MNIO_BUCKET               Bucket name (default: mntrs-csi-e2e)
 #   CSI_NAMESPACE             Namespace for csi-mntrs (default: csi-mntrs)
 #   SKIP_BUILD                Set to 1 to skip building/pushing the image
@@ -45,7 +50,7 @@ REGISTRY_PASS="${REGISTRY_PASS:-test}"
 IMAGE_TAG="${IMAGE_TAG:-dev}"
 IMAGE="${IMAGE:-${REGISTRY}/mntrs-csi:${IMAGE_TAG}}"
 
-MINIO_IMAGE="${MINIO_IMAGE:-minio/minio:latest}"
+MINIO_IMAGE="${MINIO_IMAGE:-pgsty/silo:latest}"
 MINIO_NAMESPACE="${MINIO_NAMESPACE:-minio}"
 MINIO_ROOT_USER="${MINIO_ROOT_USER:-minioadmin}"
 MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-minioadmin}"
