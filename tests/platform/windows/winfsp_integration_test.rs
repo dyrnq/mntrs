@@ -18,7 +18,14 @@ use winfsp::filesystem::{FileInfo, FileSystemContext};
 // initializes a global subscriber in main.rs; the test binary
 // doesn't, so without this RUST_LOG is silently dropped. Gated on
 // RUST_LOG being set so the test stays quiet by default.
-#[ctor::ctor]
+//
+// `#[ctor(unsafe)]` is required by ctor 1.x — the attribute
+// emits a `.init_array`-style static initializer that runs before
+// `main`, which the crate considers unsound by default. Init
+// itself is safe here (idempotent `try_init`), but the
+// acknowledge-unsafe opt-in is at the attribute level. Issue
+// #609 / issue #574 PR 3.
+#[ctor::ctor(unsafe)]
 fn __init_tracing() {
     if std::env::var_os("RUST_LOG").is_some() {
         let _ = tracing_subscriber::fmt()
