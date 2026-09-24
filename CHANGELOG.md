@@ -10,6 +10,24 @@ build for production workloads. Dates use the YYYY-MM-DD form.
 
 ## Unreleased
 
+## [0.0.1-alpha.2] - 2026-09-24
+
+Second public alpha. No behavior changes since `0.0.1-alpha.1`;
+this tag exists to (a) validate the build + release-toolchain path
+against the freshly-cut `release/v0.0.1-alpha.2` branch and (b)
+provide a stable anchor for downstream issue trackers referencing
+the alpha-2 build (`#628` CSI image build, `#630` opendal 0.59.3
+bump, `#632` transitive patch bumps — all merged into `main`
+between alpha-1 and alpha-2).
+
+### Build
+
+- Bump package version `0.0.1-alpha.1` → `0.0.1-alpha.2` in both
+  `Cargo.toml` and `csi/mntrs-csi/Cargo.toml`.
+- Regenerate `Cargo.lock` for the new version stamp.
+- Verify with `cargo build --workspace --release` (both `mntrs`
+  and `mntrs-csi` produce clean release binaries).
+
 ## [0.0.1-alpha.1] - 2026-09-21
 
 ### Highlights
