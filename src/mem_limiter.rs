@@ -145,7 +145,7 @@ impl MemoryLimiter {
     /// `release_if_reserved` (see below).
     pub fn release(&self, label: &'static str, n: u64) {
         self.used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(n))
             })
             .ok();
@@ -176,7 +176,7 @@ impl MemoryLimiter {
         // updated together on success.
         let released = alloc
             .bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 if current < n {
                     None // reservation not held
                 } else {
@@ -186,7 +186,7 @@ impl MemoryLimiter {
             .is_ok();
         if released {
             self.used
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     Some(current.saturating_sub(n))
                 })
                 .ok();
@@ -211,7 +211,7 @@ impl MemoryLimiter {
         } else {
             alloc
                 .bytes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
                     Some(c.saturating_sub((-delta) as u64))
                 })
                 .ok();
