@@ -173,7 +173,7 @@ impl OpHistogram {
         // and the only loss is the small absolute-precision tail
         // beyond 1.8e19 µs (~584 years at 1M ops/sec).
         self.sum_us
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_add(us))
             })
             .ok();

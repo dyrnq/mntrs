@@ -2359,20 +2359,35 @@ impl CoreFilesystem for CountingCoreFs {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.getattr(ino)
     }
-    forward!(setattr(
-        ino: u64,
-        mode: Option<u32>,
-        uid: Option<u32>,
-        gid: Option<u32>,
-        size: Option<u64>,
-        _atime: Option<std::time::SystemTime>,
-        _mtime: Option<std::time::SystemTime>,
-        fh: Option<u64>
-    ) -> CoreFileAttr);
+    forward!(
+        setattr(
+            ino: u64,
+            mode: Option<u32>,
+            uid: Option<u32>,
+            gid: Option<u32>,
+            size: Option<u64>,
+            _atime: Option<std::time::SystemTime>,
+            _mtime: Option<std::time::SystemTime>,
+            fh: Option<u64>,
+        ) -> CoreFileAttr
+    );
     forward!(opendir(ino: u64) -> u64);
-    forward!(readdir(ino: u64, fh: u64, offset: u64, _max: usize) -> std::sync::Arc<Vec<mntrs::core_fs::CoreDirEntry>>);
+    forward!(
+        readdir(
+            ino: u64,
+            fh: u64,
+            offset: u64,
+            _max: usize,
+        ) -> std::sync::Arc<Vec<mntrs::core_fs::CoreDirEntry>>
+    );
     forward!(releasedir(_ino: u64, _fh: u64) -> ());
-    forward!(readdir_with_attrs(ino: u64, fh: u64, marker: &str) -> Vec<(mntrs::core_fs::CoreDirEntry, CoreFileAttr)>);
+    forward!(
+        readdir_with_attrs(
+            ino: u64,
+            fh: u64,
+            marker: &str,
+        ) -> Vec<(mntrs::core_fs::CoreDirEntry, CoreFileAttr)>
+    );
     forward!(open(ino: u64, _flags: u32) -> u64);
     forward!(read(ino: u64, fh: u64, offset: u64, size: u32) -> Vec<u8>);
     forward!(write(ino: u64, fh: u64, offset: u64, data: &[u8]) -> u32);
@@ -2399,15 +2414,17 @@ impl CoreFilesystem for CountingCoreFs {
     forward!(access(ino: u64, mask: u32) -> ());
     forward!(link(ino: u64, newparent: u64, newname: &str) -> CoreFileAttr);
     forward!(fallocate(ino: u64, _fh: u64, offset: u64, length: u64, mode: i32) -> ());
-    forward!(copy_file_range(
-        ino_in: u64,
-        fh_in: u64,
-        offset_in: u64,
-        ino_out: u64,
-        fh_out: u64,
-        offset_out: u64,
-        len: u64
-    ) -> u32);
+    forward!(
+        copy_file_range(
+            ino_in: u64,
+            fh_in: u64,
+            offset_in: u64,
+            ino_out: u64,
+            fh_out: u64,
+            offset_out: u64,
+            len: u64,
+        ) -> u32
+    );
 }
 
 /// Issue #310: per-adapter `get_file_info` cache
