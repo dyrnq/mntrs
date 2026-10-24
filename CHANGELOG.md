@@ -49,6 +49,13 @@ No mntrs source behavior was altered.
 
 - Bump package version `0.0.1-alpha.2` → `0.0.1-alpha.3` in both
   `Cargo.toml` and `csi/mntrs-csi/Cargo.toml`.
+- Bump the `csi/Dockerfile` builder image from `rust:1.91-slim-bookworm`
+  to `rust:1.99-slim-bookworm`. The `Atomic*::try_update` API used by
+  `src/mem_limiter.rs` and `src/metrics.rs` only stabilized in Rust
+  1.95.0, so the 1.91 builder aborted with `E0658: use of unstable
+  library feature 'atomic_try_update'` and the CSI image was never
+  published for this tag. 1.99 matches the `stable` channel every CI
+  workflow builds with.
 - Regenerate `Cargo.lock` for the new version stamp.
 - Verify with `cargo build` (debug) and `cargo build --release`; the
   `mntrs-csi` binary is Linux-only and is built by the release
