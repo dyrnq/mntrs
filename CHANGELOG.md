@@ -10,6 +10,60 @@ build for production workloads. Dates use the YYYY-MM-DD form.
 
 ## Unreleased
 
+## [0.0.1-alpha.3] - 2026-10-24
+
+Third public alpha. No behavior changes since `0.0.1-alpha.2` — the
+delta is **dependency maintenance only**: 118 crates changed version
+across 12 dependency-bump PRs, plus two Rust 1.99 compatibility fixes.
+No mntrs source behavior was altered.
+
+### Highlights
+
+- **opendal 0.59.3 → 0.59.5** (#630, #655) — patch releases on the
+  storage layer that mntrs is built on.
+- **winfsp 0.13.1 → 0.13.2** (#659) — carries upstream's
+  "don't write a NUL terminator in `set_name`" fix. WinFSP derives the
+  filename length from `FileNameBytes = Size - sizeof(header)`, so the
+  0.13.1 behavior reported a trailing `\0` inside the UTF-16 name to
+  the kernel. mntrs calls `set_name` from exactly one place — the
+  `FILE_ACTION_REMOVED` notification path — so this only affects
+  notification filenames. **#621 (FspFileSystemNotify not updating
+  WinFSP's per-volume dir cache) is not resolved by this**; that
+  symptom is still open.
+- **rustls-webpki 0.103.16** (#659) — rejects certificate paths whose
+  SPKI bytes match the static distrusted-key list, including leaves and
+  trust anchors.
+- **ctutils 0.4.5** (#661) — picks up 0.4.4's two security fixes:
+  verified constant-time codegen for `Choice::to_*_mask`, and
+  constant-time `u128` comparison on 32-bit targets. Reaches mntrs via
+  `digest 0.11.3 → hmac 0.13.0` (HDFS native + request signing).
+- **webpki-root-certs 1.0.11** (#661) — Mozilla root store update;
+  drops `emSign Root CA - C1` and `emSign ECC Root CA - C3`.
+- **tokio 1.54.0 → 1.54.1** (#658, #661) — 1.54.1 reverts 1.54.0's
+  "remove the runtime handle from timers" change.
+- **Rust 1.99 compatibility** (#642) — `AtomicU64::fetch_update` →
+  `try_update` in the atomic helper, plus rustfmt applied to the
+  `forward!` macro args in the WinFSP integration test.
+
+### Build
+
+- Bump package version `0.0.1-alpha.2` → `0.0.1-alpha.3` in both
+  `Cargo.toml` and `csi/mntrs-csi/Cargo.toml`.
+- Regenerate `Cargo.lock` for the new version stamp.
+- Verify with `cargo build` (debug) and `cargo build --release`; the
+  `mntrs-csi` binary is Linux-only and is built by the release
+  workflow's Linux targets.
+
+### Known issues
+
+- **#621** — `FspFileSystemNotify` does not update WinFSP's per-volume
+  directory cache for newly-created files. Still open; the winfsp
+  0.13.2 `set_name` change above is related but does not fix it.
+- **#651 / #652** — `matchit` and `generic-array` remain pinned by
+  upstream (`axum 0.8.9` requires `matchit =0.8.4`; `crypto-common
+  0.1.7` requires `generic-array =0.14.7`). No action available until
+  those upstream constraints loosen.
+
 ## [0.0.1-alpha.2] - 2026-09-24
 
 Second public alpha. No behavior changes since `0.0.1-alpha.1`;
