@@ -68,7 +68,7 @@ mntrs unmount /mnt/s3
 
 ## Installation
 
-> **Alpha release** — see the [`0.0.1-alpha.2`](CHANGELOG.md#001-alpha2---2026-09-24)
+> **Alpha release** — see the [`0.0.1-alpha.3`](CHANGELOG.md#001-alpha3---2026-10-24)
 > CHANGELOG entry for known caveats before pinning to a production
 > workload. Versions before 1.0.0 may break compatibility between
 > alpha tags.
