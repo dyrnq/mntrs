@@ -38,12 +38,19 @@ name: Release Image
 #
 # Multi-arch: linux/amd64 + linux/arm64 via buildx + QEMU emulation.
 # arm64 is produced under QEMU user-mode emulation on the amd64 GHA
-# runner — no arm64 runner required. First-tag cold-cache cost is
-# ~60-70 min (opendal + 14 service crates compile under emulation
-# is ~5-10× slower than native amd64); subsequent tags share the
-# buildx layer cache and finish in ~5-15 min. The kerberos image
-# variant under docker/csi/Dockerfile stays linux/amd64 only — it
-# is e2e-only and not part of v0.0.1-alpha.x.
+# runner — no arm64 runner required. The kerberos image variant under
+# docker/csi/Dockerfile stays linux/amd64 only — it is e2e-only and not
+# part of v0.0.1-alpha.x.
+#
+# Cost: EVERY tag pays for a full cold build. This workflow sets no
+# `cache-from` / `cache-to`, so the buildx builder created by
+# docker/setup-buildx-action is fresh on each runner and its layer
+# cache dies with the job. The pre-build step alone (both platforms;
+# arm64 under QEMU, where opendal + 14 service crates compile 5-10×
+# slower than native amd64) runs 90+ minutes, and whole-workflow runs
+# measure 1h13m (v0.0.1-alpha.1) to 1h41m (v0.0.1-alpha.2). The only
+# cache reuse that exists is WITHIN a job: step 1 (push=false) writes
+# the layer cache and step 8 (push=true) replays it.
 
 on:
   push:
@@ -78,7 +85,7 @@ jobs:
       # ============================================================
       # Step 1: Pre-build with push=false.
       # Validates the entire csi/Dockerfile build pipeline end-to-end
-      # (rust:1.87-slim-bookworm builder → cargo build → debian runtime)
+      # (rust:1.99-slim-bookworm builder → cargo build → debian runtime)
       # without spending any ghcr.io push quota. This is the "verify"
       # pass — any failure here aborts before the registry is touched.
       # ============================================================
