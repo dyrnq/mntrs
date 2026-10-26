@@ -10,7 +10,7 @@ build for production workloads. Dates use the YYYY-MM-DD form.
 
 ## Unreleased
 
-## [0.0.1-alpha.3] - 2026-10-24
+## [0.0.1-alpha.3] - 2026-10-26
 
 Third public alpha. No behavior changes since `0.0.1-alpha.2` — the
 delta is **dependency maintenance only**: 118 crates changed version
@@ -53,9 +53,14 @@ No mntrs source behavior was altered.
   to `rust:1.99-slim-bookworm`. The `Atomic*::try_update` API used by
   `src/mem_limiter.rs` and `src/metrics.rs` only stabilized in Rust
   1.95.0, so the 1.91 builder aborted with `E0658: use of unstable
-  library feature 'atomic_try_update'` and the CSI image was never
-  published for this tag. 1.99 matches the `stable` channel every CI
-  workflow builds with.
+  library feature 'atomic_try_update'` and the CSI image was not
+  published on the first attempt at this tag. 1.99 matches the
+  `stable` channel every CI workflow builds with. The release was
+  re-published on 2026-10-26 with the fixed builder, so
+  `ghcr.io/dyrnq/mntrs-csi:v0.0.1-alpha.3` and
+  `docker.io/dyrnq/mntrs-csi:v0.0.1-alpha.3` now exist
+  (`linux/amd64` + `linux/arm64`), and `:latest` on both registries
+  points at the same digests.
 - Regenerate `Cargo.lock` for the new version stamp.
 - Verify with `cargo build` (debug) and `cargo build --release`; the
   `mntrs-csi` binary is Linux-only and is built by the release
