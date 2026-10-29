@@ -104,6 +104,13 @@ jobs:
       - name: Platform tests
         run: cargo test --package mntrs --test platform_test
 
+      # Issue #670: off-mode (`--vfs-cache-mode=off`, the default)
+      # write-path regression — an append fabricated a zero-filled
+      # prefix, a read through a second handle could not see the
+      # pending bytes, and `flush()` dropped the writeback.
+      - name: Off-mode writeback regression
+        run: cargo test --package mntrs --test issue_670_off_mode
+
       # WinFSP integration test (issue #516).
       #
       # Runs `tests/platform/windows/winfsp_integration_test.rs` —

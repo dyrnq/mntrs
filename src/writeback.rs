@@ -388,6 +388,41 @@ pub fn spawn(
     // `src/io/sync.rs` and PR #616.
     handle: tokio::runtime::Handle,
 ) -> (Sender, tokio::task::JoinHandle<()>) {
+    // Issue #670: no off-mode pending buffers — the disk-backed
+    // modes don't use them. The mount path calls
+    // `spawn_with_off_mode_buffers` instead.
+    spawn_with_off_mode_buffers(
+        op,
+        inodes,
+        disk_cache_index,
+        cache_dir,
+        writeback_pending,
+        Arc::new(dashmap::DashMap::new()),
+        delay,
+        handle,
+    )
+}
+
+/// Issue #670: `spawn` plus the off-mode per-path pending write
+/// buffers.
+///
+/// The worker owns the buffers' lifecycle: after a successful
+/// upload the backend is authoritative, so the buffer is dropped
+/// (unless it moved on while the upload was in flight — then the
+/// current content is re-uploaded instead of being lost).
+// The parameter list mirrors `spawn` plus the buffer map — the
+// worker's inputs are inherently a bag of shared handles.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_with_off_mode_buffers(
+    op: Arc<Operator>,
+    inodes: Inodes,
+    disk_cache_index: DiskCacheIndex,
+    cache_dir: std::path::PathBuf,
+    writeback_pending: Arc<dashmap::DashSet<String>>,
+    off_mode_buffers: Arc<dashmap::DashMap<String, crate::OffModeBuffer>>,
+    delay: Duration,
+    handle: tokio::runtime::Handle,
+) -> (Sender, tokio::task::JoinHandle<()>) {
     // Note (issue #595): upload chunk size is **not** stored
     // here. Every `WritebackTask` carries its own `buffer_size`
     // (set at the call site that constructs the task from
@@ -597,6 +632,11 @@ pub fn spawn(
                 let cache_dir_for_upload = cache_dir.clone();
                 let disk_cache_index_for_upload = disk_cache_index.clone();
                 let writeback_pending_for_upload = writeback_pending.clone();
+                // Issue #670: the off-mode pending buffer for this
+                // path — dropped once the upload that carried these
+                // exact bytes landed, re-uploaded when it moved on
+                // in the meantime.
+                let off_mode_buffers_for_upload = off_mode_buffers.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     let mut last_err = None;
@@ -670,15 +710,36 @@ pub fn spawn(
                             // default chunk (8 MiB); when non-zero
                             // it overrides the in-memory buffer
                             // accumulation threshold before flush.
-                            let write_fut = op
-                                .write_with(&remote, data.clone())
-                                .chunk(buffer_size as usize);
+                            //
+                            // Issue #670: `buffer_size == 0` must
+                            // NOT be forwarded as `.chunk(0)`.
+                            // opendal stores it as `Some(0)`, and
+                            // its write generator then truncates
+                            // every chunk to zero bytes and spins
+                            // forever in `while !bs.is_empty() {
+                            // advance(0) }` — the future never
+                            // yields, so even the 120 s timeout
+                            // below can never fire and the upload
+                            // stalls forever (holding the
+                            // semaphore permit). "0" means "keep
+                            // opendal's default chunk", so the
+                            // builder is simply left alone.
+                            let write_fut = op.write_with(&remote, data.clone());
+                            let write_fut = if buffer_size > 0 {
+                                write_fut.chunk(buffer_size as usize)
+                            } else {
+                                write_fut
+                            };
                             tokio::time::timeout(Duration::from_secs(120), write_fut)
                                 .await
                                 .map(|res| res.map(|_meta| ()))
                         };
                         match write_result {
                             Ok(Ok(_)) => {
+                                // Issue #670: clone the cache-file path
+                                // before the conditional move below —
+                                // the re-upload task needs it.
+                                let write_buffer_path_for_reupload = write_buffer_path.clone();
                                 // Issue #268.4 O14: upload ok lifecycle.
                                 // **debug** not info — sustained writes
                                 // produce one log per task, hot path
@@ -743,7 +804,60 @@ pub fn spawn(
                                 // with new content can
                                 // enqueue a fresh
                                 // task.
-                                writeback_pending_for_upload.remove(remote.as_str());
+                                //
+                                // Issue #670: off mode — the upload
+                                // carried a snapshot of the per-path
+                                // pending buffer. If the buffer moved
+                                // on (a write landed while the upload
+                                // was in flight), the backend now holds
+                                // stale bytes: re-upload the current
+                                // content instead of dropping it. If the
+                                // buffer still matches what we just
+                                // uploaded, the backend is authoritative
+                                // → drop the buffer so the memory is
+                                // freed and later reads go to the
+                                // backend.
+                                let off_mode_current = off_mode_buffers_for_upload
+                                    .get(remote.as_str())
+                                    .map(|b| b.clone())
+                                    .and_then(|buf| {
+                                        let v = buf.data.lock().ok()?;
+                                        if v.as_slice() == data.as_ref() {
+                                            None
+                                        } else {
+                                            Some(v.clone())
+                                        }
+                                    });
+                                match off_mode_current {
+                                    Some(current) => {
+                                        tracing::debug!(
+                                            path = %remote,
+                                            bytes = current.len(),
+                                            "writeback: pending buffer moved on; re-uploading"
+                                        );
+                                        // The path is still in flight —
+                                        // keep the pending entry so the
+                                        // dedup still suppresses a
+                                        // duplicate enqueue.
+                                        let _ = tx_clone.send(WritebackTask {
+                                            ino,
+                                            remote_path: remote.clone(),
+                                            write_buffer_path: write_buffer_path_for_reupload,
+                                            in_memory_payload: Some(bytes::Bytes::from(current)),
+                                            delete_cache_on_success,
+                                            retry_cycle: 0,
+                                            per_task_delay: Duration::ZERO,
+                                            buffer_size,
+                                        });
+                                    }
+                                    None => {
+                                        // Either there is no off-mode
+                                        // buffer (disk modes) or it
+                                        // matches what we uploaded.
+                                        off_mode_buffers_for_upload.remove(remote.as_str());
+                                        writeback_pending_for_upload.remove(remote.as_str());
+                                    }
+                                }
                                 // Issue #55: drop the
                                 // block-level cache for
                                 // this path. The

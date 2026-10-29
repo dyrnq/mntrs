@@ -1300,6 +1300,10 @@ pub fn mount(
         // Issue #38: empty pending set; populated on
         // first flush/release.
         writeback_pending: std::sync::Arc::new(dashmap::DashSet::new()),
+        // Issue #670: off-mode per-path pending write buffers.
+        // Empty in the disk-backed modes; populated by the
+        // off-mode open/create paths.
+        off_mode_buffers: std::sync::Arc::new(dashmap::DashMap::new()),
         // Plan #64 step 10: tombstones for write-behind deletes.
         // Always populated; remains empty in non-write-behind mode.
         delete_tombstones: std::sync::Arc::new(dashmap::DashSet::new()),
