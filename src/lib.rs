@@ -376,6 +376,52 @@ pub const INO_RECOVERY_SENTINEL: u64 = 0;
 static NEXT_HANDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 // DIR_CACHE_TTL now comes from MntrsFs.dir_cache_ttl field
 
+/// Issue #670: the off-mode "pending write" buffer for one path.
+///
+/// Off mode (`--vfs-cache-mode=off`, the default) keeps a file's
+/// bytes in RAM until the async writeback uploads them. Before
+/// issue #670 every *handle* allocated its own `Vec<u8>`, which
+/// broke two things:
+///
+///   * An append (`echo "more" >> f`) opens a fresh handle whose
+///     buffer starts empty. The off-mode write branch grows the
+///     buffer with `Vec::resize(end, 0)`, so the gap between the
+///     buffer length and the write offset was silently filled
+///     with NUL bytes, and the writeback uploaded
+///     `[NULs] + data` — the remote object was corrupted. This is
+///     exactly what the `hdfs-kerberos` CI job hit: `cat` printed
+///     `more` plus a "ignored null byte in input" warning.
+///   * A read through a *different* handle could not see the
+///     bytes until the async upload landed, so a `write` + `cat`
+///     pair read back an empty file (`read back FAIL: got ''`).
+///
+/// The buffer is therefore shared per path: every handle on the
+/// same path sees the same bytes, and the read path can serve
+/// them. The entry is dropped once the upload that carried these
+/// exact bytes has been confirmed by the backend.
+#[derive(Clone, Debug)]
+pub(crate) struct OffModeBuffer {
+    /// The file body as this mount currently knows it.
+    pub(crate) data: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    /// Whether the initial backend fetch has been attempted. The
+    /// first user of the buffer seeds it from the backend so an
+    /// append to a pre-existing file keeps the bytes that are
+    /// already there instead of fabricating a zero prefix.
+    /// Shared through an `Arc` so every clone of the buffer sees
+    /// the same flag.
+    pub(crate) seeded: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the buffer holds bytes that are **not** on the
+    /// backend yet.
+    ///
+    /// The read path only serves the buffer while this is set:
+    /// off mode has no read cache, so a buffer that merely mirrors
+    /// the backend (seeded at open time, never written) must not
+    /// shadow a newer backend version. Set by the write path;
+    /// the entry is dropped once the upload that carried these
+    /// bytes landed, which clears the flag implicitly.
+    pub(crate) dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
 /// Per-open-file-handle state
 #[derive(Debug)]
 enum FileHandleState {
@@ -399,7 +445,13 @@ enum FileHandleState {
         /// open time — i.e. only `CacheMode::Off`. Holds the
         /// entire dirty file body; the async writeback worker
         /// reads it directly when the flush/upload fires.
-        in_memory_buffer: Option<Arc<std::sync::Mutex<Vec<u8>>>>,
+        ///
+        /// Issue #670: the buffer is shared **per path** (not per
+        /// handle) so an append continues where the previous
+        /// handle left off and a read through another handle sees
+        /// the pending bytes. The struct carries the payload plus
+        /// the flags the read/write paths need.
+        in_memory_buffer: Option<OffModeBuffer>,
         dirty: bool,
         dirty_since: Option<std::time::Instant>,
         /// Issue #T2-N+1: wall-clock timestamp of the most
@@ -796,6 +848,16 @@ pub struct MntrsFs {
     /// newer one (out-of-order writes from the
     /// user's perspective).
     writeback_pending: std::sync::Arc<dashmap::DashSet<String>>,
+
+    /// Issue #670: off-mode per-path pending write buffers.
+    ///
+    /// Empty in the disk-backed modes (writes / full / minimal) —
+    /// those keep the bytes in the on-disk cache file. In off mode
+    /// this map is the ONLY local copy of the not-yet-uploaded
+    /// bytes, which is what makes read-after-write and append
+    /// work without a cache file. Keyed by the same path string
+    /// the inode table uses, so `resolve(ino).path` finds it.
+    off_mode_buffers: std::sync::Arc<dashmap::DashMap<String, OffModeBuffer>>,
 
     /// Plan #64 step 10: in-memory set of paths that are
     /// logically deleted but whose S3 DeleteObjects request
@@ -1831,12 +1893,18 @@ impl MntrsFs {
         let wb_handle = crate::io::sync::IoSync::get()
             .map(|s| s.handle())
             .unwrap_or_else(|| crate::rt().handle().clone());
-        let (tx, _handle) = crate::writeback::spawn(
+        let (tx, _handle) = crate::writeback::spawn_with_off_mode_buffers(
             op,
             inodes,
             self.disk_cache_index.clone(),
             self.cache_dir.clone(),
             self.writeback_pending.clone(),
+            // Issue #670: the worker needs the off-mode pending
+            // buffers to (a) drop the buffer once the upload that
+            // carried these exact bytes landed and (b) re-upload
+            // when the buffer moved on while the upload was in
+            // flight.
+            self.off_mode_buffers.clone(),
             delay,
             wb_handle,
         );
@@ -4599,6 +4667,18 @@ impl CoreFilesystem for MntrsFs {
                     .ok();
                 fd
             };
+            // Issue #670: the memory buffer is shared per PATH,
+            // not per handle. A fresh handle used to start with an
+            // empty buffer, so an append (`echo "more" >> f`)
+            // fabricated a zero-filled prefix and the writeback
+            // uploaded `[NULs] + data` to the backend. Sharing it
+            // also lets a read through a different handle see the
+            // bytes that have not been uploaded yet.
+            let in_memory_buffer = if !self.cache_mode.disk_write_buffer() {
+                Some(self.off_mode_buffer(&path))
+            } else {
+                None
+            };
             self.handles.insert(
                 fh,
                 FileHandleState::Write {
@@ -4614,11 +4694,12 @@ impl CoreFilesystem for MntrsFs {
                     // canonical predicate — equivalent to
                     // `== Off` today but explicit about
                     // intent (issue #T2-N).
-                    in_memory_buffer: if !self.cache_mode.disk_write_buffer() {
-                        Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
-                    } else {
-                        None
-                    },
+                    //
+                    // Issue #670: the buffer is per-path, so an
+                    // append handle continues where the previous
+                    // handle left off instead of starting from
+                    // an empty Vec.
+                    in_memory_buffer,
                     dirty: false,
                     dirty_since: None,
                     last_write_at: None,
@@ -4700,10 +4781,45 @@ impl CoreFilesystem for MntrsFs {
                     in_memory_buffer: Some(buf),
                     ..
                 } = entry.value()
-                && let Ok(v) = buf.lock()
+                && let Ok(v) = buf.data.lock()
             {
                 let buf_len = v.len() as u64;
                 if offset < buf_len {
+                    let read_size = (size as u64).min(buf_len - offset) as usize;
+                    let mut out = vec![0u8; read_size];
+                    out.copy_from_slice(&v[offset as usize..offset as usize + read_size]);
+                    return Ok(out);
+                }
+            }
+            // Issue #670: off mode — serve from the per-PATH
+            // pending buffer. The block above only covers reads
+            // through the same fh that holds the write handle; a
+            // `cat` in another process opens its own fh, so it
+            // needs the path-keyed buffer to see the bytes that
+            // have not been uploaded yet. Without this, a
+            // `write` + `cat` pair read back an empty file
+            // whenever the async upload had not landed yet
+            // (the `read back FAIL: got ''` symptom in the
+            // hdfs-kerberos CI job).
+            //
+            // Two guards keep off mode's "no read cache"
+            // contract intact:
+            //
+            //   * `dirty` — the buffer is only consulted while it
+            //     holds bytes the backend does not have yet. A
+            //     buffer that merely mirrors the backend (seeded
+            //     at open time, never written) must not shadow a
+            //     newer backend version.
+            //   * `buf_len >= actual_size` — the buffer has to
+            //     cover the whole file. A shorter buffer would
+            //     make the read look like a truncated file.
+            if !self.cache_mode.disk_write_buffer()
+                && let Some(entry) = self.off_mode_buffers.get(path.as_ref())
+                && entry.dirty.load(std::sync::atomic::Ordering::Relaxed)
+                && let Ok(v) = entry.data.lock()
+            {
+                let buf_len = v.len() as u64;
+                if buf_len >= actual_size && offset < buf_len {
                     let read_size = (size as u64).min(buf_len - offset) as usize;
                     let mut out = vec![0u8; read_size];
                     out.copy_from_slice(&v[offset as usize..offset as usize + read_size]);
@@ -5573,6 +5689,76 @@ impl CoreFilesystem for MntrsFs {
                 } else {
                     None
                 }
+            } else if !self.cache_mode.disk_write_buffer() {
+                // Issue #670: off mode — the per-path pending
+                // buffer is the local copy of the file. A write
+                // past its end must take the missing prefix from
+                // the backend, not from fabricated NUL bytes:
+                // the writeback uploads the WHOLE buffer, so a
+                // zero-filled gap silently corrupts the object.
+                let buf_len = self
+                    .handles
+                    .get(&fh_val)
+                    .and_then(|e| match e.value() {
+                        crate::FileHandleState::Write {
+                            in_memory_buffer: Some(buf),
+                            ..
+                        } => buf.data.lock().ok().map(|v| v.len() as u64),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                if buf_len < _offset {
+                    let gap = _offset - buf_len;
+                    if gap <= GAP_BACKFILL_MAX {
+                        let op = self.op.clone();
+                        let p = path.clone();
+                        let r =
+                            rt().block_on(
+                                async move { op.read_with(&p).range(buf_len.._offset).await },
+                            );
+                        match r {
+                            // The backend may return fewer bytes than
+                            // requested: the file is shorter than the
+                            // write offset, so the rest of the gap is a
+                            // sparse hole (zero-filled — correct POSIX
+                            // behaviour). The caller splices what it got
+                            // and zero-fills the remainder.
+                            Ok(buf) => Some(buf.to_vec()),
+                            // The file does not exist on the backend →
+                            // the whole gap is a sparse hole.
+                            Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+                                tracing::debug!(
+                                    path = %path,
+                                    gap = gap,
+                                    "off-mode backfill: no backend object; \
+                                     the gap is a sparse hole"
+                                );
+                                Some(Vec::new())
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    path = %path,
+                                    gap = gap,
+                                    error = %e,
+                                    "off-mode backfill failed; rejecting write to avoid corrupting the object"
+                                );
+                                return Err(std::io::Error::other(format!(
+                                    "off-mode backfill gap read failed: {e}"
+                                )));
+                            }
+                        }
+                    } else {
+                        tracing::debug!(
+                            path = %path,
+                            gap = gap,
+                            max = GAP_BACKFILL_MAX,
+                            "off-mode gap exceeds backfill cap; accepting zero-fill"
+                        );
+                        None
+                    }
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -5580,29 +5766,94 @@ impl CoreFilesystem for MntrsFs {
             None
         };
 
-        // Off-mode: bytes go into the per-handle Vec<u8>, not a
-        // disk file. Splice into the buffer at `_offset`,
-        // growing it (and zero-filling any gap) the same way
-        // the disk-fd path does. Gap backfill (issue #128) is
-        // implicit — Vec resize+overwrite covers it for the
-        // append / overwrite shape we see from FUSE. Use
-        // `disk_write_buffer()` (canonical predicate,
-        // issue #T2-N) rather than `== Off` so a future
-        // variant can't silently land here.
+        // Off-mode: bytes go into the per-path pending Vec<u8>,
+        // not a disk file. Splice into the buffer at `_offset`,
+        // growing it the same way the disk-fd path does.
+        //
+        // Issue #670: the buffer is seeded from the backend when
+        // the handle is opened, so it normally holds the file's
+        // current content and the gap between the buffer end and
+        // `_offset` is a genuine hole (POSIX sparse write) that
+        // zero-filling is correct for. When the buffer is stale
+        // (the open-time seed failed), the gap is filled from the
+        // backend by `gap_data` above — never with fabricated
+        // NUL bytes, because the writeback uploads the WHOLE
+        // buffer and would corrupt the remote object.
+        //
+        // Use `disk_write_buffer()` (canonical predicate,
+        // issue #T2-N) rather than `== Off` so a future variant
+        // can't silently land here.
         if !self.cache_mode.disk_write_buffer() {
-            if let Some(entry) = self.handles.get(&fh_val)
-                && let crate::FileHandleState::Write {
+            // Clone the buffer handle and drop the `handles` shard
+            // lock before touching it: the re-seed below may do
+            // a blocking backend round-trip and the DashMap
+            // shard lock must not be held across it.
+            let buf = self.handles.get(&fh_val).and_then(|e| match e.value() {
+                crate::FileHandleState::Write {
                     in_memory_buffer: Some(buf),
                     ..
-                } = entry.value()
-                && let Ok(mut v) = buf.lock()
-            {
-                let end = _offset + _data.len() as u64;
-                if (v.len() as u64) < end {
-                    v.resize(end as usize, 0u8);
+                } => Some(buf.clone()),
+                _ => None,
+            });
+            if let Some(buf) = &buf {
+                let mut wrote = false;
+                if let Ok(mut v) = buf.data.lock() {
+                    let end = _offset + _data.len() as u64;
+                    // Issue #670: an empty buffer while the file is
+                    // known to have content means the open-time seed
+                    // failed. Re-seed before writing — otherwise the
+                    // writeback uploads a truncated object.
+                    let known_size = self.inodes.get(&_ino).map(|e| e.size).unwrap_or(0);
+                    if v.is_empty()
+                        && (known_size > 0 || _offset > 0)
+                        && let Some(bytes) = self.fetch_backend_bytes(&path)
+                        && bytes.len() as u64 >= known_size
+                    {
+                        *v = bytes;
+                    }
+                    if (v.len() as u64) < end {
+                        // Issue #670: splice in the backend-provided
+                        // gap instead of zero-filling it. The backend
+                        // may return fewer bytes than the gap covers
+                        // (the file is shorter than the write offset) —
+                        // the rest is a sparse hole and stays zero.
+                        if let Some(gap) = &gap_data {
+                            let gap_start = v.len() as u64;
+                            let take = (gap.len() as u64).min(_offset - gap_start) as usize;
+                            if take > 0 {
+                                v.extend_from_slice(&gap[..take]);
+                            }
+                            tracing::debug!(
+                                path = %path,
+                                gap_start = gap_start,
+                                gap_len = take,
+                                "write: backfilled off-mode gap from backend"
+                            );
+                        }
+                        if (v.len() as u64) < end {
+                            v.resize(end as usize, 0u8);
+                        }
+                    }
+                    let off = _offset as usize;
+                    v[off..off + _data.len()].copy_from_slice(_data);
+                    wrote = true;
                 }
-                let off = _offset as usize;
-                v[off..off + _data.len()].copy_from_slice(_data);
+                if wrote {
+                    // Issue #670: the buffer now holds bytes the
+                    // backend does not have yet — the read path
+                    // serves them until the upload lands (and drops
+                    // the entry).
+                    //
+                    // The writeback worker drops the path entry once
+                    // the upload that carried its bytes landed. A
+                    // write through a still-open handle must publish
+                    // the bytes again, so re-register the entry
+                    // (same payload Arc) before flagging it dirty.
+                    self.off_mode_buffers
+                        .entry(path.to_string())
+                        .or_insert_with(|| buf.clone());
+                    buf.dirty.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
             }
             // Skip the disk-fd block entirely.
         } else if let Some(fd) = &write_buffer_fd
@@ -6045,8 +6296,13 @@ impl CoreFilesystem for MntrsFs {
                 // buffer so an open-missing write doesn't
                 // crash. Use `disk_write_buffer()` (issue
                 // #T2-N) rather than `== Off`.
+                //
+                // Issue #670: the buffer is shared per path (the
+                // same one `open()` would hand out), so the
+                // bytes land where the read path and the
+                // writeback worker look for them.
                 in_memory_buffer: if !self.cache_mode.disk_write_buffer() {
-                    Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+                    Some(self.off_mode_buffer(path.as_str()))
                 } else {
                     None
                 },
@@ -6112,12 +6368,62 @@ impl CoreFilesystem for MntrsFs {
                 );
                 return Err(e);
             }
-            // Push single cache file to writeback queue
+            // Push the dirty bytes to the writeback queue.
             let cpath = crate::write_buffer_path(&self.cache_dir, &path);
-            if cpath.exists() {
-                let sidecar = cpath.with_extension("dirty");
-                if let Err(e) = std::fs::write(&sidecar, path.as_bytes()) {
-                    tracing::warn!(error=%e, path=?sidecar, "sidecar write failed");
+            //
+            // Issue #670: in off mode the bytes ride in the
+            // in-memory payload, not in a cache file. The old
+            // `cpath.exists()` gate made the enqueue depend on
+            // a race with the disk-write pool (which creates the
+            // cache file asynchronously), and `dirty` was
+            // cleared unconditionally afterwards — so the
+            // following release() saw a clean handle and skipped
+            // the enqueue too. The write was silently dropped.
+            let off_mode = !self.cache_mode.disk_write_buffer();
+            // Issue #583: only Off mode packs dirty bytes inline;
+            // Writes/Full/Minimal read from the on-disk cache
+            // file at upload time. Use `disk_write_buffer()`
+            // rather than `== Off` so a future variant like
+            // Minimal (issue #T2-N) can't silently land here.
+            //
+            // flush() runs before the user-facing close(); pack
+            // whatever bytes are already in the buffer.
+            let in_memory_payload: Option<bytes::Bytes> = if off_mode {
+                let entry = self.handles.get(&_fh);
+                match entry.as_deref() {
+                    Some(crate::FileHandleState::Write {
+                        in_memory_buffer: Some(buf),
+                        ..
+                    }) => buf
+                        .data
+                        .lock()
+                        .ok()
+                        .map(|v| bytes::Bytes::copy_from_slice(&v)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let should_enqueue = if off_mode {
+                in_memory_payload.is_some()
+            } else {
+                cpath.exists()
+            };
+            // `true` once the bytes are accounted for: either
+            // the worker has them, or another task for this path
+            // is already in flight (issue #670: that task
+            // re-uploads when the pending buffer moved on), or
+            // there is nothing to upload at all. Only then may
+            // the handle be marked clean — otherwise release()
+            // would skip the enqueue and the write would be
+            // lost.
+            let mut handed_to_worker = false;
+            if should_enqueue {
+                if !off_mode {
+                    let sidecar = cpath.with_extension("dirty");
+                    if let Err(e) = std::fs::write(&sidecar, path.as_bytes()) {
+                        tracing::warn!(error=%e, path=?sidecar, "sidecar write failed");
+                    }
                 }
                 if let Some(tx) = self.writeback_sender.get() {
                     // Bug 22: surface a send() failure (writeback
@@ -6157,34 +6463,7 @@ impl CoreFilesystem for MntrsFs {
                             ino: _ino,
                             remote_path: (*path).to_string(),
                             write_buffer_path: cpath,
-                            // flush() runs before the user-
-                            // facing close(); pack whatever
-                            // bytes are already in the buffer.
-                            // For writes/full the on-disk
-                            // path takes precedence and the
-                            // worker reads from `cpath`.
-                            in_memory_payload: if !self.cache_mode.disk_write_buffer() {
-                                // Issue #583: only Off mode packs
-                                // dirty bytes inline; Writes/Full/
-                                // Minimal read from the on-disk
-                                // cache file at upload time. Use
-                                // `disk_write_buffer()` rather than
-                                // `== Off` so a future variant like
-                                // Minimal (issue #T2-N) can't
-                                // silently land here.
-                                let entry = self.handles.get(&_fh);
-                                match entry.as_deref() {
-                                    Some(crate::FileHandleState::Write {
-                                        in_memory_buffer: Some(buf),
-                                        ..
-                                    }) => {
-                                        buf.lock().ok().map(|v| bytes::Bytes::copy_from_slice(&v))
-                                    }
-                                    _ => None,
-                                }
-                            } else {
-                                None
-                            },
+                            in_memory_payload,
                             // Issue #T2-N: Minimal-mode flushes
                             // also unlink the cache file after
                             // upload. Same predicate as write()
@@ -6207,15 +6486,38 @@ impl CoreFilesystem for MntrsFs {
                                 "flush writeback send failed (worker dropped?); \
                                  .dirty sidecar kept for next-mount retry"
                             );
+                        } else {
+                            handed_to_worker = true;
                         }
                     } else {
+                        // Issue #670: a task is already in flight
+                        // for this path. That task may carry
+                        // older bytes — the writeback worker
+                        // compares the uploaded payload against
+                        // the off-mode pending buffer after the
+                        // upload and re-uploads when the buffer
+                        // moved on, so the newer bytes are not
+                        // lost. Treat the bytes as handed over.
+                        handed_to_worker = true;
                         tracing::trace!(
                             path=%path,
                             "flush: writeback already in flight for path; skipping duplicate enqueue (issue #38)"
                         );
                     }
                 }
+            } else {
+                // Nothing to upload (disk mode without a cache
+                // file). Marking the handle clean is correct.
+                handed_to_worker = true;
+            }
+            if handed_to_worker {
                 tracing::debug!(path=%path, "flush queued writeback");
+            } else {
+                tracing::debug!(
+                    path=%path,
+                    "flush: writeback not enqueued; keeping the handle dirty \
+                     so release() retries"
+                );
             }
             // Mark handle clean; writeback happens asynchronously.
             // Audit finding A6: pre-fix used `handles.get()` +
@@ -6226,15 +6528,23 @@ impl CoreFilesystem for MntrsFs {
             // mutate the existing entry in place — no clone,
             // no allocation, no second shard lock for the
             // read-then-write.
-            self.handles.entry(_fh).and_modify(|h| {
-                if let crate::FileHandleState::Write {
-                    dirty, dirty_since, ..
-                } = h
-                {
-                    *dirty = false;
-                    *dirty_since = None;
-                }
-            });
+            //
+            // Issue #670: only clear `dirty` once the bytes are
+            // accounted for. Clearing it while the enqueue
+            // failed made the following release() skip its own
+            // enqueue (it requires `dirty: true`), so the write
+            // was lost entirely.
+            if handed_to_worker {
+                self.handles.entry(_fh).and_modify(|h| {
+                    if let crate::FileHandleState::Write {
+                        dirty, dirty_since, ..
+                    } = h
+                    {
+                        *dirty = false;
+                        *dirty_since = None;
+                    }
+                });
+            }
         }
         Ok(())
     }
@@ -6399,7 +6709,11 @@ impl CoreFilesystem for MntrsFs {
                     Some(crate::FileHandleState::Write {
                         in_memory_buffer: Some(buf),
                         ..
-                    }) => buf.lock().ok().map(|v| bytes::Bytes::copy_from_slice(&v)),
+                    }) => buf
+                        .data
+                        .lock()
+                        .ok()
+                        .map(|v| bytes::Bytes::copy_from_slice(&v)),
                     _ => None,
                 }
             } else {
@@ -6688,20 +7002,24 @@ impl CoreFilesystem for MntrsFs {
                 .ok()
                 .map(|f| Arc::new(std::sync::Mutex::new(f)))
         };
+        // Issue #670: off mode — the pending buffer is shared per
+        // path and starts empty: `create()` truncated the file, so
+        // there is nothing to seed it with.
+        let in_memory_buffer = if !self.cache_mode.disk_write_buffer() {
+            Some(self.off_mode_buffer_reset(&full_path))
+        } else {
+            None
+        };
         self.handles.insert(
             fh,
             FileHandleState::Write {
                 path: Arc::from(full_path.as_str()),
                 write_buffer_fd,
-                // Mirror open(): off mode allocates a fresh
-                // empty buffer; writes/full leave it None.
+                // Mirror open(): off mode uses the per-path pending
+                // buffer; writes/full leave it None.
                 // Use `disk_write_buffer()` (issue #T2-N)
                 // rather than `== Off`.
-                in_memory_buffer: if !self.cache_mode.disk_write_buffer() {
-                    Some(Arc::new(std::sync::Mutex::new(Vec::new())))
-                } else {
-                    None
-                },
+                in_memory_buffer,
                 dirty: false,
                 dirty_since: None,
                 last_write_at: None,
@@ -6868,6 +7186,14 @@ impl CoreFilesystem for MntrsFs {
                 .ok()
                 .map(|f| Arc::new(std::sync::Mutex::new(f)))
         };
+        // Issue #670: off mode — the pending buffer is shared per
+        // path and starts empty: `create_excl()` only succeeds for
+        // a path that does not exist yet.
+        let in_memory_buffer = if !self.cache_mode.disk_write_buffer() {
+            Some(self.off_mode_buffer_reset(&full_path))
+        } else {
+            None
+        };
         self.handles.insert(
             fh,
             FileHandleState::Write {
@@ -6876,11 +7202,7 @@ impl CoreFilesystem for MntrsFs {
                 // Use `disk_write_buffer()` (issue #T2-N) rather than
                 // `== Off` so a future variant can't silently
                 // land here.
-                in_memory_buffer: if !self.cache_mode.disk_write_buffer() {
-                    Some(Arc::new(std::sync::Mutex::new(Vec::new())))
-                } else {
-                    None
-                },
+                in_memory_buffer,
                 dirty: false,
                 dirty_since: None,
                 last_write_at: None,
@@ -7795,9 +8117,18 @@ impl CoreFilesystem for MntrsFs {
             //    method (operator_futures.rs:922 in opendal
             //    0.58.1) — same shape as PR #465's existing
             //    call sites.
-            op.write_with(path.as_ref(), bytes)
-                .user_metadata(user_meta)
-                .chunk(self.buffer_size as usize)
+            // Issue #670: `buffer_size == 0` means "keep opendal's
+            // default chunk" — forwarding it as `.chunk(0)` makes
+            // opendal truncate every chunk to zero bytes and spin
+            // in an `advance(0)` loop forever. Only set the chunk
+            // when it is non-zero.
+            let write_fut = op.write_with(path.as_ref(), bytes).user_metadata(user_meta);
+            let write_fut = if self.buffer_size > 0 {
+                write_fut.chunk(self.buffer_size as usize)
+            } else {
+                write_fut
+            };
+            write_fut
                 .await
                 .map_err(|e| std::io::Error::other(format!("write_with failed: {e}")))?;
             Ok::<(), std::io::Error>(())
@@ -7889,9 +8220,15 @@ impl CoreFilesystem for MntrsFs {
                 .await
                 .map_err(|e| std::io::Error::other(format!("read failed: {e}")))?
                 .to_vec();
-            op.write_with(path.as_ref(), bytes)
-                .user_metadata(new_map)
-                .chunk(self.buffer_size as usize)
+            // Issue #670: `buffer_size == 0` means "keep opendal's
+            // default chunk" — see the setxattr path above.
+            let write_fut = op.write_with(path.as_ref(), bytes).user_metadata(new_map);
+            let write_fut = if self.buffer_size > 0 {
+                write_fut.chunk(self.buffer_size as usize)
+            } else {
+                write_fut
+            };
+            write_fut
                 .await
                 .map_err(|e| std::io::Error::other(format!("write_with failed: {e}")))?;
             Ok::<(), std::io::Error>(())
@@ -8348,6 +8685,81 @@ impl MntrsFs {
     /// backend via `op.stat()`. The subsequent
     /// `setattr(size=...)` path updates both
     /// `inodes.size` and the cache fd correctly.
+    /// Issue #670: fetch the current backend content of `path`.
+    ///
+    /// Used to seed the off-mode pending buffer so an append to a
+    /// file that already has content keeps that content instead of
+    /// fabricating a zero-filled prefix.
+    fn fetch_backend_bytes(&self, path: &str) -> Option<Vec<u8>> {
+        let op = self.op.clone();
+        let p = path.to_string();
+        rt().block_on(async move {
+            match op.read(&p).await {
+                Ok(b) => Some(b.to_vec()),
+                Err(e) if e.kind() == opendal::ErrorKind::NotFound => None,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %p,
+                        error = %e,
+                        "off-mode: backend seed read failed; \
+                         the pending buffer stays empty"
+                    );
+                    None
+                }
+            }
+        })
+    }
+
+    /// Issue #670: get (or create) the off-mode pending buffer for
+    /// `path`.
+    ///
+    /// The first caller seeds the buffer from the backend so an
+    /// append sees the content the file already has. Later callers
+    /// reuse the same buffer — that is what lets a `write` + `cat`
+    /// pair and a `write` + `append` pair see each other's bytes.
+    fn off_mode_buffer(&self, path: &str) -> OffModeBuffer {
+        let buf = self
+            .off_mode_buffers
+            .entry(path.to_string())
+            .or_insert_with(|| OffModeBuffer {
+                data: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                seeded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            })
+            .clone();
+        if !buf.seeded.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            // Seed under the data lock: a concurrent writer must
+            // not slip bytes in between the fetch and the
+            // assignment (that would lose them).
+            if let Ok(mut v) = buf.data.lock()
+                && v.is_empty()
+                && let Some(bytes) = self.fetch_backend_bytes(path)
+            {
+                *v = bytes;
+            }
+        }
+        buf
+    }
+
+    /// Issue #670: reset the off-mode pending buffer for `path`.
+    ///
+    /// `create()` truncates the file, so the buffer must start
+    /// empty — and must NOT be seeded from the backend (which was
+    /// just truncated to 0 bytes).
+    fn off_mode_buffer_reset(&self, path: &str) -> OffModeBuffer {
+        let data = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let buf = OffModeBuffer {
+            data,
+            // Already "seeded": the file is empty by
+            // definition, there is nothing to fetch.
+            seeded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            // A freshly created file has no pending bytes.
+            dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        self.off_mode_buffers.insert(path.to_string(), buf.clone());
+        buf
+    }
+
     fn populate_cache_from_backend(&self, path: &str) {
         let cpath = crate::write_buffer_path(&self.cache_dir, path);
         if cpath.exists() {
@@ -9273,6 +9685,10 @@ pub fn new_test_fs_with_mode(
         #[cfg(not(windows))]
         fuse_notifier: std::sync::OnceLock::new(),
         writeback_pending: Arc::new(dashmap::DashSet::new()),
+        // Issue #670: off-mode pending write buffers. Empty in
+        // the disk-backed modes; populated by the off-mode
+        // open/create paths.
+        off_mode_buffers: Arc::new(dashmap::DashMap::new()),
         // Plan #64 step 10: empty tombstone set in tests; tests
         // don't exercise the write-behind path (S3-only).
         delete_tombstones: Arc::new(dashmap::DashSet::new()),

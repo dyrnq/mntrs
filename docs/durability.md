@@ -48,7 +48,7 @@ user process               kernel                mntrs FUSE worker        writeb
 write(2)                   page cache            write handler
                            accumulates bytes     creates cache file (writes/full)
                                                   OR
-                                                  Vec<u8> in fh (off)
+                                                  Vec<u8> per path (off)
 
 fsync(2) / close(2)        fdatasync cache fd ──►  flush()/release()
                                                 (writes/full only)        (off: nothing to sync)
@@ -206,7 +206,7 @@ Backed by `crate::util::CacheMode` (`src/util.rs`); parsed in
 
 | Mode       | CLI value | Write buffer                  | Read cache                     | `.dirty` sidecar | Crash safety                                                    |
 |------------|-----------|-------------------------------|--------------------------------|------------------|------------------------------------------------------------------|
-| `off`      | `off`     | in-process `Vec<u8>` per fh   | L1 mem_cache only              | not written      | **dirty bytes lost on daemon crash** before the 5 s write-back lands |
+| `off`      | `off`     | in-process `Vec<u8>` per path | L1 mem_cache only              | not written      | **dirty bytes lost on daemon crash** before the 5 s write-back lands |
 | `writes`   | `writes`  | disk file with `fdatasync`    | L1 mem_cache only              | written          | dirty bytes durable across daemon crash (recovery scan re-enqueues) |
 | `full`     | `full`    | disk file with `fdatasync`    | L1 mem_cache + L2 `.block` files | written        | same as `writes`; pre-fetched blocks also persist for cross-session hits |
 | `minimal`  | `minimal` | disk file with `fdatasync`; **unlinked after upload** | L1 mem_cache only | written | same crash safety as `writes` during upload window; **no on-disk footprint between writes** |
@@ -220,7 +220,7 @@ below.
 ### Off mode
 
 No on-disk cache file. The FUSE worker accumulates bytes in
-`FileHandleState::Write::in_memory_buffer: Option<Arc<Mutex<Vec<u8>>>>`
+`FileHandleState::Write::in_memory_buffer: Option<OffModeBuffer>`
 (`src/lib.rs`) and the async writeback worker reads from a copy
 of that Vec packed into `WritebackTask.in_memory_payload`
 (`src/writeback.rs`). The user-facing `fsync(2)` returns `Ok(())`
@@ -233,6 +233,24 @@ the dirty bytes**; there is no `.dirty` sidecar to recover from.
 view), then falls through to the backend. The L1 mem_cache
 (Moka DashMap, see `src/cache.rs`) is still populated on cache
 misses — only the on-disk write buffer is gone.
+
+**One buffer per path, not per handle** (issue #670). The
+`OffModeBuffer` is shared by every handle on the same path
+(`MntrsFs::off_mode_buffers`, a `DashMap<String, OffModeBuffer>`):
+
+* A write-open seeds the buffer from the backend, so an append
+  (`echo "more" >> f`) continues where the previous handle left
+  off. Per-handle buffers started empty, and the off-mode write
+  path grew them with `Vec::resize(end, 0)` — the writeback then
+  uploaded `[NULs] + data` and **corrupted the remote object**.
+* A read through a *second* handle sees the pending bytes
+  (read-after-write) instead of an empty file. The buffer is only
+  consulted while it holds bytes the backend does not have yet
+  (`OffModeBuffer::dirty`), so off mode still has no read cache.
+* The buffer is dropped once the upload that carried exactly
+  those bytes landed. If a write landed while the upload was in
+  flight, the worker re-uploads the current content instead of
+  dropping it.
 
 ### Writes mode
 

@@ -123,6 +123,18 @@ jobs:
         if: matrix.task == 'test'
         run: cargo test --workspace --lib
 
+      # Issue #670: the off-mode write path (`--vfs-cache-mode=off`,
+      # the default) used to fabricate a zero-filled prefix on an
+      # append, could not serve a read through a second handle
+      # before the upload landed, and dropped the writeback when
+      # `flush()` lost the race with the disk-write pool — the
+      # `hdfs-kerberos` job hit all three. The regression lives in
+      # an integration test (not `--lib`) because it needs the
+      # writeback worker.
+      - name: Test (off-mode writeback regression)
+        if: matrix.task == 'test'
+        run: cargo test --package mntrs --test issue_670_off_mode
+
       - name: Clippy
         if: matrix.task == 'clippy'
         run: cargo clippy --workspace --all-targets -- -D warnings
