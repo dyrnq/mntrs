@@ -1,21 +1,48 @@
-# Windows bench baseline (initial placeholder — Issue #378)
+# Windows bench baseline (Issue #687)
 #
-# This file is intentionally empty. The first successful workflow_dispatch
-# run on main (post-merge of the Windows bench pipeline) will produce a
-# `bench-result.txt` artifact; download it and commit it here as the
-# initial baseline. Subsequent PR + weekly cron runs will then gate on
-# it (20% regression threshold, matching the bash baseline pattern).
+# Source: "Benchmark (Windows)" workflow run 42592958285 (scheduled),
+#         main @ f6422f6 — the BENCHMARK SUMMARY table only, i.e. the
+#         mntrs column of the `bench-result-windows` artifact.
+# Format: mirror of bench/baseline.txt (the rclone column is dropped
+#         because the Windows pipeline is mntrs-only).
 #
-# Format (mirror of bench/baseline.txt, rclone column dropped since this
-# PR is mntrs-only on Windows):
+# Regenerating: dispatch the "Benchmark (Windows)" workflow on main,
+#   download the `bench-result-windows` artifact, and copy its
+#   BENCHMARK SUMMARY table here.
 #
-#   ==========================================================
-#     BENCHMARK SUMMARY: mntrs (Windows WinFSP / memory://)
-#   ==========================================================
-#     Category         | Test                      |   mntrs
-#     -----------------+---------------------------+---------
-#     SeqRead          | Get-Content 1K.bin        |  0m0.005s
-#     ...
-#     -----------------+---------------------------+---------
-#     Result: mntrs=25  tests=25  (25 total)
-#   ==========================================================
+# Gate: bench/check-regression.ps1 compares the critical tests against
+#   this file. On top of the 20% threshold it applies a 0.1s baseline
+#   noise floor and a 0.1s minimum absolute slowdown, because the
+#   short critical workloads (Random-Read, Write-New 10M) vary by
+#   25-50% between runs on a GitHub Actions Windows runner and would
+#   otherwise make the gate flap. See that script for the measured
+#   numbers.
+#
+  ==========================================================
+    BENCHMARK SUMMARY: mntrs (Windows WinFSP / memory://)
+  ==========================================================
+    Category         | Test                      |   mntrs
+    ---------------+---------------------------+---------
+    SeqRead         | Get-Content 1K.bin        |  0m0.008s
+    SeqRead         | Get-Content 64K.bin       |  0m0.030s
+    SeqRead         | Get-Content 1M.bin        |  0m0.088s
+    SeqRead         | Get-Content 10M.bin       |  0m0.531s
+    SeqRead         | ReadAllBytes 4K.bin       |  0m0.001s
+    SeqRead         | ReadAllBytes 1M.bin       |  0m0.002s
+    SeqRead         | ReadAllBytes 10M.bin      |  0m0.008s
+    SeqRead         | Get-Content 100M.bin      |  0m6.915s
+    RandRead        | Random-Read 50x 1M.bin    |  0m0.032s
+    RandRead        | Random-Read 50x 10M.bin   |  0m0.008s
+    Concurrent      | Concurrent 4x 10M.bin     |  0m2.003s
+    Write           | Write-New 1K.bin          |  0m0.003s
+    Write           | Write-New 1M.bin          |  0m0.011s
+    Write           | Write-New 10M.bin         |  0m0.065s
+    Write           | Set-Content 1K            |  0m0.011s
+    Copy            | Copy-Item 1M              |  0m0.019s
+    Copy            | Copy-Item 10M             |  0m0.038s
+    Move            | Move-Item 1M              |      FAIL
+    ReadDir         | Get-ChildItem 500         |  0m0.100s
+    Delete          | Remove-Item 1M            |      FAIL
+    ---------------+---------------------------+---------
+    Result: mntrs=20  tests=20  (20 total)
+  ==========================================================

@@ -1,0 +1,67 @@
+# Windows bench baseline — pull_request runs (Issue #687)
+#
+# Source: "Benchmark (Windows)" workflow run 41989213058 (pull_request
+#         event, 2026-11-05) — the BENCHMARK SUMMARY table only.
+#
+# Why a second baseline: GitHub Actions `pull_request` runs and
+# `push`/`schedule` runs land on measurably different runner
+# hardware. Over 6 runs of each (2026-10-29 … 2026-11-09) every
+# pull_request run was faster than every push/schedule run, on
+# every workload:
+#
+#                Get-Content 100M.bin   Concurrent 4x 10M.bin
+#   push/schedule      6.60 … 7.64s          1.80 … 2.06s
+#   pull_request      3.62 … 5.98s          1.02 … 1.89s
+#
+# Same-day pairs differ by up to 40% (2026-11-09: a pull_request run
+# at 3.616s vs push runs at 6.597s / 6.915s), so this is a property
+# of the event, not of the date. Comparing a pull_request run against
+# the push/schedule baseline would therefore flag every PR as a
+# ~35% regression, and comparing a push/schedule run against this
+# baseline would flag every merge as a ~40% regression.
+#
+# The workflow picks the baseline that matches the event:
+# bench/baseline-windows.txt for push/schedule/workflow_dispatch,
+# this file for pull_request.
+#
+# This run is the slowest of the observed pull_request runs for the
+# two heavy critical workloads, so the gate only fires above a value
+# never seen before in this context.
+#
+# Regenerating: dispatch the "Benchmark (Windows)" workflow, download
+#   the `bench-result-windows` artifact, and copy its BENCHMARK
+#   SUMMARY table into the matching baseline file.
+#
+# Gate: bench/check-regression.ps1 compares the critical tests against
+#   this file with a 20% threshold, plus a 0.1s baseline noise floor
+#   and a 0.1s minimum absolute slowdown. See that script for the
+#   measured numbers.
+#
+  ==========================================================
+    BENCHMARK SUMMARY: mntrs (Windows WinFSP / memory://)
+  ==========================================================
+    Category         | Test                      |   mntrs
+    ---------------+---------------------------+---------
+    SeqRead         | Get-Content 1K.bin        |  0m0.007s
+    SeqRead         | Get-Content 64K.bin       |  0m0.010s
+    SeqRead         | Get-Content 1M.bin        |  0m0.077s
+    SeqRead         | Get-Content 10M.bin       |  0m0.539s
+    SeqRead         | ReadAllBytes 4K.bin       |  0m0.001s
+    SeqRead         | ReadAllBytes 1M.bin       |  0m0.003s
+    SeqRead         | ReadAllBytes 10M.bin      |  0m0.006s
+    SeqRead         | Get-Content 100M.bin      |  0m5.976s
+    RandRead        | Random-Read 50x 1M.bin    |  0m0.022s
+    RandRead        | Random-Read 50x 10M.bin   |  0m0.008s
+    Concurrent      | Concurrent 4x 10M.bin     |  0m1.888s
+    Write           | Write-New 1K.bin          |  0m0.002s
+    Write           | Write-New 1M.bin          |  0m0.012s
+    Write           | Write-New 10M.bin         |  0m0.062s
+    Write           | Set-Content 1K            |  0m0.011s
+    Copy            | Copy-Item 1M              |  0m0.017s
+    Copy            | Copy-Item 10M             |  0m0.033s
+    Move            | Move-Item 1M              |  0m0.029s
+    ReadDir         | Get-ChildItem 500         |  0m0.039s
+    Delete          | Remove-Item 1M            |      FAIL
+    ---------------+---------------------------+---------
+    Result: mntrs=20  tests=20  (20 total)
+  ==========================================================
