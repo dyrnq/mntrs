@@ -182,11 +182,14 @@ jobs:
             mntrs-bench.stderr.log
           if-no-files-found: warn
 
-      # Regression check. With no baseline, emits ::warning:: and
-      # exits 0 (matches bash behavior). After the first main-push
-      # run produces a bench-result.txt artifact, that file is
-      # committed as bench/baseline-windows.txt and subsequent
-      # runs gate on it.
+      # Regression check. bench/baseline-windows.txt holds the
+      # BENCHMARK SUMMARY table of a real main run (Issue #687), so
+      # this step actually gates: a critical workload that got
+      # slower than the 20% threshold, or that reports FAIL instead
+      # of a time, fails the job. A missing baseline still emits a
+      # ::warning:: and exits 0 (matches the bash baseline pattern).
+      # bench/check-regression.ps1 documents the noise floor and the
+      # minimum absolute slowdown it applies on top of the threshold.
       - name: Check regressions
         shell: pwsh
         run: |
