@@ -9,8 +9,9 @@ name: Benchmark (Windows)
 # microbench-result.txt (cargo test --test microbench --release
 # output). Both uploaded as artifacts for inspection. The
 # "Check regressions" step gates on bench/baseline-windows.txt
-# with a 20% threshold; missing baseline emits a warning and
-# exits 0 (matches the bash baseline pattern).
+# (push/schedule runs) or bench/baseline-windows-pr.txt
+# (pull_request runs) with a 20% threshold; missing baseline emits
+# a warning and exits 0 (matches the bash baseline pattern).
 #
 # Reusing the ci-windows.yml WinFSP install + DLL PATH search
 # patterns verbatim (per memory mntrs-winfsp-ci-dll-path).
@@ -182,20 +183,31 @@ jobs:
             mntrs-bench.stderr.log
           if-no-files-found: warn
 
-      # Regression check. bench/baseline-windows.txt holds the
-      # BENCHMARK SUMMARY table of a real main run (Issue #687), so
-      # this step actually gates: a critical workload that got
-      # slower than the 20% threshold, or that reports FAIL instead
-      # of a time, fails the job. A missing baseline still emits a
-      # ::warning:: and exits 0 (matches the bash baseline pattern).
-      # bench/check-regression.ps1 documents the noise floor and the
-      # minimum absolute slowdown it applies on top of the threshold.
+      # Regression check. Two baselines (Issue #687): GitHub Actions
+      # `pull_request` runs land on measurably faster runner hardware
+      # than `push`/`schedule` runs — every observed pull_request run
+      # was faster than every observed push/schedule run, on every
+      # workload, by up to 40% on the same day. Comparing across the
+      # two would flag every PR as a ~35% regression and every merge
+      # as a ~40% one, so each event type is compared against a
+      # baseline measured in the same context. The files document the
+      # measurements.
+      #
+      # With a baseline in place this step actually gates: a critical
+      # workload that got slower than the 20% threshold, or that
+      # reports FAIL instead of a time, fails the job. A missing
+      # baseline still emits a ::warning:: and exits 0 (matches the
+      # bash baseline pattern). bench/check-regression.ps1 documents
+      # the noise floor and the minimum absolute slowdown it applies
+      # on top of the threshold.
       - name: Check regressions
         shell: pwsh
+        env:
+          BENCH_BASELINE: ${{ github.event_name == 'pull_request' && 'bench/baseline-windows-pr.txt' || 'bench/baseline-windows.txt' }}
         run: |
           & ./bench/check-regression.ps1 `
               -Current bench-result.txt `
-              -Baseline bench/baseline-windows.txt `
+              -Baseline $env:BENCH_BASELINE `
               -Threshold 0.20
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

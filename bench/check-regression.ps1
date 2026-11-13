@@ -69,9 +69,16 @@
 #    10M.bin) and explicitly skips the three that cannot be measured
 #    on a shared CI runner.
 #
-# 3. The baseline itself must be a real result. bench/baseline-windows.txt
-#    now holds the BENCHMARK SUMMARY table of an actual main run
-#    (see the provenance header in that file).
+# 3. The baseline itself must be a real result, and it must come from
+#    the same kind of run. bench/baseline-windows.txt holds the
+#    BENCHMARK SUMMARY table of an actual push/schedule run and
+#    bench/baseline-windows-pr.txt holds one of an actual
+#    pull_request run — GitHub Actions lands the two event types on
+#    measurably different runner hardware (up to 40% apart on the
+#    same day), so comparing a pull_request run against the
+#    push/schedule baseline would flag every PR as a ~35% regression.
+#    The workflow picks the file that matches the event; see the
+#    provenance headers in both files.
 
 [CmdletBinding()]
 param(
